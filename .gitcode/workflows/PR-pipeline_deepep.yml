@@ -70,7 +70,7 @@ stages:
               base: ${{ atomgit.event.pull_request.base.ref }}
               repo: ${{ atomgit.repository }}
               number: ${{ env.pr_id }}
-              token: ${{ atomgit.token }}
+              token: ${{ secrets.GIT_TOKEN }}
               list-files: json
               predicate-quantifier: every
               filters: |
@@ -119,7 +119,7 @@ stages:
               owner: ${{ env.org_name }}
               repo: ${{ atomgit.event.repository.name }}
               pr_number: ${{ atomgit.event.pull_request.number }}
-              token: ${{ atomgit.token }}
+              token: ${{ secrets.GIT_TOKEN }}
               apply_label: 'true'
               run_url: https://gitcode.com/${{ env.org_name }}/${{ atomgit.event.repository.name }}/actions/runs/${{ atomgit.workflow_run_id }}
 
@@ -189,6 +189,6 @@ post:
             owner: ${{ env.org_name }}
             repo: ${{ atomgit.event.repository.name }}
             run_id: ${{ atomgit.workflow_run_id }}
-            token: ${{ atomgit.token }}
+            token: ${{ secrets.GIT_TOKEN }}
             pr_number: ${{ atomgit.event.pull_request.number }}
             apply_label: 'true'
