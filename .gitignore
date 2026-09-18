@@ -1,0 +1,37 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Native build and packaging outputs
+/build/
+/dist/
+_skbuild/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.o
+*.obj
+*.so
+*.so.*
+*.a
+*.dll
+*.pyd
+*.whl
+
+# Machine-local configuration and reports
+.env
+.env.*
+!.env.example
+*.log
+/benchmark-runs/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
