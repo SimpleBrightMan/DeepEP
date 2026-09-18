@@ -1,92 +1,115 @@
-# DeepEP for Ascend
+<h1 align="center">DeepEP</h1>
 
-[简体中文](README.zh-CN.md) | English
+<div align="center">
 
-An expert-parallel communication library for Ascend NPUs, designed for token dispatch, result combine, and routing layouts in mixture-of-experts workloads.
+简体中文 | <a href="./readme_en.md">English</a>
 
-The planned `deep_ep` package follows DeepEP V1/V2 user workflows. Device kernels use AscendC with SHMEM as the initial communication foundation. MegaMoE Beta is a separately organized experiment for communication and expert-compute fusion.
+</div>
 
-> **Early development.** APIs, installable packages, and runnable examples are not yet available. See the [roadmap](docs/roadmap.md) for implementation and device validation status.
+<div align="center">
 
-## Architecture
+[![Document](https://img.shields.io/badge/Document-DeepEP-blue)](docs/README.md)
+[![Platform](https://img.shields.io/badge/Platform-Ascend%20NPU-red)](https://www.hiascend.com/)
+[![Kernel](https://img.shields.io/badge/Kernel-AscendC-brightgreen)](csrc/kernels/README.md)
+[![Communication](https://img.shields.io/badge/Communication-SHMEM-lightgrey)](https://gitcode.com/cann/shmem)
 
-![Planned DeepEP architecture](figures/architecture.svg)
+</div>
 
-Public Python APIs delegate to native bindings and EP operations, then execution preparation and complete AscendC kernels. `runtime/` owns persistent resources and completion objects. Shared device components are extracted into `device/` when actual reuse justifies them. SHMEM and optional CATLASS/CatCCOS dependencies will be resolved by the root build.
+面向 Ascend NPU 的专家并行（Expert Parallelism，EP）通信库，为 MoE 训练和推理提供 token 分发、结果归并与路由布局支持。
 
-## Planned features
+项目计划通过 `deep_ep` 提供原生 DeepEP 风格的 V1/V2 用户接口，以 AscendC 实现设备算子，以 SHMEM 作为首发通信基础。MegaMoE Beta 作为独立实验单元，探索通信与专家计算融合。
 
-| Area | Target entry | Current status |
+> **项目处于早期开发阶段。** API、安装包和可运行示例尚未提供。实现进度及设备验证状态见[路线图](docs/roadmap.md)。
+
+## 架构
+
+以下为 DeepEP 的目标架构：连接上层 MoE 框架与 Ascend 设备实现，按接口契约、业务与执行准备、设备算子和平台依赖组织各层职责。各模块尚待实现与设备验证。
+
+<p align="center">
+  <a href="figures/architecture.svg">
+    <img src="figures/architecture.svg" alt="DeepEP 软件架构" width="800">
+  </a>
+</p>
+
+核心 EP 计划通过 V1/V2 接口组织 token 分发与归并，可融合布局处理、数据重排和量化，专家计算由调用框架组织。MegaMoE Beta 计划使用独立实验性 API，以超大融合算子覆盖通信、专家计算及激活等 MoE 流程。
+
+设计中，两类业务按需共享运行上下文、资源和完成对象，并结合拓扑与执行策略选择实现。SHMEM 提供通信基础，CATLASS 和 CatCCOS 按所选算子需要引入。图中实线箭头表示调用或启动，虚线箭头表示支撑或依赖。
+
+## 规划功能
+
+| 功能 | 目标入口 | 当前状态 |
 | --- | --- | --- |
-| V1 EP | `Buffer`; layout, dispatch, combine | Planned |
-| V1 low latency | Dedicated dispatch/combine workflows | Planned; separate qualification |
-| V2 EP | `ElasticBuffer`, `EPHandle` | Planned |
-| Communication/computation overlap | Events and asynchronous options | Planned |
-| MegaMoE Beta | `deep_ep_experimental.megamoe` | Planned; optional build |
+| V1 专家通信 | `Buffer`；layout、dispatch、combine | 待实现 |
+| V1 低时延 | 专用 dispatch/combine 流程 | 待实现、单独验证 |
+| V2 专家通信 | `ElasticBuffer`、`EPHandle` | 待实现 |
+| 通信计算重叠 | 事件与异步选项 | 待实现 |
+| MegaMoE Beta | `deep_ep_experimental.megamoe` | 待实现、可选构建 |
 
-Compatibility will be checked against a pinned upstream API revision, including imports, arguments, return layouts, handle reuse, and completion behavior. See the [API plan](docs/api.md) and [roadmap](docs/roadmap.md).
+API 一致性覆盖导入、参数、返回布局、handle 复用和完成行为。功能资格以固定的原生 API 基线及目标设备验证记录为准，详见 [API 规划](docs/api.md)和[路线图](docs/roadmap.md)。
 
-## Repository layout
+## 目录结构
 
 ```text
 DeepEP/
-├── deep_ep/              # Python API families and completion helpers
-├── csrc/                 # Bindings, ops, runtime, execution, kernels, device
-├── cmake/                # Host/AscendC build and install rules
-├── third-party/          # Pinned dependency sources or SDK integration
-├── configs/              # Topologies, execution policies, release presets
-├── tests/                # API, V1/V2 correctness, integration
-├── benchmarks/           # Communication measurements and result records
-├── examples/             # Complete public API workflows
-├── experiments/megamoe/  # Self-contained optional Beta implementation
-├── docs/                 # Architecture, API, build, performance, development
-└── figures/              # Documentation diagrams
+├── deep_ep/              # Python API 家族与完成包装
+├── csrc/                 # bindings、ops、runtime、execution、kernels、device
+├── cmake/                # Host/AscendC 构建与安装规则
+├── third-party/          # 固定版本依赖源码或 SDK 接入
+├── configs/              # 拓扑、执行策略、发行预设
+├── tests/                # API、V1/V2 正确性、集成验证
+├── benchmarks/           # 通信性能测量与结果记录
+├── examples/             # 完整公开 API 使用流程
+├── experiments/megamoe/  # 独立、可选的 Beta 实现单元
+├── docs/                 # 架构、API、构建、性能、开发说明
+└── figures/              # 文档图稿
 ```
 
-Directory READMEs describe module responsibilities. See the [repository layout](docs/repository-layout.md) for the planned source organization and file responsibilities.
+各模块 README 说明维护职责；[目录设计](docs/repository-layout.md)列出规划中的源码组织与文件分工。
 
-## API workflows
+## 用户 API 与业务流程
 
-The target V1 workflow is layout preparation → dispatch → expert computation → combine. V2 uses `ElasticBuffer` and `EPHandle`, with expert computation consuming the selected returned layout. Asynchronous consumers must establish the required completion dependency before reading communication results.
+V1 目标流程为布局准备 → dispatch → 专家计算 → combine。V2 通过 `ElasticBuffer` 和 `EPHandle` 组织调用，专家计算消费对应返回布局。异步路径在读取通信结果前建立必要的完成依赖。
 
-The framework or a selected fusion implementation performs expert computation. Exact signatures, weighting rules, supported dtypes, and Ascend tuning semantics will be documented against the chosen baseline in [docs/api.md](docs/api.md).
+专家计算由框架或选定融合实现负责。具体签名、权重处理、数据类型及 Ascend 调优语义将在固定接口基线后写入 [docs/api.md](docs/api.md)。
 
-## Performance
+## 性能
 
-No device measurements are available yet. EP results will report dispatch/combine latency and a stated bandwidth definition. MegaMoE results will report full-workflow latency against a semantically equivalent baseline. Every result must identify the revision, environment, topology, shapes, precision, timing boundary, and reproduction command. See the [measurement protocol](docs/performance.md) and [result template](benchmarks/results/template.csv).
+目前没有目标设备实测数据。标准 EP 分别报告 dispatch/combine 延迟，并说明带宽计算口径；MegaMoE 报告相同业务语义下的完整流程延迟及基线。每条结果记录源码版本、环境、拓扑、shape、精度、计时边界和复现命令。
 
-## Requirements and installation
+测量要求见[性能文档](docs/performance.md)，结果格式见 [CSV 模板](benchmarks/results/template.csv)。
 
-The target environment includes Ascend NPUs, a matched driver/CANN/AscendC stack, SHMEM, Python, PyTorch, and `torch_npu`. Exact versions and device support remain to be validated. CATLASS and CatCCOS are optional dependencies selected by the implementation.
+## 环境与安装
 
-Clone the repository:
+目标环境包含 Ascend NPU、匹配的驱动/CANN/AscendC、SHMEM、Python、PyTorch 和 `torch_npu`。具体版本与设备支持待验证；CATLASS 和 CatCCOS 按实际实现选用。
+
+获取仓库：
 
 ```bash
 git clone https://gitcode.com/Ascend/DeepEP.git
 cd DeepEP
 ```
 
-Installation is not available yet. See [build and packaging](docs/build.md) for the planned build pipeline, dependencies, and artifacts.
+安装方式尚未开放。构建流程、依赖和产物规划见[构建与打包](docs/build.md)。
 
 ## MegaMoE Beta
 
-[experiments/megamoe/](experiments/megamoe/README.md) owns the planned fused workflow, native extension, Python namespace, configuration, tests, and benchmark entry. The target composition is dispatch–GMM–activation–GMM–combine. Kernel boundaries and optional quantization depend on the selected implementation.
+[experiments/megamoe/](experiments/megamoe/README.md)集中承载融合流程、原生扩展、Python 命名空间、配置、测试及性能入口。目标逻辑为 dispatch–GMM–激活–GMM–combine；Kernel 边界和可选量化由具体实现确定。
 
-`DEEPEP_BUILD_MEGAMOE` is a planned build option, defaulting to `OFF`. Beta API and performance qualification will be versioned independently of the core API.
+`DEEPEP_BUILD_MEGAMOE` 为规划中的构建开关，默认 `OFF`。Beta 接口与性能资格按版本单独维护。
 
-## Development and testing
+## 开发与测试
 
-Start with the [architecture](docs/architecture.md), [development guide](docs/development.md), and [contribution guide](CONTRIBUTING.md). The [test plan](tests/README.md) covers API compatibility, numerical correctness, resource ownership, and installation. [Examples](examples/README.md) will demonstrate complete V1/V2 workflows; [benchmarks](benchmarks/README.md) will measure device performance.
+开发入口包括[架构](docs/architecture.md)、[开发指南](docs/development.md)和[贡献指南](CONTRIBUTING.md)。[测试规划](tests/README.md)覆盖 API 兼容性、数值正确性、资源所有权和安装；[示例](examples/README.md)将展示完整 V1/V2 流程，[性能入口](benchmarks/README.md)负责设备测量。
 
-## Roadmap
+## 路线图
 
-1. Implement the root build, dependency resolution, package layout, and artifact collection.
-2. Implement and qualify V1/V2 workflows against a pinned API baseline.
-3. Deliver and qualify the optional MegaMoE Beta with reproducible measurements.
-4. Extract shared device components where concrete consumers establish a stable contract.
+1. 实现根构建、依赖解析、包结构和产物收集。
+2. 对照固定 API 基线实现并验证 V1/V2 业务流程。
+3. 交付可选 MegaMoE Beta，提供正确性和可复现性能记录。
+4. 根据真实消费者和稳定契约提炼共享设备组件。
 
-See the [roadmap and qualification matrix](docs/roadmap.md) for completion criteria.
+完成标准见[路线图与资格矩阵](docs/roadmap.md)。
 
-## Contributing and licensing
+## 贡献与许可
 
-Contributions should include the affected workflow, build scope, and correctness/performance evidence; see [CONTRIBUTING.md](CONTRIBUTING.md). A project license and third-party notices have not yet been published.
+贡献需说明对应调用流程、构建范围及正确性/性能证据，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。项目许可证及第三方版权声明尚未发布。

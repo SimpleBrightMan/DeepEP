@@ -4,8 +4,8 @@
 
 ```text
 DeepEP/
-├── README.md  # 英文项目首页、功能与快速开始
-├── README.zh-CN.md  # 中文项目首页、功能与快速开始
+├── README.md  # 中文项目首页、功能与快速开始
+├── readme_en.md  # 英文项目首页、功能与快速开始
 ├── LICENSE  # 发布审核确认的项目许可证
 ├── NOTICE  # 实际采用组件的版权与分发声明
 ├── CONTRIBUTING.md  # 贡献、命名与开发约定
@@ -108,7 +108,8 @@ DeepEP/
 │   ├── development.md  # 实现导航、命名、变体与测试
 │   └── roadmap.md  # 功能资格与公共能力接入
 ├── figures/
-│   └── architecture.svg  # README 架构图；独立文档资源类别
+│   ├── architecture.svg  # 中文首页及架构文档使用的架构图
+│   └── architecture_en.svg  # 英文首页使用的对应架构图
 ├── tests/
 │   ├── __init__.py  # 测试包入口
 │   ├── utils/

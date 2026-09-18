@@ -12,4 +12,4 @@
 | [development.md](development.md) | 源码导航、文件粒度与实现次序 |
 | [roadmap.md](roadmap.md) | 开发阶段、功能状态与验证要求 |
 
-用户入口：[中文首页](../README.zh-CN.md) / [English README](../README.md)。
+用户入口：[中文首页](../README.md) / [English README](../readme_en.md)。
