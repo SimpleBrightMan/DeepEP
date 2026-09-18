@@ -1,4 +1,4 @@
-name: PR-pipeline_
+name: PR-pipeline_deepep
 
 concurrency:
   max: 120
@@ -15,7 +15,7 @@ on:
 
   pull_request_comment:
     types: [created]
-    branches: [ 'master', '26.1.0', '26.0.0', '7.3.0' ]
+    branches: [ 'main' ]
     comments: [ '^compile$' ]
 
 env:
