@@ -32,6 +32,7 @@ compile_commands.json
 *.log
 /benchmark-runs/
 /api-contracts.xml
+/cpu-correctness.xml
 .DS_Store
 Thumbs.db
 .idea/

@@ -19,7 +19,7 @@ An expert-parallel communication library for Ascend NPUs, designed for token dis
 
 The planned `deep_ep` package follows DeepEP V1/V2 user workflows. Device kernels use AscendC with SHMEM as the initial communication foundation. MegaMoE Beta is a separately organized experiment for communication and expert-compute fusion.
 
-> **Early development.** Importable API declarations and contract tests are available. All runtime constructors, communication operations, and event operations explicitly raise `NotImplementedError`. Native implementations, installable packages, and runnable communication examples are not yet available. See the [roadmap](docs/roadmap.md).
+> **Early development.** API declarations, contract tests, independent CPU references, and collectible V1/V2 device scenarios are available. All runtime constructors, communication operations, and event operations still raise `NotImplementedError`; device communication is not qualified. Native implementations, installable packages, and runnable communication examples are not yet available. See the [test guide](tests/README.md) and [roadmap](docs/roadmap.md).
 
 ## Architecture
 

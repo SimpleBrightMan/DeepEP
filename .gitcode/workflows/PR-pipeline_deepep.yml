@@ -127,8 +127,8 @@ stages:
     name: CodeCheck
     select: selected_by_default
     jobs:
-      API_contracts:
-        name: CPU API contracts
+      CPU_correctness:
+        name: CPU API and reference tests
         if: ${{ jobs.Detect_file_changes.outputs.need_build_ut == 'yes' }}
         runs-on: [ self-hosted, x86, cpu=32 ]
         container:
@@ -138,15 +138,15 @@ stages:
             uses: checkout
             with:
               ref: refs/merge-requests/${{ env.pr_id }}/merge
-          - name: Install API test dependencies
+          - name: Install test dependencies
             run: python3.11 -m pip install -r requirements-dev.txt
-          - name: Verify API contracts without device dependencies
-            run: python3.11 -m pytest tests/api -m "not framework" --junitxml=api-contracts.xml
-          - name: Upload API contract results
+          - name: Verify contracts, references and device collection
+            run: python3.11 -m pytest -m "not framework" --junitxml=cpu-correctness.xml
+          - name: Upload CPU correctness results
             uses: upload-artifact
             with:
-              name: api-contracts
-              path: api-contracts.xml
+              name: cpu-correctness
+              path: cpu-correctness.xml
               overwrite: true
 
 #      CodeCheck_pre_commit:
