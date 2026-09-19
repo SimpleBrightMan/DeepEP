@@ -31,6 +31,7 @@ compile_commands.json
 !.env.example
 *.log
 /benchmark-runs/
+/api-contracts.xml
 .DS_Store
 Thumbs.db
 .idea/

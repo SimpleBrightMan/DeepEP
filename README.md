@@ -19,7 +19,7 @@
 
 项目计划通过 `deep_ep` 提供原生 DeepEP 风格的 V1/V2 用户接口，以 AscendC 实现设备算子，以 SHMEM 作为首发通信基础。MegaMoE Beta 作为独立实验单元，探索通信与专家计算融合。
 
-> **项目处于早期开发阶段。** API、安装包和可运行示例尚未提供。实现进度及设备验证状态见[路线图](docs/roadmap.md)。
+> **项目处于早期开发阶段。** 已提供可导入的 API 声明和契约测试；所有运行时对象构造、通信和事件操作均明确抛出 `NotImplementedError`。原生后端、安装包及可运行通信示例尚未提供。实现进度见[路线图](docs/roadmap.md)。
 
 ## 架构
 
@@ -70,7 +70,7 @@ DeepEP/
 
 V1 目标流程为布局准备 → dispatch → 专家计算 → combine。V2 通过 `ElasticBuffer` 和 `EPHandle` 组织调用，专家计算消费对应返回布局。异步路径在读取通信结果前建立必要的完成依赖。
 
-专家计算由框架或选定融合实现负责。具体签名、权重处理、数据类型及 Ascend 调优语义将在固定接口基线后写入 [docs/api.md](docs/api.md)。
+专家计算由框架或选定融合实现负责。具体签名和目标语义见 [docs/api.md](docs/api.md)。接口基线已固定；数据传输和 Ascend 调优实现仍待开发。
 
 ## 性能
 
@@ -112,4 +112,4 @@ cd DeepEP
 
 ## 贡献与许可
 
-贡献需说明对应调用流程、构建范围及正确性/性能证据，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。项目许可证及第三方版权声明尚未发布。
+贡献需说明对应调用流程、构建范围及正确性/性能证据，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。项目许可证尚待确定；已采用接口声明的来源及许可见 [third-party/](third-party/README.md)。

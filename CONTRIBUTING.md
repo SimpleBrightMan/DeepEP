@@ -17,8 +17,8 @@ Documentation changes should preserve working relative links and keep English an
 
 ## Development commands
 
-Build and test entry points are under development. See [docs/build.md](docs/build.md) and [tests/README.md](tests/README.md) for their planned organization and requirements.
+API contract tests are available; see [tests/README.md](tests/README.md). Native build and device test entry points remain under development; see [docs/build.md](docs/build.md).
 
 ## Licensing
 
-A project license and third-party notices have not yet been published. Preserve copyright and license information when introducing dependency sources.
+A project license has not yet been selected. Preserve copyright and license information when introducing dependency sources. Attribution for adopted interface declarations is recorded in [third-party/README.md](third-party/README.md).

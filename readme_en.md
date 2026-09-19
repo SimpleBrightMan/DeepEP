@@ -19,7 +19,7 @@ An expert-parallel communication library for Ascend NPUs, designed for token dis
 
 The planned `deep_ep` package follows DeepEP V1/V2 user workflows. Device kernels use AscendC with SHMEM as the initial communication foundation. MegaMoE Beta is a separately organized experiment for communication and expert-compute fusion.
 
-> **Early development.** APIs, installable packages, and runnable examples are not yet available. See the [roadmap](docs/roadmap.md) for implementation and device validation status.
+> **Early development.** Importable API declarations and contract tests are available. All runtime constructors, communication operations, and event operations explicitly raise `NotImplementedError`. Native implementations, installable packages, and runnable communication examples are not yet available. See the [roadmap](docs/roadmap.md).
 
 ## Architecture
 
@@ -70,7 +70,7 @@ Directory READMEs describe module responsibilities. See the [repository layout](
 
 The target V1 workflow is layout preparation → dispatch → expert computation → combine. V2 uses `ElasticBuffer` and `EPHandle`, with expert computation consuming the selected returned layout. Asynchronous consumers must establish the required completion dependency before reading communication results.
 
-The framework or a selected fusion implementation performs expert computation. Exact signatures, weighting rules, supported dtypes, and Ascend tuning semantics will be documented against the chosen baseline in [docs/api.md](docs/api.md).
+The framework or a selected fusion implementation performs expert computation. The signature baseline and target semantics are documented in [docs/api.md](docs/api.md). Data transport and Ascend tuning remain unimplemented.
 
 ## Performance
 
@@ -110,4 +110,4 @@ See the [roadmap and qualification matrix](docs/roadmap.md) for completion crite
 
 ## Contributing and licensing
 
-Contributions should include the affected workflow, build scope, and correctness/performance evidence; see [CONTRIBUTING.md](CONTRIBUTING.md). A project license and third-party notices have not yet been published.
+Contributions should include the affected workflow, build scope, and correctness/performance evidence; see [CONTRIBUTING.md](CONTRIBUTING.md). A project license is still to be selected. Attribution and licensing for the adopted interface declarations are recorded in [third-party/](third-party/README.md).

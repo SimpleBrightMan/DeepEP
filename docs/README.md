@@ -7,6 +7,7 @@
 | [architecture.md](architecture.md) | 分层职责、调用链与依赖关系 |
 | [repository-layout.md](repository-layout.md) | 源码目录规划与文件职责 |
 | [api.md](api.md) | API 对标范围、工作流与基线要求 |
+| [api-contracts.md](api-contracts.md) | 已提供的接口声明、默认值差异、明确失败及验证设计 |
 | [build.md](build.md) | 构建主链、产物、安装及依赖锁定 |
 | [performance.md](performance.md) | EP/Beta 测量口径与复现记录 |
 | [development.md](development.md) | 源码导航、文件粒度与实现次序 |

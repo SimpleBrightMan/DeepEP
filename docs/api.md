@@ -1,6 +1,6 @@
 # API 与兼容性规划
 
-本文定义 V1/V2 接口的兼容性目标与工作流。Python API 和原生扩展尚未提供，实现与验证进展见[路线图](roadmap.md)。
+本文定义 V1/V2 接口的兼容性目标与工作流。当前已提供可导入的 API 声明和契约测试，所有运行时构造和操作均明确抛出 `NotImplementedError`；原生扩展尚未实现。声明范围、默认值差异及目标数据语义见 [API 声明设计](api-contracts.md)，设备资格见[路线图](roadmap.md)。
 
 ## 公开对象与职责
 
@@ -9,10 +9,10 @@
 | `Buffer` | `deep_ep/buffers/legacy.py` | V1 布局、dispatch、combine 与对应低时延流程 |
 | `ElasticBuffer` | `deep_ep/buffers/elastic.py` | V2 业务操作 |
 | `EPHandle` | 与 V2 同组 | V2 布局及跨调用业务元数据 |
-| `Config` | `csrc/ops/config.hpp`，经包入口导出 | 兼容配置对象，定义采用单一来源 |
+| `Config` | 当前在私有 `_config.py` 声明，后续由原生绑定提供 | 兼容配置对象；当前不能构造，不提供 Ascend 调优默认值 |
 | `EventOverlap` 等完成包装 | `deep_ep/utils/event.py` | 用户可观察的完成与等待行为 |
 
-目标导入集中在 `deep_ep/__init__.py`；扩展加载集中在 `_native.py`。这些文件当前尚未创建。
+公开导入集中在 `deep_ep/__init__.py`。当前 `_native.py` 仅提供明确失败的边界，不导入 Torch、torch_npu 或原生扩展。相同公开类型可从对应 buffers/utils 模块导入。
 
 ## 工作流
 
@@ -25,7 +25,7 @@
 
 ## 固定基线
 
-实施时新增 `tests/api/upstream_api.json`，至少记录：
+已新增 `tests/api/upstream_api.json`，记录所选 EP 接口的固定基线和差异：
 
 | 字段类别 | 要求 |
 | --- | --- |
@@ -36,7 +36,7 @@
 | 完成行为 | 异步选项、事件、hook、允许消费结果的时机 |
 | 覆盖证据 | 测试路径、目标设备和本版本支持范围 |
 
-兼容性基线将固定到 [DeepEP 原生仓库](https://github.com/deepseek-ai/DeepEP) 的具体 tag 或 commit，并与本项目的版本和测试覆盖关联。参考版本目前尚未确定。
+兼容性基线固定到 [DeepEP 原生仓库](https://github.com/deepseek-ai/DeepEP/tree/a56d6156febcd9976e55adc85b5155bfac9f28f8) 的提交 `a56d6156febcd9976e55adc85b5155bfac9f28f8`。源码路径、SHA-256、方法签名和明确的差异离线保存。基线仅覆盖本批选定对象，不代表兼容上游全部功能。
 
 ## Ascend 参数语义
 

@@ -127,6 +127,28 @@ stages:
     name: CodeCheck
     select: selected_by_default
     jobs:
+      API_contracts:
+        name: CPU API contracts
+        if: ${{ jobs.Detect_file_changes.outputs.need_build_ut == 'yes' }}
+        runs-on: [ self-hosted, x86, cpu=32 ]
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/mindspore/mindspore_python3.11:v0.1
+        steps:
+          - name: checkout
+            uses: checkout
+            with:
+              ref: refs/merge-requests/${{ env.pr_id }}/merge
+          - name: Install API test dependencies
+            run: python3.11 -m pip install -r requirements-dev.txt
+          - name: Verify API contracts without device dependencies
+            run: python3.11 -m pytest tests/api -m "not framework" --junitxml=api-contracts.xml
+          - name: Upload API contract results
+            uses: upload-artifact
+            with:
+              name: api-contracts
+              path: api-contracts.xml
+              overwrite: true
+
 #      CodeCheck_pre_commit:
 #        name: CodeCheck_pre_commit
 #        if : ${{ jobs.Detect_file_changes.outputs.need_build_ut == 'yes' }}
