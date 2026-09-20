@@ -8,7 +8,7 @@ E4M3FN values and FP32 scales converted back to BF16 before combine.
 
 from bisect import bisect_left
 from dataclasses import asdict, dataclass
-from math import isfinite, sqrt
+from math import fsum, isfinite, sqrt
 from random import Random
 import struct
 
@@ -177,9 +177,11 @@ def error_metrics(actual, golden, *, dtype):
             relative_errors.append(error / (abs(wanted) + 1e-7))
     return ErrorMetrics(
         max(relative_errors, default=0.0),
-        sum(relative_errors) / len(relative_errors) if relative_errors else 0.0,
+        # Built-in float sum changed in Python 3.12. Use an explicit accurate
+        # reduction so the checked-in metrics also reproduce on Python 3.11.
+        fsum(relative_errors) / len(relative_errors) if relative_errors else 0.0,
         (
-            sqrt(sum(error * error for error in normal_errors) / len(normal_errors))
+            sqrt(fsum(error * error for error in normal_errors) / len(normal_errors))
             if normal_errors
             else 0.0
         ),

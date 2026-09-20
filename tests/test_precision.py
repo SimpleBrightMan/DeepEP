@@ -1,6 +1,8 @@
 """Precision policy, dtype emulation, matrix and golden regression tests."""
 
 import json
+from fractions import Fraction
+from math import sqrt
 from pathlib import Path
 
 import pytest
@@ -108,6 +110,20 @@ def test_small_domain_is_not_hidden_by_relative_error():
     assert metrics.small_count == 1
     assert metrics.small_error_count == 1
     assert metrics.normal_count == 1
+
+
+def test_metric_reductions_preserve_small_terms_across_python_versions():
+    # Exact rational accumulation is an independent oracle for the reduction.
+    # On Python 3.11, builtin float sum loses the small squared errors after 1.
+    actual = (2.0,) + (1.0 + 2**-27,) * 128
+    golden = (1.0,) * len(actual)
+    metrics = error_metrics(actual, golden, dtype="bfloat16")
+    errors = [abs(a - b) for a, b in zip(actual, golden)]
+    relative = [error / (abs(b) + 1e-7) for error, b in zip(errors, golden)]
+    exact_relative = sum(Fraction.from_float(value) for value in relative)
+    exact_squares = sum(Fraction.from_float(value * value) for value in errors)
+    assert metrics.mere == float(exact_relative) / len(actual)
+    assert metrics.rmse == sqrt(float(exact_squares) / len(actual))
 
 
 def test_bootstrap_recheck_enforces_sample_fuse_and_ci_rule():

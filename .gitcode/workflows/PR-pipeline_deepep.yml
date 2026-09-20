@@ -128,7 +128,7 @@ stages:
     select: selected_by_default
     jobs:
       CPU_correctness:
-        name: CPU API and reference tests
+        name: CPU API, reference and benchmark tests
         if: ${{ jobs.Detect_file_changes.outputs.need_build_ut == 'yes' }}
         runs-on: [ self-hosted, x86, cpu=32 ]
         container:
@@ -140,8 +140,13 @@ stages:
               ref: refs/merge-requests/${{ env.pr_id }}/merge
           - name: Install test dependencies
             run: python3.11 -m pip install -r requirements-dev.txt
-          - name: Verify contracts, references and device collection
+          - name: Verify contracts, references, benchmark protocol and device collection
             run: python3.11 -m pytest -m "not framework" --junitxml=cpu-correctness.xml
+          - name: Validate benchmark presets without devices
+            run: |
+              python3.11 -m benchmarks.bench_ep --dry-run --preset smoke
+              python3.11 -m benchmarks.bench_ep --dry-run --preset upstream-bf16
+              python3.11 -m benchmarks.bench_ep --dry-run --preset upstream-fp8
           - name: Upload CPU correctness results
             uses: upload-artifact
             with:

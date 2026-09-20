@@ -1,14 +1,43 @@
-# 性能结果记录
+# 性能结果记录（schema_version=1）
 
-[template.csv](template.csv) 只有字段表头，用于后续保存 EP 与 Beta 的可复现测量摘要。当前没有性能数据。
+[template.csv](template.csv) 仅含表头。当前没有设备测量数据，单元测试的合成样本不纳入结果仓库。
 
-- 身份与环境：源码提交、构建信息、完整软件环境、硬件与拓扑配置路径。
-- 负载与执行：API 家族、操作、dtype、shape、rank 数、策略、实际变体、AIV 配置和随机种子。
-- 测量：预热/重复次数、计时边界、rank 聚合、延迟统计和带宽字节定义。
-- 对比与复现：基线提交及延迟、加速比、正确性记录、复现命令与原始结果路径。
+## 输出状态与文件
 
-时间字段使用带时区的 ISO 8601；延迟单位为微秒，带宽单位为十进制 GB/s。不适用字段留空并在 notes 说明，不以 0 代替未测量。统计值和派生值必须来自保留的原始数据。
+| 状态 | 输出 | 允许内容 |
+| --- | --- | --- |
+| `planned` | stdout；指定新目录时写 `config.json`、`plan.json` | 配置、能力、计时定义与逻辑字节数；正确性 `not_run` |
+| `measured` | rank 0 stdout、`config.json`、`result.json`、`summary.csv` | 完整原始样本、聚合统计及前后正确性通过 |
+| `failed` | stdout 的 schema_version/status/error_type，详细错误在 stderr | 不写成功结果，不以 0 代替时延；参数解析错误直接返回非零 |
 
-环境与配置路径应指向随结果归档的可共享文件。基线延迟须采用与候选相同的统计方式和计时范围；没有匹配基线时不填写 speedup。
+只有成功退出原生会话的测量才能发布 `measured`。已有目录不覆盖；写入失败时残留目录不能视为完整记录。未测量时不生成 `statistics`、`rank_samples_us`、`rank_max_samples_us` 或性能 CSV。
 
-完整口径见 [性能文档](../../docs/performance.md)。
+## JSON 字段契约
+
+| 字段 | 类型 / 定义 |
+| --- | --- |
+| `schema_version` | 整数 1；不兼容语义变化需升级版本 |
+| `status` | planned / measured / failed |
+| `config` | 全量规范化负载配置，字段与约束见[设计](../../docs/benchmark-design.md) |
+| `config_fingerprint` | 上述配置排序 JSON 的 64 位 SHA256 |
+| `required_capabilities` | 排序的能力字符串数组 |
+| `timing` | 时钟、完成边界、包括/排除项、聚合/百分位、缓存策略与操作定义 |
+| `traffic` | definition/includes/excludes；每个源 rank 的行数、dispatch/combine 字节数，以及所选操作全 rank effective_bytes |
+| `correctness_result` | planned 为 not_run；measured 为 passed_pre_and_post |
+| `revision`, `measured_at` | 仅 measured：完整小写 40 位 Git SHA、带时区 ISO 8601 UTC 时间 |
+| `metadata` | 仅 measured：backend/device/software/topology/variant；显式公开标识，不自动收集机器信息 |
+| `rank_samples_us` | 仅 measured：world_size × iterations 的正有限数，rank-major、逐轮对齐 |
+| `rank_max_samples_us` | 仅 measured：每轮跨 rank MAX 的原始聚合数组 |
+| `statistics` | 仅 measured：latency_mean/min/max/p50/p95_us、bandwidth_gbps、bandwidth_statistic |
+
+延迟为微秒，带宽为十进制 GB/s。带宽字段 `bandwidth_statistic=effective_bytes_over_mean_rank_max_latency`。逻辑字节数包含本地路由，不代表物理链路流量；FP8 scale、索引、权重及 padding 不计入。
+
+## CSV 与复现
+
+CSV 一次实验一行，保留旧字段并追加 schema、状态、后端、双方向 dtype、布局、缓存模式、alignment、权重开关、路由、mean/min/max、带宽统计口径和完整配置指纹。字段顺序由测试与模板同时锁定。不适用的 nodes/build_info_path/policy_path/num_aiv 等留空；基线提交/延迟/speedup 未测量时留空。
+
+raw_results_path 与 environment_path 都指向随目录归档的 `result.json`；配置位于 `config.json`。摘要中的 launcher 和新输出目录使用占位符，复现时按实际公开拓扑补齐，所有 rank 使用同一份配置与源码 SHA。
+
+同配置的 record_id 相同，区分重复实验还需 measured_at、revision、metadata；不要只用 record_id 当全局唯一键。公开前检查所有字段，仅保留可共享信息，不上传完整进程环境、访问凭据或本地机器路径。
+
+[测量口径](../../docs/performance.md) · [详细设计与适配器契约](../../docs/benchmark-design.md)

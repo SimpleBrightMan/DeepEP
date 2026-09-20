@@ -74,7 +74,7 @@ The framework or a selected fusion implementation performs expert computation. T
 
 ## Performance
 
-No device measurements are available yet. EP results will report dispatch/combine latency and a stated bandwidth definition. MegaMoE results will report full-workflow latency against a semantically equivalent baseline. Every result must identify the revision, environment, topology, shapes, precision, timing boundary, and reproduction command. See the [measurement protocol](docs/performance.md) and [result template](benchmarks/results/template.csv).
+No device measurements are available yet. The [benchmark CLI](benchmarks/README.md) provides framework-free dry-runs, a timing/aggregation engine, and versioned JSON/CSV output. A native measurement adapter is not implemented; measurement attempts fail before device initialization, and plans contain no measured metrics. EP results distinguish dispatch, combine, and directly measured roundtrip, using a stated logical-byte definition. MegaMoE full-workflow measurements remain separate. See the [detailed design](docs/benchmark-design.md), [measurement protocol](docs/performance.md), and [result template](benchmarks/results/template.csv).
 
 ## Requirements and installation
 

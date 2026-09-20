@@ -71,6 +71,8 @@ python -m pytest tests/test_precision.py -q
 
 生成文件 `tests/golden/deepep_reference_v2.json` 包含 schema、上游提交、完整 CPU reference case 配置、设备资格 case 配置、有效 route slot 数、普通/展开布局行数、expert count 摘要、CPU FP64 combine 摘要、上游 dtype 标杆摘要及标杆相对 Golden 的误差指标。
 
+MERE/RMSE 的浮点归约显式使用 `math.fsum`，避免 Python 3.11 与 3.12 的内置 `sum` 算法差异导致 Golden 指标末位不一致（见 [Python 版本说明](https://docs.python.org/3.12/library/functions.html#sum)）。这不放宽精度阈值或 Golden 一致性检查；测试另用精确有理数累加核对小误差项。
+
 Golden 不保存海量张量文本；输入由公开、无随机状态的整数公式完全重建，结果用规范 JSON 的 SHA-256 锁定。修改公式、路由语义、dtype 舍入或归并答案都会使回归失败。更新 Golden 必须同时审核生成器变更，禁止只替换摘要来消除失败。
 
 设备结果不得写回覆盖 CPU Golden。应作为独立 capture 文件输入同一比较器，并保留 rank、case、dtype、shape 和来源标识。真实 GPU 标杆可替换 manifest 中的 dtype 模拟值，但必须使用同一输入和固定上游提交。

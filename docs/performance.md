@@ -1,30 +1,38 @@
 # 性能测量与复现
 
-当前没有 benchmark 实现或目标 NPU 测量数据。本文件定义后续记录口径；[结果模板](../benchmarks/results/template.csv)只有表头，没有实测数据。
+已提供 [benchmark 入口](../benchmarks/README.md)、无设备规划与测量协议引擎。原生适配器尚未实现，当前**没有设备实测数据**；[结果模板](../benchmarks/results/template.csv)只有表头。完整配置、时序、能力门禁和后端接入条件见[详细设计](benchmark-design.md)。
 
 ## 测量范围
 
-| 类型 | 分别报告 | 基线要求 |
+| 模式 | 计时工作 | 准备工作（不计时） |
 | --- | --- | --- |
-| 核心 EP | dispatch 延迟、combine 延迟、明确口径的有效带宽 | 相同路由、精度、布局、规模与完成边界 |
-| MegaMoE Beta | 完整 dispatch–GMM–激活–GMM–combine 延迟 | 数学语义、权重处理、精度与负载一致的组合流程 |
+| dispatch | 调用至输出可安全消费；fresh 含其通知/布局操作 | 输入与路由；cached 模式额外准备可复用 handle |
+| combine | 调用至 BF16 合并输出可安全消费 | 用真实 dispatch 准备匹配 handle 和 BF16 合并输入 |
+| roundtrip | 直接测量 dispatch → 同一 handle 的 combine，无专家 GEMM | 输入、路由及 cached handle；FP8 接收数据恢复 BF16 在计时内 |
 
-EP 通信带宽与 MegaMoE 端到端加速分别记录。异步 API 的 Host 返回耗时不代表 Device 完成延迟。测量必须说明事件、同步点及消费结果的边界。
+roundtrip 不能由两份单项延迟相加得出。普通布局按目标 rank 去重，展开布局保留有效槽位重数。带权重时值通道独立传递，不额外把 gate 乘到 hidden payload；这不是完整 MoE 业务延迟。
 
-## 必需记录
+计时采用同步 Host 墙钟 `perf_counter_ns`。每轮先 barrier、同步，再开始计时；调用后等待完成依赖并同步，最后停止计时。API 内分配计入，预先生成输入、正确性检查、结果释放和样本收集不计入。该口径包含 Host 调度与完成等待，不能与纯 kernel event 时间混用。
 
-保存源码和基线提交、软件配套、硬件和拓扑、节点/rank 数、每 rank token 数、hidden、top-k、expert 数、dtype、实际变体、策略和 AIV 配置。记录预热次数、重复次数、随机种子、计时方法、rank 聚合方式与复现命令。
+## 统计与字节定义
 
-有效带宽按 `effective_bytes / elapsed_seconds` 计算，使用 GB/s 时以 `10^9` 换算。`effective_bytes` 必须明确是否计入路由重复、scale、元数据和跨链路重复传输；未定义字节口径时只报告延迟。
+保存全 rank、逐 iteration 原始微秒样本。对齐同一轮后取 rank MAX，再计算 mean/min/max、nearest-rank p50/p95；不能先算各 rank 的分位数再取 MAX。
 
-加速比采用匹配基线的 `baseline_latency / candidate_latency`，需保持统计方式和计时边界一致。记录 p50、p95 等统计值时明确采样和跨 rank 聚合方式。
+`effective_bytes` 是全 rank 的**有效 hidden payload 逻辑字节数**：
 
-## 执行过程
+- 普通布局：每个源 token 的有效目标 rank 数 × H × 元素字节数。
+- 展开布局：每个源 token 的有效路由槽位数 × H × 元素字节数，重复 expert 槽位分别计数。
+- BF16 dispatch 每元素 2 字节，FP8 dispatch 每元素 1 字节；combine 总是 BF16、每元素 2 字节；roundtrip 两方向相加。
+- 包括本 rank 路由；不包含 padding、FP8 scale、索引、权重、协议开销或链路重传。
 
-1. 固定代码、配套、拓扑、负载、策略与随机种子。
-2. 先验证结果正确性、异步完成和 handle 条件。
-3. 明确预热与测量区间，在完成边界上计时。
-4. 保存各 rank 原始结果与聚合规则，再生成摘要。
-5. 将复现命令、配置和日志位置与结果一同归档。
+报告 `bandwidth_gbps = effective_bytes / (mean_rank_max_us × 1000)`，使用十进制 GB/s。这是约定口径的有效带宽，**不是物理链路带宽、单 rank 带宽或互联利用率**。路由全无效时可出现有效字节数为零，但原始延迟仍必须为正数。
 
-本地测量输出可放入根目录 `benchmark-runs/`（已忽略）。可公开的基线数据经核对后存入 `benchmarks/results/`；Beta 专属测量与对应版本和配置关联。
+## 正确性与记录要求
+
+测量前后均验证相同负载的路由、布局、payload/scale、combine 数值和值通道，按[精度标准](precision.md)使用独立 Golden 和上游同 dtype 标杆。任一 rank 失败、样本缺失/非有限值、能力不足或资源退出失败，都不能发布成功结果。
+
+结果保存完整配置、配置指纹、源码 SHA、公开软件/设备/拓扑标识、计时/字节口径及原始样本，见[结果字段](../benchmarks/results/README.md)。版本、负载、精度、拓扑、缓存策略和完成边界一致才可比较。没有匹配的实测基线，不填写基线延迟或加速比；未测量不填写 0。
+
+输出放入被 Git 忽略的 `benchmark-runs/` 新目录。发布前逐项检查元数据，只保留可公开、可复现的信息；入口不会自动采集机器名、地址、环境变量或本地路径。dry-run 的规划文件不能作为性能证据。
+
+MegaMoE Beta 后续独立记录完整 dispatch–GMM–激活–GMM–combine 的延迟及语义匹配基线，不能与此处 EP 通信有效带宽混用。

@@ -10,6 +10,7 @@
 | [api-contracts.md](api-contracts.md) | 已提供的接口声明、默认值差异、明确失败及验证设计 |
 | [build.md](build.md) | 构建主链、产物、安装及依赖锁定 |
 | [performance.md](performance.md) | EP/Beta 测量口径与复现记录 |
+| [benchmark-design.md](benchmark-design.md) | EP benchmark 配置、计时/统计引擎、结果协议及原生适配器契约 |
 | [precision.md](precision.md) | 精度标准、BF16/FP8 双标杆、Golden 与资格矩阵 |
 | [development.md](development.md) | 源码导航、文件粒度与实现次序 |
 | [roadmap.md](roadmap.md) | 开发阶段、功能状态与验证要求 |

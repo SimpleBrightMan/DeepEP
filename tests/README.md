@@ -15,6 +15,7 @@ python -m pytest -m "not framework" --junitxml=cpu-correctness.xml
 
 - `test_reference.py`：人工计算锚点、全局路由参考、两种布局及独立数值通道；注入错路由、漏行、重复行、错索引/计数/权重、遗漏贡献、额外乘 gate 和 NaN，确认检查器拒绝错误结果。
 - `test_harness.py`：设备执行开关、空资格选择、启动参数、异常清理与已有进程组保护；模拟对象只检查环境生命周期，不代表通信后端。
+- `test_benchmark.py`：配置/能力门禁、独立路由字节数、完成边界计时、逐轮 rank MAX、失败传播和 JSON/CSV 协议；轨迹对象只验证引擎，不产生设备性能证据。
 - `utils/reference.py`：只从全 rank 输入和路由生成预期，不读取待测实现的 handle 或内部表，不调用设备代码。
 - `utils/precision.py`：BF16/E4M3FN 上游 dtype 模拟、L0-L2 双标杆指标和小值域判定。
 - `golden/deepep_reference_v2.json`：由固定公式重建的版本化 Golden 摘要，同时锁定设备资格矩阵；生成与审核方法见[精度标准](../docs/precision.md)。
@@ -77,7 +78,7 @@ torchrun --standalone --nproc-per-node=8 -m pytest tests/elastic/test_workflows.
 不支持的参数组合在初始化 NPU/SHMEM 前明确 skip，避免把缺失能力误判成算子精度失败。
 缺少启动信息、设备、依赖，或已声明支持的路径运行时报错，仍然失败。
 
-若后端没有 `elastic-reinitialize`，一次 torchrun 只允许选中一个受支持用例；门禁会在设备初始化前拒绝多用例运行。此时由外层脚本为每个 node id 启动独立 torchrun。例如 B04 当前只声明 expanded BF16 dispatch，可按单个 node id 运行：
+若后端没有 `elastic-reinitialize`，一次 torchrun 只允许选中一个受支持用例；门禁会在设备初始化前拒绝多用例运行。此时由外层脚本为每个 node id 启动独立 torchrun。例如仅支持 expanded BF16 dispatch 的后端，可按单个 node id 运行：
 
 ```bash
 torchrun --standalone --nproc-per-node=2 -m pytest \

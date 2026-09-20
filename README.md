@@ -76,7 +76,7 @@ V1 目标流程为布局准备 → dispatch → 专家计算 → combine。V2 �
 
 目前没有目标设备实测数据。标准 EP 分别报告 dispatch/combine 延迟，并说明带宽计算口径；MegaMoE 报告相同业务语义下的完整流程延迟及基线。每条结果记录源码版本、环境、拓扑、shape、精度、计时边界和复现命令。
 
-测量要求见[性能文档](docs/performance.md)，结果格式见 [CSV 模板](benchmarks/results/template.csv)。
+已提供 [benchmark CLI](benchmarks/README.md)、无设备 dry-run、计时/统计引擎及 JSON/CSV 协议。原生测量适配器尚未接入，非 dry-run 会在设备初始化前拒绝执行；规划结果不是实测数据。设计见[benchmark 详细设计](docs/benchmark-design.md)，口径见[性能文档](docs/performance.md)，结果格式见 [CSV 模板](benchmarks/results/template.csv)。
 
 ## 环境与安装
 
