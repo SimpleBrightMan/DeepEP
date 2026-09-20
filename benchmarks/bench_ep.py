@@ -17,9 +17,7 @@ PRESETS = {
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument(
-        "--config", type=Path, help="Strict JSON workload; CLI fields override it"
-    )
+    result.add_argument("--config", type=Path, help="Strict JSON workload; CLI fields override it")
     result.add_argument("--preset", choices=PRESETS)
     result.add_argument("--list-scenarios", action="store_true")
     result.add_argument(
@@ -32,9 +30,7 @@ def parser():
         type=Path,
         help="New directory; existing output is never overwritten",
     )
-    result.add_argument(
-        "--revision", help="Full source Git SHA; required for measurement"
-    )
+    result.add_argument("--revision", help="Full source Git SHA; required for measurement")
     for name in ("api", "operation", "dtype", "layout", "dispatch-mode", "route"):
         result.add_argument("--" + name, default=argparse.SUPPRESS)
     for name in (
@@ -66,10 +62,7 @@ def main(argv=None):
     if args.pop("list_scenarios"):
         print(
             json.dumps(
-                {
-                    name: load_config(Path(__file__).parent / "configs" / file)
-                    for name, file in PRESETS.items()
-                },
+                {name: load_config(Path(__file__).parent / "configs" / file) for name, file in PRESETS.items()},
                 indent=2,
             )
         )
@@ -86,18 +79,12 @@ def main(argv=None):
         data = (
             load_config(config_file)
             if config_file
-            else (
-                load_config(Path(__file__).parent / "configs" / PRESETS[preset])
-                if preset
-                else {}
-            )
+            else (load_config(Path(__file__).parent / "configs" / PRESETS[preset]) if preset else {})
         )
         if not isinstance(data, dict):
             raise ValueError("configuration must be a JSON object")
         if "tokens_per_rank" in args:
-            args["tokens_per_rank"] = tuple(
-                int(value) for value in args["tokens_per_rank"].split(",")
-            )
+            args["tokens_per_rank"] = tuple(int(value) for value in args["tokens_per_rank"].split(","))
         config = Config.from_dict(data | args)
         if dry_run:
             report = plan(config)
@@ -114,20 +101,14 @@ def main(argv=None):
         import re
 
         if not revision or not re.fullmatch(r"[0-9a-f]{40}", revision):
-            raise ValueError(
-                "measurement requires --revision with a full lowercase Git SHA"
-            )
+            raise ValueError("measurement requires --revision with a full lowercase Git SHA")
         if output is None or output.exists():
-            raise ValueError(
-                "measurement requires --output-dir pointing to a new directory"
-            )
+            raise ValueError("measurement requires --output-dir pointing to a new directory")
         # Native adapter is a context manager; partial construction and error
         # teardown must be bounded and must not touch a caller-owned group.
         with factory(config.to_dict()) as runtime:
             measurements = measure(config, runtime)
-            report = measured_result(
-                config, measurements, revision=revision, metadata=runtime.metadata
-            )
+            report = measured_result(config, measurements, revision=revision, metadata=runtime.metadata)
             is_writer = runtime.rank == 0
         # Failed teardown must not leave a successful performance artifact.
         if is_writer:

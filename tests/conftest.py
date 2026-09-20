@@ -39,9 +39,7 @@ def pytest_addoption(parser):
 
 
 def _parse_capabilities(config):
-    raw = config.getoption("--device-capabilities") or os.environ.get(
-        "DEEPEP_DEVICE_CAPABILITIES", ""
-    )
+    raw = config.getoption("--device-capabilities") or os.environ.get("DEEPEP_DEVICE_CAPABILITIES", "")
     if len(raw) > 512:
         raise pytest.UsageError("device capability declaration is too long")
     values = {value.strip() for value in raw.split(",") if value.strip()}
@@ -49,14 +47,9 @@ def _parse_capabilities(config):
         return DEVICE_CAPABILITIES
     unknown = values - DEVICE_CAPABILITIES
     if unknown:
-        raise pytest.UsageError(
-            "unknown device capabilities: " + ", ".join(sorted(unknown))
-        )
+        raise pytest.UsageError("unknown device capabilities: " + ", ".join(sorted(unknown)))
     if not values:
-        raise pytest.UsageError(
-            "--run-device requires --device-capabilities (or "
-            "DEEPEP_DEVICE_CAPABILITIES)"
-        )
+        raise pytest.UsageError("--run-device requires --device-capabilities (or DEEPEP_DEVICE_CAPABILITIES)")
     return frozenset(values)
 
 
@@ -73,9 +66,7 @@ def _requirements(item):
         expanded = params.get("expanded")
         dtype = params.get("dtype", "bfloat16")
         operation = params.get("operation", "dispatch")
-    required = {
-        "elastic-expanded" if expanded else "elastic-ordinary"
-    }
+    required = {"elastic-expanded" if expanded else "elastic-ordinary"}
     if dtype == "float8_e4m3fn":
         required.add("elastic-fp8")
     if operation in {"combine", "roundtrip"}:
@@ -97,9 +88,7 @@ def _case_world_size(item):
 @pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(config, items):
     if not config.getoption("--run-device"):
-        reason = (
-            "NPU communication not run: requires implemented backend and --run-device"
-        )
+        reason = "NPU communication not run: requires implemented backend and --run-device"
         for item in items:
             if item.get_closest_marker("device"):
                 item.add_marker(pytest.mark.skip(reason=reason))
@@ -124,22 +113,14 @@ def pytest_collection_modifyitems(config, items):
         if launch_world_size and expected_world_size != launch_world_size:
             item.add_marker(
                 pytest.mark.skip(
-                    reason=(
-                        "world-size gate: case requires "
-                        f"EP{expected_world_size}, launch is EP{launch_world_size}"
-                    )
+                    reason=(f"world-size gate: case requires EP{expected_world_size}, launch is EP{launch_world_size}")
                 )
             )
             continue
         missing = _requirements(item) - capabilities
         if missing:
             item.add_marker(
-                pytest.mark.skip(
-                    reason=(
-                        "backend capability gate: unsupported "
-                        + ", ".join(sorted(missing))
-                    )
-                )
+                pytest.mark.skip(reason=("backend capability gate: unsupported " + ", ".join(sorted(missing))))
             )
         else:
             supported.append(item)
@@ -152,12 +133,8 @@ def pytest_collection_modifyitems(config, items):
 
 
 def pytest_collection_finish(session):
-    if session.config.getoption("--run-device") and not getattr(
-        session.config, "_device_supported_count", 0
-    ):
-        raise pytest.UsageError(
-            "--run-device requires at least one selected, supported device test"
-        )
+    if session.config.getoption("--run-device") and not getattr(session.config, "_device_supported_count", 0):
+        raise pytest.UsageError("--run-device requires at least one selected, supported device test")
 
 
 @pytest.fixture(scope="session")

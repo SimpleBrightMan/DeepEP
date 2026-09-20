@@ -84,9 +84,7 @@ def test_invalid_configuration(change):
         Config.from_dict(Config().to_dict() | change)
 
 
-@pytest.mark.parametrize(
-    "filename", ["smoke.json", "upstream_bf16.json", "upstream_fp8.json"]
-)
+@pytest.mark.parametrize("filename", ["smoke.json", "upstream_bf16.json", "upstream_fp8.json"])
 def test_presets_have_no_measured_metrics(filename):
     config = Config.from_dict(load_config(ROOT / "benchmarks/configs" / filename))
     report = plan(config)
@@ -138,10 +136,7 @@ def test_bytes_match_independent_route_reference(layout, route, operation, dtype
     )
     # Use an independent, hand-readable layout oracle instead of repeating the
     # implementation's destination-set calculation in this test.
-    routes = tuple(
-        tuple(route_for_token(cfg, r, t) for t in range(n))
-        for r, n in enumerate(cfg.tokens_per_rank)
-    )
+    routes = tuple(tuple(route_for_token(cfg, r, t) for t in range(n)) for r, n in enumerate(cfg.tokens_per_rank))
     x = tuple(tuple((float(t),) for t in range(n)) for n in cfg.tokens_per_rank)
     case = Case("byte_check", cfg.experts, 1, cfg.topk, x, routes, None)
     oracle = dispatch(case, expanded=layout == "expanded")
@@ -216,11 +211,7 @@ class TraceRuntime:
     def verify(self):
         self.calls.append("verify")
         self.verifications += 1
-        if (
-            self.failure == "verify"
-            or self.failure == "post_verify"
-            and self.verifications == 2
-        ):
+        if self.failure == "verify" or self.failure == "post_verify" and self.verifications == 2:
             raise AssertionError("injected mismatch")
 
     def all_ranks_ok(self, local_ok):
@@ -369,10 +360,7 @@ def test_csv_and_raw_report_are_reproducible_and_do_not_overwrite(tmp_path):
         revision="a" * 40,
         metadata=METADATA,
     )
-    assert (
-        report["statistics"]["bandwidth_gbps"]
-        == traffic(cfg)["effective_bytes"] / 30000
-    )
+    assert report["statistics"]["bandwidth_gbps"] == traffic(cfg)["effective_bytes"] / 30000
     output = tmp_path / "run"
     write_result(output, report)
     restored = json.loads((output / "result.json").read_text())
@@ -397,9 +385,7 @@ def test_dry_run_directory_has_no_performance_files(tmp_path, capsys):
 
 def test_failed_teardown_does_not_publish_performance(tmp_path, monkeypatch, capsys):
     runtime = TraceRuntime("close")
-    monkeypatch.setattr(
-        "benchmarks._backend.resolve_backend", lambda _: lambda _: runtime
-    )
+    monkeypatch.setattr("benchmarks._backend.resolve_backend", lambda _: lambda _: runtime)
     output = tmp_path / "failed"
     assert (
         main(
@@ -494,15 +480,13 @@ def test_complete_capabilities_only_resolve_factory_without_calling_it(monkeypat
         "route_balanced",
     }
     assert cfg.required_capabilities() == expected
-    assert (
-        "single_rank"
-        in Config(world_size=1, tokens_per_rank=(16,)).required_capabilities()
-    )
-    factory = lambda _: pytest.fail("resolution must not initialize")
+    assert "single_rank" in Config(world_size=1, tokens_per_rank=(16,)).required_capabilities()
+
+    def factory(_):
+        pytest.fail("resolution must not initialize")
+
     native = SimpleNamespace(
-        describe_benchmark=lambda _: dict(
-            protocol_version=1, capabilities=sorted(expected), shape_supported=True
-        ),
+        describe_benchmark=lambda _: dict(protocol_version=1, capabilities=sorted(expected), shape_supported=True),
         create_benchmark=factory,
     )
     monkeypatch.setattr("benchmarks._backend.import_module", lambda _: native)
@@ -555,14 +539,10 @@ def test_result_recomputes_statistics_instead_of_trusting_summary():
 
 
 @pytest.mark.parametrize("rank", [0, 1])
-def test_cli_success_publishes_only_after_teardown_on_rank_zero(
-    tmp_path, monkeypatch, capsys, rank
-):
+def test_cli_success_publishes_only_after_teardown_on_rank_zero(tmp_path, monkeypatch, capsys, rank):
     runtime = TraceRuntime()
     runtime.rank = rank
-    monkeypatch.setattr(
-        "benchmarks._backend.resolve_backend", lambda _: lambda _: runtime
-    )
+    monkeypatch.setattr("benchmarks._backend.resolve_backend", lambda _: lambda _: runtime)
     from benchmarks import bench_ep
 
     original_write = bench_ep.write_result
@@ -613,18 +593,14 @@ def test_cli_success_publishes_only_after_teardown_on_rank_zero(
         "gather_samples",
     ],
 )
-def test_cli_runtime_failures_always_close_without_publishing(
-    tmp_path, monkeypatch, capsys, failure
-):
+def test_cli_runtime_failures_always_close_without_publishing(tmp_path, monkeypatch, capsys, failure):
     runtime = TraceRuntime()
 
     def fail(*args):
         raise RuntimeError("injected private diagnostic")
 
     setattr(runtime, failure, fail)
-    monkeypatch.setattr(
-        "benchmarks._backend.resolve_backend", lambda _: lambda _: runtime
-    )
+    monkeypatch.setattr("benchmarks._backend.resolve_backend", lambda _: lambda _: runtime)
     output = tmp_path / "failure"
     assert (
         main(
@@ -672,9 +648,7 @@ def test_cli_rejects_bad_arguments_without_performance(argv):
 
 def test_cli_overrides_config_and_roundtrips_fingerprint(tmp_path, capsys):
     config = tmp_path / "input.json"
-    config.write_text(
-        json.dumps(dict(operation="roundtrip", dtype="fp8", layout="ordinary"))
-    )
+    config.write_text(json.dumps(dict(operation="roundtrip", dtype="fp8", layout="ordinary")))
     assert (
         main(
             [
@@ -697,8 +671,6 @@ def test_cli_overrides_config_and_roundtrips_fingerprint(tmp_path, capsys):
 def test_zero_logical_traffic_is_distinct_from_unmeasured_latency():
     cfg = Config(tokens_per_rank=(1, 0), topk=1, route="masked", warmup=0, iterations=1)
     assert traffic(cfg)["effective_bytes"] == 0
-    result = measured_result(
-        cfg, {"rank_samples_us": [[1], [2]]}, revision="a" * 40, metadata=METADATA
-    )
+    result = measured_result(cfg, {"rank_samples_us": [[1], [2]]}, revision="a" * 40, metadata=METADATA)
     assert result["statistics"]["bandwidth_gbps"] == 0
     assert result["statistics"]["latency_mean_us"] == 2

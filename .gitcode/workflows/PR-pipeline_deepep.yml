@@ -154,32 +154,21 @@ stages:
               path: cpu-correctness.xml
               overwrite: true
 
-#      CodeCheck_pre_commit:
-#        name: CodeCheck_pre_commit
-#        if : ${{ jobs.Detect_file_changes.outputs.need_build_ut == 'yes' }}
-#        runs-on: [ self-hosted, x86, cpu=32 ]
-#        container:
-#          image: swr.cn-north-4.myhuaweicloud.com/mindspore/mindspore_python3.11:v0.1
-#        steps:
-#          - name: checkout
-#            uses: checkout
-#            with:
-#              ref: refs/merge-requests/${{ env.pr_id }}/merge
-#              allow-unsafe-pr-checkout: true
-#          - name: setup-python311
-#            run: |
-#              PYTHON311_BIN=$(dirname "$(which python3.11)")
-#              ln -sf "$(which python3.11)" "$PYTHON311_BIN/python"
-#              echo "$PYTHON311_BIN" >> "$ATOMGIT_PATH"
-#              python --version
-#          - name: install gitleaks
-#            run: |
-#              cd ${ATOMGIT_WORKSPACE}
-#              wget --no-host-directories -c --no-check-certificate https://pytorch-package.obs.cn-north-4.myhuaweicloud.com/pta-codecheck/gitleaks
-#              chmod +x gitleaks
-#              cd -
-#          - name: pre-commit
-#            uses: openlibing-pre-commit-action
+      CodeCheck_pre_commit:
+        name: Pre-commit checks
+        # Run for documentation-only PRs too; all files keeps rule changes covered.
+        runs-on: [ self-hosted, x86, cpu=32 ]
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/mindspore/mindspore_python3.11:v0.1
+        steps:
+          - name: checkout
+            uses: checkout
+            with:
+              ref: refs/merge-requests/${{ env.pr_id }}/merge
+          - name: Install development dependencies
+            run: python3.11 -m pip install -r requirements-dev.txt
+          - name: Check all tracked files
+            run: python3.11 -m pre_commit run --all-files --show-diff-on-failure
 
       sca-pr:
         if : ${{ jobs.Detect_file_changes.outputs.need_build_ut == 'yes' }}

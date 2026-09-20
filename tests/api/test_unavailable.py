@@ -14,9 +14,7 @@ import deep_ep
 
 ROOT = Path(__file__).resolve().parents[2]
 BASELINE = json.loads(Path(__file__).with_name("upstream_api.json").read_text(encoding="utf-8"))
-METHODS = [
-    (name, method) for name, spec in BASELINE["objects"].items() for method in spec["methods"]
-]
+METHODS = [(name, method) for name, spec in BASELINE["objects"].items() for method in spec["methods"]]
 
 
 class Uninspectable:
@@ -41,11 +39,7 @@ def test_every_declared_operation_fails_before_touching_inputs(name, method):
 @pytest.mark.parametrize("name", BASELINE["exports"])
 def test_constructors_cannot_create_usable_objects(name):
     cls = getattr(deep_ep, name)
-    args = [
-        Uninspectable()
-        for p in inspect.signature(cls).parameters.values()
-        if p.default is inspect.Parameter.empty
-    ]
+    args = [Uninspectable() for p in inspect.signature(cls).parameters.values() if p.default is inspect.Parameter.empty]
     with pytest.raises(NotImplementedError, match=f"{name}.__init__"):
         cls(*args)
 

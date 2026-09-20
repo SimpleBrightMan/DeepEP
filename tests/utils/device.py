@@ -46,9 +46,7 @@ def _valid_positions(case, expanded, handle, expected_rows):
         start = (previous + case.expert_alignment - 1) // case.expert_alignment
         start *= case.expert_alignment
         if end < start:
-            raise AssertionError(
-                "Expanded expert prefix sum precedes its aligned start"
-            )
+            raise AssertionError("Expanded expert prefix sum precedes its aligned start")
         positions.extend(range(start, end))
         previous = end
     assert len(positions) == expected_rows, "Expanded valid row count differs"
@@ -97,17 +95,9 @@ def buffer_for(session, case, api):
             deep_ep.Buffer.get_dispatch_config(case.world_size),
             deep_ep.Buffer.get_combine_config(case.world_size),
         ]
-        nvl = max(
-            c.get_nvl_buffer_size_hint(case.hidden * 2, case.world_size)
-            for c in configs
-        )
-        rdma = max(
-            c.get_rdma_buffer_size_hint(case.hidden * 2, case.world_size)
-            for c in configs
-        )
-        buffer = deep_ep.Buffer(
-            group, num_nvl_bytes=nvl, num_rdma_bytes=rdma, explicitly_destroy=True
-        )
+        nvl = max(c.get_nvl_buffer_size_hint(case.hidden * 2, case.world_size) for c in configs)
+        rdma = max(c.get_rdma_buffer_size_hint(case.hidden * 2, case.world_size) for c in configs)
+        buffer = deep_ep.Buffer(group, num_nvl_bytes=nvl, num_rdma_bytes=rdma, explicitly_destroy=True)
     else:
         buffer = deep_ep.ElasticBuffer(
             group,
@@ -133,22 +123,14 @@ def launch_dispatch(session, buffer, case, api, expanded, *, handle=None):
     x = tensor(torch, case.x[rank], (n, case.hidden), torch.bfloat16, device)
     if case.dtype == "float8_e4m3fn":
         if api != "elastic":
-            raise AssertionError(
-                "FP8 qualification is currently scoped to the upstream V2 path"
-            )
+            raise AssertionError("FP8 qualification is currently scoped to the upstream V2 path")
         x = cast_to_fp8(torch, x)
     index_dtype = getattr(deep_ep, "topk_idx_t", torch.int64)
     idx = tensor(torch, case.routes[rank], (n, case.topk), index_dtype, device)
-    weights = (
-        None
-        if case.weights is None
-        else tensor(torch, case.weights[rank], (n, case.topk), torch.float32, device)
-    )
+    weights = None if case.weights is None else tensor(torch, case.weights[rank], (n, case.topk), torch.float32, device)
     if api == "legacy":
         if handle is None:
-            per_rank, per_rdma, per_expert, mask, event = buffer.get_dispatch_layout(
-                idx, case.experts
-            )
+            per_rank, per_rdma, per_expert, mask, event = buffer.get_dispatch_layout(idx, case.experts)
             _wait_if_async(event)
             args = dict(
                 topk_idx=idx,
@@ -211,21 +193,15 @@ def snapshot(case, rank, expanded, received, *, elastic):
             assert observed_rows == n, f"{field} differs"
     else:
         assert rx.shape[0] == n, "V1 received row count differs"
-    rx_bf16 = (
-        cast_from_fp8(__import__("torch"), rx) if case.dtype == "float8_e4m3fn" else rx
-    )
+    rx_bf16 = cast_from_fp8(__import__("torch"), rx) if case.dtype == "float8_e4m3fn" else rx
     positions = _valid_positions(case, expanded, handle, n)
     assert rx_bf16.shape[0] > max(positions, default=-1)
     all_x = rx_bf16.cpu().tolist()
     x = [all_x[index] for index in positions]
     all_indices = None if ri is None else ri.cpu().tolist()
-    indices = (
-        None if all_indices is None else [all_indices[index] for index in positions]
-    )
+    indices = None if all_indices is None else [all_indices[index] for index in positions]
     all_weights = None if rw is None else rw.cpu().tolist()
-    weights = (
-        None if all_weights is None else [all_weights[index] for index in positions]
-    )
+    weights = None if all_weights is None else [all_weights[index] for index in positions]
     assert_dispatch(observed_case, rank, expanded, x, indices, weights, counts)
     if case.dtype == "float8_e4m3fn":
         all_raw_values = rx[0].float().cpu().tolist()
@@ -236,9 +212,7 @@ def snapshot(case, rank, expanded, received, *, elastic):
         for i, values in enumerate(x):
             match = next(row for row in candidates if row.x == tuple(values))
             candidates.remove(match)
-            expected_values, expected_scales = encode_upstream_fp8_row(
-                case.x[match.source][match.token]
-            )
+            expected_values, expected_scales = encode_upstream_fp8_row(case.x[match.source][match.token])
             assert_close(raw_values[i], expected_values, label="FP8 payload")
             assert_close(raw_scales[i], expected_scales, label="FP8 scales")
     return x, indices, weights, tuple(counts)
@@ -253,9 +227,7 @@ def observed_rows(case, rank, expanded, raw):
     x, indices, weights, counts = raw
     candidates = list(dispatch(case, expanded=expanded).ranks[rank])
     experts = [
-        rank * (case.experts // case.world_size) + expert
-        for expert, count in enumerate(counts)
-        for _ in range(count)
+        rank * (case.experts // case.world_size) + expert for expert, count in enumerate(counts) for _ in range(count)
     ]
     rows = []
     for i, values in enumerate(x):
@@ -284,25 +256,17 @@ def run_operation(session, buffer, case, api, expanded, operation):
         return
     observed_case = replace(case, x=emulate_upstream_case(case))
     layout = observed_rows(observed_case, rank, expanded, raw)
-    payloads = expert_payload(
-        observed_case, layout, use_received_x=operation == "roundtrip"
-    )[rank]
+    payloads = expert_payload(observed_case, layout, use_received_x=operation == "roundtrip")[rank]
     n = len(payloads)
     device = f"npu:{launch.local_rank}"
     payload_x = [p.x for p in payloads]
-    payload_weights = (
-        None
-        if case.weights is None
-        else [p.weights[0] if expanded else p.weights for p in payloads]
-    )
+    payload_weights = None if case.weights is None else [p.weights[0] if expanded else p.weights for p in payloads]
     combine_rows = n
     if expanded and case.expert_alignment > 1:
         positions = _valid_positions(case, True, received[-1], n)
         combine_rows = received[-1].num_expanded_tokens
         padded_x = [[0.0] * case.hidden for _ in range(combine_rows)]
-        padded_weights = (
-            None if payload_weights is None else [0.0] * combine_rows
-        )
+        padded_weights = None if payload_weights is None else [0.0] * combine_rows
         for position, values in zip(positions, payload_x):
             padded_x[position] = values
         if payload_weights is not None:
@@ -326,8 +290,7 @@ def run_operation(session, buffer, case, api, expanded, operation):
     _wait_if_async(event)
     benchmark_x, _ = expected_expert_combine(observed_case)
     benchmark_x = tuple(
-        tuple(tuple(quantize_bfloat16(value) for value in row) for row in rank_rows)
-        for rank_rows in benchmark_x
+        tuple(tuple(quantize_bfloat16(value) for value in row) for row in rank_rows) for rank_rows in benchmark_x
     )
     golden_x, golden_values = expected_expert_combine(case)
     assert out.dtype == torch.bfloat16
@@ -345,9 +308,7 @@ def run_operation(session, buffer, case, api, expanded, operation):
     else:
         assert values.dtype == torch.float32
         assert tuple(values.shape) == (len(case.x[rank]), case.topk)
-        assert_close(
-            values.cpu().tolist(), golden_values[rank], label="combined values"
-        )
+        assert_close(values.cpu().tolist(), golden_values[rank], label="combined values")
 
 
 def run_cached(session, buffer, case, api, expanded):

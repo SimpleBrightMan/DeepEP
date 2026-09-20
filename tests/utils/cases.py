@@ -25,9 +25,7 @@ class Case:
         if self.world_size < 1 or self.experts < 1 or self.experts % self.world_size:
             raise ValueError("Experts must divide evenly across nonempty ranks")
         if self.hidden < 1 or self.topk < 1 or self.topk > self.experts:
-            raise ValueError(
-                "hidden and topk must be positive and topk must not exceed experts"
-            )
+            raise ValueError("hidden and topk must be positive and topk must not exceed experts")
         if self.expert_alignment < 1:
             raise ValueError("expert_alignment must be positive")
         if self.distribution not in ("tagged", "uniform", "normal", "small", "outlier"):
@@ -46,14 +44,9 @@ class Case:
             for token, (x, indices) in enumerate(zip(tokens, routes)):
                 if len(x) != self.hidden or len(indices) != self.topk:
                     raise ValueError("Token/routing shape mismatch")
-                if any(
-                    type(e) is not int or e < -1 or e >= self.experts for e in indices
-                ):
+                if any(type(e) is not int or e < -1 or e >= self.experts for e in indices):
                     raise ValueError("Expert index must be -1 or in [0, num_experts)")
-                if (
-                    self.weights is not None
-                    and len(self.weights[rank][token]) != self.topk
-                ):
+                if self.weights is not None and len(self.weights[rank][token]) != self.topk:
                     raise ValueError("Weight shape mismatch")
 
 
@@ -72,22 +65,16 @@ ROUTES = {
 }
 
 
-def make_case(
-    name, *, hidden=4, with_weights=True, dtype="bfloat16", expert_alignment=1
-):
+def make_case(name, *, hidden=4, with_weights=True, dtype="bfloat16", expert_alignment=1):
     routes = ROUTES[name]
     x = tuple(
-        tuple(
-            tuple(1 + rank * 8 + token + col % 3 for col in range(hidden))
-            for token in range(len(rank_routes))
-        )
+        tuple(tuple(1 + rank * 8 + token + col % 3 for col in range(hidden)) for token in range(len(rank_routes)))
         for rank, rank_routes in enumerate(routes)
     )
     weights = (
         tuple(
             tuple(
-                tuple((1 + rank * 8 + token * 2 + slot) / 16 for slot in range(2))
-                for token in range(len(rank_routes))
+                tuple((1 + rank * 8 + token * 2 + slot) / 16 for slot in range(2)) for token in range(len(rank_routes))
             )
             for rank, rank_routes in enumerate(routes)
         )
@@ -130,9 +117,7 @@ def make_matrix_case(
         linear = token * hidden + col
         seed = (rank + 1) * 1000003 + (token + 1) * 1009 + col
         if distribution == "tagged":
-            return (
-                ((rank + 1) * 131 + (token + 3) * 17 + (col + 5) * 29) % 2041 - 1020
-            ) / 64.0
+            return (((rank + 1) * 131 + (token + 3) * 17 + (col + 5) * 29) % 2041 - 1020) / 64.0
         if distribution == "uniform":
             return unit(seed) * 10.0 - 5.0
         if distribution == "normal":
@@ -151,17 +136,12 @@ def make_matrix_case(
         total_values = count * hidden
         outlier_count = max(1, total_values // 1000) if total_values else 0
         outliers = (
-            {
-                min(total_values - 1, index * total_values // outlier_count)
-                for index in range(outlier_count)
-            }
+            {min(total_values - 1, index * total_values // outlier_count) for index in range(outlier_count)}
             if outlier_count
             else set()
         )
         for token in range(count):
-            rank_x.append(
-                tuple(value_for(rank, token, col, outliers) for col in range(hidden))
-            )
+            rank_x.append(tuple(value_for(rank, token, col, outliers) for col in range(hidden)))
             token_routes = []
             for slot in range(topk):
                 expert = (rank * 11 + token * 7 + slot * 13) % experts
@@ -171,10 +151,7 @@ def make_matrix_case(
             rank_routes.append(tuple(token_routes))
             if with_weights:
                 rank_weights.append(
-                    tuple(
-                        ((rank + 1) * 19 + (token + 1) * 7 + slot * 3) % 127 / 128.0
-                        for slot in range(topk)
-                    )
+                    tuple(((rank + 1) * 19 + (token + 1) * 7 + slot * 3) % 127 / 128.0 for slot in range(topk))
                 )
         x.append(tuple(rank_x))
         routes.append(tuple(rank_routes))

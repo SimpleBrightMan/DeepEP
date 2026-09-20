@@ -12,15 +12,11 @@ pytestmark = pytest.mark.device
 @pytest.mark.parametrize("name", ROUTES)
 @pytest.mark.parametrize("expanded", [False, True], ids=["ordinary", "expanded"])
 @pytest.mark.parametrize("with_weights", [False, True])
-@pytest.mark.parametrize(
-    "dtype", ["bfloat16", "float8_e4m3fn"], ids=["bf16", "fp8-e4m3fn"]
-)
+@pytest.mark.parametrize("dtype", ["bfloat16", "float8_e4m3fn"], ids=["bf16", "fp8-e4m3fn"])
 @pytest.mark.parametrize("operation", ["dispatch", "combine", "roundtrip"])
 def test_elastic(device_session, name, expanded, with_weights, dtype, operation):
     if device_session[2].world_size != 2:
-        pytest.skip(
-            "two-rank semantic scenarios are covered separately from the EP matrix"
-        )
+        pytest.skip("two-rank semantic scenarios are covered separately from the EP matrix")
     case = make_case(name, hidden=256, with_weights=with_weights, dtype=dtype)
     with buffer_for(device_session, case, "elastic") as buffer:
         run_operation(device_session, buffer, case, "elastic", expanded, operation)

@@ -16,8 +16,7 @@ class Launch:
 def read_launch(environ):
     try:
         rank, local_rank, world, local_world = (
-            int(environ[name])
-            for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE")
+            int(environ[name]) for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE")
         )
         port = int(environ["MASTER_PORT"])
         address = environ["MASTER_ADDR"]
@@ -40,9 +39,7 @@ def owned_process_group(torch, launch):
     """Only destroy the group created here; never reuse or tear down a caller's group."""
     dist = torch.distributed
     if dist.is_initialized():
-        raise RuntimeError(
-            "Device tests require a fresh process; a process group already exists"
-        )
+        raise RuntimeError("Device tests require a fresh process; a process group already exists")
     if not torch.npu.is_available() or launch.local_rank >= torch.npu.device_count():
         raise RuntimeError("Requested NPU is unavailable")
     torch.npu.set_device(launch.local_rank)

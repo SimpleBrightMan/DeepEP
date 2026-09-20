@@ -50,9 +50,7 @@ def test_signature_matches_upstream_with_documented_deviations(name, method, spe
             value["default"] = parameter.default
         actual.append(value)
     assert actual == expected
-    assert isinstance(inspect.getattr_static(cls, method), staticmethod) == (
-        spec["kind"] == "staticmethod"
-    )
+    assert isinstance(inspect.getattr_static(cls, method), staticmethod) == (spec["kind"] == "staticmethod")
 
 
 def test_snapshot_pins_sources_and_does_not_claim_implementation():

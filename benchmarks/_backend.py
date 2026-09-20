@@ -44,9 +44,7 @@ def resolve_backend(config):
     describe = getattr(native, "describe_benchmark", None)
     factory = getattr(native, "create_benchmark", None)
     if not callable(describe) or not callable(factory):
-        raise BackendUnavailable(
-            "native benchmark adapter is not implemented; use --dry-run to inspect the plan"
-        )
+        raise BackendUnavailable("native benchmark adapter is not implemented; use --dry-run to inspect the plan")
     descriptor = describe(config.to_dict())
     if (
         not isinstance(descriptor, dict)
@@ -55,15 +53,11 @@ def resolve_backend(config):
     ):
         raise BackendUnavailable("native benchmark adapter protocol must be version 1")
     supported = descriptor.get("capabilities")
-    if not isinstance(supported, (list, tuple)) or any(
-        not isinstance(c, str) for c in supported
-    ):
+    if not isinstance(supported, (list, tuple)) or any(not isinstance(c, str) for c in supported):
         raise BackendUnavailable("native benchmark capabilities must be a string array")
     missing = config.required_capabilities() - set(supported)
     if missing:
-        raise BackendUnavailable(
-            "unsupported benchmark capabilities: " + ", ".join(sorted(missing))
-        )
+        raise BackendUnavailable("unsupported benchmark capabilities: " + ", ".join(sorted(missing)))
     if descriptor.get("shape_supported") is not True:
         raise BackendUnavailable("native backend does not support the requested shape")
     return factory

@@ -33,30 +33,21 @@ def raw_dispatch(layout, rank):
     x = [list(row.x) for row in rows]
     indices = None if layout.expanded else [list(row.indices) for row in rows]
     has_weights = any(row.weights is not None for rows in layout.ranks for row in rows)
-    weights = (
-        None
-        if not has_weights
-        else [row.weights[0] if layout.expanded else list(row.weights) for row in rows]
-    )
+    weights = None if not has_weights else [row.weights[0] if layout.expanded else list(row.weights) for row in rows]
     return x, indices, weights, list(layout.counts[rank])
 
 
 def test_hand_calculated_dispatch(tiny):
     ordinary = dispatch(tiny)
     assert ordinary.counts == ((1, 3), (1, 0))
-    assert [
-        (row.source, row.token, row.indices, row.x, row.weights) for row in ordinary.ranks[0]
-    ] == [
+    assert [(row.source, row.token, row.indices, row.x, row.weights) for row in ordinary.ranks[0]] == [
         (0, 0, (0, 1), (2,), (0.25, 0.5)),
         (1, 0, (1, 1), (5,), (0.125, 0.625)),
     ]
     assert ordinary.ranks[1][0].indices == (0, -1)
     assert ordinary.ranks[1][0].weights == (0.75, 9.0)
     expanded = dispatch(tiny, expanded=True)
-    assert [
-        (row.expert, row.source, row.token, row.slots, row.x, row.weights)
-        for row in expanded.ranks[0]
-    ] == [
+    assert [(row.expert, row.source, row.token, row.slots, row.x, row.weights) for row in expanded.ranks[0]] == [
         (0, 0, 0, (0,), (2,), (0.25,)),
         (1, 0, 0, (1,), (2,), (0.5,)),
         (1, 1, 0, (0,), (5,), (0.125,)),
@@ -96,9 +87,7 @@ def test_identity_roundtrip_is_not_the_input(tiny):
     ordinary, expanded = dispatch(tiny), dispatch(tiny, expanded=True)
 
     def identity(layout):
-        payloads = tuple(
-            tuple(Payload(row.x, row.weights) for row in rows) for rows in layout.ranks
-        )
+        payloads = tuple(tuple(Payload(row.x, row.weights) for row in rows) for rows in layout.ranks)
         return combine(tiny, layout, payloads)[0]
 
     assert identity(ordinary) == (((2.0,), (3.0,)), ((5.0,),))
@@ -122,9 +111,7 @@ def test_invalid_reference_inputs_fail(tiny, change):
         dispatch(replace(tiny, **change))
 
 
-@pytest.mark.parametrize(
-    "fault", ["wrong_rank", "missing", "duplicate", "weight", "index", "count"]
-)
+@pytest.mark.parametrize("fault", ["wrong_rank", "missing", "duplicate", "weight", "index", "count"])
 @pytest.mark.parametrize("expanded", [False, True])
 def test_dispatch_checker_rejects_injected_faults(tiny, fault, expanded):
     layout = dispatch(tiny, expanded=expanded)
@@ -151,9 +138,7 @@ def test_dispatch_checker_rejects_injected_faults(tiny, fault, expanded):
         assert_dispatch(tiny, 0, expanded, x, indices, weights, counts)
 
 
-@pytest.mark.parametrize(
-    "fault", ["missing_contribution", "gate_twice", "wrong_value", "nan", "shape"]
-)
+@pytest.mark.parametrize("fault", ["missing_contribution", "gate_twice", "wrong_value", "nan", "shape"])
 def test_combine_checker_rejects_injected_faults(tiny, fault):
     layout = dispatch(tiny, expanded=True)
     payloads = [list(rank) for rank in expert_payload(tiny, layout)]

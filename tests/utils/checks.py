@@ -20,9 +20,7 @@ def assert_dispatch(case, rank, expanded, x, indices, weights, counts):
 
     actual_keys, expected_keys = [], []
     experts = [
-        rank * (case.experts // case.world_size) + expert
-        for expert, count in enumerate(counts)
-        for _ in range(count)
+        rank * (case.experts // case.world_size) + expert for expert, count in enumerate(counts) for _ in range(count)
     ]
     for i, row in enumerate(rows):
         assert len(x[i]) == case.hidden, "Received hidden dimension differs"
@@ -38,18 +36,12 @@ def assert_dispatch(case, rank, expanded, x, indices, weights, counts):
             values = (
                 None
                 if weights is None
-                else tuple(
-                    value if indices[i][slot] >= 0 else None
-                    for slot, value in enumerate(weights[i])
-                )
+                else tuple(value if indices[i][slot] >= 0 else None for slot, value in enumerate(weights[i]))
             )
             expected_values = (
                 None
                 if row.weights is None
-                else tuple(
-                    value if row.indices[slot] >= 0 else None
-                    for slot, value in enumerate(row.weights)
-                )
+                else tuple(value if row.indices[slot] >= 0 else None for slot, value in enumerate(row.weights))
             )
             key = (tuple(x[i]), tuple(indices[i]), values)
             wanted = (row.x, row.indices, expected_values)
@@ -70,6 +62,4 @@ def assert_close(actual, expected, *, label="output", atol=0.0, rtol=0.0):
             assert_close(got, wanted, label=f"{label}[{index}]", atol=atol, rtol=rtol)
     else:
         assert isfinite(actual), f"{label}: nonfinite value"
-        assert isclose(
-            actual, expected, abs_tol=atol, rel_tol=rtol
-        ), f"{label}: {actual} != {expected}"
+        assert isclose(actual, expected, abs_tol=atol, rel_tol=rtol), f"{label}: {actual} != {expected}"

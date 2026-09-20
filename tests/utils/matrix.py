@@ -195,9 +195,7 @@ _CONTROL_FIELDS = {"expanded", "operation"}
 
 
 def case_from_spec(spec):
-    return make_matrix_case(
-        **{key: value for key, value in spec.items() if key not in _CONTROL_FIELDS}
-    )
+    return make_matrix_case(**{key: value for key, value in spec.items() if key not in _CONTROL_FIELDS})
 
 
 def iter_matrix_cases():
@@ -212,9 +210,7 @@ def device_specs_for_world_size(world_size):
 def validate_device_spec(spec):
     case = case_from_spec(spec)
     if case.hidden % 256:
-        raise ValueError(
-            "V2 device qualification requires hidden to be divisible by 256"
-        )
+        raise ValueError("V2 device qualification requires hidden to be divisible by 256")
     if case.expert_alignment not in (1, 128):
         raise ValueError("device qualification covers expert_alignment 1 or 128")
     if spec["operation"] not in ("dispatch", "combine", "roundtrip"):

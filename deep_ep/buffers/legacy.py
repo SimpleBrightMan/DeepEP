@@ -4,6 +4,7 @@
 These declarations do not provide an Ascend implementation. Every operation
 raises NotImplementedError before inspecting tensors or acquiring resources.
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -11,6 +12,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 from .._native import _unavailable
 
 if TYPE_CHECKING:
+    import mpi4py.MPI
     import torch
     import torch.distributed as dist
     from .._config import Config
@@ -123,9 +125,7 @@ class Buffer:
         """Declare Buffer.combine; execution is not implemented."""
         _unavailable("Buffer.combine")
 
-    def clean_low_latency_buffer(
-        self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int
-    ) -> None:
+    def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> None:
         """Declare Buffer.clean_low_latency_buffer; execution is not implemented."""
         _unavailable("Buffer.clean_low_latency_buffer")
 

@@ -4,6 +4,7 @@
 These declarations do not provide an Ascend implementation. Every operation
 raises NotImplementedError before inspecting tensors or acquiring resources.
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple

@@ -90,12 +90,7 @@ def _decode_e4m3fn(bits):
     return sign * value
 
 
-_E4M3_POSITIVE = sorted(
-    (value, bits)
-    for bits in range(0x80)
-    for value in (_decode_e4m3fn(bits),)
-    if value is not None
-)
+_E4M3_POSITIVE = sorted((value, bits) for bits in range(0x80) for value in (_decode_e4m3fn(bits),) if value is not None)
 _E4M3_VALUES = [item[0] for item in _E4M3_POSITIVE]
 
 
@@ -145,9 +140,7 @@ def emulate_upstream_row(row, dtype):
 
 
 def emulate_upstream_case(case):
-    return tuple(
-        tuple(emulate_upstream_row(row, case.dtype) for row in rank) for rank in case.x
-    )
+    return tuple(tuple(emulate_upstream_row(row, case.dtype) for row in rank) for rank in case.x)
 
 
 def _flatten(values):
@@ -180,11 +173,7 @@ def error_metrics(actual, golden, *, dtype):
         # Built-in float sum changed in Python 3.12. Use an explicit accurate
         # reduction so the checked-in metrics also reproduce on Python 3.11.
         fsum(relative_errors) / len(relative_errors) if relative_errors else 0.0,
-        (
-            sqrt(fsum(error * error for error in normal_errors) / len(normal_errors))
-            if normal_errors
-            else 0.0
-        ),
+        (sqrt(fsum(error * error for error in normal_errors) / len(normal_errors)) if normal_errors else 0.0),
         small_error_count,
         len(normal_errors),
         small_count,
@@ -198,10 +187,7 @@ def compare_dual(actual, benchmark, golden, *, dtype, level="L2"):
     got = error_metrics(actual, golden, dtype=dtype)
     ref = error_metrics(benchmark, golden, dtype=dtype)
     floor = DTYPE_POLICY[dtype]["small_error"]
-    ratios = tuple(
-        getattr(got, name) / max(getattr(ref, name), floor)
-        for name in ("mare", "mere", "rmse")
-    )
+    ratios = tuple(getattr(got, name) / max(getattr(ref, name), floor) for name in ("mare", "mere", "rmse"))
     small_ratio = got.small_error_count / max(ref.small_error_count, 1)
     limits = LEVEL_LIMITS[level]
     return AccuracyReport(
@@ -211,19 +197,14 @@ def compare_dual(actual, benchmark, golden, *, dtype, level="L2"):
         ref,
         ratios,
         small_ratio,
-        all(value <= limit for value, limit in zip(ratios, limits))
-        and small_ratio <= 2.0,
+        all(value <= limit for value, limit in zip(ratios, limits)) and small_ratio <= 2.0,
     )
 
 
 def _median(values):
     ordered = sorted(values)
     middle = len(ordered) // 2
-    return (
-        ordered[middle]
-        if len(ordered) % 2
-        else (ordered[middle - 1] + ordered[middle]) / 2.0
-    )
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2.0
 
 
 def _quantile(ordered, probability):
@@ -254,10 +235,7 @@ def bootstrap_median_recheck(ratios, *, bootstrap_samples=2000, seed=0):
             "sample_count_below_200",
         )
     random = Random(seed)
-    medians = sorted(
-        _median([values[random.randrange(len(values))] for _ in values])
-        for _ in range(bootstrap_samples)
-    )
+    medians = sorted(_median([values[random.randrange(len(values))] for _ in values]) for _ in range(bootstrap_samples))
     lower, upper = _quantile(medians, 0.025), _quantile(medians, 0.975)
     passed = lower <= 1.0
     return RecheckReport(

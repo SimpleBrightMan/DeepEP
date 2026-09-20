@@ -46,3 +46,44 @@ csrc/runtime/            共享上下文、资源和事件
 ## 文档维护
 
 检查 Markdown 相对链接、目录路径、UTF-8 编码、SVG 有效性与 `git diff --check`。保持中英文首页的功能状态与使用说明一致。此类静态检查不能替代 API、构建或设备测试。
+
+## 提交前检查与 CI
+
+[`.pre-commit-config.yaml`](../.pre-commit-config.yaml) 是本地与 CI 共用的检查入口。框架版本固定在 `requirements-dev.txt`，hook 固定到提交 SHA。使用 Python 3.11 按[贡献指南](../CONTRIBUTING.md)安装开发依赖并运行 `pre-commit install` 后，每次提交会检查暂存文件。
+
+| 检查 | 范围与约定 |
+| --- | --- |
+| `trailing-whitespace` | 清理行尾空白，保留 Markdown 的双空格换行 |
+| `end-of-file-fixer` | 确保非空文本文件以一个换行符结束 |
+| `check-yaml` | 检查 YAML 语法和重复键 |
+| `check-json` | 检查 JSON 语法和重复键 |
+| `check-added-large-files` | 拦截超过 1 MiB 的普通 Git 文件；Git LFS 文件由工具排除 |
+| `check-merge-conflict` | 检查遗留的合并冲突标记 |
+| `detect-private-key` | 检查常见私钥文件标记 |
+| `ruff-check` | 检查 Python 导入、语句、语法、未使用导入和未定义名称等常规问题，规则见 [`.ruff.toml`](../.ruff.toml) |
+| `ruff-format` | 统一 Python 缩进、空格、换行和引号；使用空格缩进、双引号和 LF 换行，目标行宽 120 列 |
+| clang-format | 第一方 C/C++/AscendC，包括 `.asc`；采用 [`.clang-format`](../.clang-format) 中的四空格、120 列等规则 |
+| codespell | 文档、代码及文本配置；`AGRS` 和 `CANN` 为有效术语，JSON/CSV 数据及 SVG 图稿不做拼写改写 |
+
+第三方源码不运行 Ruff、clang-format 和 codespell；`third-party/README.md` 仍检查拼写。基础检查没有全局排除第三方目录，也不整体跳过 SVG/CSV 文件。私钥标记检查不能替代现有的依赖与安全扫描。
+
+大小检查使用 `--enforce-all`，冲突标记检查使用 `--assume-in-merge`，确保在 CI 的干净 checkout 中也检查已提交文件，不依赖暂存区或正在进行的 merge 状态。
+
+```bash
+# 手动检查暂存文件。
+pre-commit run --show-diff-on-failure
+
+# 首次接入或修改规则后检查全仓。
+pre-commit run --all-files --show-diff-on-failure
+
+# 提交后检查本次 PR 相对目标分支的改动。
+git fetch upstream main
+PRE_COMMIT_BASE="$(git merge-base upstream/main HEAD)"
+pre-commit run --show-diff-on-failure --from-ref "$PRE_COMMIT_BASE" --to-ref HEAD
+```
+
+行尾修复、ruff-format 和 clang-format 可能改写文件。检查差异、重新暂存并提交后，重复检查直到退出码为 0 且没有新的改写。首次运行会从 GitCode 镜像获取 hook，并从 Python 包源安装各自的隔离环境；下载失败同样会使检查失败。更新版本时需同步核对版本注释并执行全仓检查。
+
+[GitCode 流水线](../.gitcode/workflows/PR-pipeline_deepep.yml)沿用现有 PR 评论 `compile` 触发方式。`CodeCheck_pre_commit` 检查 PR 的合并结果，使用固定开发依赖运行 `python3.11 -m pre_commit run --all-files --show-diff-on-failure`，不受 `need_build_ut` 条件限制，因此纯文档 PR 也执行。失败直接使作业失败，流水线不会自动提交修改。
+
+CPU 正确性、benchmark dry-run、SCA 和恶意代码扫描保持各自的作业与执行条件。pre-commit 不启动 NPU，也不代替这些验证。

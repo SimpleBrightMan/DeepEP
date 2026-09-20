@@ -60,9 +60,7 @@ class Config:
         if len(self.tokens_per_rank) != self.world_size or any(
             type(t) is not int or not 0 <= t <= 1048576 for t in self.tokens_per_rank
         ):
-            raise ValueError(
-                "tokens_per_rank must contain one nonnegative integer per rank"
-            )
+            raise ValueError("tokens_per_rank must contain one nonnegative integer per rank")
         if not 1 <= sum(self.tokens_per_rank) <= 1048576:
             raise ValueError("total tokens must be in [1, 1048576]")
         if sum(self.tokens_per_rank) * self.topk > 8388608:
@@ -70,25 +68,15 @@ class Config:
         if self.world_size * self.iterations > 1000000:
             raise ValueError("at most 1000000 rank samples can be retained")
         if self.experts % self.world_size or self.topk > self.experts:
-            raise ValueError(
-                "experts must divide across ranks and topk must not exceed experts"
-            )
+            raise ValueError("experts must divide across ranks and topk must not exceed experts")
         if self.alignment not in (1, 128):
             raise ValueError("alignment must be 1 or 128")
-        if self.api == "legacy" and (
-            self.layout != "ordinary" or self.dtype != "bf16" or self.alignment != 1
-        ):
-            raise ValueError(
-                "legacy benchmark currently covers ordinary BF16 with alignment=1"
-            )
+        if self.api == "legacy" and (self.layout != "ordinary" or self.dtype != "bf16" or self.alignment != 1):
+            raise ValueError("legacy benchmark currently covers ordinary BF16 with alignment=1")
         if self.dtype == "fp8" and self.hidden % 128:
-            raise ValueError(
-                "FP8 per-128-column scaling requires hidden divisible by 128"
-            )
+            raise ValueError("FP8 per-128-column scaling requires hidden divisible by 128")
         if self.api == "elastic" and self.operation != "dispatch" and self.hidden % 256:
-            raise ValueError(
-                "pinned upstream V2 combine requires hidden divisible by 256"
-            )
+            raise ValueError("pinned upstream V2 combine requires hidden divisible by 256")
         if self.operation == "combine" and self.dispatch_mode == "cached":
             raise ValueError("dispatch_mode=cached applies to dispatch or roundtrip")
         return self
@@ -104,18 +92,14 @@ class Config:
             raise ValueError("configuration must be a JSON object")
         unknown = set(data) - {f.name for f in fields(cls)}
         if unknown:
-            raise ValueError(
-                "unknown configuration fields: " + ", ".join(sorted(unknown))
-            )
+            raise ValueError("unknown configuration fields: " + ", ".join(sorted(unknown)))
         data = dict(data)
         if isinstance(data.get("tokens_per_rank"), list):
             data["tokens_per_rank"] = tuple(data["tokens_per_rank"])
         return cls(**data).validate()
 
     def fingerprint(self):
-        return hashlib.sha256(
-            json.dumps(self.to_dict(), sort_keys=True).encode()
-        ).hexdigest()
+        return hashlib.sha256(json.dumps(self.to_dict(), sort_keys=True).encode()).hexdigest()
 
     def required_capabilities(self):
         required = {self.api, "dispatch", self.layout, self.dtype}
@@ -161,19 +145,13 @@ def load_config(path):
 
 def route_for_token(config, rank, token):
     """Stable integer formula, shared with native adapters; duplicates stay slots."""
-    indices = [
-        (config.seed + rank * 17 + token * 7 + slot) % config.experts
-        for slot in range(config.topk)
-    ]
+    indices = [(config.seed + rank * 17 + token * 7 + slot) % config.experts for slot in range(config.topk)]
     if config.route == "skew":
         indices = [e % (config.experts // config.world_size) for e in indices]
     elif config.route == "duplicate" and config.topk > 1:
         indices[1] = indices[0]
     elif config.route == "masked":
-        indices = [
-            -1 if (config.seed + rank + token + slot) % 5 == 0 else e
-            for slot, e in enumerate(indices)
-        ]
+        indices = [-1 if (config.seed + rank + token + slot) % 5 == 0 else e for slot, e in enumerate(indices)]
     return tuple(indices)
 
 
@@ -198,26 +176,14 @@ def traffic(config):
     local_experts = config.experts // config.world_size
     for rank, tokens in enumerate(config.tokens_per_rank):
         for token in range(tokens):
-            destinations = [
-                e // local_experts
-                for e in route_for_token(config, rank, token)
-                if e >= 0
-            ]
-            rows[rank] += (
-                len(set(destinations))
-                if config.layout == "ordinary"
-                else len(destinations)
-            )
+            destinations = [e // local_experts for e in route_for_token(config, rank, token) if e >= 0]
+            rows[rank] += len(set(destinations)) if config.layout == "ordinary" else len(destinations)
     dispatch = [n * config.hidden * (1 if config.dtype == "fp8" else 2) for n in rows]
     combine = [n * config.hidden * 2 for n in rows]
     measured = (
         dispatch
         if config.operation == "dispatch"
-        else (
-            combine
-            if config.operation == "combine"
-            else [a + b for a, b in zip(dispatch, combine)]
-        )
+        else (combine if config.operation == "combine" else [a + b for a, b in zip(dispatch, combine)])
     )
     return {
         "definition": "aggregate_useful_hidden_payload_bytes_v1",

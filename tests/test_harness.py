@@ -63,9 +63,7 @@ def mock_framework(initialized=False):
     dist = Mock()
     state = {"initialized": initialized}
     dist.is_initialized.side_effect = lambda: state["initialized"]
-    dist.init_process_group.side_effect = lambda **kwargs: state.update(
-        initialized=True
-    )
+    dist.init_process_group.side_effect = lambda **kwargs: state.update(initialized=True)
     dist.destroy_process_group.side_effect = lambda: state.update(initialized=False)
     npu = Mock()
     npu.is_available.return_value = True
@@ -97,10 +95,7 @@ def test_owned_group_cleanup_including_failure(failure):
         run()
     torch.distributed.destroy_process_group.assert_called_once()
     assert not state["initialized"]
-    assert (
-        torch.distributed.init_process_group.call_args.kwargs["timeout"].total_seconds()
-        == 90
-    )
+    assert torch.distributed.init_process_group.call_args.kwargs["timeout"].total_seconds() == 90
 
 
 def test_existing_group_is_never_reused_or_destroyed():
@@ -149,9 +144,7 @@ def test_payload_matching_survives_scheduling_permutation(expanded):
         assert_close(roundtrip[0].x, clean[0].x)
 
 
-@pytest.mark.parametrize(
-    "mode", ["disabled", "missing_capabilities", "requested", "empty_selection"]
-)
+@pytest.mark.parametrize("mode", ["disabled", "missing_capabilities", "requested", "empty_selection"])
 def test_pytest_device_gate(mode):
     root = Path(__file__).resolve().parents[1]
     target = "tests/legacy/test_workflows.py::test_cached_dispatch"
@@ -165,9 +158,7 @@ def test_pytest_device_gate(mode):
     env = dict(os.environ, PYTHONPATH=str(root), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     for name in ("RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE"):
         env.pop(name, None)
-    result = subprocess.run(
-        args, cwd=root, env=env, text=True, capture_output=True, timeout=30
-    )
+    result = subprocess.run(args, cwd=root, env=env, text=True, capture_output=True, timeout=30)
     output = result.stdout + result.stderr
     if mode == "disabled":
         assert result.returncode == 0 and "1 skipped" in output, output
@@ -196,9 +187,7 @@ def test_device_gate_rejects_multiple_cases_without_reinitialize():
         "tests/elastic/test_workflows.py",
     ]
     env = dict(os.environ, PYTHONPATH=str(root), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
-    result = subprocess.run(
-        args, cwd=root, env=env, text=True, capture_output=True, timeout=30
-    )
+    result = subprocess.run(args, cwd=root, env=env, text=True, capture_output=True, timeout=30)
     output = result.stdout + result.stderr
     assert result.returncode != 0
     assert "select exactly one supported device case" in output

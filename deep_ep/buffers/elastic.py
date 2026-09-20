@@ -4,6 +4,7 @@
 These declarations do not provide an Ascend implementation. Every operation
 raises NotImplementedError before inspecting tensors or acquiring resources.
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, Tuple, Union
@@ -84,9 +85,7 @@ class ElasticBuffer:
         """Declare ElasticBuffer.get_buffer_size_hint; execution is not implemented."""
         _unavailable("ElasticBuffer.get_buffer_size_hint")
 
-    def barrier(
-        self, use_comm_stream: bool = True, with_cpu_sync: bool = False, sequential: bool = True
-    ) -> None:
+    def barrier(self, use_comm_stream: bool = True, with_cpu_sync: bool = False, sequential: bool = True) -> None:
         """Declare ElasticBuffer.barrier; execution is not implemented."""
         _unavailable("ElasticBuffer.barrier")
 

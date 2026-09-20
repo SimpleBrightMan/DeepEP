@@ -65,20 +65,14 @@ def plan(config):
 
 def aggregate_samples(samples, world_size, iterations):
     """samples is rank-major and iteration-aligned; reject partial/nonfinite data."""
-    if (
-        type(world_size) is not int
-        or type(iterations) is not int
-        or min(world_size, iterations) < 1
-    ):
+    if type(world_size) is not int or type(iterations) is not int or min(world_size, iterations) < 1:
         raise ValueError("world_size and iterations must be positive integers")
     if not isinstance(samples, (tuple, list)) or len(samples) != world_size:
         raise ValueError("incomplete rank samples")
     for row in samples:
         if not isinstance(row, (tuple, list)) or len(row) != iterations:
             raise ValueError("incomplete iteration samples")
-        if any(
-            type(v) not in (int, float) or not math.isfinite(v) or v <= 0 for v in row
-        ):
+        if any(type(v) not in (int, float) or not math.isfinite(v) or v <= 0 for v in row):
             raise ValueError("latency samples must be finite and positive")
     maximums = [max(row[i] for row in samples) for i in range(iterations)]
     ordered = sorted(maximums)
@@ -101,9 +95,7 @@ def _verify_collectively(runtime):
     except Exception as caught:
         error = caught
     if runtime.all_ranks_ok(error is None) is not True:
-        raise RuntimeError(
-            "correctness verification failed on at least one rank"
-        ) from error
+        raise RuntimeError("correctness verification failed on at least one rank") from error
     if error is not None:
         raise RuntimeError("backend incorrectly accepted failed correctness") from error
 
@@ -145,9 +137,7 @@ def measure(config, runtime, *, clock=time.perf_counter_ns):
     _verify_collectively(runtime)
     gathered = runtime.gather_samples(samples)
     maximums, stats = aggregate_samples(gathered, config.world_size, config.iterations)
-    stats["bandwidth_gbps"] = traffic(config)["effective_bytes"] / (
-        stats["latency_mean_us"] * 1000
-    )
+    stats["bandwidth_gbps"] = traffic(config)["effective_bytes"] / (stats["latency_mean_us"] * 1000)
     stats["bandwidth_statistic"] = "effective_bytes_over_mean_rank_max_latency"
     return {
         "rank_samples_us": gathered,
@@ -164,30 +154,16 @@ def measured_result(config, measurements, *, revision, metadata):
         raise ValueError("revision must be a full lowercase Git SHA")
     allowed = {"backend", "device", "software", "topology", "variant"}
     if not isinstance(metadata, dict) or set(metadata) != allowed:
-        raise ValueError(
-            "metadata must contain exactly backend/device/software/topology/variant"
-        )
+        raise ValueError("metadata must contain exactly backend/device/software/topology/variant")
     for value in metadata.values():
-        if (
-            not isinstance(value, str)
-            or not 1 <= len(value) <= 256
-            or any(ord(c) < 32 for c in value)
-        ):
-            raise ValueError(
-                "metadata values must be short, nonempty single-line strings"
-            )
+        if not isinstance(value, str) or not 1 <= len(value) <= 256 or any(ord(c) < 32 for c in value):
+            raise ValueError("metadata values must be short, nonempty single-line strings")
         if value.lstrip().startswith(("=", "+", "-", "@")):
-            raise ValueError(
-                "metadata must not start with a spreadsheet formula prefix"
-            )
+            raise ValueError("metadata must not start with a spreadsheet formula prefix")
     # Recompute rather than trust externally supplied summary numbers.
-    maximums, stats = aggregate_samples(
-        measurements["rank_samples_us"], config.world_size, config.iterations
-    )
+    maximums, stats = aggregate_samples(measurements["rank_samples_us"], config.world_size, config.iterations)
     report = plan(config)
-    stats["bandwidth_gbps"] = report["traffic"]["effective_bytes"] / (
-        stats["latency_mean_us"] * 1000
-    )
+    stats["bandwidth_gbps"] = report["traffic"]["effective_bytes"] / (stats["latency_mean_us"] * 1000)
     stats["bandwidth_statistic"] = "effective_bytes_over_mean_rank_max_latency"
     report.update(
         status="measured",
@@ -271,8 +247,6 @@ def write_result(directory, report):
     path.mkdir(parents=True, exist_ok=False)
     filename = "result.json" if csv_text is not None else "plan.json"
     (path / filename).write_text(encoded, encoding="utf-8")
-    (path / "config.json").write_text(
-        json.dumps(config.to_dict(), indent=2) + "\n", encoding="utf-8"
-    )
+    (path / "config.json").write_text(json.dumps(config.to_dict(), indent=2) + "\n", encoding="utf-8")
     if csv_text is not None:
         (path / "summary.csv").write_text(csv_text, encoding="utf-8")

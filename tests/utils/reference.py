@@ -42,16 +42,12 @@ def dispatch(case, *, expanded=False):
         expert_counts = [0] * local_experts
         for source, routes in enumerate(case.routes):
             for token, indices in enumerate(routes):
-                slots = tuple(
-                    s for s, e in enumerate(indices) if e >= 0 and e // local_experts == destination
-                )
+                slots = tuple(s for s, e in enumerate(indices) if e >= 0 and e // local_experts == destination)
                 for slot in slots:
                     expert_counts[indices[slot] % local_experts] += 1
                 if expanded:
                     for slot in slots:
-                        weights = (
-                            None if case.weights is None else (case.weights[source][token][slot],)
-                        )
+                        weights = None if case.weights is None else (case.weights[source][token][slot],)
                         rows.append(
                             Row(
                                 source,
@@ -64,9 +60,7 @@ def dispatch(case, *, expanded=False):
                             )
                         )
                 elif slots:
-                    local = tuple(
-                        e % local_experts if s in slots else -1 for s, e in enumerate(indices)
-                    )
+                    local = tuple(e % local_experts if s in slots else -1 for s, e in enumerate(indices))
                     weights = None if case.weights is None else case.weights[source][token]
                     rows.append(Row(source, token, slots, local, case.x[source][token], weights))
         if expanded:
@@ -97,8 +91,7 @@ def expert_payload(case, layout, *, use_received_x=False):
                 slots = row.slots if layout.expanded else range(case.topk)
                 # Poison nonlocal values: combine must not add them to a slot.
                 weights = tuple(
-                    0.5 - case.weights[row.source][row.token][s] if s in row.slots else 777.0
-                    for s in slots
+                    0.5 - case.weights[row.source][row.token][s] if s in row.slots else 777.0 for s in slots
                 )
             payloads.append(Payload(x, weights))
         ranks.append(tuple(payloads))
@@ -111,9 +104,7 @@ def combine(case, layout, payloads):
     if len(payloads) != case.world_size or len(layout.ranks) != case.world_size:
         raise ValueError("Combine rank count mismatch")
     output = [[[0.0] * case.hidden for _ in tokens] for tokens in case.x]
-    weights = (
-        None if case.weights is None else [[[0.0] * case.topk for _ in tokens] for tokens in case.x]
-    )
+    weights = None if case.weights is None else [[[0.0] * case.topk for _ in tokens] for tokens in case.x]
     for rows, rank_payloads in zip(layout.ranks, payloads):
         if len(rows) != len(rank_payloads):
             raise ValueError("Combine row count mismatch")
@@ -129,9 +120,7 @@ def combine(case, layout, payloads):
                 output[row.source][row.token][col] += value
             if weights is not None:
                 for index, slot in enumerate(row.slots):
-                    weights[row.source][row.token][slot] += payload.weights[
-                        index if layout.expanded else slot
-                    ]
+                    weights[row.source][row.token][slot] += payload.weights[index if layout.expanded else slot]
 
     def freeze(data):
         return tuple(tuple(tuple(row) for row in rank) for rank in data)
