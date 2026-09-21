@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "runtime_reference": {
+    "repository": "https://gitcode.com/lishaoxun/ascend_deepep",
+    "revision": "b41ee585ed69f405d715ef3d59f5750c558884fa"
+  },
+  "shmem": {
+    "repository": "https://gitcode.com/cann/shmem",
+    "revision": "df2fa21daa43a6bc4c44672af9192a1247c31999",
+    "distribution": "external SDK; headers and library recorded by record_shmem_sdk.py",
+    "header_sha256_lf": {
+      "host/shmem_host_def.h": "a1c3ffa482163c513e470e5328e272d544e4d08fe49fd4e83153fdf450b33f95",
+      "host/init/shmem_host_init.h": "3bad001979d840e529eab332d024fec4e2978adb8e2d1b2c5d10fbb0980a61bb",
+      "host/mem/shmem_host_heap.h": "5ef864fd9c6c812169de6e1dfbbb6b55481cd9cb67e543a681c3e19d5ce627b4",
+      "host/data_plane/shmem_host_cc.h": "dc8704f0d3fe00abe99ad5c9fa0bb74a79f7cda8c2af9242dc717cdd9f45ceb6",
+      "host_device/shmem_common_types.h": "bc6103349eaa36ae0583716ad7a19c7fc8e7f418f99d1a3adab3552133044411",
+      "host_device/shmem_common_macros.h": "d1540f47e041ddc544a975ddf9fda2e9801c5243d5730a5966598229adb7af60"
+    }
+  },
+  "python_build": {"build": "1.2.2.post1", "setuptools": "79.0.1", "wheel": "0.47.0", "pybind11": "3.0.4"},
+  "target": "Ascend950",
+  "device_kernels": [],
+  "qualification": "See docs/runtime-design.md; build success does not qualify EP operations"
+}

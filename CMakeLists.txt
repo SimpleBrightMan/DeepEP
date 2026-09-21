@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.20)
+project(deepep_runtime LANGUAGES CXX)
+file(WRITE "${CMAKE_BINARY_DIR}/compiler-info.json"
+    "{\"id\":\"${CMAKE_CXX_COMPILER_ID}\",\"version\":\"${CMAKE_CXX_COMPILER_VERSION}\"}\n")
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
+find_package(pybind11 CONFIG REQUIRED)
+include(cmake/Dependencies.cmake)
+pybind11_add_module(_C csrc/bindings/module.cpp csrc/runtime/session.cpp)
+target_include_directories(_C PRIVATE csrc "${ASCEND_HOME_PATH}/include" "${SHMEM_ROOT}/include")
+target_link_libraries(_C PRIVATE ascendcl shmem ${CMAKE_DL_LIBS})
+target_compile_options(_C PRIVATE -O2 -Wall -Wextra -Werror -fstack-protector-strong)
+target_compile_options(_C PRIVATE "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
+    "-ffile-prefix-map=${SHMEM_ROOT}=SHMEM_SDK" "-ffile-prefix-map=${ASCEND_HOME_PATH}=CANN_SDK")
+target_compile_definitions(_C PRIVATE _FORTIFY_SOURCE=2)
+target_link_options(_C PRIVATE -Wl,-z,relro,-z,now,-z,noexecstack)
+# SDKs are external dependencies. Never embed checkout/toolkit absolute RPATHs.
+set_target_properties(_C PROPERTIES INSTALL_RPATH "" INSTALL_RPATH_USE_LINK_PATH FALSE)
+install(TARGETS _C LIBRARY DESTINATION .)

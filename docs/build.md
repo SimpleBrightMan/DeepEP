@@ -1,83 +1,77 @@
-# 构建、打包与安装设计
+# 构建、打包与安装
 
-**当前状态：构建系统尚未实现。** 本文的文件名、target、开关和命令是目标设计。仓库目前没有 `pyproject.toml`、`setup.py`、根 `CMakeLists.txt` 或可安装 wheel。
+当前提供 **Host 运行时基础 wheel**，不含 dispatch/combine kernel。
+详细范围、资源所有权和验收矩阵见[运行时设计](runtime-design.md)。
+包名为 `ascend-deepep`，导入名仍为 `deep_ep`；不要与其他提供 `deep_ep` 的包装在同一环境。
 
-## 构建主链
+## 前置条件
 
-```text
-PEP 517 前端
-  → setuptools（pyproject.toml / setup.py）
-  → build_support.py：统一配置、构建、安装、收集
-  → 一次根 CMake：核心与选定 Beta，共同解析依赖
-  → Host 编译 + AscendC Device 编译
-  → 安装暂存树
-  → wheel / 源码安装 / editable 安装
-```
-
-metadata 查询只读取必要包信息。native 编译在实际构建阶段进行。不同架构、依赖、变体或 Beta 配置用独立构建目录和配置指纹隔离。
-
-## 文件与目标
-
-| 文件或模块 | 规划责任 |
-| --- | --- |
-| `pyproject.toml`、`setup.py` | 构建后端、Python 包元数据和扩展声明 |
-| `build_support.py` | 一次根 CMake 调用及产物收集；各 hook 共用配置 |
-| `CMakeLists.txt` | 架构、依赖、核心/Beta 目标与安装入口 |
-| `cmake/Dependencies.cmake` | 依赖来源、固定版本与有效 targets |
-| `cmake/HostTargets.cmake` | Python、Torch、torch_npu 与 Host ABI |
-| `cmake/AscendC.cmake` | 所选 CANN 工具链的真实 Device 编译助手 |
-| `cmake/Install.cmake` | 扩展、库、配置与构建信息的安装清单 |
-| `VERSION`、`MANIFEST.in` | 版本来源与源码发行内容 |
-| `dependencies.lock.json` | 实际依赖提交及工具链/运行环境配套 |
-| `build.sh`、`develop.sh`、`install.sh` | 同一构建流程的薄入口 |
-
-| 拟议 target | 输入 | 目标产物 |
-| --- | --- | --- |
-| `deepep_runtime` | `csrc/runtime/` | 核心/Beta 按需复用的 Host 运行库 |
-| `deepep_kernels` | 核心 Kernel 与已形成的共享组件 | 工具链支持的 Kernel 链接/加载产物 |
-| `deepep_python` | 注册、bindings、ops、execution | `deep_ep._C` |
-| `megamoe_kernels` | Beta Device 实现 | 独立 Beta Kernel 产物 |
-| `megamoe_python` | Beta 注册与 Host 操作 | `deep_ep_experimental.megamoe._C` |
-
-Kernel 库的实际形式与后缀须用锁定的 AscendC 工具链验证。Host/Device 共用参数只维护一份声明。编译清单只消费真实实现及实际启用的变体。
-
-## 环境与配置
-
-目标运行/编译环境为 Ascend Linux 配套，需锁定驱动、CANN/AscendC、SHMEM、Python、PyTorch、`torch_npu` 和 Host 编译器。CATLASS/CatCCOS 仅在所选实现需要时引入。当前没有经过验证的版本组合。
-
-规划的配置优先级：显式命令或环境覆盖 → release 预设 → 项目默认值。
-
-| 配置 | 目标语义 |
-| --- | --- |
-| `DEEPEP_BUILD_MEGAMOE` | `OFF` 构建核心；`ON` 同时包含完整 Beta 内容 |
-| `DEEPEP_NPU_ARCH` | 已验证的 NPU 编译目标 |
-| `SHMEM_ROOT` | 选定 SHMEM SDK 的有效路径 |
-| `configs/release/` | 发行功能、目标架构及依赖配套 |
-
-这些选项尚未实现解析。最终配置与实际产物应记录在安装树 `_build_info.json`，包含源码版本、依赖来源、工具链、架构、变体、Python ABI 和 Beta 开关。
-
-## 目标命令
-
-仅在实现和配套环境就绪后使用；`CANN_ENV`、`DEEPEP_NPU_ARCH`、`SHMEM_ROOT` 由验证配套给出：
+- Linux、Python ≥3.11、C++17 编译器、CMake ≥3.20。
+- CANN 9.2.0 与配套驱动/框架，目标 Ascend950；其他组合尚未放开。
+- 预先构建固定提交的 SHMEM SDK（见 `dependencies.lock.json`），安装根包含 `include/` 和 `lib/libshmem.so`。
+- 普通 CPU 测试仅需 `requirements-dev.txt`；wheel 构建依赖固定在 `pyproject.toml`。
+- 本仓不自动下载/编译外部 SDK，不将驱动/CANN/SHMEM 打入 wheel。SDK 及其传递依赖必须由部署环境提供。
 
 ```bash
 source "$CANN_ENV"
-export DEEPEP_NPU_ARCH SHMEM_ROOT
-python -m pip install -r requirements-dev.txt
+export DEEPEP_NPU_ARCH=Ascend950
+export SHMEM_ROOT=/path/to/pinned/shmem-sdk
+export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
 
-DEEPEP_BUILD_MEGAMOE=OFF python -m build --wheel --no-isolation
-# 使用独立构建目录或清洁工作树构建 Beta。
-DEEPEP_BUILD_MEGAMOE=ON python -m build --wheel --no-isolation
-python -m build --sdist --no-isolation
+# 在 SDK 的专用副本中记录身份；已存在 manifest 时不覆盖。
+python scripts/record_shmem_sdk.py --sdk "$SHMEM_ROOT" \
+  --revision df2fa21daa43a6bc4c44672af9192a1247c31999
 
-python -m pip install "$WHEEL"
-python -m pip install --no-build-isolation -e .
+python -m pip install -r requirements-build.txt -r requirements-dev.txt
+python -m build --sdist --wheel --no-isolation
 ```
 
-源码发行必须包含完整第一方和实验源码，并提供许可允许、可取得的固定依赖方案。只有 `.gitmodules` 无法保证脱离 Git 元数据的源码包可重建。
+版本声明由 SDK 提供方负责，脚本校验固定公共头文件、记录头文件及库的校验和；不把“头文件一致”等同于“二进制来源可信”。
+若 SDK 无法匹配，必须提供固定提交的构建，不能修改 manifest 绕过检查。
 
-## 安装验收
+`setup.py` 元数据查询不需要 SDK/框架。实际构建只经 `build_support.py` 调用根 CMake。
+不同环境使用不同指纹目录；构建信息随 wheel 安装。`DEEPEP_BUILD_MEGAMOE` 仅允许 OFF。
+安装产物没有构建机绝对 RPATH，使用部署环境的 SDK 路径；加载时核对实际 SHMEM 二进制身份。
 
-在干净环境分别检查核心与 Beta wheel 内容、独立加载、共享库查找、版本和构建信息；从 sdist 重建并核对功能清单。核心配置只安装核心内容，Beta 配置同步安装其源码对应产物、Python 包和配置。最后在目标 NPU 上运行完整示例及安装集成测试。
+## 自动化构建、隔离安装与验证
 
-构建、安装及设备验证状态见[路线图](roadmap.md)。
+在已准备好匹配 torch/torch_npu、pytest 与构建依赖的环境中运行：
+
+```bash
+python scripts/validate_package.py --output /path/to/new-validation-directory \
+  --system-site-packages
+```
+
+该命令创建新 venv，在其中自动安装固定的构建/测试依赖，运行源码测试，构建 wheel/sdist、从 sdist 再构建 wheel、检查内容与元数据，安装后在源码目录外运行测试。
+无网络环境使用 `--wheelhouse /path/to/wheels`，只从预下载目录安装；缺包明确失败。
+`--system-site-packages` **明确复用已有框架依赖**；不是宣称完全隔离所有 Python 依赖。
+省略此选项创建不继承系统包的环境，需要另行准备框架/测试依赖，否则验证失败。
+不会修改调用方 Python 环境，也不会默认占用设备。输出目录必须全新；失败日志/产物保留用于定位。
+
+设备资源已由作业调度方分配后，可追加真实运行时验证：
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1
+export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
+python scripts/validate_package.py --output /path/to/another-new-directory \
+  --system-site-packages --runtime-ranks 2
+```
+
+设备编号和端口为示例，必须替换为本作业已预留资源。不要复用已有任务的通信端口。
+支持显式选择 EP2/4/8 的资源测试；只有实际完成的规模才能记入资格。
+每个 rank 的成功结果、JUnit XML 和 `validation.json` 一并保留；失败不会写成功摘要。
+
+`--runtime-ranks` 只验证资源、事件与生命周期，不是 dispatch/combine 正确性或带宽。
+dispatch → 专家计算 → combine 集成已增加独立选项 `--ep-roundtrip npu-stub|native`：
+前者使用真实 NPU Tensor 和 HCCL 参考通信，后者仅调用安装包公开算法 API。
+开发者也可用 `scripts/validate_ep.py` 跳过重复构建/安装，直接验收候选 wheel；
+完整命令、算子接入要求和结果边界见 [NPU 集成测试](npu-roundtrip.md)。
+正式发布前仍需许可证确认、受支持配套环境审批以及后续算法批次的独立资格验证。
+
+## CI 接入
+
+现有 `compile` 流水线自动运行 CPU 契约、构建预检、Python/原生资源故障注入与回归测试。
+原生 fault-injection 的编译要求 Linux/g++；不是 CANN ABI 或设备测试。
+原生构建/设备 runner 还需维护者配置 SDK、框架和独占设备资源，当前不伪造 runner 标签或镜像。
+对应 runner 的必选门禁命令就是上面的 `validate_package.py`；依赖或能力缺失应失败，不应改成 skip。
+归档 `source-tests.xml`、`installed-tests.xml`、`validation.json` 和每个 rank 的输出；wheel/sdist 作为独立产物留存。

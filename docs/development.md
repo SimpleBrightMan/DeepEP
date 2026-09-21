@@ -13,7 +13,7 @@ csrc/kernels/            完整设备实现及私有辅助
 csrc/runtime/            共享上下文、资源和事件
 ```
 
-`deep_ep/__init__.py` 汇总导出，`csrc/python_api.cpp` 汇总核心原生注册。Beta 在 `experiments/megamoe/` 中建立自己的入口与构建目标。
+`deep_ep/__init__.py` 汇总导出，当前 `csrc/bindings/module.cpp` 汇总资源层原生注册；后续算法注册仍保持单一扩展入口。Beta 在 `experiments/megamoe/` 中建立自己的入口与构建目标。
 
 ## 文件粒度与命名
 

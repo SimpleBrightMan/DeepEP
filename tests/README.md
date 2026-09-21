@@ -4,6 +4,19 @@
 
 ## CPU 验证
 
+已增加 [V1 功能桩与小型集成测试](../docs/functional-roundtrip.md)：
+显式选择单进程 CPU 模拟，成功执行 dispatch → 专家计算 → combine，检查中间数据和最终 L2 精度。
+它不替代公开 Buffer，不注册到原生后端，也不作为 wheel 算法或 NPU 通信资格。
+
+```bash
+python -m tests.integration.run_roundtrip --backend functional-stub
+python -m pytest tests/integration -q --durations=5
+```
+
+新增 `tests/runtime/`：资源准入、事件/hook/释放故障注入、构建前置检查及真实设备探针。
+完整 wheel/sdist 构建→新 venv 安装→源码目录外运行测试见[构建指南](../docs/build.md)。
+普通 pytest 不自动安装包、不自动占卡；真实资源探针与尚未实现的 EP 通信矩阵分别统计。
+
 从仓库根目录运行（建议使用隔离的 Python 环境）：
 
 ```bash
@@ -26,7 +39,7 @@ python -m pytest -m "not framework" --junitxml=cpu-correctness.xml
 python -m pytest --require-framework -s --junitxml=cpu-correctness.xml
 ```
 
-该模式要求框架兼容检查实际执行；依赖缺失会失败。检查仅导入框架、验证接口仍明确报错且未初始化 NPU，不分配设备 Tensor 或运行通信。普通 CPU 运行会明确跳过该单项；其他错误不会被转换为 skip。
+该模式要求框架兼容检查实际执行；依赖缺失会失败。检查普通导入不初始化 NPU、未实现通信操作仍报错；不分配设备 Tensor。普通 CPU 运行跳过该单项；其他错误不转换为 skip。安装环境下已实现方法不再执行“必须失败”的断言，改由运行时测试覆盖。
 
 GitCode 的 `compile` 触发流水线运行 CPU 契约、参考及框架自检，并上传 JUnit；设备 skip 数保留在结果里。框架导入检查、设备通信资格与流水线扫描结果分别记录。
 
@@ -52,6 +65,12 @@ GitCode 的 `compile` 触发流水线运行 CPU 契约、参考及框架自检�
 预设语义样本继续采用精确比较。资格矩阵另以 CPU FP64 为 Golden、上游同 dtype 路径为第二标杆，按 L2 的 MARE/MERE/RMSE 和小值域错误数比判定。完整规则见[精度标准、Golden 与比较方法](../docs/precision.md)。
 
 ## 设备功能资格（后端实现后执行）
+
+小型 V1 前向闭环另提供 [NPU Tensor 外层入口](../docs/npu-roundtrip.md)：
+`python scripts/validate_ep.py --backend native --devices 0,1 --output /path/to/new-results`。
+后续算子开发者通过公开 API 运行相同场景，无需改用例；当前尚无原生算法，native 明确失败。
+显式选择 `--backend npu-stub` 可用真实 NPU Tensor/HCCL 基础算子验证测试链路，结果不算原生算子资格。
+构建安装一体入口为 `scripts/validate_package.py --ep-roundtrip npu-stub|native`。
 
 仅收集设备用例，无需安装框架：
 
@@ -97,7 +116,7 @@ torchrun --standalone --nproc-per-node=2 -m pytest \
 - `api/`：固定原生 API 基线、导出和典型完整调用。
 - `legacy/`：V1 dispatch、combine、低时延和复用路径。
 - `elastic/`：V2 dispatch、combine、EPHandle 与布局衔接。
-- `integration/`：核心/Beta 安装、框架接入与资源生命周期。
+- `integration/`：当前为 V1 普通布局功能桩、小型闭环精度与故障测试；真实算法安装/框架集成待接入。
 - `utils/`：分布式环境辅助和业务参考；Beta 专属测试放在实验目录。
 
 [完整文件规划](../docs/repository-layout.md) · [架构说明](../docs/architecture.md)

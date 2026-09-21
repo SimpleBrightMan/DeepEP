@@ -10,7 +10,7 @@ import pytest
 
 
 @pytest.mark.framework
-def test_torch_npu_import_does_not_enable_stubs_or_initialize_devices(request):
+def test_torch_npu_import_does_not_enable_communication_or_initialize_devices(request):
     missing = [name for name in ("torch", "torch_npu") if importlib.util.find_spec(name) is None]
     if missing:
         reason = "Framework compatibility requires: " + ", ".join(missing)
@@ -23,13 +23,14 @@ import json
 import torch, torch_npu
 assert not torch.npu.is_initialized(), 'Framework import already initialized an NPU'
 import deep_ep
-for construct in (lambda: deep_ep.Buffer(None), lambda: deep_ep.ElasticBuffer(None),
-                  deep_ep.EventHandle, deep_ep.EventOverlap):
+for construct in (lambda: deep_ep.Buffer.dispatch(None, None),
+                  lambda: deep_ep.ElasticBuffer.dispatch(None, None),
+                  deep_ep.Config):
     try:
         construct()
     except NotImplementedError:
         continue
-    raise AssertionError('API stub unexpectedly succeeded')
+    raise AssertionError('Unimplemented communication/configuration unexpectedly succeeded')
 assert not torch.npu.is_initialized(), 'DeepEP declarations initialized an NPU'
 print(json.dumps({'torch': torch.__version__, 'torch_npu': torch_npu.__version__,
                   'npu_initialized': torch.npu.is_initialized(), 'deep_ep': deep_ep.__file__}))

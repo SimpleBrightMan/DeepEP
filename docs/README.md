@@ -9,9 +9,12 @@
 | [api.md](api.md) | API 对标范围、工作流与基线要求 |
 | [api-contracts.md](api-contracts.md) | 已提供的接口声明、默认值差异、明确失败及验证设计 |
 | [build.md](build.md) | 构建主链、产物、安装及依赖锁定 |
+| [runtime-design.md](runtime-design.md) | 原生资源/事件生命周期、支持边界及安装验证 |
 | [performance.md](performance.md) | EP/Beta 测量口径与复现记录 |
 | [benchmark-design.md](benchmark-design.md) | EP benchmark 配置、计时/统计引擎、结果协议及原生适配器契约 |
 | [precision.md](precision.md) | 精度标准、BF16/FP8 双标杆、Golden 与资格矩阵 |
+| [functional-roundtrip.md](functional-roundtrip.md) | 显式功能桩、V1 小型前向闭环、精度与后端隔离 |
+| [npu-roundtrip.md](npu-roundtrip.md) | 真实 NPU Tensor、外层运行选项与后续原生算子验收入口 |
 | [development.md](development.md) | 源码导航、文件粒度与实现次序 |
 | [roadmap.md](roadmap.md) | 开发阶段、功能状态与验证要求 |
 

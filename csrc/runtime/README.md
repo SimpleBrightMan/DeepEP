@@ -4,6 +4,10 @@
 
 ## 规划内容与职责
 
+当前 `session.hpp/.cpp` 实现独占 SHMEM 资源的建立、工作区和显式销毁；只借用框架 ACL context。
+真实事件委托 torch_npu 的事件 API，不建立另一套 ACL 全局初始化。支持边界见[运行时设计](../../docs/runtime-design.md)。
+下列更细模块划分随实际消费者演进，不创建空实现。
+
 - `context.hpp/.cpp`：本库操作共享的运行上下文。
 - `resources.hpp/.cpp`：实际资源的取得、引用与释放适配。
 - `event.hpp/.cpp`：原生完成对象与框架事件衔接。

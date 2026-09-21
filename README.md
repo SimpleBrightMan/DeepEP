@@ -19,7 +19,7 @@
 
 项目计划通过 `deep_ep` 提供原生 DeepEP 风格的 V1/V2 用户接口，以 AscendC 实现设备算子，以 SHMEM 作为首发通信基础。MegaMoE Beta 作为独立实验单元，探索通信与专家计算融合。
 
-> **项目处于早期开发阶段。** 已提供 API 声明、契约测试、独立 CPU 参考与可收集的 V1/V2 设备用例。所有运行时对象构造、通信和事件操作仍明确抛出 `NotImplementedError`；设备通信尚未通过验证。原生后端、安装包及可运行通信示例尚未提供。运行方法见[测试说明](tests/README.md)，实现进度见[路线图](docs/roadmap.md)。
+> **项目处于早期开发阶段。** 已提供 API 契约、独立 CPU 参考、V1/V2 通信资格用例，以及可构建的 Host 运行时 wheel。安装原生扩展后支持受限的资源创建/销毁和真实事件；dispatch/combine 等通信算法仍明确报未实现，不代表设备通信通过。支持边界见[运行时设计](docs/runtime-design.md)，测试方法见[测试说明](tests/README.md)。
 
 ## 架构
 
@@ -89,13 +89,13 @@ git clone https://gitcode.com/Ascend/DeepEP.git
 cd DeepEP
 ```
 
-安装方式尚未开放。构建流程、依赖和产物规划见[构建与打包](docs/build.md)。
+Host 运行时 wheel 的构建、隔离安装和自动验证见[构建与打包](docs/build.md)。尚不能用它运行 EP 通信。
 
 ## MegaMoE Beta
 
 [experiments/megamoe/](experiments/megamoe/README.md)集中承载融合流程、原生扩展、Python 命名空间、配置、测试及性能入口。目标逻辑为 dispatch–GMM–激活–GMM–combine；Kernel 边界和可选量化由具体实现确定。
 
-`DEEPEP_BUILD_MEGAMOE` 为规划中的构建开关，默认 `OFF`。Beta 接口与性能资格按版本单独维护。
+`DEEPEP_BUILD_MEGAMOE` 当前仅接受 `OFF`；开启会明确报错。Beta 接口与性能资格另行维护。
 
 ## 开发与测试
 

@@ -31,7 +31,7 @@ pre-commit run --all-files --show-diff-on-failure
 
 现有流水线通过 PR 评论 `compile` 触发，对 PR 的合并结果运行相同的全仓 pre-commit 命令，纯文档 PR 也会检查。任一钩子失败都会使作业失败，CI 不会自动提交修复。暂存文件和 PR 改动范围的检查命令见[开发指南](docs/development.md)。
 
-API 契约测试已可用，见[测试说明](tests/README.md)。原生构建与设备测试入口仍在开发中，见[构建指南](docs/build.md)。
+API 契约、原生运行时构建安装及资源/事件测试入口已可用，见[测试说明](tests/README.md)和[构建指南](docs/build.md)。dispatch/combine 等算法仍未实现。
 
 ## 许可证
 

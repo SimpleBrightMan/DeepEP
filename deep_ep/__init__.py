@@ -1,8 +1,7 @@
-"""DeepEP for Ascend API declarations, without a communication backend.
+"""DeepEP resource/event interfaces; imports do not require Torch or an NPU SDK.
 
-Imports work without Torch or an NPU installation. Creating any public runtime
-object or invoking an operation raises NotImplementedError. Importability is
-not evidence of device support; see docs/api.md.
+Installed native wheels provide resource/event primitives, not EP algorithms.
+Without the extension, runtime calls fail explicitly. See docs/runtime-design.md.
 """
 
 from ._config import Config

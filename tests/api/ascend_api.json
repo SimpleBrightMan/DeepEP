@@ -1,5 +1,16 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "contract": "Ascend EP declarations adapted from the cited upstream sources, not an exact upstream signature snapshot.",
+  "platform_naming": {
+    "scaleup": "Intra-domain transport; no particular interconnect implementation is implied.",
+    "scaleout": "Inter-domain transport; no particular interconnect implementation is implied.",
+    "memory_transport": "Memory-semantic transport only, not all scale-up backends; flags do not establish capability.",
+    "qps": "Reserved for a QP-capable backend, not a shared DMA queue/channel count; no QP policy is implemented.",
+    "compute_units": "Backend-defined compute scheduling units; values are not hardware tuning recommendations.",
+    "device": "NPU execution, timeout and reference-capture terminology.",
+    "aligned_col_major_sf": "Reserved scale-factor layout option; no implementation or alignment capability is implied.",
+    "compatibility": "Only the declared Ascend keyword names are accepted; removed platform-specific aliases are not retained."
+  },
   "upstream": {
     "repository": "https://github.com/deepseek-ai/DeepEP",
     "revision": "a56d6156febcd9976e55adc85b5155bfac9f28f8",
@@ -37,7 +48,7 @@
     "Engram",
     "pipeline parallelism",
     "AGRS",
-    "CUDA architecture probes",
+    "device architecture probes",
     "native extension internals"
   ],
   "target_contracts": {
@@ -45,7 +56,7 @@
     "Buffer.get_dispatch_layout": {
       "returns": [
         "num_tokens_per_rank",
-        "num_tokens_per_rdma_rank",
+        "num_tokens_per_scaleout_rank",
         "num_tokens_per_expert",
         "is_token_in_rank",
         "event"
@@ -123,12 +134,12 @@
           "parameters": [
             {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
             {"name": "group", "kind": "POSITIONAL_OR_KEYWORD"},
-            {"name": "num_nvl_bytes", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
-            {"name": "num_rdma_bytes", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "num_scaleup_bytes", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "num_scaleout_bytes", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
             {"name": "low_latency_mode", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
             {"name": "num_qps_per_rank", "kind": "POSITIONAL_OR_KEYWORD", "default": 24},
-            {"name": "allow_nvlink_for_low_latency_mode", "kind": "POSITIONAL_OR_KEYWORD", "default": true},
-            {"name": "allow_mnnvl", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "allow_memory_transport_for_low_latency_mode", "kind": "POSITIONAL_OR_KEYWORD", "default": true},
+            {"name": "allow_multinode_memory_transport", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
             {"name": "explicitly_destroy", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
             {"name": "enable_shrink", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
             {"name": "comm", "kind": "POSITIONAL_OR_KEYWORD", "default": null}
@@ -141,11 +152,11 @@
             {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"}
           ]
         },
-        "set_num_sms": {
+        "set_num_compute_units": {
           "upstream_line": 154,
           "kind": "staticmethod",
           "parameters": [
-            {"name": "new_num_sms", "kind": "POSITIONAL_OR_KEYWORD"}
+            {"name": "new_num_compute_units", "kind": "POSITIONAL_OR_KEYWORD"}
           ]
         },
         "capture": {
@@ -153,7 +164,7 @@
           "kind": "staticmethod",
           "parameters": []
         },
-        "get_low_latency_rdma_size_hint": {
+        "get_low_latency_scaleout_size_hint": {
           "upstream_line": 176,
           "kind": "staticmethod",
           "parameters": [
@@ -204,7 +215,7 @@
             {"name": "x", "kind": "POSITIONAL_OR_KEYWORD"},
             {"name": "handle", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
             {"name": "num_tokens_per_rank", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
-            {"name": "num_tokens_per_rdma_rank", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
+            {"name": "num_tokens_per_scaleout_rank", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
             {"name": "is_token_in_rank", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
             {"name": "num_tokens_per_expert", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
             {"name": "topk_idx", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
@@ -300,7 +311,7 @@
             {"name": "num_experts", "kind": "POSITIONAL_OR_KEYWORD"},
             {"name": "expert_alignment", "kind": "POSITIONAL_OR_KEYWORD"},
             {"name": "num_max_tokens_per_rank", "kind": "POSITIONAL_OR_KEYWORD"},
-            {"name": "num_sms", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "num_compute_units", "kind": "POSITIONAL_OR_KEYWORD"},
             {"name": "topk_idx", "kind": "POSITIONAL_OR_KEYWORD"},
             {"name": "num_recv_tokens", "kind": "POSITIONAL_OR_KEYWORD"},
             {"name": "num_expanded_tokens", "kind": "POSITIONAL_OR_KEYWORD"},
@@ -339,7 +350,7 @@
             {"name": "sl_idx", "kind": "POSITIONAL_OR_KEYWORD", "default": 3},
             {"name": "num_allocated_qps", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
             {"name": "num_cpu_timeout_secs", "kind": "POSITIONAL_OR_KEYWORD", "default": 300},
-            {"name": "num_gpu_timeout_secs", "kind": "POSITIONAL_OR_KEYWORD", "default": 100},
+            {"name": "num_device_timeout_secs", "kind": "POSITIONAL_OR_KEYWORD", "default": 100},
             {"name": "explicitly_destroy", "kind": "POSITIONAL_OR_KEYWORD", "default": false}
           ]
         },
@@ -399,7 +410,7 @@
             {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"}
           ]
         },
-        "get_theoretical_num_sms": {
+        "get_theoretical_num_compute_units": {
           "upstream_line": 729,
           "kind": "method",
           "parameters": [
@@ -407,10 +418,10 @@
             {"name": "num_experts", "kind": "POSITIONAL_OR_KEYWORD"},
             {"name": "num_topk", "kind": "POSITIONAL_OR_KEYWORD"},
             {"name": "num_scaleout_topk", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
-            {"name": "rdma_gbs", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
-            {"name": "nvlink_gbs", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
-            {"name": "sm_read_gbs", "kind": "POSITIONAL_OR_KEYWORD", "default": 200},
-            {"name": "sm_write_gbs", "kind": "POSITIONAL_OR_KEYWORD", "default": 50}
+            {"name": "scaleout_gbs", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "scaleup_gbs", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "compute_read_gbs", "kind": "POSITIONAL_OR_KEYWORD", "default": 200},
+            {"name": "compute_write_gbs", "kind": "POSITIONAL_OR_KEYWORD", "default": 50}
           ]
         },
         "get_theoretical_num_qps": {
@@ -418,7 +429,7 @@
           "kind": "method",
           "parameters": [
             {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
-            {"name": "num_sms", "kind": "POSITIONAL_OR_KEYWORD"}
+            {"name": "num_compute_units", "kind": "POSITIONAL_OR_KEYWORD"}
           ]
         },
         "dispatch": {
@@ -433,7 +444,7 @@
             {"name": "num_experts", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
             {"name": "num_max_tokens_per_rank", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
             {"name": "expert_alignment", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
-            {"name": "num_sms", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "num_compute_units", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
             {"name": "num_qps", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
             {"name": "previous_event", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
             {"name": "previous_event_before_epilogue", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
@@ -444,7 +455,7 @@
             {"name": "do_cpu_sync", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
             {"name": "do_expand", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
             {"name": "do_zero_padding", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
-            {"name": "use_tma_aligned_col_major_sf", "kind": "POSITIONAL_OR_KEYWORD", "default": false}
+            {"name": "use_aligned_col_major_sf", "kind": "POSITIONAL_OR_KEYWORD", "default": false}
           ]
         },
         "combine": {
@@ -456,7 +467,7 @@
             {"name": "handle", "kind": "POSITIONAL_OR_KEYWORD"},
             {"name": "topk_weights", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
             {"name": "bias", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
-            {"name": "num_sms", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
+            {"name": "num_compute_units", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
             {"name": "num_qps", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
             {"name": "previous_event", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
             {"name": "previous_event_before_epilogue", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
@@ -531,14 +542,14 @@
           "kind": "method",
           "parameters": [
             {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
-            {"name": "num_sms", "kind": "POSITIONAL_OR_KEYWORD", "default": 20},
-            {"name": "num_max_nvl_chunked_send_tokens", "kind": "POSITIONAL_OR_KEYWORD", "default": 6},
-            {"name": "num_max_nvl_chunked_recv_tokens", "kind": "POSITIONAL_OR_KEYWORD", "default": 256},
-            {"name": "num_max_rdma_chunked_send_tokens", "kind": "POSITIONAL_OR_KEYWORD", "default": 6},
-            {"name": "num_max_rdma_chunked_recv_tokens", "kind": "POSITIONAL_OR_KEYWORD", "default": 256}
+            {"name": "num_compute_units", "kind": "POSITIONAL_OR_KEYWORD", "default": 20},
+            {"name": "num_max_scaleup_chunked_send_tokens", "kind": "POSITIONAL_OR_KEYWORD", "default": 6},
+            {"name": "num_max_scaleup_chunked_recv_tokens", "kind": "POSITIONAL_OR_KEYWORD", "default": 256},
+            {"name": "num_max_scaleout_chunked_send_tokens", "kind": "POSITIONAL_OR_KEYWORD", "default": 6},
+            {"name": "num_max_scaleout_chunked_recv_tokens", "kind": "POSITIONAL_OR_KEYWORD", "default": 256}
           ]
         },
-        "get_nvl_buffer_size_hint": {
+        "get_scaleup_buffer_size_hint": {
           "upstream_line": 1759,
           "kind": "method",
           "parameters": [
@@ -547,7 +558,7 @@
             {"name": "num_ranks", "kind": "POSITIONAL_ONLY"}
           ]
         },
-        "get_rdma_buffer_size_hint": {
+        "get_scaleout_buffer_size_hint": {
           "upstream_line": 1760,
           "kind": "method",
           "parameters": [

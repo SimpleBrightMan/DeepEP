@@ -10,10 +10,23 @@ import sys
 import pytest
 
 import deep_ep
+from importlib.machinery import EXTENSION_SUFFIXES
 
 
-ROOT = Path(__file__).resolve().parents[2]
-BASELINE = json.loads(Path(__file__).with_name("upstream_api.json").read_text(encoding="utf-8"))
+ROOT = Path(deep_ep.__file__).resolve().parent.parent
+INSTALLED_NATIVE = any((ROOT / "deep_ep" / ("_C" + suffix)).is_file() for suffix in EXTENSION_SUFFIXES)
+RUNTIME_METHODS = {
+    "Buffer.__init__",
+    "Buffer.destroy",
+    "Buffer.capture",
+    "Buffer.get_comm_stream",
+    "ElasticBuffer.__init__",
+    "ElasticBuffer.destroy",
+    "ElasticBuffer.capture",
+    "ElasticBuffer.get_comm_stream",
+    "ElasticBuffer.barrier",
+}
+BASELINE = json.loads(Path(__file__).with_name("ascend_api.json").read_text(encoding="utf-8"))
 METHODS = [(name, method) for name, spec in BASELINE["objects"].items() for method in spec["methods"]]
 
 
@@ -24,8 +37,21 @@ class Uninspectable:
         raise AssertionError(f"Stub unexpectedly inspected input attribute {name}")
 
 
+@pytest.mark.parametrize("num_qps", [0, 1, 32])
+@pytest.mark.parametrize("method", ["dispatch", "combine"])
+def test_reserved_qp_budget_does_not_enable_an_algorithm(method, num_qps):
+    operation = getattr(deep_ep.ElasticBuffer, method)
+    args = [Uninspectable(), Uninspectable()]
+    if method == "combine":
+        args.append(Uninspectable())
+    with pytest.raises(NotImplementedError, match=rf"ElasticBuffer\.{method} is not implemented"):
+        operation(*args, num_qps=num_qps)
+
+
 @pytest.mark.parametrize("name,method", METHODS, ids=[f"{n}.{m}" for n, m in METHODS])
 def test_every_declared_operation_fails_before_touching_inputs(name, method):
+    if INSTALLED_NATIVE and (name.startswith("Event") or f"{name}.{method}" in RUNTIME_METHODS):
+        pytest.skip("Implemented runtime operation covered by runtime tests")
     operation = getattr(getattr(deep_ep, name), method)
     args = [
         Uninspectable()
@@ -38,6 +64,13 @@ def test_every_declared_operation_fails_before_touching_inputs(name, method):
 
 @pytest.mark.parametrize("name", BASELINE["exports"])
 def test_constructors_cannot_create_usable_objects(name):
+    if INSTALLED_NATIVE and name in {
+        "Buffer",
+        "ElasticBuffer",
+        "EventHandle",
+        "EventOverlap",
+    }:
+        pytest.skip("Implemented runtime constructor covered by runtime tests")
     cls = getattr(deep_ep, name)
     args = [Uninspectable() for p in inspect.signature(cls).parameters.values() if p.default is inspect.Parameter.empty]
     with pytest.raises(NotImplementedError, match=f"{name}.__init__"):
@@ -58,6 +91,8 @@ def run_isolated(code):
 
 
 def test_imports_and_failure_paths_do_not_load_framework_or_native_runtime():
+    if INSTALLED_NATIVE:
+        pytest.skip("Source-only failure path; installed import isolation is tested separately")
     run_isolated(
         """
 import importlib.abc, sys
@@ -85,6 +120,8 @@ assert 'torch' not in sys.modules
 
 
 def test_fake_event_does_not_gain_completion_or_context_manager_success():
+    if INSTALLED_NATIVE:
+        pytest.skip("Installed events are covered by runtime tests")
     event = object.__new__(deep_ep.EventOverlap)
     with pytest.raises(NotImplementedError):
         event.current_stream_wait(release_handle=True)

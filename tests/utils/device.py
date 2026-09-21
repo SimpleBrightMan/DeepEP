@@ -26,12 +26,12 @@ def _host_list(value):
 
 
 def _wait_if_async(event):
-    """Wait only when the API returned a real asynchronous event.
+    """Insert a stream dependency when the returned wrapper holds an event.
 
-    Synchronous dispatch/combine returns ``EventOverlap(None)``.  Calling its
-    wait method is an error in both the declared contract and the Ascend
-    implementation, while an asynchronous result must still be ordered before
-    its tensors are inspected.
+    Otherwise this helper performs no wait; that is not proof of communication
+    completion. It neither constructs nor requires an empty event wrapper.
+    Future synchronous algorithm return types must follow the public contract
+    defined with their implementation, not be inferred from this helper.
     """
     if getattr(event, "event", None) is not None:
         event.current_stream_wait()
@@ -95,9 +95,9 @@ def buffer_for(session, case, api):
             deep_ep.Buffer.get_dispatch_config(case.world_size),
             deep_ep.Buffer.get_combine_config(case.world_size),
         ]
-        nvl = max(c.get_nvl_buffer_size_hint(case.hidden * 2, case.world_size) for c in configs)
-        rdma = max(c.get_rdma_buffer_size_hint(case.hidden * 2, case.world_size) for c in configs)
-        buffer = deep_ep.Buffer(group, num_nvl_bytes=nvl, num_rdma_bytes=rdma, explicitly_destroy=True)
+        scaleup = max(c.get_scaleup_buffer_size_hint(case.hidden * 2, case.world_size) for c in configs)
+        scaleout = max(c.get_scaleout_buffer_size_hint(case.hidden * 2, case.world_size) for c in configs)
+        buffer = deep_ep.Buffer(group, num_scaleup_bytes=scaleup, num_scaleout_bytes=scaleout, explicitly_destroy=True)
     else:
         buffer = deep_ep.ElasticBuffer(
             group,
@@ -130,13 +130,13 @@ def launch_dispatch(session, buffer, case, api, expanded, *, handle=None):
     weights = None if case.weights is None else tensor(torch, case.weights[rank], (n, case.topk), torch.float32, device)
     if api == "legacy":
         if handle is None:
-            per_rank, per_rdma, per_expert, mask, event = buffer.get_dispatch_layout(idx, case.experts)
+            per_rank, per_scaleout, per_expert, mask, event = buffer.get_dispatch_layout(idx, case.experts)
             _wait_if_async(event)
             args = dict(
                 topk_idx=idx,
                 topk_weights=weights,
                 num_tokens_per_rank=per_rank,
-                num_tokens_per_rdma_rank=per_rdma,
+                num_tokens_per_scaleout_rank=per_scaleout,
                 num_tokens_per_expert=per_expert,
                 is_token_in_rank=mask,
             )

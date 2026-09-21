@@ -11,6 +11,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import deep_ep
 
 from benchmarks._backend import BackendUnavailable, resolve_backend
 from benchmarks._config import (
@@ -328,6 +329,7 @@ def test_capability_gate_happens_before_factory(monkeypatch):
 def test_cli_does_not_import_framework_or_initialize_devices(mode):
     code = """
 import sys
+sys.path.insert(0, sys.argv.pop(1))
 class RejectFramework:
     def find_spec(self, fullname, path=None, target=None):
         if fullname.split('.')[0] in ('torch', 'torch_npu', 'numpy', 'mpi4py'):
@@ -337,7 +339,8 @@ from benchmarks.bench_ep import main
 raise SystemExit(main(sys.argv[1:]))
 """
     result = subprocess.run(
-        [sys.executable, "-S", "-c", code] + ([] if mode == "run" else [mode]),
+        [sys.executable, "-S", "-c", code, str(Path(deep_ep.__file__).resolve().parent.parent)]
+        + ([] if mode == "run" else [mode]),
         cwd=ROOT,
         capture_output=True,
         text=True,

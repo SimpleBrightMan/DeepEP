@@ -19,7 +19,7 @@ An expert-parallel communication library for Ascend NPUs, designed for token dis
 
 The planned `deep_ep` package follows DeepEP V1/V2 user workflows. Device kernels use AscendC with SHMEM as the initial communication foundation. MegaMoE Beta is a separately organized experiment for communication and expert-compute fusion.
 
-> **Early development.** API declarations, contract tests, independent CPU references, and collectible V1/V2 device scenarios are available. All runtime constructors, communication operations, and event operations still raise `NotImplementedError`; device communication is not qualified. Native implementations, installable packages, and runnable communication examples are not yet available. See the [test guide](tests/README.md) and [roadmap](docs/roadmap.md).
+> **Early development.** API contracts, CPU references, V1/V2 qualification tests, and a buildable Host-runtime wheel are available. Installed native extensions provide restricted resource lifetimes and real events. EP algorithms still raise `NotImplementedError`; this is not device communication qualification. See the [runtime design](docs/runtime-design.md), [test guide](tests/README.md), and [roadmap](docs/roadmap.md).
 
 ## Architecture
 
@@ -87,13 +87,13 @@ git clone https://gitcode.com/Ascend/DeepEP.git
 cd DeepEP
 ```
 
-Installation is not available yet. See [build and packaging](docs/build.md) for the planned build pipeline, dependencies, and artifacts.
+See [build and packaging](docs/build.md) for native-wheel compilation, isolated installation and automated validation. The runtime wheel does not implement EP communication.
 
 ## MegaMoE Beta
 
 [experiments/megamoe/](experiments/megamoe/README.md) owns the planned fused workflow, native extension, Python namespace, configuration, tests, and benchmark entry. The target composition is dispatch–GMM–activation–GMM–combine. Kernel boundaries and optional quantization depend on the selected implementation.
 
-`DEEPEP_BUILD_MEGAMOE` is a planned build option, defaulting to `OFF`. Beta API and performance qualification will be versioned independently of the core API.
+`DEEPEP_BUILD_MEGAMOE` currently accepts only `OFF`; enabling it fails explicitly. Beta API and performance qualification will be versioned independently.
 
 ## Development and testing
 

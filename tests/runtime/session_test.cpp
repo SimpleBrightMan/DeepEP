@@ -1,0 +1,126 @@
+// Link-time SDK doubles test ownership decisions, never ABI/device support.
+#include "runtime/session.hpp"
+#include "host/init/shmem_host_init.h"
+#include <cassert>
+#include <stdexcept>
+#include <string>
+
+namespace {
+int initialized = 0, allocations = 0, frees = 0, finalized = 0, barriers = 0;
+int init_status = 0, memset_status = 0, finalize_status = 0;
+bool allocation_failure = false;
+int storage = 0, context_token = 0, another_context = 0;
+void* current_context = &context_token;
+template <class Action>
+void fails(Action action)
+{
+    bool failed = false;
+    try {
+        action();
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    assert(failed);
+}
+}  // namespace
+int aclrtGetCurrentContext(aclrtContext* context)
+{
+    *context = current_context;
+    return 0;
+}
+const char* aclrtGetSocName()
+{
+    return "Ascend950";
+}
+int aclrtMemset(void*, size_t, int, size_t)
+{
+    return memset_status;
+}
+int aclshmemx_init_status()
+{
+    return initialized;
+}
+int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
+{
+    assert(attr->n_pes == 2 && attr->local_mem_size == (2 << 20));
+    if (init_status == 0) {
+        initialized = 2;
+    }
+    return init_status;
+}
+int aclshmem_finalize()
+{
+    ++finalized;
+    if (finalize_status == 0) {
+        initialized = 0;
+    }
+    return finalize_status;
+}
+void* aclshmem_malloc(size_t)
+{
+    ++allocations;
+    return allocation_failure ? nullptr : &storage;
+}
+void aclshmem_free(void* value)
+{
+    assert(value == &storage);
+    ++frees;
+}
+void aclshmem_barrier_all()
+{
+    ++barriers;
+}
+
+int main(int argc, char** argv)
+{
+    assert(argc == 2);
+    const std::string mode = argv[1];
+    auto create = []() { return deepep::Session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30); };
+    if (mode == "invalid") {
+        fails([]() { deepep::Session s(0, 2, 3, "x", 0); });
+        assert(!deepep::Session::busy() && allocations == 0);
+    } else if (mode == "init-fault") {
+        init_status = -1;
+        fails(create);
+        assert(deepep::Session::busy() && finalized == 0);
+    } else if (mode == "allocation-fault" || mode == "memset-fault") {
+        allocation_failure = mode == "allocation-fault";
+        memset_status = mode == "memset-fault" ? -1 : 0;
+        fails(create);
+        assert(!deepep::Session::busy() && finalized == 1);
+        assert(frees == (allocation_failure ? 0 : 1));
+    } else if (mode == "foreign") {
+        initialized = 2;
+        fails(create);
+        assert(finalized == 0 && allocations == 0);
+    } else if (mode == "abandoned") {
+        {
+            auto session = create();
+        }
+        assert(deepep::Session::busy() && finalized == 0 && frees == 0);
+    } else {
+        auto session = create();
+        fails(create);
+        current_context = &another_context;
+        fails([&]() { session.close(); });
+        assert(finalized == 0 && frees == 0);
+        current_context = &context_token;
+        if (mode == "close-fault") {
+            finalize_status = -1;
+            fails([&]() { session.close(); });
+            assert(!session.closed() && deepep::Session::busy() && frees == 1);
+            fails([&]() { session.close(); });
+            fails([&]() { session.barrier(); });
+            assert(finalized == 1 && frees == 1);
+            return 0;
+        }
+        session.barrier();
+        session.close();
+        session.close();
+        assert(session.closed() && !deepep::Session::busy() && frees == 1);
+        fails([&]() { session.barrier(); });
+        auto next = create();
+        next.close();
+        assert(frees == 2);
+    }
+}

@@ -1,6 +1,6 @@
 # API 与兼容性规划
 
-本文定义 V1/V2 接口的兼容性目标与工作流。当前已提供可导入的 API 声明和契约测试，所有运行时构造和操作均明确抛出 `NotImplementedError`；原生扩展尚未实现。声明范围、默认值差异及目标数据语义见 [API 声明设计](api-contracts.md)，设备资格见[路线图](roadmap.md)。
+本文定义 V1/V2 接口的兼容性目标与工作流。接口基线和未支持操作的失败测试已提供；安装原生扩展后可使用受限资源构造/销毁、通信流和真实事件。支持条件见[运行时设计](runtime-design.md)。dispatch/combine 等 EP 算法仍报 `NotImplementedError`。目标数据语义见[API 契约](api-contracts.md)，资格见[路线图](roadmap.md)。
 
 ## 公开对象与职责
 
@@ -12,7 +12,7 @@
 | `Config` | 当前在私有 `_config.py` 声明，后续由原生绑定提供 | 兼容配置对象；当前不能构造，不提供 Ascend 调优默认值 |
 | `EventOverlap` 等完成包装 | `deep_ep/utils/event.py` | 用户可观察的完成与等待行为 |
 
-公开导入集中在 `deep_ep/__init__.py`。当前 `_native.py` 仅提供明确失败的边界，不导入 Torch、torch_npu 或原生扩展。相同公开类型可从对应 buffers/utils 模块导入。
+公开导入集中在 `deep_ep/__init__.py`。普通导入不加载 Torch、torch_npu 或扩展；运行时调用通过 `_native.py` 延迟加载自身安装的扩展并校验 SDK 身份。相同公开类型可从对应 buffers/utils 模块导入。
 
 ## 工作流
 
@@ -25,7 +25,7 @@
 
 ## 固定基线
 
-已新增 `tests/api/upstream_api.json`，记录所选 EP 接口的固定基线和差异：
+已新增 `tests/api/ascend_api.json`，记录所选 EP 接口的固定基线和差异：
 
 | 字段类别 | 要求 |
 | --- | --- |
@@ -43,3 +43,5 @@
 保持原生参数名时，需要明确它映射到哪些 Ascend 资源、支持范围与默认行为。AIV 核数、workspace、对齐、设备拓扑和策略的具体数值均待实现验证，不直接沿用其他仓库的默认值。
 
 接口变更同时更新绑定、业务处理、示例、兼容性测试及[资格矩阵](roadmap.md)。
+
+公共命名区分通信域 `scaleup / scaleout`、内存语义 `memory_transport` 和后端资源 QP；本次关键字迁移和后续多引擎配置约束见 [API 契约](api-contracts.md)。命名不代表新增后端支持。

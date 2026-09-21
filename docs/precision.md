@@ -23,7 +23,7 @@
 
 ## 3. 双标杆指标
 
-CPU FP64 数学参考为 Golden，GPU 上游结果（未接设备时为固定上游 dtype 路径的明确标注模拟值）为第二标杆。对 NPU 和第二标杆分别计算：
+CPU FP64 数学参考为 Golden，固定参考实现的独立结果为第二标杆；未采集独立设备结果时，必须明确标为固定 dtype 路径模拟值。对 NPU 和第二标杆分别计算：
 
 - `MARE = max(abs(actual - golden) / (abs(golden) + 1e-7))`
 - `MERE = mean(abs(actual - golden) / (abs(golden) + 1e-7))`
@@ -75,10 +75,10 @@ MERE/RMSE 的浮点归约显式使用 `math.fsum`，避免 Python 3.11 与 3.12 
 
 Golden 不保存海量张量文本；输入由公开、无随机状态的整数公式完全重建，结果用规范 JSON 的 SHA-256 锁定。修改公式、路由语义、dtype 舍入或归并答案都会使回归失败。更新 Golden 必须同时审核生成器变更，禁止只替换摘要来消除失败。
 
-设备结果不得写回覆盖 CPU Golden。应作为独立 capture 文件输入同一比较器，并保留 rank、case、dtype、shape 和来源标识。真实 GPU 标杆可替换 manifest 中的 dtype 模拟值，但必须使用同一输入和固定上游提交。
+设备结果不得写回覆盖 CPU Golden。应作为独立 capture 文件输入同一比较器，并保留 rank、case、dtype、shape 和来源标识。独立设备标杆可替换 manifest 中的 dtype 模拟值，但必须使用同一输入和固定参考实现版本。
 
 ## 6. 当前边界
 
 - 已完成：纯 Python 高精度参考、BF16/E4M3FN dtype 模拟、双标杆 L2 比较器、小值域规则、Bootstrap 复检、版本化 Golden、参数矩阵、故障注入和可收集的 V1/V2 设备用例。
-- 待真实后端完成后执行：全 rank NPU capture、真实 GPU 第二标杆、NaN/Inf 设备行为、alignment 128/padding、跨节点拓扑、至少 200 次失败复检与压力运行。
+- 待真实后端完成后执行：全 rank NPU capture、独立设备第二标杆、NaN/Inf 设备行为、alignment 128/padding、跨节点拓扑、至少 200 次失败复检与压力运行。
 - BF16/FP8 是固定上游 V2 EP 测试明确覆盖的 activation 路径；不得从 Python 签名存在推导 FP16/FP32 activation 已获支持。索引和权重 dtype 仍分别按原生 `topk_idx_t` 与 FP32 验证。

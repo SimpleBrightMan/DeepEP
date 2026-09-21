@@ -33,6 +33,8 @@ compile_commands.json
 /benchmark-runs/
 /api-contracts.xml
 /cpu-correctness.xml
+/source-tests.xml
+/installed-tests.xml
 .DS_Store
 Thumbs.db
 .idea/

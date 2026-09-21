@@ -2,6 +2,11 @@
 
 本文列出规划中的源码目录与文件职责。部分文件尚未实现，功能进展见[路线图](roadmap.md)。可选组件和第三方源码在具体实现及依赖版本确定后接入。
 
+当前 Host 基础的实际文件为 `csrc/bindings/module.cpp`、`csrc/runtime/session.hpp/.cpp`、
+`deep_ep/_runtime.py`、`scripts/record_shmem_sdk.py` 和 `scripts/validate_package.py`。
+事件复用框架实现，不单独链接 Torch C++ ABI；尚未需要的细分文件和 Device target 不创建空实现。
+详细落地范围见[运行时设计](runtime-design.md)，下列树仍表示完整项目的目标组织。
+
 ```text
 DeepEP/
 ├── README.md  # 中文项目首页、功能与快速开始
@@ -117,7 +122,7 @@ DeepEP/
 │   │   ├── envs.py  # 测试使用的分布式环境准备辅助
 │   │   └── reference.py  # 业务正确性参考
 │   ├── api/
-│   │   ├── upstream_api.json  # 选定原生接口基线、版本与覆盖记录
+│   │   ├── ascend_api.json  # 选定原生接口基线、版本与覆盖记录
 │   │   ├── test_exports.py  # 公开导出与类型身份
 │   │   └── test_calls.py  # 典型用户调用工作流
 │   ├── legacy/
