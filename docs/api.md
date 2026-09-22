@@ -25,7 +25,7 @@
 
 ## 固定基线
 
-已新增 `tests/api/ascend_api.json`，记录所选 EP 接口的固定基线和差异：
+已新增 `tests/api/api_contract.json`，记录所选 EP 接口的固定基线和差异：
 
 | 字段类别 | 要求 |
 | --- | --- |

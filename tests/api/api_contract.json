@@ -1,6 +1,6 @@
 {
-  "schema_version": 2,
-  "contract": "Ascend EP declarations adapted from the cited upstream sources, not an exact upstream signature snapshot.",
+  "schema_version": 3,
+  "contract": "EP declarations adapted from the cited upstream sources, not an exact upstream signature snapshot.",
   "platform_naming": {
     "scaleup": "Intra-domain transport; no particular interconnect implementation is implied.",
     "scaleout": "Inter-domain transport; no particular interconnect implementation is implied.",
@@ -9,7 +9,7 @@
     "compute_units": "Backend-defined compute scheduling units; values are not hardware tuning recommendations.",
     "device": "NPU execution, timeout and reference-capture terminology.",
     "aligned_col_major_sf": "Reserved scale-factor layout option; no implementation or alignment capability is implied.",
-    "compatibility": "Only the declared Ascend keyword names are accepted; removed platform-specific aliases are not retained."
+    "compatibility": "Only the declared project keyword names are accepted; removed platform-specific aliases are not retained."
   },
   "upstream": {
     "repository": "https://github.com/deepseek-ai/DeepEP",
@@ -36,7 +36,7 @@
       "symbol": "ElasticBuffer.dispatch",
       "parameter": "do_expand",
       "upstream_default": false,
-      "ascend_default": null,
+      "project_default": null,
       "reason": "None will select False on first dispatch and inherit the handle layout on cached dispatch; explicit conflicts must fail. No dispatch is implemented yet."
     }
   ],

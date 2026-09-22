@@ -8,7 +8,7 @@
 
 参考 [DeepSeek DeepEP](https://github.com/deepseek-ai/DeepEP/tree/a56d6156febcd9976e55adc85b5155bfac9f28f8)，提交 `a56d6156febcd9976e55adc85b5155bfac9f28f8`。
 
-[机器可读基线](../tests/api/ascend_api.json)记录本项目选定方法的参数顺序/种类、默认值，以及参考源文件/行号和 SHA-256。它是经过平台适配的 Ascend 契约，不是原样复制的上游签名快照或上游全部 API 的兼容声明。契约测试离线运行，不依赖上游 main 或网络。
+[机器可读基线](../tests/api/api_contract.json)记录本项目选定方法的参数顺序/种类、默认值，以及参考源文件/行号和 SHA-256。它是经过平台适配的 Ascend 契约，不是原样复制的上游签名快照或上游全部 API 的兼容声明。契约测试离线运行，不依赖上游 main 或网络。
 
 平台相关命名统一如下：`scaleup / scaleout` 表示域内/域间传输，`compute_units` 表示后端定义的调度计算单元，`device` 表示设备侧；不暗示具体链路、分核策略或算子能力。不保留旧平台关键字别名，旧调用需迁移；位置顺序和参考默认值不变。RDMA 等技术名仅在描述具体后端时使用，不与通信域名称混用。
 

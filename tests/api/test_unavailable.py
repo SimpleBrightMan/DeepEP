@@ -26,7 +26,7 @@ RUNTIME_METHODS = {
     "ElasticBuffer.get_comm_stream",
     "ElasticBuffer.barrier",
 }
-BASELINE = json.loads(Path(__file__).with_name("ascend_api.json").read_text(encoding="utf-8"))
+BASELINE = json.loads(Path(__file__).with_name("api_contract.json").read_text(encoding="utf-8"))
 METHODS = [(name, method) for name, spec in BASELINE["objects"].items() for method in spec["methods"]]
 
 

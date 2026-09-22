@@ -4,7 +4,7 @@
 
 ## API 声明来源
 
-本批 EP 接口签名参照 DeepSeek DeepEP 的提交 `a56d6156febcd9976e55adc85b5155bfac9f28f8`，并采用 Ascend 平台命名。源文件及 SHA-256 见 [API 基线](../tests/api/ascend_api.json)，对应 MIT 版权与许可全文保留于 [deepseek-deepep.LICENSE](deepseek-deepep.LICENSE)。这里仅复用接口声明，不包含上游设备执行实现；本项目自身的发行许可证仍由维护者确定。
+本批 EP 接口签名参照 DeepSeek DeepEP 的提交 `a56d6156febcd9976e55adc85b5155bfac9f28f8`，并采用 Ascend 平台命名。源文件及 SHA-256 见 [API 基线](../tests/api/api_contract.json)，对应 MIT 版权与许可全文保留于 [deepseek-deepep.LICENSE](deepseek-deepep.LICENSE)。这里仅复用接口声明，不包含上游设备执行实现；本项目自身的发行许可证仍由维护者确定。
 
 ## 测试语义来源
 

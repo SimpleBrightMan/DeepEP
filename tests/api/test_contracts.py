@@ -11,7 +11,7 @@ import pytest
 import deep_ep
 
 
-BASELINE = json.loads(Path(__file__).with_name("ascend_api.json").read_text(encoding="utf-8"))
+BASELINE = json.loads(Path(__file__).with_name("api_contract.json").read_text(encoding="utf-8"))
 METHODS = [
     (name, method, spec)
     for name, object_spec in BASELINE["objects"].items()
@@ -45,13 +45,13 @@ def test_public_methods_have_no_undeclared_aliases(name, spec):
 
 
 @pytest.mark.parametrize("name,method,spec", METHODS, ids=[f"{n}.{m}" for n, m, _ in METHODS])
-def test_signature_matches_ascend_contract(name, method, spec):
+def test_signature_matches_project_contract(name, method, spec):
     expected = copy.deepcopy(spec["parameters"])
     for deviation in BASELINE["deviations"]:
         if deviation["symbol"] == f"{name}.{method}":
             parameter = next(p for p in expected if p["name"] == deviation["parameter"])
             assert parameter["default"] == deviation["upstream_default"]
-            parameter["default"] = deviation["ascend_default"]
+            parameter["default"] = deviation["project_default"]
     cls = getattr(deep_ep, name)
     actual = []
     for parameter in inspect.signature(getattr(cls, method)).parameters.values():
@@ -64,7 +64,7 @@ def test_signature_matches_ascend_contract(name, method, spec):
 
 
 def test_snapshot_pins_sources_and_does_not_claim_implementation():
-    assert BASELINE["schema_version"] == 2
+    assert BASELINE["schema_version"] == 3
     assert "not an exact upstream signature snapshot" in BASELINE["contract"]
     assert set(BASELINE["platform_naming"]) == {
         "scaleup",

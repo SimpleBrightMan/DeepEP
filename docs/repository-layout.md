@@ -122,7 +122,7 @@ DeepEP/
 │   │   ├── envs.py  # 测试使用的分布式环境准备辅助
 │   │   └── reference.py  # 业务正确性参考
 │   ├── api/
-│   │   ├── ascend_api.json  # 选定原生接口基线、版本与覆盖记录
+│   │   ├── api_contract.json  # 选定原生接口基线、版本与覆盖记录
 │   │   ├── test_exports.py  # 公开导出与类型身份
 │   │   └── test_calls.py  # 典型用户调用工作流
 │   ├── legacy/
