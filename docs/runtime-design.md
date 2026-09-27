@@ -6,17 +6,17 @@
 参考运行时固定到 [personal_v1 的 b41ee585](https://gitcode.com/lishaoxun/ascend_deepep/tree/b41ee585ed69f405d715ef3d59f5750c558884fa)，
 保留其框架事件与 SHMEM 资源分层思路，不整体搬入算法、构建目录或预编译二进制。
 
-当前仅实现 Host 资源基础：SHMEM MTE 对称工作区、通信流、真实事件及显式销毁。
-没有编译任何 EP kernel，也没有 benchmark 实测适配器。
-wheel 成功不代表 V1/V2 dispatch/combine、低时延、FP8、cached、训练或性能获得资格。
-这些调用仍在读取 Tensor 前抛出 `NotImplementedError`。
+当前实现 Host 资源、完整 Notify 和受限的 [V2 expanded dispatch / combine](elastic.md)。
+ElasticBuffer 在同一 SHMEM session 中启用 MTE+URMA，legacy Buffer 保留 MTE 配置。
+BF16/FP8、可选权重、cached dispatch 和 BF16 combine 已有执行路径；V1 算法、训练和
+benchmark 实测适配器尚未接通。wheel 构建成功不代表设备精度或性能获得资格。
 
 ## 构建、安装与依赖
 
 `PEP 517 → setuptools build_ext → 一次根 CMake → install 暂存树 → wheel`。
 元数据和 sdist hook 不加载框架、不初始化设备、不配置 CMake。真正构建时才检查 SDK。
 Host C++17 扩展使用独立 pybind11，不链接 PyTorch C++ ABI；框架流/事件经 Python API 访问。
-后续 kernel 批次再增加 AscendC target，不为尚未实现的 kernel 创建空 target。
+Notify/dispatch/combine 使用独立的 bisheng `-xasc` target，Host 扩展保持普通 C++17。
 
 - Python ≥3.11、Linux；当前编译基线 CANN 9.2.0，目标 Ascend950。
 - Python 构建依赖和 SHMEM 来源写入 `dependencies.lock.json`。
@@ -34,15 +34,16 @@ Host C++17 扩展使用独立 pybind11，不链接 PyTorch C++ ABI；框架流/�
 | 接口 | 本批实现/限制 |
 | --- | --- |
 | Buffer 构造 | 显式进程组、`num_scaleup_bytes`、`explicitly_destroy=True`；只支持默认 MTE 资源配置，`num_scaleout_bytes` 非零仍拒绝 |
-| ElasticBuffer 构造 | 显式进程组、`num_bytes`、`explicitly_destroy=True`；不根据算法形状推导容量 |
+| ElasticBuffer 构造 | 进程组或显式 rank/world_size、`explicitly_destroy=True`；显式 num_bytes 或根据 T/H/K/dtype 给出容量预算 |
 | destroy | 各 rank 同序显式调用；成功后幂等；不销毁调用方进程组/设备 |
 | get_comm_stream | 返回框架创建的真实 NPU 通信流；销毁后拒绝 |
 | capture | V1 返回 EventOverlap；V2 返回 EventHandle；真实记录当前流 |
 | EventHandle/EventOverlap | 真实流等待、单次 hook、上下文退出等待、可选释放；空事件明确拒绝 |
 | ElasticBuffer.barrier | 仅 `with_cpu_sync=True, sequential=True` 的主机同步屏障；默认异步模式拒绝 |
-| Config/EPHandle/size hints/拓扑/算法操作 | 保留签名及未实现错误，不伪造策略、布局、拓扑或数据 |
+| ElasticBuffer.dispatch/combine/EPHandle/size hint | 见 [Elastic 文档](elastic.md)；元数据和 payload 输出有独立框架存储 |
+| Config/拓扑/其他算法操作 | 保留签名及未实现错误 |
 
-容量范围 2 MiB～1 GiB，2 MiB 对齐；进程组规模 2～8。
+legacy Buffer 保留容量 2 MiB～1 GiB、规模 2～8 的限制；ElasticBuffer 工作区支持至 32 GiB，2 MiB 对齐，完整算子链路支持 EP2～128 的 2 的幂规模。
 通信域不等同于具体传输引擎；`memory_transport` 开关仅指内存语义路径。QP 参数不用于当前 MTE 资源配置，也不统一表示各类 DMA 队列/通道；详见 [API 分层与后续扩展设计](api-contracts.md#通信域传输语义与资源配置分层)。
 数值范围是资源准入边界，不是这些规模下的通信性能声明。
 调用方必须先设置当前 NPU，所有使用/销毁保持创建时设备与 ACL context。

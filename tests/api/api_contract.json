@@ -336,7 +336,7 @@
           "kind": "method",
           "parameters": [
             {"name": "self", "kind": "POSITIONAL_OR_KEYWORD"},
-            {"name": "group", "kind": "POSITIONAL_OR_KEYWORD"},
+            {"name": "group", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
             {"name": "num_bytes", "kind": "POSITIONAL_OR_KEYWORD", "default": null},
             {"name": "num_cpu_bytes", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
             {"name": "num_max_tokens_per_rank", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
@@ -351,7 +351,9 @@
             {"name": "num_allocated_qps", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
             {"name": "num_cpu_timeout_secs", "kind": "POSITIONAL_OR_KEYWORD", "default": 300},
             {"name": "num_device_timeout_secs", "kind": "POSITIONAL_OR_KEYWORD", "default": 100},
-            {"name": "explicitly_destroy", "kind": "POSITIONAL_OR_KEYWORD", "default": false}
+            {"name": "explicitly_destroy", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
+            {"name": "rank", "kind": "KEYWORD_ONLY", "default": null},
+            {"name": "world_size", "kind": "KEYWORD_ONLY", "default": null}
           ]
         },
         "destroy": {
@@ -371,7 +373,8 @@
             {"name": "num_topk", "kind": "POSITIONAL_OR_KEYWORD", "default": 0},
             {"name": "use_fp8_dispatch", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
             {"name": "allow_hybrid_mode", "kind": "POSITIONAL_OR_KEYWORD", "default": true},
-            {"name": "allow_multiple_reduction", "kind": "POSITIONAL_OR_KEYWORD", "default": true}
+            {"name": "allow_multiple_reduction", "kind": "POSITIONAL_OR_KEYWORD", "default": true},
+            {"name": "world_size", "kind": "KEYWORD_ONLY", "default": null}
           ]
         },
         "barrier": {

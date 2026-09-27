@@ -9,6 +9,7 @@ namespace {
 int initialized = 0, allocations = 0, frees = 0, finalized = 0, barriers = 0;
 int init_status = 0, memset_status = 0, finalize_status = 0;
 bool allocation_failure = false;
+int qp_count = 0;
 int storage = 0, context_token = 0, another_context = 0;
 void* current_context = &context_token;
 template <class Action>
@@ -43,10 +44,17 @@ int aclshmemx_init_status()
 int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
 {
     assert(attr->n_pes == 2 && attr->local_mem_size == (2 << 20));
+    assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | (qp_count ? ACLSHMEM_DATA_OP_UDMA : 0)));
     if (init_status == 0) {
         initialized = 2;
     }
     return init_status;
+}
+int aclshmemx_set_qp_num(data_op_engine_type_t engine, uint32_t count)
+{
+    assert(engine == ACLSHMEM_DATA_OP_UDMA && count == 6 && initialized == 0);
+    qp_count = count;
+    return 0;
 }
 int aclshmem_finalize()
 {
@@ -76,7 +84,12 @@ int main(int argc, char** argv)
     assert(argc == 2);
     const std::string mode = argv[1];
     auto create = []() { return deepep::Session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30); };
-    if (mode == "invalid") {
+    if (mode == "udma") {
+        deepep::Session session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, true);
+        assert(session.udma() && qp_count == 6);
+        session.close();
+        assert(!deepep::Session::busy());
+    } else if (mode == "invalid") {
         fails([]() { deepep::Session s(0, 2, 3, "x", 0); });
         assert(!deepep::Session::busy() && allocations == 0);
     } else if (mode == "init-fault") {
@@ -96,6 +109,7 @@ int main(int argc, char** argv)
     } else if (mode == "abandoned") {
         {
             auto session = create();
+            assert(!session.closed());
         }
         assert(deepep::Session::busy() && finalized == 0 && frees == 0);
     } else {

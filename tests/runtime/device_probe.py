@@ -63,7 +63,7 @@ def main():
                     with EventOverlap(EventHandle(), (surviving_tensor,))(True):
                         pass
                 expect(RuntimeError, lambda: generation(group, **kwargs))
-                expect(NotImplementedError, lambda: buf.dispatch(None))
+                expect(ValueError if generation is ElasticBuffer else NotImplementedError, lambda: buf.dispatch(None))
                 if generation is ElasticBuffer:
                     expect(NotImplementedError, buf.barrier)
                     buf.barrier(with_cpu_sync=True)

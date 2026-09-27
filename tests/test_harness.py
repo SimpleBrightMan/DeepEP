@@ -181,10 +181,10 @@ def test_device_gate_rejects_multiple_cases_without_reinitialize():
         "pytest",
         "-q",
         "--run-device",
-        "--device-capabilities=elastic-expanded",
+        "--device-capabilities=legacy",
         "-k",
-        "dispatch and expanded and bf16 and normal",
-        "tests/elastic/test_workflows.py",
+        "dispatch and normal",
+        "tests/legacy/test_workflows.py",
     ]
     env = dict(os.environ, PYTHONPATH=str(root), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     result = subprocess.run(args, cwd=root, env=env, text=True, capture_output=True, timeout=30)

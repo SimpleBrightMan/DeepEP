@@ -53,12 +53,12 @@
 
 ## 一个明确的默认值差异
 
-上游 `ElasticBuffer.dispatch(..., do_expand=False)` 在本项目声明为 `do_expand: Optional[bool] = None`，用于区分省略和显式传值。预定执行语义如下，当前桩不执行这些分支：
+上游 `ElasticBuffer.dispatch(..., do_expand=False)` 在本项目声明为 `do_expand: Optional[bool] = None`，用于区分省略和显式传值。当前仅支持 expanded，行为如下：
 
 | 调用 | 目标行为 |
 | --- | --- |
-| 首次 dispatch，省略/传 None | 采用 False，保持不展开布局 |
-| 首次 dispatch，显式 False/True | 使用指定布局 |
+| 首次 dispatch，省略/传 None | 采用 True，使用展开布局 |
+| 首次 dispatch，显式 False/True | False 拒绝；True 使用展开布局 |
 | cached dispatch，省略/传 None | 继承 handle 的原布局 |
 | cached dispatch，显式模式与 handle 不同 | 明确报错，不能静默改变行布局 |
 
@@ -66,7 +66,7 @@
 
 ## 目标数据与返回契约
 
-以下是后续实现需要满足的目标，**当前调用均报未实现**。T 为源 rank 实际 token 数，N 为接收 rank 的去重行数，R 为有效专家路由行数，H 为 hidden，K 为 top-k；padding 能力另行资格验证。
+以下是总体兼容目标；当前已接通 [V2 expanded dispatch 和 BF16 combine 的受限实现](elastic.md)，V1 算法仍未实现。T 为源 rank 实际 token 数，N 为接收 rank 的去重行数，R 为有效专家路由行数，H 为 hidden，K 为 top-k；padding 能力另行资格验证。
 
 | 操作 | 目标返回 |
 | --- | --- |
@@ -78,7 +78,7 @@
 
 V2 False 使用 rank 去重布局：x `[N,H]`、idx/weights `[N,K]`；True 使用 expert-major 布局：x `[R,H]`、idx 为 None、weights `[R]`。权重输入可选，未传时权重输出为 None。重复路由按 top-k 槽位保留，不能简单去掉重复 expert。
 
-BF16 激活、FP32 路由权重/梯度作为首个实现目标。签名中保留的 FP8、alignment、列主序 scale 布局、bias 和调优参数均未提供执行能力，不能根据参数存在推导支持域。
+当前 expanded dispatch 支持 BF16 和 FP8 E4M3FN/行主序 FP32 scales、可选 FP32 权重，alignment=1。列主序 scales、bias、梯度和一般调优能力尚未提供，具体限制见 dispatch 文档。
 
 `combine(topk_weights=...)` 表示独立回传的路由值/梯度，不能自动把该值再乘到 x。前向 gate 权重应只在约定的一处施加。训练包装可使用 combine backward→cached dispatch、dispatch backward→combine 来回传 dX/dProb；本批没有 autograd 或通信反向实现。
 
@@ -86,7 +86,7 @@ BF16 激活、FP32 路由权重/梯度作为首个实现目标。签名中保留
 
 EPHandle 的调用方字段包括 `do_expand`、`num_experts`、`num_max_tokens_per_rank`、`num_recv_tokens_per_expert_list`。原生路由计划应绑定 buffer，保留到对应 combine/backward/recompute 完成；后续非 cached dispatch 不得偷偷替换旧 handle 的计划。
 
-capacity 是上界，实际 T 可在容量内变化，rank 间也可不同；cached 复用须匹配其具体路由输入。以上均为后续验收目标，当前没有内存池、路由检查或变长实现。
+目标中 capacity 是上界、rank 间 T 可不同。当前实现只接受各 rank 相同 T，fresh 可在上界内变化；cached 复用须匹配原 T/K/E 和路由，且校验所属 buffer 与持久 tensor 版本。
 
 V1 `Buffer.capture()` 目标返回 EventOverlap，V2 `ElasticBuffer.capture()` 目标返回 EventHandle。入口仅解包 EventOverlap，不能对原始 EventHandle 再通用解包一次。异步返回后，调用方建立完成依赖才能消费结果；dtype/contiguous 转换应发生在 capture 前。接口实现需明确输出所有权，避免旧结果被后续通信覆盖。
 

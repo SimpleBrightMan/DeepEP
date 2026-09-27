@@ -259,6 +259,8 @@ def test_outer_launcher_runs_every_case_once_without_install(monkeypatch, launch
     (
         ([], True),
         (list(REQUIRED_OPERATIONS), True),
+        # The Elastic operations emitted by CMakeLists.txt into capabilities.json.
+        (["ElasticBuffer.dispatch", "ElasticBuffer.combine"], True),
         (["unknown"], False),
         (["Buffer.dispatch"] * 2, False),
         (None, False),

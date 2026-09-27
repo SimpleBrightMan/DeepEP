@@ -19,7 +19,7 @@ An expert-parallel communication library for Ascend NPUs, designed for token dis
 
 The planned `deep_ep` package follows DeepEP V1/V2 user workflows. Device kernels use AscendC with SHMEM as the initial communication foundation. MegaMoE Beta is a separately organized experiment for communication and expert-compute fusion.
 
-> **Early development.** API contracts, CPU references, V1/V2 qualification tests, and a buildable Host-runtime wheel are available. Installed native extensions provide restricted resource lifetimes and real events. EP algorithms still raise `NotImplementedError`; this is not device communication qualification. See the [runtime design](docs/runtime-design.md), [test guide](tests/README.md), and [roadmap](docs/roadmap.md).
+> **Early development.** API contracts, CPU references, runtime resources and real events are available. [V2 expanded dispatch / combine](docs/elastic.md) connects Notify, BF16/FP8 dispatch and BF16 combine; supported scales still require device qualification. V1 algorithms remain unimplemented. See the interface document and [test guide](tests/README.md).
 
 ## Architecture
 
@@ -70,7 +70,7 @@ Directory READMEs describe module responsibilities. See the [repository layout](
 
 The target V1 workflow is layout preparation → dispatch → expert computation → combine. V2 uses `ElasticBuffer` and `EPHandle`, with expert computation consuming the selected returned layout. Asynchronous consumers must establish the required completion dependency before reading communication results.
 
-The framework or a selected fusion implementation performs expert computation. The signature baseline and target semantics are documented in [docs/api.md](docs/api.md). Data transport and Ascend tuning remain unimplemented.
+The framework or a selected fusion implementation performs expert computation. The signature baseline and target semantics are documented in [docs/api.md](docs/api.md). V2 expanded data transport and reduction are implemented within the [Elastic interface limits](docs/elastic.md); V1 algorithms remain unimplemented.
 
 ## Performance
 
@@ -87,7 +87,7 @@ git clone https://gitcode.com/Ascend/DeepEP.git
 cd DeepEP
 ```
 
-See [build and packaging](docs/build.md) for native-wheel compilation, isolated installation and automated validation. The runtime wheel does not implement EP communication.
+The wheel includes the Host runtime, Notify, BF16/FP8 dispatch, and BF16 combine. See [build and packaging](docs/build.md) for environment preparation, local build/install, and building one shared wheel for installation on each node. See the [Elastic guide](docs/elastic.md) for single-node and multi-node precision tests.
 
 ## MegaMoE Beta
 

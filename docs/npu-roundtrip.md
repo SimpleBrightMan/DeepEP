@@ -1,5 +1,8 @@
 # NPU Tensor 集成测试与算子接入
 
+本页的 `native` 后端面向 V1 `Buffer`，不是当前 V2 `ElasticBuffer` 算子的测试入口。
+验证已接入的 Notify/dispatch/combine，请使用 [Elastic 文档](elastic.md#编译与运行)中的两个测试脚本。
+
 本入口使用真实 NPU Tensor，运行 dispatch → 专家计算/加权 → combine → 逐 rank L2 精度检查。
 输入、接收数据、专家计算、combine 输入和最终输出都检查 NPU device、dtype 和 shape。
 CPU 仅用于确定性输入生成、独立 Golden 和结果核对；不使用 CPU 功能桩代替设备执行。
@@ -13,7 +16,8 @@ CPU 仅用于确定性输入生成、独立 Golden 和结果核对；不使用 C
 
 HCCL 在这里是 **npu-stub 的显式通信实现**，不加入 DeepEP 原生算法的强制依赖。
 两种模式都不回退到 CPU 或其他通信实现。native 遇到未实现、缺能力、未安装、未返回真实完成事件或精度错误会失败。
-目前 Host-only wheel 尚未声明三个原生算法，native 会在设置 NPU/分配 SHMEM 前拒绝；不能修改元数据制造“通过”。
+当前 wheel 声明的是 `ElasticBuffer.dispatch/combine`，尚未实现 V1 的三个 `Buffer` 算法；
+本页的 native 后端仍会在设置 NPU/分配 SHMEM 前拒绝，不能修改元数据制造“通过”。
 
 ## 最外层：构建、安装、运行一次完成
 

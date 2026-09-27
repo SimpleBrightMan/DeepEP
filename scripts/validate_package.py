@@ -64,8 +64,24 @@ def inspect_wheel(path):
         if len([n for n in names if n.endswith("deepseek-deepep.LICENSE")]) != 1:
             raise RuntimeError("Wheel must include the adopted API's third-party license")
         info = json.loads(archive.read("deep_ep/_build_info.json"))
+        kernel_capabilities = {
+            "elastic-notify-metadata-v1",
+            "elastic-dispatch-expanded-v1",
+            "elastic-combine-expanded-v1",
+        }
+        if kernel_capabilities.intersection(info.get("capabilities", [])):
+            if "deep_ep/libdeepep_kernels.so" not in names:
+                raise RuntimeError("Kernel capabilities require their packaged Device library")
+        if "deep_ep/libdeepep_notify.so" in names:
+            raise RuntimeError("Wheel contains a stale libdeepep_notify.so; rebuild the package")
         operations = info.get("communication_operations")
-        known = {"Buffer.get_dispatch_layout", "Buffer.dispatch", "Buffer.combine"}
+        known = {
+            "Buffer.get_dispatch_layout",
+            "Buffer.dispatch",
+            "Buffer.combine",
+            "ElasticBuffer.dispatch",
+            "ElasticBuffer.combine",
+        }
         if (
             not isinstance(operations, list)
             or any(not isinstance(operation, str) or operation not in known for operation in operations)

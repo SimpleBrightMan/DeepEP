@@ -49,6 +49,7 @@ def lifecycle_binary(tmp_path_factory):
         "abandoned",
         "close-fault",
         "normal",
+        "udma",
     ],
 )
 def test_native_lifecycle_faults(lifecycle_binary, case):

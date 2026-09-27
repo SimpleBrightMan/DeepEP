@@ -19,7 +19,7 @@
 
 项目计划通过 `deep_ep` 提供原生 DeepEP 风格的 V1/V2 用户接口，以 AscendC 实现设备算子，以 SHMEM 作为首发通信基础。MegaMoE Beta 作为独立实验单元，探索通信与专家计算融合。
 
-> **项目处于早期开发阶段。** 已提供 API 契约、独立 CPU 参考、V1/V2 通信资格用例，以及可构建的 Host 运行时 wheel。安装原生扩展后支持受限的资源创建/销毁和真实事件；dispatch/combine 等通信算法仍明确报未实现，不代表设备通信通过。支持边界见[运行时设计](docs/runtime-design.md)，测试方法见[测试说明](tests/README.md)。
+> **项目处于早期开发阶段。** 已提供 API 契约、独立 CPU 参考、运行时和真实事件。[V2 expanded dispatch / combine](docs/elastic.md) 已接通 Notify、BF16/FP8 dispatch 和 BF16 combine；各规模仍需设备验收。V1 算法尚未实现。支持边界见接口文档，测试方法见[测试说明](tests/README.md)。
 
 ## 架构
 
@@ -41,7 +41,7 @@
 | --- | --- | --- |
 | V1 专家通信 | `Buffer`；layout、dispatch、combine | 待实现 |
 | V1 低时延 | 专用 dispatch/combine 流程 | 待实现、单独验证 |
-| V2 专家通信 | `ElasticBuffer`、`EPHandle` | 待实现 |
+| V2 专家通信 | `ElasticBuffer`、`EPHandle` | expanded dispatch 和 BF16 combine 已接通；设备资格待验证 |
 | 通信计算重叠 | 事件与异步选项 | 待实现 |
 | MegaMoE Beta | `deep_ep_experimental.megamoe` | 待实现、可选构建 |
 
@@ -70,7 +70,7 @@ DeepEP/
 
 V1 目标流程为布局准备 → dispatch → 专家计算 → combine。V2 通过 `ElasticBuffer` 和 `EPHandle` 组织调用，专家计算消费对应返回布局。异步路径在读取通信结果前建立必要的完成依赖。
 
-专家计算由框架或选定融合实现负责。具体签名和目标语义见 [docs/api.md](docs/api.md)。接口基线已固定；数据传输和 Ascend 调优实现仍待开发。
+专家计算由框架或选定融合实现负责。具体签名和目标语义见 [docs/api.md](docs/api.md)。当前 V2 已实现展开式数据传输与归约，支持范围和限制见 [Elastic 接口](docs/elastic.md)；V1 算法仍待实现。
 
 ## 性能
 
@@ -89,7 +89,7 @@ git clone https://gitcode.com/Ascend/DeepEP.git
 cd DeepEP
 ```
 
-Host 运行时 wheel 的构建、隔离安装和自动验证见[构建与打包](docs/build.md)。尚不能用它运行 EP 通信。
+当前 wheel 包含 Host 运行时、Notify、BF16/FP8 dispatch 和 BF16 combine。环境准备、单机编译安装、共享目录构建 wheel 并逐节点安装，见[构建与打包](docs/build.md)；单机与多机的 ElasticBuffer 精度用例见 [Elastic 编译与运行](docs/elastic.md#编译与运行)。
 
 ## MegaMoE Beta
 

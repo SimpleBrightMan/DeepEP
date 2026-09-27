@@ -10,6 +10,7 @@
 | [api-contracts.md](api-contracts.md) | 已提供的接口声明、默认值差异、明确失败及验证设计 |
 | [build.md](build.md) | 构建主链、产物、安装及依赖锁定 |
 | [runtime-design.md](runtime-design.md) | 原生资源/事件生命周期、支持边界及安装验证 |
+| [elastic.md](elastic.md) | Notify 元数据、dispatch / combine 接口限制、SHMEM 空间及单机/多机测试命令 |
 | [performance.md](performance.md) | EP/Beta 测量口径与复现记录 |
 | [benchmark-design.md](benchmark-design.md) | EP benchmark 配置、计时/统计引擎、结果协议及原生适配器契约 |
 | [precision.md](precision.md) | 精度标准、BF16/FP8 双标杆、Golden 与资格矩阵 |

@@ -6,6 +6,7 @@ import os
 import socket
 import threading
 import warnings
+from contextlib import nullcontext
 
 from ._native import npu_api, require_native
 
@@ -30,27 +31,48 @@ def endpoint():
     return value
 
 
+def rank_and_world(group, rank=None, world_size=None):
+    """Resolve an explicit SHMEM identity or an existing framework group."""
+    if group is None:
+        from .buffers._elastic_layout import WORLD_SIZES
+
+        integer("world_size", world_size, 2, 256)
+        if world_size not in WORLD_SIZES:
+            raise ValueError("Runtime supports EP2/4/8/16/32/64/128/256")
+        integer("rank", rank, 0, world_size - 1)
+        return rank, world_size
+    if rank is not None or world_size is not None:
+        raise ValueError("Pass either group or rank/world_size, not both")
+    import torch.distributed as dist
+
+    if not isinstance(group, dist.ProcessGroup):
+        raise TypeError("group must be an initialized torch.distributed ProcessGroup")
+    return dist.get_rank(group), dist.get_world_size(group)
+
+
 class Runtime:
     """One explicit collective lifetime per process; a live owner is retained."""
 
-    def __init__(self, group, capacity, timeout=120):
+    def __init__(self, group, capacity, timeout=120, *, udma=False, rank=None, world_size=None):
         global _OWNER
         native = require_native("Runtime.__init__")
-        integer("capacity", capacity, 2 << 20, 1 << 30)
+        integer("capacity", capacity, 2 << 20, 32 << 30)
         if capacity % (2 << 20):
             raise ValueError("capacity must be aligned to 2 MiB")
         integer("timeout", timeout, 1, 300)
         address = endpoint()
-        import torch
-        import torch.distributed as dist
+        rank, size = rank_and_world(group, rank, world_size)
+        from .buffers._elastic_layout import WORLD_SIZES
 
-        if group is None or not isinstance(group, dist.ProcessGroup):
-            raise TypeError("Pass an initialized torch.distributed ProcessGroup explicitly")
-        rank, size = dist.get_rank(group), dist.get_world_size(group)
-        integer("world_size", size, 2, 8)
-        backend = str(dist.get_backend(group))
-        if backend not in {"gloo", "hccl"}:
-            raise NotImplementedError("Runtime bootstrap supports Gloo or HCCL process groups")
+        if size not in WORLD_SIZES:
+            raise ValueError("Runtime supports EP2/4/8/16/32/64/128/256")
+        if group is not None:
+            import torch
+            import torch.distributed as dist
+
+            backend = str(dist.get_backend(group))
+            if backend not in {"gloo", "hccl"}:
+                raise NotImplementedError("Runtime bootstrap supports Gloo or HCCL process groups")
         npu = npu_api()
         self.device = npu.current_device()
         self.group = group
@@ -58,35 +80,55 @@ class Runtime:
         with _LOCK:
             busy = _OWNER is not None or native.runtime_busy()
 
-            def digest(value):
-                return int.from_bytes(hashlib.sha256(value.encode()).digest()[:7], "little")
+            if group is None:
+                if busy:
+                    raise RuntimeError("This process already owns a SHMEM runtime")
+            else:
 
-            local = torch.tensor(
-                [
-                    capacity,
-                    timeout,
-                    digest(address),
-                    int(busy),
-                    digest(socket.gethostname()),
-                    digest(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")),
-                    self.device,
-                ],
-                dtype=torch.int64,
-                device=f"npu:{self.device}" if backend == "hccl" else "cpu",
-            )
-            peers = [torch.empty_like(local) for _ in range(size)]
-            dist.all_gather(peers, local, group=group)
-            values = [value.cpu().tolist() for value in peers]
-            if any(value[3] for value in values):
-                raise RuntimeError("A rank already owns a SHMEM runtime; destroy it collectively first")
-            if any(value[:3] != values[0][:3] for value in values):
-                raise ValueError("Ranks disagree on workspace capacity, timeout or bootstrap endpoint")
-            if any(value[4:6] != values[0][4:6] for value in values):
-                raise NotImplementedError("Runtime supports one host with a common visible-device mapping")
-            if len({value[6] for value in values}) != size:
-                raise ValueError("Each rank must use a distinct local NPU")
+                def digest(value):
+                    return int.from_bytes(hashlib.sha256(value.encode()).digest()[:7], "little")
+
+                local = torch.tensor(
+                    [
+                        capacity,
+                        timeout,
+                        digest(address),
+                        int(busy),
+                        digest(socket.gethostname()),
+                        digest(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")),
+                        self.device,
+                        int(udma),
+                    ],
+                    dtype=torch.int64,
+                    device=f"npu:{self.device}" if backend == "hccl" else "cpu",
+                )
+                peers = [torch.empty_like(local) for _ in range(size)]
+                dist.all_gather(peers, local, group=group)
+                values = [value.cpu().tolist() for value in peers]
+                if any(value[3] for value in values):
+                    raise RuntimeError("A rank already owns a SHMEM runtime; destroy it collectively first")
+                if any(value[:3] != values[0][:3] for value in values):
+                    raise ValueError("Ranks disagree on workspace capacity, timeout or bootstrap endpoint")
+                if any(value[7] != values[0][7] for value in values):
+                    raise ValueError("Ranks disagree on MTE/URMA runtime engines")
+                hosts = {value[4] for value in values}
+                for host in hosts:
+                    local = [value for value in values if value[4] == host]
+                    if len({value[5] for value in local}) != 1:
+                        raise ValueError("Ranks on one host must use a common visible-device mapping")
+                    if len({value[6] for value in local}) != len(local):
+                        raise ValueError("Each rank on one host must use a distinct local NPU")
+            self.rank, self.world_size = rank, size
+            self.capacity = capacity
+            self.notify_lock = threading.RLock()
+            self.notify_failed = False
+            self.notify_inflight = None
             self.stream = npu.Stream(device=self.device)
-            self.native = native.Runtime(rank, size, capacity, address, timeout)
+            self.native = (
+                native.Runtime(rank, size, capacity, address, timeout, udma)
+                if udma
+                else native.Runtime(rank, size, capacity, address, timeout)
+            )
             _OWNER = self
 
     def ensure_alive(self):
@@ -97,12 +139,13 @@ class Runtime:
 
     def close(self):
         global _OWNER
-        with _LOCK:
+        with getattr(self, "notify_lock", nullcontext()), _LOCK:
             if self.closed:
                 return
             self.ensure_alive()
             self.stream.synchronize()
             self.native.close()
+            self.notify_inflight = None
             self.closed = True
             _OWNER = None
 

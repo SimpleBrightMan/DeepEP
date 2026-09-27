@@ -1,6 +1,6 @@
 # API 与兼容性规划
 
-本文定义 V1/V2 接口的兼容性目标与工作流。接口基线和未支持操作的失败测试已提供；安装原生扩展后可使用受限资源构造/销毁、通信流和真实事件。支持条件见[运行时设计](runtime-design.md)。dispatch/combine 等 EP 算法仍报 `NotImplementedError`。目标数据语义见[API 契约](api-contracts.md)，资格见[路线图](roadmap.md)。
+本文定义 V1/V2 接口的兼容性目标与工作流。接口基线和未支持操作的失败测试已提供；安装原生扩展后可使用资源构造/销毁、通信流、真实事件，以及受限的 [V2 expanded dispatch](elastic.md) 和 [BF16 combine](elastic.md)。V1 算法仍报 `NotImplementedError`。目标数据语义见[API 契约](api-contracts.md)，资格见[路线图](roadmap.md)。
 
 ## 公开对象与职责
 

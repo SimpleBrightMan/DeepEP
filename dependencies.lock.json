@@ -17,8 +17,32 @@
       "host_device/shmem_common_macros.h": "d1540f47e041ddc544a975ddf9fda2e9801c5243d5730a5966598229adb7af60"
     }
   },
-  "python_build": {"build": "1.2.2.post1", "setuptools": "79.0.1", "wheel": "0.47.0", "pybind11": "3.0.4"},
+  "python_build": {
+    "build": "1.2.2.post1",
+    "setuptools": "79.0.1",
+    "wheel": "0.47.0",
+    "pybind11": "3.0.4"
+  },
   "target": "Ascend950",
-  "device_kernels": [],
-  "qualification": "See docs/runtime-design.md; build success does not qualify EP operations"
+  "notify_reference": {
+    "repository": "https://gitcode.com/lishaoxun/ascend_deepep",
+    "revision": "226032d760423329596d57929072962a588ee40a",
+    "entrypoint": "kernels/notify.cpp"
+  },
+  "dispatch_reference": {
+    "revision": "226032d760423329596d57929072962a588ee40a",
+    "entrypoint": "kernels/elastic_dispatch_transport.h",
+    "adaptation": "URMA primary; Notify forward-list task partition with MTE secondary"
+  },
+  "device_kernels": [
+    "full-notify-metadata",
+    "expanded-dispatch-urma-mte",
+    "expanded-combine-urma-mte"
+  ],
+  "qualification": "See docs/runtime-design.md; build success does not qualify EP operations",
+  "combine_reference": {
+    "revision": "8db1952e1c1fbed0d34bbff0925786d4e3b675c5",
+    "entrypoint": "kernels/put_combine.cpp",
+    "adaptation": "No trace; expanded BF16; fixed Session arena; null reduce_schedule"
+  }
 }

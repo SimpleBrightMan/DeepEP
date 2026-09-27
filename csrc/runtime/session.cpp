@@ -24,12 +24,12 @@ bool Session::busy()
     return occupied || aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED;
 }
 
-Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout)
+Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma)
 {
     constexpr uint64_t alignment = 2ULL * 1024 * 1024;
-    if (size < 2 || size > 8 || rank < 0 || rank >= size || bytes < alignment || bytes > 1024ULL * 1024 * 1024 ||
-        bytes % alignment != 0 || timeout < 1 || timeout > 300 || endpoint.empty() ||
-        endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN || endpoint.find('\0') != std::string::npos) {
+    if (size < 2 || size > 256 || (size & (size - 1)) || rank < 0 || rank >= size || bytes < alignment ||
+        bytes > 32ULL * 1024 * 1024 * 1024 || bytes % alignment != 0 || timeout < 1 || timeout > 300 ||
+        endpoint.empty() || endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN || endpoint.find('\0') != std::string::npos) {
         throw std::invalid_argument("Invalid rank, capacity, timeout or bootstrap endpoint");
     }
     std::lock_guard<std::mutex> guard(runtime_mutex);
@@ -51,13 +51,19 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     attr.local_mem_size = bytes;
     std::memcpy(attr.ip_port, endpoint.c_str(), endpoint.size() + 1);
     attr.comm_args = &uid;
-    attr.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_MTE;
+    attr.option_attr.data_op_engine_type =
+        udma ? static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA) : ACLSHMEM_DATA_OP_MTE;
     attr.option_attr.shm_init_timeout = timeout;
     attr.option_attr.shm_create_timeout = timeout;
     attr.option_attr.control_operation_timeout = timeout;
     // A failed initialization can leave SDK state behind. Keep the process
     // reserved until a new process is launched; do not finalize foreign state.
     occupied = true;
+    if (udma) {
+        // Payload owns QP0/1 per peer. Retain the primary scheduler's six-QP
+        // resource contract; the other control slots are workspace cachelines.
+        check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 6), "aclshmemx_set_qp_num");
+    }
     check(aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attr), "aclshmemx_init_attr");
     try {
         workspace_ = aclshmem_malloc(bytes);
@@ -66,6 +72,9 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
         }
         check(aclrtMemset(workspace_, bytes, 0, bytes), "aclrtMemset");
         bytes_ = bytes;
+        rank_ = rank;
+        world_ = size;
+        udma_ = udma;
         closed_ = false;
     } catch (...) {
         if (workspace_ != nullptr) {

@@ -7,8 +7,10 @@
 | 项目 | 状态 | 开发内容 |
 | --- | --- | --- |
 | API 基线 | 已固定、已提供声明 | 原生提交 `a56d6156febcd9976e55adc85b5155bfac9f28f8`；导出/签名/错误行为测试，详见 [API](api.md) |
-| API 运行时 | 资源/事件基础已实现 | 受限构造/销毁、通信流、真实事件；EP 操作仍未实现，见[运行时设计](runtime-design.md) |
-| 独立参考与功能测试框架 | 已提供 | 两 rank 手算语义层、EP1/2/4/8 CPU Golden 矩阵、故障注入；V1/V2 分发/合并/往返、cached 及 EP1/2/4/8 BF16/FP8 设备资格矩阵可收集，默认明确报告未运行，见[测试说明](../tests/README.md) |
+| API 运行时 | 资源/事件及受限 V2 dispatch/combine 已实现 | 单 session MTE+URMA、真实事件、Notify/expanded dispatch/combine，见[运行时设计](runtime-design.md) |
+| V2 expanded dispatch | 已接通，设备资格待验证 | BF16/FP8、weights、fresh/cached、forward-list MTE 转发，见[专项测试](elastic.md) |
+| V2 expanded combine | 已接通，设备资格待验证 | BF16、重复调用、复用 dispatch handle，见 [Elastic 文档](elastic.md) |
+| 独立参考与功能测试框架 | 已提供 | 保留 CPU Golden 和基础测试；当前 Elastic 使用 dispatch/combine 两个独立 NPU 入口，见[测试说明](../tests/README.md) |
 | 构建与发行 | Host wheel 构建已实现 | 根 CMake、构建桥、SDK 身份、sdist 重建和安装验证；正式发行/算法资格仍待完成 |
 | V1 功能桩与小型闭环 | CPU 模拟已提供 | 显式测试后端、6 个具名 BF16 场景、逐专家计算/归并、L2 和故障注入；不表示公开 wheel 算法或 NPU 通信通过，见[设计](functional-roundtrip.md) |
 | NPU Tensor 小型闭环 | 双卡功能桩已验证；原生入口已提供 | NPU Tensor/HCCL 参考通信，6 场景逐 rank 通过；`validate_package.py --ep-roundtrip` 和免重建入口供后续原生算子验收，见[NPU 测试](npu-roundtrip.md)；不等于原生 EP 通过 |
