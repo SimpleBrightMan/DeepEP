@@ -3,6 +3,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#ifdef DEEPEP_BUILD_EP_GMM_FUSED
+#include <memory>
+#include <vector>
+#endif
 
 namespace deepep {
 // The framework owns ACL initialization, device and context. Only this workspace
@@ -24,6 +28,14 @@ public:
         return bytes_;
     }
     static bool busy();
+#ifdef DEEPEP_BUILD_EP_GMM_FUSED
+    static std::unique_ptr<Session> create_udma(int rank, int size, uint64_t heap_bytes, uint64_t workspace_bytes,
+                                                const std::string& endpoint, const std::vector<uint8_t>& uid_bytes);
+    static size_t udma_unique_id_size();
+    static std::vector<uint8_t> udma_unique_id();
+    uintptr_t udma_workspace_address() const;
+#endif
+
     void* workspace() const
     {
         check_context();
@@ -43,6 +55,9 @@ public:
     }
 
 private:
+#ifdef DEEPEP_BUILD_EP_GMM_FUSED
+    Session() = default;
+#endif
     void check_context() const;
     aclrtContext context_ = nullptr;
     void* workspace_ = nullptr;

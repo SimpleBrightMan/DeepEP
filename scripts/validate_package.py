@@ -64,6 +64,35 @@ def inspect_wheel(path):
         if len([n for n in names if n.endswith("deepseek-deepep.LICENSE")]) != 1:
             raise RuntimeError("Wheel must include the adopted API's third-party license")
         info = json.loads(archive.read("deep_ep/_build_info.json"))
+        component = "deep_ep_experimental/ep_gmm_fused/"
+        if any(component in n and not n.startswith(component) for n in names):
+            raise RuntimeError("Wheel contains nested EP_GMM_FUSED staging artifacts")
+        if info.get("ep_gmm_fused", {}).get("enabled", False):
+            if len([n for n in names if n.startswith(component + "_C.") and n.endswith(".so")]) != 1:
+                raise RuntimeError("EP_GMM_FUSED wheel must contain exactly one component extension")
+            required = {
+                "__init__.py",
+                "_build_info.json",
+                "NOTICE.md",
+                "upstream.json",
+                "licenses/shmem/LICENSE",
+                "licenses/catccos/LICENSE",
+                "licenses/catlass/LICENSE",
+            }
+            missing = sorted(component + name for name in required if component + name not in names)
+            if missing:
+                raise RuntimeError(f"Incomplete EP_GMM_FUSED wheel: {missing}")
+            if any(n.startswith(component + ".libs/") for n in names):
+                raise RuntimeError("EP_GMM_FUSED must use the external SHMEM SDK; bundled libraries are unsupported")
+            component_info = json.loads(archive.read(component + "_build_info.json"))
+            if (
+                not info.get("shmem", {}).get("revision")
+                or component_info.get("shmem_revision") != info["shmem"]["revision"]
+            ):
+                raise RuntimeError("EP_GMM_FUSED and the core runtime must use the same SHMEM revision")
+        elif any(n.startswith(component) for n in names):
+            raise RuntimeError("Core wheel contains disabled EP_GMM_FUSED artifacts")
+
         kernel_capabilities = {
             "elastic-notify-metadata-v4",
             "elastic-dispatch-expanded-v1",
@@ -89,6 +118,17 @@ def inspect_wheel(path):
         ):
             raise RuntimeError("Invalid or unknown communication_operations build metadata")
         return info
+
+
+def resolve_component_paths(env, source):
+    # A rebuild from an unpacked sdist must use the same provisioned SDKs.
+    if env.get("DEEPEP_BUILD_EP_GMM_FUSED", "OFF").upper() not in {"ON", "1", "TRUE"}:
+        return
+    for name, default in (
+        ("CATCCOS_SOURCE_PATH", source / "third-party/catccos"),
+        ("SHMEM_SOURCE_PATH", source / "third-party/shmem"),
+    ):
+        env[name] = str(Path(env.get(name, default)).resolve())
 
 
 def main():
@@ -121,6 +161,7 @@ def main():
     env = dict(os.environ, PYTHONNOUSERSITE="1", PYTHONUNBUFFERED="1")
     env.pop("PYTHONPATH", None)
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    resolve_component_paths(env, source)
     if args.ep_roundtrip:
         if __package__:
             from .validate_ep import validate_devices
@@ -224,12 +265,12 @@ def main():
         original_files = {
             name: original.read(name)
             for name in original.namelist()
-            if name.startswith("deep_ep/") and not name.endswith(".so")
+            if name.startswith(("deep_ep/", "deep_ep_experimental/")) and ".so" not in Path(name).suffixes
         }
         reconstructed_files = {
             name: reconstructed.read(name)
             for name in reconstructed.namelist()
-            if name.startswith("deep_ep/") and not name.endswith(".so")
+            if name.startswith(("deep_ep/", "deep_ep_experimental/")) and ".so" not in Path(name).suffixes
         }
         if original_files != reconstructed_files:
             raise RuntimeError("sdist rebuild changed installed Python/metadata content")
@@ -254,6 +295,18 @@ def main():
         "m=require_native('installation check'); assert pathlib.Path(m.__file__).resolve().is_relative_to(root); "
         "import torch,torch_npu; assert not torch.npu.is_initialized(); print('Installed native package verified')"
     )
+    if info.get("ep_gmm_fused", {}).get("enabled", False):
+        # Both extensions must coexist and load exactly the same external SDK.
+        probe += (
+            "; import deep_ep_experimental.ep_gmm_fused._C as component; "
+            "assert pathlib.Path(component.__file__).resolve().is_relative_to(root); "
+            "loaded={pathlib.Path(line.split(maxsplit=5)[5]).resolve() "
+            "for line in pathlib.Path('/proc/self/maps').read_text().splitlines() "
+            "if len(line.split(maxsplit=5)) == 6 "
+            "and pathlib.Path(line.split(maxsplit=5)[5]).name.startswith('libshmem.so')}; "
+            "assert loaded == {pathlib.Path(m.shmem_library_path()).resolve()}, loaded; "
+            "assert not torch.npu.is_initialized(); print('Installed shared EP_GMM_FUSED runtime verified')"
+        )
     run([python, "-I", "-c", probe], output, env, 120)
     # Copy tests, not the Python package: sys.path cannot select checkout code.
     shutil.copytree(source / "tests", output / "tests", ignore=shutil.ignore_patterns("__pycache__"))
@@ -270,6 +323,7 @@ def main():
             "pytest",
             "--require-framework",
             "--junitxml=installed-tests.xml",
+            "tests",
         ],
         output,
         env,

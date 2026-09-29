@@ -12,6 +12,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+option(DEEPEP_BUILD_EP_GMM_FUSED "Build Ascend950 communication/GMM experiment" OFF)
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
 include(cmake/Dependencies.cmake)
@@ -27,6 +28,11 @@ target_link_options(_C PRIVATE -Wl,-z,relro,-z,now,-z,noexecstack)
 # SDKs are external dependencies. Never embed checkout/toolkit absolute RPATHs.
 set_target_properties(_C PROPERTIES INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
 install(TARGETS _C LIBRARY DESTINATION .)
+if(DEEPEP_BUILD_EP_GMM_FUSED)
+    target_compile_definitions(_C PRIVATE DEEPEP_BUILD_EP_GMM_FUSED=1)
+    add_subdirectory(experiments/ep_gmm_fused)
+endif()
+
 
 # Capability declarations live alongside the targets actually built above.
 # Packaging consumes this file instead of maintaining another operator list.

@@ -5,6 +5,9 @@
 #include "host/init/shmem_host_init.h"
 #include "host/mem/shmem_host_heap.h"
 #include "host/data_plane/shmem_host_cc.h"
+#ifdef DEEPEP_BUILD_EP_GMM_FUSED
+#include <limits>
+#endif
 
 namespace deepep {
 namespace {
@@ -88,6 +91,102 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
         throw;
     }
 }
+
+#ifdef DEEPEP_BUILD_EP_GMM_FUSED
+size_t Session::udma_unique_id_size()
+{
+    return sizeof(aclshmemx_uniqueid_t);
+}
+
+std::vector<uint8_t> Session::udma_unique_id()
+{
+    std::lock_guard<std::mutex> guard(runtime_mutex);
+    aclshmemx_uniqueid_t uid{};
+    check(aclshmemx_get_uniqueid(&uid), "aclshmemx_get_uniqueid");
+    std::vector<uint8_t> bytes(sizeof(uid));
+    std::memcpy(bytes.data(), &uid, sizeof(uid));
+    return bytes;
+}
+
+std::unique_ptr<Session> Session::create_udma(int rank, int size, uint64_t heap_bytes, uint64_t workspace_bytes,
+                                              const std::string& endpoint, const std::vector<uint8_t>& uid_bytes)
+{
+    if (size < 1 || size > 8 || rank < 0 || rank >= size ||
+        heap_bytes > uint64_t(std::numeric_limits<int64_t>::max()) || workspace_bytes == 0 ||
+        workspace_bytes > heap_bytes || (!uid_bytes.empty() && uid_bytes.size() != sizeof(aclshmemx_uniqueid_t)) ||
+        (uid_bytes.empty() && (endpoint.empty() || endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN ||
+                               endpoint.find('\0') != std::string::npos))) {
+        throw std::invalid_argument("Invalid UDMA rank, heap, workspace, bootstrap endpoint or unique ID");
+    }
+    std::lock_guard<std::mutex> guard(runtime_mutex);
+    if (occupied || aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED) {
+        throw std::runtime_error("A SHMEM runtime already exists in this process");
+    }
+    std::unique_ptr<Session> session(new Session());
+    check(aclrtGetCurrentContext(&session->context_), "aclrtGetCurrentContext");
+    if (session->context_ == nullptr) {
+        throw std::runtime_error("Initialize the framework NPU context before creating a runtime");
+    }
+    const char* soc = aclrtGetSocName();
+    if (soc == nullptr || std::string(soc).rfind("Ascend950", 0) != 0) {
+        throw std::runtime_error("This runtime build is qualified only for Ascend950");
+    }
+    aclshmemx_init_attr_t attr{};
+    aclshmemx_uniqueid_t uid{};
+    auto mode = ACLSHMEMX_INIT_WITH_DEFAULT;
+    if (uid_bytes.empty()) {
+        attr.my_pe = rank;
+        attr.n_pes = size;
+        attr.local_mem_size = heap_bytes;
+        std::memcpy(attr.ip_port, endpoint.c_str(), endpoint.size() + 1);
+        uid.version = ACLSHMEM_UNIQUEID_VERSION;
+        uid.my_pe = rank;
+        uid.n_pes = size;
+        attr.comm_args = &uid;
+    } else {
+        std::memcpy(&uid, uid_bytes.data(), sizeof(uid));
+        check(aclshmemx_set_attr_uniqueid_args(rank, size, static_cast<int64_t>(heap_bytes), &uid, &attr),
+              "aclshmemx_set_attr_uniqueid_args");
+        mode = ACLSHMEMX_INIT_WITH_UNIQUEID;
+    }
+    // Preserve the locked SDK's optional-attribute version and timeout defaults.
+    attr.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_UDMA;
+    occupied = true;
+    check(aclshmemx_init_attr(mode, &attr), "aclshmemx_init_attr");
+    try {
+        session->workspace_ = aclshmem_malloc(workspace_bytes);
+        if (session->workspace_ == nullptr) {
+            throw std::runtime_error("aclshmem_malloc failed");
+        }
+        check(aclrtMemset(session->workspace_, workspace_bytes, 0, workspace_bytes), "aclrtMemset");
+        session->bytes_ = workspace_bytes;
+        session->rank_ = rank;
+        session->world_ = size;
+        session->udma_ = true;
+        session->closed_ = false;
+    } catch (...) {
+        if (session->workspace_ != nullptr) {
+            aclshmem_free(session->workspace_);
+            session->workspace_ = nullptr;
+        }
+        if (aclshmem_finalize() == 0) {
+            occupied = false;
+        }
+        throw;
+    }
+    return session;
+}
+
+uintptr_t Session::udma_workspace_address() const
+{
+    std::lock_guard<std::mutex> guard(runtime_mutex);
+    check_context();
+    if (!udma_) {
+        throw std::runtime_error("This runtime does not own a UDMA workspace");
+    }
+    return reinterpret_cast<uintptr_t>(workspace_);
+}
+#endif
 
 void Session::check_context() const
 {

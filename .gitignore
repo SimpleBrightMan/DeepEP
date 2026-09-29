@@ -39,3 +39,9 @@ compile_commands.json
 Thumbs.db
 .idea/
 .vscode/
+
+/.test-deps/
+/.venv-comm-gmm/
+/.venv-ep-gmm-fused/
+/third-party/catccos/
+/third-party/shmem/

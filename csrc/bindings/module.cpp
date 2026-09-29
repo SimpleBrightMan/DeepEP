@@ -2,6 +2,10 @@
 #include <dlfcn.h>
 #include "host/init/shmem_host_init.h"
 #include "runtime/session.hpp"
+#ifdef DEEPEP_BUILD_EP_GMM_FUSED
+#include <pybind11/stl.h>
+#endif
+
 #include "ops/notify.hpp"
 #include "ops/dispatch.hpp"
 #include "ops/combine.hpp"
@@ -27,6 +31,16 @@ PYBIND11_MODULE(_C, module)
         .def("close", &deepep::Session::close, py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("closed", &deepep::Session::closed)
         .def_property_readonly("capacity", &deepep::Session::capacity);
+#ifdef DEEPEP_BUILD_EP_GMM_FUSED
+    module.def("create_udma_runtime", &deepep::Session::create_udma, py::arg("rank"), py::arg("size"),
+               py::arg("heap_bytes"), py::arg("workspace_bytes"), py::arg("endpoint"), py::arg("uid_bytes"),
+               py::call_guard<py::gil_scoped_release>());
+    module.def("udma_unique_id_size", &deepep::Session::udma_unique_id_size);
+    module.def("udma_unique_id", &deepep::Session::udma_unique_id, py::call_guard<py::gil_scoped_release>());
+    module.def("udma_workspace_address", &deepep::Session::udma_workspace_address,
+               py::call_guard<py::gil_scoped_release>());
+#endif
+
     deepep::bind_notify(module);
     deepep::bind_dispatch(module);
     deepep::bind_combine(module);

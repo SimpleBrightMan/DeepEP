@@ -8,11 +8,70 @@ import platform
 import shutil
 import subprocess
 import sys
+import sysconfig
 import warnings
 
 from setuptools.command.build_ext import build_ext
+from setuptools.command.build import build
+from setuptools.command.egg_info import egg_info
+from setuptools.command.install_lib import install_lib
 
 ROOT = Path(__file__).resolve().parent
+
+
+class BuildEggInfo(egg_info):
+    def finalize_options(self):
+        # Source metadata must not shadow the installed distribution in pip.
+        # Preserve an explicit --egg-base from the PEP 517 metadata hook.
+        if self.egg_base is None:
+            self.egg_base = "build/metadata"
+            Path(self.egg_base).mkdir(parents=True, exist_ok=True)
+        super().finalize_options()
+
+
+def enabled(name, environment=None):
+    env = os.environ if environment is None else environment
+    value = env.get(name, "OFF").upper()
+    if value not in {"ON", "OFF", "1", "0", "TRUE", "FALSE"}:
+        raise ValueError(f"{name} must be ON or OFF, got {value!r}")
+    return value in {"ON", "1", "TRUE"}
+
+
+class ConfiguredBuild(build):
+    def finalize_options(self):
+        default_lib = (
+            self.build_lib is None
+            and (self.build_platlib if self.distribution.has_ext_modules() else self.build_purelib) is None
+        )
+        default_temp = self.build_temp is None
+        super().finalize_options()
+        # Registered only for the experiment; keep its default staging separate
+        # from the core build while respecting explicit output directories.
+        variant = "ep-gmm-fused-shared"
+        if enabled("DEEPEP_LINEINFO"):
+            variant += "-lineinfo"
+        if default_lib:
+            self.build_lib = str(Path(self.build_lib).with_name(Path(self.build_lib).name + "-" + variant))
+        if default_temp:
+            self.build_temp = str(Path(self.build_temp).with_name(Path(self.build_temp).name + "-" + variant))
+
+
+class CheckedInstallLib(install_lib):
+    def install(self):
+        # install_lib recursively copies staging, including stale native files
+        # that build_py does not know about. Check even with bdist_wheel --skip-build.
+        component_enabled = enabled("DEEPEP_BUILD_EP_GMM_FUSED")
+        for directory in (self.build_dir, self.install_dir):
+            root = Path(directory)
+            for component in root.glob("**/deep_ep_experimental/ep_gmm_fused"):
+                relative = component.relative_to(root).as_posix()
+                if not component_enabled or relative != "deep_ep_experimental/ep_gmm_fused":
+                    raise RuntimeError(
+                        f"Stale EP_GMM_FUSED staging at {component}. "
+                        f"Move {root} outside the build tree and rebuild; "
+                        "use separate --build-lib paths for different component configurations."
+                    )
+        return super().install()
 
 
 def source_fingerprint():
@@ -28,14 +87,15 @@ def source_fingerprint():
             "MANIFEST.in",
             "requirements-dev.txt",
             "requirements-build.txt",
+            "experiments/ep_gmm_fused/tests/requirements.txt",
             "third-party/deepseek-deepep.LICENSE",
         )
     ]
-    for name in ("deep_ep", "csrc", "cmake", "scripts", "tests", "benchmarks"):
+    for name in ("deep_ep", "csrc", "cmake", "scripts", "tests", "benchmarks", "experiments/ep_gmm_fused"):
         files.extend(
             path
             for path in (ROOT / name).rglob("*")
-            if (path.suffix in {".py", ".cpp", ".hpp", ".h", ".cmake", ".json"} or path.name == "CMakeLists.txt")
+            if (path.suffix in {".py", ".sh", ".cpp", ".hpp", ".h", ".cmake", ".json"} or path.name == "CMakeLists.txt")
             and path.name != "_build_info.json"
         )
     digest = hashlib.sha256()
@@ -92,8 +152,10 @@ def build_configuration(environment=None):
         raise RuntimeError("DEEPEP_NPU_ARCH must be Ascend950; other targets are unqualified")
     if env.get("DEEPEP_BUILD_MEGAMOE", "OFF") != "OFF":
         raise RuntimeError("MegaMoE is not implemented; DEEPEP_BUILD_MEGAMOE must be OFF")
+    ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED", env)
+    lineinfo = ep_gmm_fused and enabled("DEEPEP_LINEINFO", env)
     result = {"arch": "Ascend950", "python": sys.version, "machine": platform.machine()}
-    result["build_type"] = env.get("DEEPEP_BUILD_TYPE", "Release")
+    result["build_type"] = env.get("DEEPEP_BUILD_TYPE", "RelWithDebInfo" if lineinfo else "Release")
     if result["build_type"] not in {"Release", "RelWithDebInfo", "Debug"}:
         raise RuntimeError("DEEPEP_BUILD_TYPE must be Release, RelWithDebInfo or Debug")
     for name, header in (
@@ -200,39 +262,76 @@ def build_configuration(environment=None):
         for p in sorted((sdk_root / "src").rglob("*"))
         if p.is_file() and p.suffix in {".h", ".hpp"}
     }
+    result["ep_gmm_fused"] = {
+        "enabled": ep_gmm_fused,
+        "lineinfo": lineinfo,
+    }
+    if result["ep_gmm_fused"]["enabled"]:
+        import torch
+        import torch_npu
+
+        result["ep_gmm_fused"].update(
+            torch=torch.__version__,
+            torch_npu=torch_npu.__version__,
+            torch_cxx11_abi=bool(torch._C._GLIBCXX_USE_CXX11_ABI),
+            shmem_revision=lock["shmem"]["revision"],
+        )
+        source = Path(env.get("SHMEM_SOURCE_PATH", ROOT / "third-party/shmem"))
+        result["ep_gmm_fused_paths"] = {
+            "CATCCOS_SOURCE_PATH": str(Path(env.get("CATCCOS_SOURCE_PATH", ROOT / "third-party/catccos")).resolve()),
+            "SHMEM_SOURCE_PATH": str(source.resolve()),
+            "Torch_DIR": str(Path(torch.__file__).parent / "share/cmake/Torch"),
+            "TORCH_NPU_PATH": str(Path(torch_npu.__file__).parent),
+        }
     return result
 
 
 class CMakeBuild(build_ext):
+    def run(self):
+        # Check before setuptools temporarily clears inplace during run().
+        if enabled("DEEPEP_BUILD_EP_GMM_FUSED") and (self.inplace or self.editable_mode):
+            raise RuntimeError("EP_GMM_FUSED requires a wheel; editable/inplace builds are not supported")
+        super().run()
+
     def build_extension(self, ext):
         import pybind11
 
         configuration = build_configuration()
+        ep_gmm_fused = configuration.get("ep_gmm_fused", {}).get("enabled", False)
         fingerprint = build_cache_key(configuration)
         directory = Path(self.build_temp).resolve() / fingerprint
         destination = Path(self.get_ext_fullpath(ext.name)).resolve().parent
-        jobs = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL", "4")
+        default_jobs = os.environ.get("MAX_JOBS", "4") if ep_gmm_fused else "4"
+        jobs = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL", default_jobs)
         if not jobs.isdecimal() or not 1 <= int(jobs) <= 64:
             raise RuntimeError("CMAKE_BUILD_PARALLEL_LEVEL must be in [1, 64]")
         cmake = configuration["cmake_path"]
         directory.mkdir(parents=True, exist_ok=True)
-        checked_run(
-            [
-                cmake,
-                "-S",
-                ROOT,
-                "-B",
-                directory,
-                f"-DCMAKE_BUILD_TYPE={configuration['build_type']}",
-                f"-DDEEPEP_DEVICE_JOBS={jobs}",
-                f"-DPython_EXECUTABLE={sys.executable}",
-                f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
-                f"-DCMAKE_CXX_COMPILER={configuration['compiler_path']}",
-                f"-DASCEND_HOME_PATH={configuration['ASCEND_HOME_PATH']}",
-                f"-DSHMEM_ROOT={configuration['SHMEM_ROOT']}",
-                f"-DCMAKE_INSTALL_PREFIX={destination}",
-            ]
-        )
+        arguments = [
+            cmake,
+            "-S",
+            ROOT,
+            "-B",
+            directory,
+            f"-DCMAKE_BUILD_TYPE={configuration['build_type']}",
+            f"-DDEEPEP_DEVICE_JOBS={jobs}",
+            f"-DPython_EXECUTABLE={sys.executable}",
+            f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
+            f"-DCMAKE_CXX_COMPILER={configuration['compiler_path']}",
+            f"-DASCEND_HOME_PATH={configuration['ASCEND_HOME_PATH']}",
+            f"-DSHMEM_ROOT={configuration['SHMEM_ROOT']}",
+            f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}",
+            f"-DCMAKE_INSTALL_PREFIX={destination}",
+        ]
+        if ep_gmm_fused:
+            arguments.extend(
+                [
+                    f"-DPython3_EXECUTABLE={sys.executable}",
+                    f"-DDEEPEP_EXTENSION_SUFFIX={sysconfig.get_config_var('EXT_SUFFIX')}",
+                    *(f"-D{name}={value}" for name, value in configuration["ep_gmm_fused_paths"].items()),
+                ]
+            )
+        checked_run(arguments)
         checked_run([cmake, "--build", directory, "--parallel", jobs])
         checked_run([cmake, "--install", directory])
         # A reused setuptools build_lib may still contain the former library.
@@ -250,6 +349,7 @@ class CMakeBuild(build_ext):
                 "ASCEND_HOME_PATH",
                 "SHMEM_ROOT",
                 "compiler_path",
+                "ep_gmm_fused_paths",
                 "cmake_path",
                 "python_executable",
                 "build_environment",
@@ -260,3 +360,19 @@ class CMakeBuild(build_ext):
         (destination / "_build_info.json").write_text(
             json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+        if ep_gmm_fused:
+            experiment = ROOT / "experiments/ep_gmm_fused"
+            component = destination.parent / "deep_ep_experimental/ep_gmm_fused"
+            for name in ("NOTICE.md", "upstream.json"):
+                shutil.copy2(experiment / name, component / name)
+            (component / "LICENSE").unlink(missing_ok=True)
+            component_info = dict(
+                configuration["ep_gmm_fused"],
+                npu_arch="dav-3510",
+                python=sys.version,
+                platform=platform.platform(),
+                upstream=json.loads((experiment / "upstream.json").read_text())["commit"],
+            )
+            (component / "_build_info.json").write_text(
+                json.dumps(component_info, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )

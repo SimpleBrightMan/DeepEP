@@ -4,7 +4,7 @@
 constexpr int ACLSHMEM_MAX_IP_PORT_LEN = 64;
 constexpr int ACLSHMEM_STATUS_NOT_INITIALIZED = 0;
 constexpr int ACLSHMEM_DATA_OP_MTE = 1;
-constexpr int ACLSHMEM_DATA_OP_UDMA = 2;
+constexpr int ACLSHMEM_DATA_OP_UDMA = 8;
 using data_op_engine_type_t = int;
 constexpr int ACLSHMEMX_INIT_WITH_DEFAULT = 1;
 struct aclshmemx_uniqueid_t {
@@ -18,7 +18,7 @@ struct aclshmemx_init_attr_t {
     void* comm_args = nullptr;
     struct {
         int data_op_engine_type = 0;
-        unsigned shm_init_timeout = 0, shm_create_timeout = 0, control_operation_timeout = 0;
+        unsigned shm_init_timeout = 120, shm_create_timeout = 120, control_operation_timeout = 120;
     } option_attr;
 };
 int aclshmemx_init_status();
