@@ -1,3 +1,12 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
 #include <pybind11/pybind11.h>
 #include <memory>
 #include <dlfcn.h>
@@ -31,7 +40,8 @@ PYBIND11_MODULE(_C, module)
         .def("barrier", &deepep::Session::barrier, py::call_guard<py::gil_scoped_release>())
         .def("close", &deepep::Session::close, py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("closed", &deepep::Session::closed)
-        .def_property_readonly("capacity", &deepep::Session::capacity);
+        .def_property_readonly("capacity", &deepep::Session::capacity)
+        .def_property_readonly("peer_table", &deepep::Session::peer_table);
 #ifdef DEEPEP_BUILD_MEGAMOE
     module.def(
         "create_megamoe_runtime",

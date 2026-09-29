@@ -1,3 +1,14 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
+#include "ops/device_phase_timing.hpp"
+
 #include "ops/notify.hpp"
 #include <pybind11/stl.h>
 #include <algorithm>
@@ -7,6 +18,7 @@
 #include <vector>
 #include "kernels/notify/launch.hpp"
 #include "kernels/notify/tiling.hpp"
+#include "kernels/dispatch/tiling.hpp"
 #include "runtime/session.hpp"
 #include "host/mem/shmem_host_heap.h"
 #include "host/data_plane/shmem_host_rma.h"
@@ -31,26 +43,29 @@ Specs specs(const ascend_deepep::NotifyTiling& t)
 {
     const int64_t p = t.world, n = t.tokens, k = t.topk, e = t.experts;
     const int64_t f = t.forward_capacity, b = t.backward_capacity, c = t.chunks, l = std::min(p, int64_t(8));
-    return {{"meta", {{n, k, 6}, "int32"}},
-            {"hist", {{((n + 15) / 16) * ((e + p + 15) / 16 * 16)}, "int32"}},
-            {"bases", {{e}, "int32"}},
-            {"prefix", {{p + 1}, "int32"}},
-            {"counts", {{e}, "int32"}},
-            {"gateways", {{p}, "int32"}},
-            {"local_dst", {{n, k}, "int32"}},
-            {"server_mask", {{n}, "int64"}},
-            {"dst", {{n, k}, "int32"}},
-            {"forward_list", {{p, f, 6}, "int32"}},
-            {"forward_counts", {{p}, "int32"}},
-            {"backward_list", {{l, b, 3}, "int64"}},
-            {"backward_counts", {{l}, "int32"}},
-            {"chunk_ranges", {{p, c, 2}, "int32"}},
-            {"chunk_masks", {{p / std::min(p, int64_t(64)), c}, "int32"}},
-            {"rank_rows", {{p}, "int32"}},
-            {"gather_rows", {{p}, "int32"}},
-            {"expert_totals", {{e}, "int32"}},
-            // R is only known after Notify. Every route can land on one rank.
-            {"weight_return_meta", {{b}, "int32"}}};
+    Specs result = {{"meta", {{n, k, 6}, "int32"}},
+                    {"hist", {{((n + 15) / 16) * ((e + p + 15) / 16 * 16)}, "int32"}},
+                    {"bases", {{e}, "int32"}},
+                    {"prefix", {{p + 1}, "int32"}},
+                    {"counts", {{e}, "int32"}},
+                    {"gateways", {{p}, "int32"}},
+                    {"local_dst", {{n, k}, "int32"}},
+                    {"server_mask", {{n}, "int64"}},
+                    {"dst", {{n, k}, "int32"}},
+                    {"forward_list", {{p, f, 6}, "int32"}},
+                    {"forward_counts", {{p}, "int32"}},
+                    {"backward_list", {{l, b, 3}, "int64"}},
+                    {"backward_counts", {{l}, "int32"}},
+                    {"chunk_ranges", {{p, c, 2}, "int32"}},
+                    {"chunk_masks", {{p / std::min(p, int64_t(64)), c}, "int32"}},
+                    {"rank_rows", {{p}, "int32"}},
+                    {"gather_rows", {{p}, "int32"}},
+                    {"expert_totals", {{e}, "int32"}},
+                    // R is only known after Notify. Every route can land on one rank.
+                    {"weight_return_meta", {{b}, "int32"}}};
+    if (t.world <= 256U)
+        result["_peer_plan"] = {{int64_t(ascend_deepep::DispatchPlanBytes(t.world, t.tokens, t.topk))}, "uint8"};
+    return result;
 }
 uint8_t* tensor_pointer(py::handle tensor, const Shape& shape, const std::string& dtype, int device)
 {
@@ -96,19 +111,52 @@ void bind_notify(py::module_& module)
         }
         // Mapping validation happens on every rank before device collectives (Python preflight).
         auto stream = reinterpret_cast<aclrtStream>(stream_address);
+        const bool measure = outputs.contains("kernel_timing") && outputs["kernel_timing"].cast<bool>();
         py::gil_scoped_release release;
+        DevicePhaseTiming timing(measure), plan_timing(measure);
+        timing.mark(0, stream);
+        session.invalidate_dispatch_controls();
         notify_full_kernel_do(stream, input, workspace, ptr.at("meta"), ptr.at("hist"), ptr.at("bases"),
                               ptr.at("prefix"), ptr.at("counts"), ptr.at("gateways"), ptr.at("local_dst"),
                               ptr.at("server_mask"), ptr.at("dst"), ptr.at("forward_list"), ptr.at("forward_counts"),
                               ptr.at("backward_list"), ptr.at("backward_counts"), ptr.at("chunk_ranges"),
                               ptr.at("chunk_masks"), ptr.at("rank_rows"), ptr.at("gather_rows"),
                               ptr.at("weight_return_meta"), reinterpret_cast<uint8_t*>(&t));
-        notify_dispatch_barrier_kernel_do(stream, 32);
+        timing.mark(1, stream);
+        notify_dispatch_barrier_kernel_do(stream, t.num_cores);
+        // The post-Notify barrier retires count exchange. Its first two 512B
+        // slots can now hold admission status without enlarging the workspace.
+        auto plan_t = ascend_deepep::MakeDispatchTiling(t.rank, t.world, t.tokens, t.topk, t.experts, 1U, true);
+        plan_t.sync = t.count_send;
+        plan_timing.mark(0, stream);
+        if (t.world <= 256U) {
+            const auto plan_bytes = ascend_deepep::DispatchPlanBytes(t.world, t.tokens, t.topk);
+            if (aclrtMemsetAsync(ptr.at("_peer_plan"), plan_bytes, 0, plan_bytes, stream) != 0)
+                throw std::runtime_error("Cannot initialize Notify peer-table mailbox");
+        }
+        plan_timing.mark(1, stream);
+        if (t.world <= 256U)
+            notify_dispatch_peer_plan_kernel_do(stream, workspace, ptr.at("dst"), ptr.at("forward_list"),
+                                                ptr.at("forward_counts"), ptr.at("_peer_plan"),
+                                                reinterpret_cast<uint8_t*>(&plan_t), t.address_stride);
+        plan_timing.mark(2, stream);
+        plan_timing.mark(3, stream);
+        timing.mark(2, stream);
         const auto bytes = uint64_t(experts) * sizeof(int32_t);
         if (aclrtMemcpyAsync(ptr.at("expert_totals"), bytes, workspace + t.expert_totals, bytes,
                              ACL_MEMCPY_DEVICE_TO_DEVICE, stream) != 0) {
             throw std::runtime_error("Cannot preserve notify expert totals");
         }
+        timing.mark(3, stream);
+        if (t.world <= 256U) {
+            if (aclrtSynchronizeStream(stream) != 0) throw std::runtime_error("Notify peer-table preparation failed");
+            uint32_t status = 0;
+            if (aclrtMemcpy(&status, sizeof(status), workspace + plan_t.sync + 512U, sizeof(status),
+                            ACL_MEMCPY_DEVICE_TO_HOST) != 0)
+                throw std::runtime_error("Cannot read Notify peer-table admission status");
+            if (status) throw std::invalid_argument("Notify peer-table admission failed: SQ capacity or invalid plan");
+        }
+        return std::make_pair(timing.finish(stream), plan_timing.finish(stream));
     });
     module.def("notify_check_mapping", [](Session& session) {
         void* workspace = session.workspace();

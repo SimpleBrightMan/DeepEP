@@ -1,4 +1,5 @@
 #pragma once
 #include <cstddef>
 void* aclshmem_malloc(size_t);
+void* aclshmem_align(size_t, size_t);
 void aclshmem_free(void*);

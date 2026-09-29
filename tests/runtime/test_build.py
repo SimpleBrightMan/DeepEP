@@ -207,7 +207,7 @@ def test_lock_declares_operators_without_claiming_device_qualification():
 
 
 @pytest.mark.parametrize(
-    "capability", ["elastic-notify-metadata-v4", "elastic-dispatch-expanded-v1", "elastic-combine-expanded-v3"]
+    "capability", ["elastic-notify-metadata-v6", "elastic-dispatch-expanded-v1", "elastic-combine-expanded-v3"]
 )
 def test_elastic_wheel_requires_device_library(tmp_path, capability):
     validator = load(ROOT / "scripts/validate_package.py")

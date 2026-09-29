@@ -1,3 +1,12 @@
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# -----------------------------------------------------------------------------------------------------------
+
 """Host workspace layouts for Elastic Notify, dispatch and combine."""
 
 WORLD_SIZES = (2, 4, 8, 16, 32, 64, 128, 256)
@@ -59,9 +68,9 @@ def workspace_layout(world, tokens, topk, experts=1024):
     return layout
 
 
-def dispatch_layout(world, tokens, topk, experts, rows, fp8=False):
-    if world not in (2, 4, 8, 16, 32, 64, 128):
-        raise ValueError("Payload dispatch supports EP2/4/8/16/32/64/128")
+def dispatch_layout(world, tokens, topk, experts, rows, fp8=False, weights=False):
+    if world not in WORLD_SIZES:
+        raise ValueError("Payload dispatch supports EP2/4/8/16/32/64/128/256")
     notify = workspace_layout(world, tokens, topk, experts)
     integer("receive capacity", rows, 1, world * tokens * topk)
     stride = 1 << (rows - 1).bit_length()
@@ -69,8 +78,13 @@ def dispatch_layout(world, tokens, topk, experts, rows, fp8=False):
         raise ValueError("Dispatch power-of-two address encoding exceeds int32")
     if type(fp8) is not bool:
         raise TypeError("fp8 must be bool")
+    if type(weights) is not bool:
+        raise TypeError("weights must be bool")
+    routes = tokens * topk
+    weight_capacity = (routes + 59) // 60 * 60 if weights else 0
+    weight_inbox_stride = 512 + weight_capacity // 60 * 512 if weight_capacity else 0
     row_bytes = 7168 if fp8 else 14336
-    inbox_stride = (512 + tokens * topk * 256 + 511) // 512 * 512 if fp8 else 0
+    inbox_stride = 512 + ((tokens * topk + 1) // 2) * 512 if fp8 else 0
     regions = (
         ("sync", world * 49152 + 65536),
         ("book", world * 16),
@@ -79,12 +93,21 @@ def dispatch_layout(world, tokens, topk, experts, rows, fp8=False):
         ("weights", rows * 4),
         ("scales", rows * 224 if fp8 else 0),
         ("inbox", world * inbox_stride),
+        ("peer_book", world * 512),
+        ("done", world * 512),
+        ("weight_inbox", world * weight_inbox_stride),
     )
     layout, cursor = {}, notify["workspace_bytes"]
     for name, size in regions:
         layout[name] = cursor
         cursor += (size + 511) // 512 * 512
     layout.update(workspace_bytes=cursor, address_stride=stride, inbox_stride=inbox_stride)
+    layout.update(weight_capacity=weight_capacity, weight_inbox_stride=weight_inbox_stride)
+    layout.update(
+        aggregate_protocol=1,
+        aggregate_packet_bytes=512,
+        scale_batch_rows=(64 if world <= 64 else 56 if world <= 128 else 24) if fp8 else 0,
+    )
     layout["num_bytes"] = max(PAGE_BYTES, (cursor + PAGE_BYTES - 1) // PAGE_BYTES * PAGE_BYTES)
     if layout["num_bytes"] > MAX_BYTES:
         raise ValueError("Dispatch workspace exceeds the 32 GiB runtime limit")
@@ -129,8 +152,10 @@ def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256):
 
 
 def elastic_size_hint(world, tokens, topk, experts, rows, gather_rows, fp8=False):
-    dispatch = dispatch_layout(world, tokens, topk, experts, rows, fp8)["workspace_bytes"]
-    combine = combine_layout(world, tokens, topk, rows, gather_rows)["workspace_bytes"]
+    dispatch = dispatch_layout(world, tokens, topk, experts, rows, fp8, weights=True)["workspace_bytes"]
+    # EP256 currently supports Dispatch only. Keep the two-half workspace
+    # contract, but do not call (or silently enable) the <=128 Combine layout.
+    combine = combine_layout(world, tokens, topk, rows, gather_rows)["workspace_bytes"] if world <= 128 else 0
     # A fixed boundary prevents fresh/cached calls with different shapes or
     # BF16/FP8 dispatch from ever overlapping outstanding combine output copies.
     half = (max(dispatch, combine) + PAGE_BYTES - 1) // PAGE_BYTES * PAGE_BYTES

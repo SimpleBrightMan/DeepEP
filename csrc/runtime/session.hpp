@@ -1,8 +1,20 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
 #pragma once
 #include <acl/acl.h>
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <array>
+#include <limits>
+#include <stdexcept>
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
 #include <memory>
 #include <vector>
@@ -52,6 +64,30 @@ public:
     {
         return world_;
     }
+    bool peer_table() const
+    {
+        return peer_table_;
+    }
+    uint64_t next_generation()
+    {
+        if (generation_ == std::numeric_limits<uint64_t>::max())
+            throw std::overflow_error("Dispatch generation exhausted; recreate Session");
+        return ++generation_;
+    }
+    using DispatchControlLayout = std::array<uint64_t, 10>;
+    bool dispatch_controls_match(const DispatchControlLayout& layout) const
+    {
+        return dispatch_controls_valid_ && dispatch_control_layout_ == layout;
+    }
+    void invalidate_dispatch_controls()
+    {
+        dispatch_controls_valid_ = false;
+    }
+    void remember_dispatch_controls(const DispatchControlLayout& layout)
+    {
+        dispatch_control_layout_ = layout;
+        dispatch_controls_valid_ = true;
+    }
     bool udma() const
     {
         return udma_;
@@ -70,5 +106,9 @@ private:
     int rank_ = 0;
     int world_ = 0;
     bool udma_ = false;
+    bool peer_table_ = false;
+    uint64_t generation_ = 0;
+    bool dispatch_controls_valid_ = false;
+    DispatchControlLayout dispatch_control_layout_{};
 };
 }  // namespace deepep

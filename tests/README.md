@@ -36,3 +36,35 @@ LL ST 运行时必须通过命令行、JSON 或环境变量显式提供 master �
 示例配置中的 `xxx.xxx.xxx.xxx` 和 `xxxxx` 需替换后使用；JSON 的 `master_port`、`shmem_port` 应填写不带引号的整数。
 
 FP8 ST 可通过 `--dtype fp8 --fp8-scale-dtype int32 float32 --do-cpu-sync 0 1` 同时覆盖两种 scales 格式和 CPU 同步开关；JSON 的 `matrix` 同样支持 `"fp8_scale_dtype": ["int32", "float32"]`。该选项默认 `int32`，仅对 FP8 生效。FP32 用例使用随源 rank、token 和分组变化的非单位 scales，按位核对 dispatch 搬运及行对应关系，专家参考计算使用收到的 scales 反量化后验证 combine。结果记录 scales 格式，性能仍分别测量 dispatch/combine kernel。
+
+
+### Notify 与紧凑表 Event 计时
+
+`tests/elastic/run_peer_table_check.py` 在原有测试参数上增加
+`--kernel-profile --routing-profile`，会额外执行 fresh-handle 采样，
+按 `--warmup` / `--iterations` 预热与记录，每次重新执行 Notify 和紧凑表构建。
+这部分独立于复用 handle 的 dispatch 性能采样，不添加计时前全 rank barrier。
+各 rank JSON 的 `routing_device_ms` 保存以下 Event 区间（毫秒）：
+
+- `notify_device_ms`：Notify kernel、后置 barrier 与轮转/转发表准备、expert totals 保存、总时间（包含建表）。
+- `prepare_device_ms`：Notify 内部的表清零、建表 kernel、末尾 Event 间隔、准备总时间；这是 Notify 总时间的子区间，不能重复相加。
+
+建表 kernel 包括 peer-table、紧凑 forward plan 和原有 admission 同步；
+不包含主机读取 admission 状态。Notify 和 prepare 均不包含 Python 分配与校验。
+普通 API 不设置 `_routing_diagnostics`，不创建这些计时 Event。
+运行 `dispatch_metrics.py <结果目录>` 后，`kernel-summary.json` 的 `routing`
+按每次采样取各 rank 最大值，再计算均值与中位数。不同阶段的 rank 最大值不能直接相加作为端到端耗时。
+
+
+### Peer-ready 持久 generation 协议
+
+dispatch 不再逐次清零接收控制标志，
+移除 payload kernel 的入口 `aclshmemx_barrier_all_vec`；地址发布的本地同步、
+MTE 完成后再发布 generation 的顺序，以及出口完成协议保持不变。
+64 位 generation 不复用，耗尽后要求重建 Session。
+
+冷启动、布局变化、Notify/LL 工作区复用后的控制区初始化在 Host 侧执行；
+缓存调用复用已初始化的控制区。每次调用均保留 stream drain + host 全 rank join，
+保证上次输出拷贝和标志消费完成后才能启动下一轮，不支持跨轮重叠。
+Host join 和冷初始化均在 dispatch Event 区间之外，因此 kernel Event 不能代表
+包含这些同步成本的完整 API 时延。原 profile 的 entry_barrier 槽保留但不再执行设备全局同步。

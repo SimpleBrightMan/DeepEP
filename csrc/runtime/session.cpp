@@ -1,5 +1,17 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
 #include "runtime/session.hpp"
 #include <cstring>
+#include <cstdlib>
+#include <vector>
+#include "kernels/udma_layout.hpp"
 #include <mutex>
 #include <stdexcept>
 #include "host/init/shmem_host_init.h"
@@ -37,6 +49,11 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
         endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN || endpoint.find('\0') != std::string::npos) {
         throw std::invalid_argument("Invalid rank, capacity, timeout or bootstrap endpoint");
     }
+    // BF16 and FP8 use the same peer-table transport at every supported EP size.
+    peer_table_ = udma;
+    if (peer_table_ && (size < 2 || size > 256 || (size & (size - 1)))) {
+        throw std::invalid_argument("peer-table requires EP2/4/8/16/32/64/128/256");
+    }
     std::lock_guard<std::mutex> guard(runtime_mutex);
     if (occupied || aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED) {
         throw std::runtime_error("A SHMEM runtime already exists in this process");
@@ -65,14 +82,18 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     // reserved until a new process is launched; do not finalize foreign state.
     occupied = true;
     if (udma) {
-        // Both payload operators reserve one QP pair per cross sender (16).
-        // The SDK shares Clos SQs across peers; local MESH QPs stay private.
-        check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 32), "aclshmemx_set_qp_num");
+        // Combine owns pairs 0..15; peer-table Dispatch uses pairs 0..7.
+        // Serialized operators reuse the bank, not concurrent SQ writers.
+        // The pinned SDK shares Clos SQs across peers; MESH routes are separate.
+        check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, ascend_deepep::udma_layout::kQpCount),
+              "aclshmemx_set_qp_num");
         check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, true), "aclshmemx_set_shared_jetty");
     }
     check(aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attr), "aclshmemx_init_attr");
     try {
-        workspace_ = aclshmem_malloc(bytes);
+        // Peer-table aggregate packets require physical 512B boundaries, not
+        // merely 512B-relative offsets within a possibly 16B-aligned allocation.
+        workspace_ = udma ? aclshmem_align(512U, bytes) : aclshmem_malloc(bytes);
         if (workspace_ == nullptr) {
             throw std::runtime_error("aclshmem_malloc failed");
         }

@@ -1,8 +1,21 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
 #include "kernel_operator.h"
 #include "shmem.h"
 #include "simt_api/device_functions.h"
 #include "tiling.hpp"
 #include "launch.hpp"
+#include "../udma_layout.hpp"
+#include "peer_order.hpp"
+#include "scale_pipeline_layout.hpp"
+#include "profile.hpp"
 using namespace AscendC;
 namespace {
 template <typename T>
@@ -33,25 +46,48 @@ __aicore__ inline void NativeStore(__gm__ T* destination, LocalTensor<T> ub, uin
     SetFlag<HardEvent::MTE3_S>(EVENT_ID3);
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID3);
 }
+
+template <typename T>
+__aicore__ inline void NativeLoadPacket(LocalTensor<T> ub, __gm__ T* source, uint32_t count)
+{
+    GlobalTensor<T> gm;
+    gm.SetGlobalBuffer(source);
+    gm.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+    SetFlag<HardEvent::S_MTE2>(EVENT_ID2);
+    WaitFlag<HardEvent::S_MTE2>(EVENT_ID2);
+    DataCopyPad(ub, gm, DataCopyExtParams(1, count * sizeof(T), 0, 0, 0), DataCopyPadExtParams<T>{false, 0, 0, 0});
+    SetFlag<HardEvent::MTE2_S>(EVENT_ID2);
+    WaitFlag<HardEvent::MTE2_S>(EVENT_ID2);
+}
+__aicore__ inline void NativeLoadPacketTails(LocalTensor<int32_t> ub, GM_ADDR blocks, uint32_t count)
+{
+    GlobalTensor<int32_t> gm;
+    gm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(blocks + 480U));
+    gm.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+    SetFlag<HardEvent::S_MTE2>(EVENT_ID2);
+    WaitFlag<HardEvent::S_MTE2>(EVENT_ID2);
+    DataCopyPad(ub, gm, DataCopyExtParams(count, 32U, 480U, 0U, 0U), DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
+    SetFlag<HardEvent::MTE2_S>(EVENT_ID2);
+    WaitFlag<HardEvent::MTE2_S>(EVENT_ID2);
+}
 }  // namespace
 
 namespace {
-// Payload sources and destinations are offsets in this Session SHMEM heap.
-// Keep peer ownership,
-// group credits, dual-QP SO completion and local output-copy scheduling together.
+// Payload lives in framework GM; only controls and aggregate inboxes use SHMEM.
+// Keep peer ownership, dual-QP SO completion and local row expansion unchanged.
 #if (defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)) && CATLASS_ARCH == 3510
 // Preserve cross-server group/credit and dual-QP 3:1. Secondary is in dispatch.cpp.
-// Adaptation: stable Notify rows and symmetric workspace offsets, no expert migration.
-namespace DispatchMoonep {
-__aicore__ inline __gm__ uint8_t* LivePeerWindow(GM_ADDR workspace, __gm__ uint64_t* book, int32_t peer,
-                                                 uint32_t book_words = 2U)
+// Adaptation: stable Notify rows and per-call live output virtual addresses, no expert migration.
+namespace DispatchDeepep {
+__aicore__ inline __gm__ uint8_t* PeerHiddenAddress(__gm__ uint64_t* book, int32_t peer,
+                                                    uint32_t book_words = ascend_deepep::kPeerAddressRowWords)
 {
-    // SHMEM translates the local registered offset exactly once.
-    // Dispatch invalidates this call's address table after the publication
-    // barrier. This is scalar AICore code; asc_ldcg is a SIMT VF intrinsic.
+    // EnsureDeepepPeerAddress acquires the current-generation record before use.
+    // This ordinary GM VA is a URMA destination, NOT a remote MTE mapping.
+    // Never feed it to remote MTE or apply symmetric-heap translation to it.
     GlobalTensor<uint64_t> addresses;
     addresses.SetGlobalBuffer(book);
-    return workspace + addresses.GetValue(uint64_t(peer) * book_words);
+    return reinterpret_cast<__gm__ uint8_t*>(addresses.GetValue(uint64_t(peer) * book_words));
 }
 
 constexpr uint32_t kUdmaWqeBatchSize = 128;
@@ -136,12 +172,6 @@ static_assert(kUdmaWqeScratchBytes + kMteUbBytes + kLocalCopyTileBytes + kSlotSe
               kAivUbCapacityBytes - 8 * 1024);
 
 constexpr uint32_t kVectorSlotSelectCountAlign = 64;
-// Local MESH QPs remain peer-private in the shared-Clos SHMEM backend.
-// Cross QPs are physical shared SQs, so each sending AIV owns one pair.
-__aicore__ inline uint32_t DispatchPhysicalQp(uint32_t rank, uint32_t peer, uint32_t slot)
-{
-    return rank / 8U == peer / 8U ? slot : 2U * (GetBlockIdx() - 8U) + slot;
-}
 __aicore__ inline uint32_t GetChunkQpSlot(int64_t chunk_index, uint32_t active_qp_count)
 {
     if (active_qp_count == 2) {
@@ -268,9 +298,12 @@ __aicore__ inline int32_t GetGroupDstRank(int32_t rank, int32_t world_size, uint
         const uint32_t frame_toggle = GetDispatchFrameToggle(group);
         const uint32_t subround = GetDispatchFrameSubround(group);
 
+        //
         const uint32_t group_row_delta = subround / 2U;
         const uint32_t group_side_delta = subround % 2U;
 
+        //
+        //
         const uint32_t destination_frame = source_frame ^ source_group_side ^ frame_toggle;
         const uint32_t destination_group_row = (source_group_row + group_row_delta) % kDispatchGroupRowBlocks;
         const uint32_t destination_group_side = source_group_side ^ group_side_delta;
@@ -344,24 +377,6 @@ __aicore__ inline void DispatchSplitRange(int64_t total, int64_t part_count, int
     range_end = range_begin + base_count + (part_index < remainder ? 1 : 0);
 }
 
-__aicore__ inline void DispatchSplitWeightRange(int64_t total, int64_t part_count, int64_t part_index,
-                                                int64_t& range_begin, int64_t& range_end)
-{
-    const int64_t group_size = static_cast<int64_t>(kWeightsPerGmConflictGroup);
-    const int64_t group_count = total > 0 ? total / group_size + (total % group_size != 0 ? 1 : 0) : 0;
-    int64_t group_begin = 0;
-    int64_t group_end = 0;
-    DispatchSplitRange(group_count, part_count, part_index, group_begin, group_end);
-    range_begin = group_begin * group_size;
-    range_end = group_end * group_size;
-    if (range_begin > total) {
-        range_begin = total;
-    }
-    if (range_end > total) {
-        range_end = total;
-    }
-}
-
 __aicore__ inline void IssueGmBytesToUb(AscendC::LocalTensor<uint8_t> destination_ub, GM_ADDR source_gm, uint32_t bytes)
 {
     AscendC::GlobalTensor<uint8_t> source_tensor;
@@ -379,24 +394,17 @@ __aicore__ inline void IssueUbBytesToGm(GM_ADDR destination_gm, AscendC::LocalTe
     AscendC::DataCopyPad(destination_tensor, source_ub, copy_parameters);
 }
 
-// Logical slots are initialized by AIV16..31 before the address barrier.
+// Only refresh outgoing values. Received generations persist across calls;
+// clearing them here could erase a fast peer's current-generation publication.
 __aicore__ inline void InitializeTokenScatterPeerSignals(int32_t current_rank, uint32_t group_rank_index,
                                                          uint64_t magic, uint32_t active_qp_count,
                                                          __gm__ uint8_t* sync_buffer)
 {
-    for (uint32_t i = 0; i < active_qp_count; ++i) {
-        const uint32_t qp_idx = kActiveUdmaQpIndices[i];
-        __gm__ uint64_t* signal_flag = GetPeerCompletionFlag(current_rank, group_rank_index, qp_idx, sync_buffer);
-        *signal_flag = 0;
-        dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(signal_flag));
-    }
+    (void)active_qp_count;
     __gm__ uint64_t* completion_value =
         GetPeerCompletionFlag(current_rank, group_rank_index, kPeerCompletionValueSlot, sync_buffer);
     *completion_value = magic;
     dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(completion_value));
-    __gm__ uint64_t* credit_flag = GetPeerCreditFlag(current_rank, group_rank_index, sync_buffer);
-    *credit_flag = 0;
-    dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(credit_flag));
 }
 
 __aicore__ inline bool IsSourceReadyForForwarding(int32_t incoming_peer, uint32_t current_rank_index, uint64_t magic,
@@ -436,8 +444,8 @@ __aicore__ inline void PublishPeerCompletionSignal(int32_t dst_rank, int32_t cur
             continue;
         }
         aclshmemx_udma_qp_put_nbi<uint64_t, PIPE_MTE3, kUdmaSyncSoCqeConfig>(
-            signal_flag, completion_value, reinterpret_cast<__ubuf__ uint64_t*>(udma_wqe_buffer), 1, dst_rank,
-            DispatchPhysicalQp(current_rank, dst_rank, qp_idx), EVENT_ID0);
+            signal_flag, completion_value, reinterpret_cast<__ubuf__ uint64_t*>(udma_wqe_buffer), 1, dst_rank, qp_idx,
+            EVENT_ID0);
     }
 }
 
@@ -471,25 +479,10 @@ __aicore__ inline void PublishNextPeerCredit(uint32_t group, int32_t current_ran
 
 // One permanent owner per physical peer, including BOTH primary QPs.
 // An FM owner never joins a Clos group. Self-copy has no QP.
-__aicore__ inline uint32_t MoonClosOwners(uint32_t world)
-{
-    return world == 128U ? 16U : 8U;
-}
-__aicore__ inline uint32_t MoonLocalFirst(uint32_t world)
-{
-    return 8U + MoonClosOwners(world);
-}
-__aicore__ inline uint32_t MoonLocalWorkers(uint32_t world)
-{
-    return 33U - MoonLocalFirst(world);
-}
-__aicore__ inline uint32_t MoonLocalWorker(uint32_t world, uint32_t core)
-{
-    // Keep the original local worker0 as the self-ready publisher. AIV7 is last.
-    return core == 7U ? MoonLocalWorkers(world) - 1U : core - MoonLocalFirst(world);
-}
-
-struct MoonSecondaryState {
+struct DeepepSecondaryState {
+    uint64_t profile = 0;
+    uint64_t* detail = nullptr;
+    uint32_t detail_mode = 0, rotation_wqes = 4, detail_phase = 0;
     // GM_ADDR is a pointer macro, so each member needs its own declaration.
     GM_ADDR hidden;
     GM_ADDR workspace;
@@ -497,11 +490,14 @@ struct MoonSecondaryState {
     __gm__ uint8_t* sync;
     uint32_t rank, world, core, lanes, row_bytes;
     uint64_t magic;
+    bool peer = false, clos_shared_jetty = true, clos_split_qp = true, address_peer_ready = true;
+    uint32_t book_words = 64U, clos_table_owner = 0U, scale_bytes = 0U;
+    uint64_t clos_relay_mailbox = 0U, scale_send_offset = 0U, address_seen[4]{};
 };
 
-__aicore__ inline void CopyMoonRows(GM_ADDR source, GM_ADDR destination, uint32_t row_bytes,
-                                    AscendC::LocalTensor<int32_t> rows, uint32_t count,
-                                    AscendC::TBuf<AscendC::QuePosition::VECCALC>& slot_buffer)
+__aicore__ inline void CopyDeepepRows(GM_ADDR source, GM_ADDR destination, uint32_t row_bytes,
+                                      AscendC::LocalTensor<int32_t> rows, uint32_t count,
+                                      AscendC::TBuf<AscendC::QuePosition::VECCALC>& slot_buffer)
 {
     const uint32_t stride = ((row_bytes + 31U) / 32U) * 32U;
     const uint32_t fit = stride <= kDuplicateHiddenStageBytes ? kDuplicateHiddenStageBytes / stride : 1U;
@@ -536,23 +532,23 @@ __aicore__ inline void CopyMoonRows(GM_ADDR source, GM_ADDR destination, uint32_
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
 }
 
-struct MoonPrimaryState {
+struct DeepepPrimaryState {
     GM_ADDR input;
     GM_ADDR destinations;
-    MoonSecondaryState* secondary;
+    DeepepSecondaryState* secondary;
     uint32_t tokens, topk, address_stride;
+    uint64_t clos_peer_table = 0, clos_peer_rows = 0, bytes = 0;
 };
 
 // One complete selection tile per visit. All deferred WQEs are submitted before
 // switching peers. QP selection remains based on the ORIGINAL route-tile index.
-__aicore__ inline void IssueMoonPrimaryTile(MoonPrimaryState& p, int32_t dst_rank, int64_t chunk_start,
-                                            __ubuf__ uint8_t* udma_wqe_buffer,
-                                            AscendC::TBuf<AscendC::QuePosition::VECCALC>& slot_select_buffer)
+__aicore__ inline void IssueDeepepPrimaryTile(DeepepPrimaryState& p, int32_t dst_rank, int64_t chunk_start,
+                                              __ubuf__ uint8_t* udma_wqe_buffer,
+                                              AscendC::TBuf<AscendC::QuePosition::VECCALC>& slot_select_buffer)
 {
     auto& s = *p.secondary;
     auto* hidden = p.input;
     auto* encoded_destinations = reinterpret_cast<__gm__ int32_t*>(p.destinations);
-    auto* workspace = s.workspace;
     auto* book = s.book;
     const uint32_t current_rank = s.rank, active_qp_count = 2U;
     const int64_t num_topk = p.topk, route_count = int64_t(p.tokens) * p.topk;
@@ -580,7 +576,7 @@ __aicore__ inline void IssueMoonPrimaryTile(MoonPrimaryState& p, int32_t dst_ran
     const uint32_t route_tile = dst_rank / 8 == current_rank / 8 ? slotChunkCount : 1024U;
     const int64_t chunk_index = chunk_start / route_tile;
     const uint32_t qp_slot = GetChunkQpSlot(chunk_index, dst_rank / 8 == current_rank / 8 ? 1U : active_qp_count);
-    const uint32_t qp_idx = DispatchPhysicalQp(current_rank, dst_rank, kActiveUdmaQpIndices[qp_slot]);
+    const uint32_t qp_idx = kActiveUdmaQpIndices[qp_slot];
 
     const int64_t remaining_count = route_count - chunk_start;
     const uint32_t chunk_count =
@@ -614,11 +610,9 @@ __aicore__ inline void IssueMoonPrimaryTile(MoonPrimaryState& p, int32_t dst_ran
     const uint64_t local_selected_count = selected_route_count;
 
     aclshmemx_submit_state_t udma_submit_state{};
-    aclshmemx_defer_t defer_action(udma_submit_state);
-    aclshmemx_submit_t submit_action(udma_submit_state);
 
     constexpr uint32_t batch_rows = kUdmaWqeBatchSize;
-    auto* target = LivePeerWindow(workspace, book, dst_rank);
+    auto* target = PeerHiddenAddress(book, dst_rank, s.book_words);
 
     for (uint64_t batch_start = 0; batch_start < local_selected_count; batch_start += batch_rows) {
         const uint64_t batch_end =
@@ -630,9 +624,11 @@ __aicore__ inline void IssueMoonPrimaryTile(MoonPrimaryState& p, int32_t dst_ran
             const int64_t output_offset = dst_local.GetValue(route_index - chunk_start) % address_stride;
             __gm__ uint8_t* hidden_destination = target + output_offset * hidden_row_bytes;
             __gm__ uint8_t* hidden_source = hidden + token_index * hidden_row_bytes;
-            aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_MTE3, kUdmaDataRoNoCqeConfig>(
-                hidden_destination, hidden_source, udma_wqe_buffer, static_cast<uint32_t>(hidden_row_bytes), dst_rank,
-                qp_idx, EVENT_ID0, defer_action);
+            // Same SDK aggregate primitive as public put, without its heap
+            // translation. All intermediate RO remain CQE-free.
+            aclshmemi_udma_stage_send_wqe<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, kUdmaDataRoNoCqeConfig>(
+                hidden_destination, hidden_source, dst_rank, qp_idx, hidden_row_bytes, udma_wqe_buffer,
+                udma_submit_state);
         }
 
         const uint64_t selected = batch_end - 1;
@@ -641,122 +637,14 @@ __aicore__ inline void IssueMoonPrimaryTile(MoonPrimaryState& p, int32_t dst_ran
         const int64_t output_offset = dst_local.GetValue(route_index - chunk_start) % address_stride;
         __gm__ uint8_t* hidden_destination = target + output_offset * hidden_row_bytes;
         __gm__ uint8_t* hidden_source = hidden + token_index * hidden_row_bytes;
-        aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_MTE3, kUdmaDataRoCqeConfig>(
-            hidden_destination, hidden_source, udma_wqe_buffer, static_cast<uint32_t>(hidden_row_bytes), dst_rank,
-            qp_idx, EVENT_ID0, submit_action);
+        aclshmemi_udma_submit_send_wqes<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, kUdmaDataRoCqeConfig>(
+            hidden_destination, hidden_source, dst_rank, qp_idx, hidden_row_bytes, udma_wqe_buffer, EVENT_ID0,
+            udma_submit_state);
     }
 }
 
-__aicore__ inline bool MoonFlagEquals(__gm__ uint64_t* flag, uint64_t expected)
-{
-    AscendC::GlobalTensor<uint64_t> value;
-    value.SetGlobalBuffer(flag);
-    dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(flag));
-    return value.GetValue(0) == expected;
-}
-
-// All calls for a physical cross-server peer (BOTH QPs) belong to 8 + logical%8.
-// Its two logical peers progress independently until both have submitted final SO.
-__aicore__ inline void DispatchMoonCross(MoonPrimaryState& p, __ubuf__ uint8_t* wqe,
-                                         AscendC::TBuf<AscendC::QuePosition::VECCALC>& copy,
-                                         AscendC::TBuf<AscendC::QuePosition::VECCALC>& slots)
-{
-    auto& s = *p.secondary;
-    if (s.world <= 8U) {
-        return;
-    }
-    const uint32_t owner = s.core - 8U, width = GetDispatchGroupWidth(s.world);
-    const uint32_t owners = MoonClosOwners(s.world), sequences = 16U / owners;
-    const uint32_t groups = s.world / width, receiver_index = GetGroupRankIndex(s.rank, s.world);
-    auto* group_sync = s.sync + uint64_t(s.world) * kRankSyncSlotBytes;
-    const bool strict = s.world <= kStrictGroupSyncMaxWorldSize;
-    SyncActiveAivs(owner, owners, GetGroupSyncInitToken(s.magic, groups), group_sync);
-    const uint32_t logical[2]{owner, owner + owners};
-    uint32_t group[2]{0U, sequences == 2U ? 0U : groups};
-    int32_t peers[2]{}, incoming[2]{};
-    uint64_t cursor[2]{};
-    bool initialize[2]{true, true}, submitted[2]{}, credit[2]{}, ready[2]{};
-    while (group[0] < groups || group[1] < groups) {
-        for (uint32_t j = 0; j < sequences; ++j) {
-            if (group[j] >= groups) {
-                continue;
-            }
-            if (initialize[j]) {
-                peers[j] = GetGroupDstRank(s.rank, s.world, group[j], logical[j]);
-                incoming[j] = GetGroupIncomingPeer(s.rank, s.world, group[j], logical[j]);
-                cursor[j] = 0;
-                // Local FM runs on 0..6; it NEVER participates in Clos waits.
-                submitted[j] = peers[j] / 8 == s.rank / 8;
-                credit[j] = group[j] == 0U;
-                ready[j] = false;
-                initialize[j] = false;
-            }
-            if (!submitted[j]) {
-                if (!credit[j]) {
-                    credit[j] = MoonFlagEquals(GetPeerCreditFlag(peers[j], receiver_index, s.sync),
-                                               GetPeerCreditToken(s.magic, group[j], groups));
-                    if (!credit[j]) {
-                        continue;
-                    }
-                }
-                // One complete tile per visit; never switch with deferred WQEs.
-                if (cursor[j] < uint64_t(p.tokens) * p.topk) {
-                    IssueMoonPrimaryTile(p, peers[j], cursor[j], wqe, slots);
-                    cursor[j] += 1024U;
-                }
-                if (cursor[j] >= uint64_t(p.tokens) * p.topk) {
-                    PublishPeerCompletionSignal(peers[j], s.rank, logical[j], 2U, s.sync, wqe);
-                    submitted[j] = true;
-                }
-            }
-            if (submitted[j] && !ready[j]) {
-                // Poll, don't block the other logical sequence on incoming SO.
-                ready[j] = incoming[j] / 8 == s.rank / 8 ||
-                           IsSourceReadyForForwarding(incoming[j], receiver_index, s.magic, 2U, s.sync);
-            }
-        }
-        if (strict && (!ready[0] || !ready[1])) {
-            continue;
-        }
-        const uint32_t strict_group = group[0];
-        if (strict) {
-            SyncActiveAivs(owner, 8U, GetGroupSyncPhaseToken(s.magic, strict_group, groups, kGroupSyncCompletionPhase),
-                           group_sync);
-        }
-        // Only grant the ORIGINAL next incoming edge, after this edge is ready.
-        // In strict mode grant both credits before either blocking quiet, as before.
-        for (uint32_t j = 0; j < sequences; ++j) {
-            if (ready[j] && group[j] + 1U < groups) {
-                // A predecessor may be a skipped local edge. Still publish the
-                // NEXT cross edge's credit; otherwise that sender can wait forever.
-                const int32_t next = GetNextGroupCreditPeer(s.rank, s.world, group[j], logical[j]);
-                if (next / 8 != s.rank / 8) {
-                    PublishNextPeerCredit(group[j], s.rank, s.world, logical[j], s.magic, groups, s.sync, copy);
-                }
-            }
-        }
-        // SDK quiet can still block this AIV; this is not asynchronous CQ polling.
-        // Both QPs are retired by their permanent owner before its sequence advances.
-        for (uint32_t j = 0; j < sequences; ++j)
-            if (ready[j] && group[j] < groups && peers[j] / 8 != s.rank / 8) {
-                aclshmemx_udma_qp_quiet(peers[j], DispatchPhysicalQp(s.rank, peers[j], kActiveUdmaQpIndices[0]));
-                aclshmemx_udma_qp_quiet(peers[j], DispatchPhysicalQp(s.rank, peers[j], kActiveUdmaQpIndices[1]));
-            }
-        if (strict) {
-            SyncActiveAivs(owner, 8U, GetGroupSyncPhaseToken(s.magic, strict_group, groups, kGroupSyncDonePhase),
-                           group_sync);
-        }
-        for (uint32_t j = 0; j < sequences; ++j)
-            if (ready[j] && group[j] < groups) {
-                ++group[j];
-                initialize[j] = true;
-                ready[j] = false;
-            }
-    }
-}
-
-__aicore__ inline void DispatchMoonLocalPeer(MoonPrimaryState& p, __ubuf__ uint8_t* wqe,
-                                             AscendC::TBuf<AscendC::QuePosition::VECCALC>& slots)
+__aicore__ inline void DispatchDeepepLocalPeer(DeepepPrimaryState& p, __ubuf__ uint8_t* wqe,
+                                               AscendC::TBuf<AscendC::QuePosition::VECCALC>& slots)
 {
     auto& s = *p.secondary;
     if (s.core + 1U >= s.lanes) {
@@ -765,7 +653,7 @@ __aicore__ inline void DispatchMoonLocalPeer(MoonPrimaryState& p, __ubuf__ uint8
     const uint32_t lane = (s.rank % 8U + s.core + 1U) % s.lanes;
     const int32_t peer = s.rank / 8U * 8U + lane;
     for (uint64_t route = 0; route < uint64_t(p.tokens) * p.topk; route += slotChunkCount) {
-        IssueMoonPrimaryTile(p, peer, route, wqe, slots);
+        IssueDeepepPrimaryTile(p, peer, route, wqe, slots);
     }
     PublishPeerCompletionSignal(peer, s.rank, GetGroupRankIndex(peer, s.world), 1U, s.sync, wqe);
     aclshmemx_udma_qp_quiet(peer, kActiveUdmaQpIndices[0]);
@@ -773,20 +661,21 @@ __aicore__ inline void DispatchMoonLocalPeer(MoonPrimaryState& p, __ubuf__ uint8
 
 // <=64P: 17 local writers use the unused upper group region.
 // 128P: 16 Clos owners need the full group region; nine local flags follow FM signals.
-__aicore__ inline __gm__ uint64_t* MoonLocalPrimaryDone(MoonSecondaryState& s, uint32_t worker)
+__aicore__ inline __gm__ uint64_t* DeepepLocalPrimaryDone(DeepepSecondaryState& s, uint32_t worker)
 {
     return reinterpret_cast<__gm__ uint64_t*>(s.sync + uint64_t(s.world) * kRankSyncSlotBytes +
-                                              (s.world == 128U ? 40960U : 16384U) + uint64_t(worker) * 512U);
+                                              (s.world >= 128U ? 40960U : 16384U) + uint64_t(worker) * 512U);
 }
 
-__aicore__ inline void DispatchMoonLocalCopy(MoonPrimaryState& p, __ubuf__ uint8_t* wqe,
-                                             AscendC::TBuf<AscendC::QuePosition::VECCALC>& copy,
-                                             AscendC::TBuf<AscendC::QuePosition::VECCALC>& slots)
+__aicore__ inline void DispatchDeepepLocalCopy(DeepepPrimaryState& p, __ubuf__ uint8_t* wqe,
+                                               AscendC::TBuf<AscendC::QuePosition::VECCALC>& copy,
+                                               AscendC::TBuf<AscendC::QuePosition::VECCALC>& slots)
 {
     auto& s = *p.secondary;
-    const uint32_t worker = MoonLocalWorker(s.world, s.core);
+    const uint32_t worker = s.core - ascend_deepep::scale_clos::LocalFirst(s.world);
     int64_t begin = 0, end = 0;
-    DispatchSplitRange(int64_t(p.tokens) * p.topk, MoonLocalWorkers(s.world), worker, begin, end);
+    DispatchSplitRange(int64_t(p.tokens) * p.topk, ascend_deepep::scale_clos::LocalWorkers(s.world), worker, begin,
+                       end);
     auto routes = copy.Get<int32_t>();
     auto rows = routes[kUdmaWqeBatchSize];
 
@@ -806,262 +695,50 @@ __aicore__ inline void DispatchMoonLocalCopy(MoonPrimaryState& p, __ubuf__ uint8
         if (!count) {
             continue;
         }
-        CopyMoonRows(p.input, s.hidden, s.row_bytes, rows, count, slots);
+        CopyDeepepRows(p.input, s.hidden, s.row_bytes, rows, count, slots);
     }
     AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
-    auto* done = MoonLocalPrimaryDone(s, worker);
+    auto* done = DeepepLocalPrimaryDone(s, worker);
     *done = s.magic;
     dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(done));
 
     // Other writers need not wait for worker0; each has drained its own copy.
     // Self expansion starts only after every active writer has published done.
     if (worker == 0U) {
-        for (uint32_t i = 0; i < MoonLocalWorkers(s.world); ++i) {
-            aclshmem_uint64_wait_until(MoonLocalPrimaryDone(s, i), ACLSHMEM_CMP_EQ, s.magic);
+        for (uint32_t i = 0; i < ascend_deepep::scale_clos::LocalWorkers(s.world); ++i) {
+            aclshmem_uint64_wait_until(DeepepLocalPrimaryDone(s, i), ACLSHMEM_CMP_EQ, s.magic);
         }
         PublishPeerCompletionSignal(s.rank, s.rank, GetGroupRankIndex(s.rank, s.world), 1U, s.sync, wqe);
     }
 }
 
-__simt_vf__ __launch_bounds__(kWeightSimtThreadCount) inline void DispatchScatterWeightsSimtVf(
-    __gm__ float* weights, __gm__ int32_t* encoded_destinations, GM_ADDR workspace, __gm__ uint64_t* book,
-    uint32_t address_stride, uint32_t route_begin, uint32_t local_route_count, uint32_t route_shift,
-    uint32_t first_group, uint32_t book_words)
-{
-    const uint32_t thread_index = static_cast<uint32_t>(threadIdx.x);
-    const uint32_t local_group_count =
-        (local_route_count + kWeightsPerGmConflictGroup - 1U) / kWeightsPerGmConflictGroup;
-    for (uint32_t group_order = 0; group_order < local_group_count; ++group_order) {
-        uint32_t group_index = first_group + group_order;
-        if (group_index >= local_group_count) {
-            group_index -= local_group_count;
-        }
-        const uint32_t local_route_index = group_index * kWeightsPerGmConflictGroup + thread_index;
-        if (local_route_index >= local_route_count) {
-            continue;
-        }
-
-        const uint32_t route_index = route_begin + local_route_index;
-        const uint32_t encoded_bits = static_cast<uint32_t>(encoded_destinations[route_index]);
-        if (encoded_bits == 0x80000000U) {
-            continue;
-        }  // invalid route, NOT duplicate destination zero
-        const uint32_t sign_mask = 0U - (encoded_bits >> 31U);
-        const uint32_t flat_destination = encoded_bits ^ sign_mask;
-        // dispatch_dst is repacked with a power-of-two stride.
-        const uint32_t destination_rank = flat_destination >> route_shift;
-        const uint32_t destination_local_offset = flat_destination & (address_stride - 1U);
-
-        const uint64_t base = uint64_t(destination_rank) * book_words;
-        // Weight addresses refer to this invocation's registered output.
-        const uint64_t weight_offset = asc_ldcg(book + base + 1U);
-        auto* target = reinterpret_cast<__gm__ float*>(workspace + weight_offset);
-        ::simt::aclshmem_float_p(target + destination_local_offset, weights[route_index],
-                                 static_cast<int32_t>(destination_rank));
-    }
-    asc_threadfence();
-}
-
-__aicore__ inline void DispatchScatterWeightsSimt(GM_ADDR weights_gm, GM_ADDR dst_gm, GM_ADDR workspace,
-                                                  __gm__ uint64_t* book, uint32_t address_stride, int64_t route_count,
-                                                  int64_t aiv_index, int64_t aiv_count, uint32_t book_words)
-{
-    if (route_count <= 0 || aiv_count <= 0 || aiv_index < 0 || aiv_index >= aiv_count) {
-        return;
-    }
-
-    int64_t route_begin = 0;
-    int64_t route_end = 0;
-    DispatchSplitWeightRange(route_count, aiv_count, aiv_index, route_begin, route_end);
-    if (route_begin >= route_end) {
-        return;
-    }
-
-    uint32_t route_shift = 0;
-    for (uint32_t value = address_stride; value > 1U; value >>= 1U) {
-        ++route_shift;
-    }
-
-    __gm__ float* weights = reinterpret_cast<__gm__ float*>(weights_gm);
-    __gm__ int32_t* encoded_destinations = reinterpret_cast<__gm__ int32_t*>(dst_gm);
-    const int32_t current_rank = aclshmem_my_pe();
-    const uint32_t route_begin_u32 = static_cast<uint32_t>(route_begin);
-    const uint32_t local_route_count = static_cast<uint32_t>(route_end - route_begin);
-    const uint32_t local_group_count =
-        (local_route_count + kWeightsPerGmConflictGroup - 1U) / kWeightsPerGmConflictGroup;
-    const uint32_t first_group =
-        (static_cast<uint32_t>(current_rank) + static_cast<uint32_t>(aiv_index)) % local_group_count;
-
-    asc_vf_call<DispatchScatterWeightsSimtVf>(dim3(kWeightSimtThreadCount), weights, encoded_destinations, workspace,
-                                              book, address_stride, route_begin_u32, local_route_count, route_shift,
-                                              first_group, book_words);
-
-    AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
-    AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID2);
-    AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
-    return;
-}
-
-}  // namespace DispatchMoonep
+}  // namespace DispatchDeepep
 #endif
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-using namespace DispatchMoonep;
+using namespace DispatchDeepep;
 using ascend_deepep::DispatchTiling;
+
+#include "peer_transport.hpp"
+#include "peer_plan.hpp"
+#include "peer_scale.hpp"
 
 // Notify assigns exactly one final row to each valid expert occurrence. Each
 // secondary record has one owner: floor(count*w/workers)..floor(count*(w+1)/workers).
 // The record's primary row is read-only once the original source's SO arrives.
-// Secondary never uses a QP; every primary physical peer retains its sole owner.
-__aicore__ inline void Forward(MoonSecondaryState& s, GM_ADDR forward, GM_ADDR counts, uint32_t capacity,
-                               TBuf<QuePosition::VECCALC>& metadata, TBuf<QuePosition::VECCALC>& staging)
-{
-    const uint32_t first = MoonLocalFirst(s.world);
-    const uint32_t workers = 40U - first;
-    const uint32_t worker = s.core < 8U ? s.core : s.core - first + 8U;
-    uint32_t cursor[128]{}, end[128]{};
-    bool ready[128]{};
-    auto records = metadata.Get<int32_t>();
-    NativeLoad(records, reinterpret_cast<__gm__ int32_t*>(counts), s.world);
-    uint32_t pending = 0;
-    for (uint32_t source = 0; source < s.world; ++source) {
-        const uint32_t n = records.GetValue(source);
-        cursor[source] = uint64_t(n) * worker / workers;
-        end[source] = uint64_t(n) * (worker + 1U) / workers;
-        pending += cursor[source] != end[source];
-    }
-    while (pending) {
-        for (uint32_t source = 0; source < s.world; ++source) {
-            if (cursor[source] == end[source]) {
-                continue;
-            }
-            if (!ready[source]) {
-                ready[source] =
-                    IsSourceReadyForForwarding(source, GetGroupRankIndex(s.rank, s.world), s.magic, 2U, s.sync);
-                if (!ready[source]) {
-                    continue;
-                }
-            }
-            const uint32_t n = end[source] - cursor[source] < 64U ? end[source] - cursor[source] : 64U;
-            NativeLoad(records,
-                       reinterpret_cast<__gm__ int32_t*>(forward) + (uint64_t(source) * capacity + cursor[source]) * 6U,
-                       n * 6U);
-            // Two hidden staging slots, each at a 32-byte aligned UB offset.
-            // MTE3->MTE2 credits cover reuse, including the final drain.
-            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
-            uint32_t stage = 0;
-            for (uint32_t i = 0; i < n;) {
-                const int32_t peer = records.GetValue(i * 6U + 3U);
-                if (peer < 0) {
-                    ++i;
-                    continue;
-                }  // singleton marker has no secondary payload
-                const uint32_t primary = records.GetValue(i * 6U + 2U);
-                const TEventID event = stage == 0 ? EVENT_ID0 : EVENT_ID1;
-                auto ub = staging.GetWithOffset<uint8_t>(16384, stage * 16384);
-                WaitFlag<HardEvent::MTE3_MTE2>(event);
-                IssueGmBytesToUb(ub, s.hidden + uint64_t(primary) * s.row_bytes, s.row_bytes);
-                SetFlag<HardEvent::MTE2_MTE3>(event);
-                WaitFlag<HardEvent::MTE2_MTE3>(event);
-                // Consecutive fan-out records reuse this immutable hidden UB
-                // row. Only task/tile boundaries can cause an extra primary read.
-                do {
-                    const int32_t target = records.GetValue(i * 6U + 3U);
-                    const uint32_t row = records.GetValue(i * 6U + 4U);
-                    if (target >= 0) {
-                        auto* destination = s.hidden + uint64_t(row) * s.row_bytes;
-                        // Same-rank duplicates have a distinct final row too.
-                        if (uint32_t(target) != s.rank) {
-                            destination = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(destination, target));
-                        }
-                        IssueUbBytesToGm(destination, ub, s.row_bytes);
-                    }
-                    ++i;
-                } while (i < n && uint32_t(records.GetValue(i * 6U + 2U)) == primary);
-                SetFlag<HardEvent::MTE3_MTE2>(event);
-                stage ^= 1U;
-            }
-            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
-            cursor[source] += n;
-            pending -= cursor[source] == end[source];
-        }
-    }
-    // Follow Notify's mapped-MTE protocol: drain instructions and flush the
-    // data cache before this worker announces completion through the collective.
-    aclshmemx_mte_quiet();
-}
+// Each FM core owns one private MESH QP0 for BOTH primary and secondary,
+// sequentially. Clos shared SQs and scale/weight inbox transfers are separate.
+#include "fm_simt.hpp"
 
-// Independent aggregate scales: 32 AIVs own disjoint peers/sources. Each
-// source->destination pair owns a complete inbox (no credits/receiver progress
-// needed for sending). A record is [row:int32, padding:28B, scale:224B]. Hidden
-// forwarding never carries scales. All normal MTE segments are 32B aligned.
-__aicore__ inline void Scales(GM_ADDR workspace, GM_ADDR input, GM_ADDR destinations, const DispatchTiling& t,
-                              TBuf<QuePosition::VECCALC>& metadata, TBuf<QuePosition::VECCALC>& staging)
-{
-    const uint32_t owner = GetBlockIdx() - 32U, routes = t.tokens * t.topk;
-    auto dst = metadata.Get<int32_t>();
-    auto pack = staging.Get<uint8_t>();
-    for (uint32_t index = owner; index < t.world; index += 32U) {
-        const uint32_t peer = (index + t.rank) % t.world;
-        auto* inbox = workspace + t.inbox + uint64_t(t.rank) * t.inbox_stride;
-        auto* remote = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(inbox, peer));
-        uint32_t total = 0, packed = 0;
-        for (uint32_t first = 0; first < routes; first += 256U) {
-            const uint32_t n = routes - first < 256U ? routes - first : 256U;
-            NativeLoad(dst, reinterpret_cast<__gm__ int32_t*>(destinations) + first, n);
-            for (uint32_t i = 0; i < n; ++i) {
-                const int32_t encoded = dst.GetValue(i);
-                if (uint32_t(encoded) == 0x80000000U) {
-                    continue;
-                }
-                const uint32_t flat = encoded < 0 ? uint32_t(~encoded) : uint32_t(encoded);
-                if (flat / t.address_stride != peer) {
-                    continue;
-                }
-                pack.ReinterpretCast<int32_t>().SetValue(packed * 64U, flat % t.address_stride);
-                NativeLoad(pack[packed * 256U + 32U], input + uint64_t((first + i) / t.topk) * 224U, 224U);
-                ++packed;
-                if (packed == 32U) {
-                    NativeStore(remote + 512U + uint64_t(total) * 256U, pack, packed * 256U);
-                    total += packed;
-                    packed = 0;
-                }
-            }
-        }
-        if (packed) {
-            NativeStore(remote + 512U + uint64_t(total) * 256U, pack, packed * 256U);
-            total += packed;
-        }
-        aclshmemx_mte_quiet();  // payload visibility must precede publication
-        // Previous NativeStore drained MTE3 before overwriting the pack buffer.
-        pack.ReinterpretCast<uint64_t>().SetValue(0, uint64_t(total) + 1U);
-        NativeStore(reinterpret_cast<__gm__ uint64_t*>(remote), pack.ReinterpretCast<uint64_t>(), 1U);
-        aclshmemx_mte_quiet();
-    }
-    for (uint32_t source = owner; source < t.world; source += 32U) {
-        auto* inbox = workspace + t.inbox + uint64_t(source) * t.inbox_stride;
-        auto* flag = reinterpret_cast<__gm__ uint64_t*>(inbox);
-        aclshmem_uint64_wait_until(flag, ACLSHMEM_CMP_NE, 0U);
-        GlobalTensor<uint64_t> header;
-        header.SetGlobalBuffer(flag);
-        dcci_cacheline(inbox);
-        const uint32_t total = header.GetValue(0) - 1U;
-        for (uint32_t first = 0; first < total; first += 32U) {
-            const uint32_t n = total - first < 32U ? total - first : 32U;
-            NativeLoad(pack, inbox + 512U + uint64_t(first) * 256U, n * 256U);
-            for (uint32_t i = 0; i < n; ++i) {
-                const uint32_t row = pack.ReinterpretCast<int32_t>().GetValue(i * 64U);
-                NativeStore(workspace + t.scales + uint64_t(row) * 224U, pack[i * 256U + 32U], 224U);
-            }
-        }
-    }
-}
+#include "fm_forward.hpp"
 
+template <bool Profile>
 __aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR forward, GM_ADDR counts,
                                 GM_ADDR weights, GM_ADDR scales, const DispatchTiling& t)
 {
-    const uint32_t core = GetBlockIdx(), cores = t.fp8 ? 64U : 32U;
+    const uint32_t core = GetBlockIdx(), cores = 64U;
+    const uint64_t profile = t.profile + uint64_t(core) * 256U;
+    DispatchDetail<Profile> detail;
+    DispatchProfileMark<Profile>(profile, 0U);
     TPipe pipe;
     TBuf<TPosition::VECOUT> wqe_buffer;
     TBuf<QuePosition::VECCALC> copy, slots;
@@ -1072,46 +749,42 @@ __aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR
     pipe.InitBuffer(slots, kSlotSelectUbBytes);
     auto* wqe = reinterpret_cast<__ubuf__ uint8_t*>(wqe_buffer.Get<uint8_t>().GetPhyAddr());
     auto* sync = workspace + t.sync;
-    auto* book = reinterpret_cast<__gm__ uint64_t*>(workspace + t.book);
-    // Every invocation clears control lines, even when its shape/layout changed.
-    // This kernel's entry barrier follows the prior call's output copies on
-    // each rank's stream. Native code drains the prior collective before reuse.
-    auto zeros = copy.Get<uint64_t>();
-    for (uint32_t i = 0; i < 64U; ++i) {
-        zeros.SetValue(i, 0U);
-    }
-    const uint64_t sync_bytes = uint64_t(t.world) * kRankSyncSlotBytes + 65536U;
-    for (uint64_t offset = uint64_t(core) * 512U; offset < sync_bytes; offset += uint64_t(cores) * 512U) {
-        NativeStore(reinterpret_cast<__gm__ uint64_t*>(sync + offset), zeros, 64U);
-    }
-    if (t.fp8) {
-        for (uint32_t source = core; source < t.world; source += cores) {
-            NativeStore(reinterpret_cast<__gm__ uint64_t*>(workspace + t.inbox + uint64_t(source) * t.inbox_stride),
-                        zeros, 1U);
-        }
-    }
-    if (core == 0U) {
-        auto entries = copy.Get<uint64_t>();
-        for (uint32_t peer = 0; peer < t.world; ++peer) {
-            entries.SetValue(peer * 2U, t.output);
-            entries.SetValue(peer * 2U + 1U, t.weights);
-        }
-        NativeStore(book, entries, t.world * 2U);
-    }
-    // All control stores complete before flags become readable by any sender.
-    aclshmemx_barrier_all_vec();
+    auto* book = reinterpret_cast<__gm__ uint64_t*>(workspace + t.peer_book);
+    // Host initializes these controls once per layout/workspace lifetime.
+    // Never erase incoming current-generation flags in a late-starting kernel.
+    DispatchProfileMark<Profile>(profile, 1U);
+    // Peer generation/address handshakes gate consumers; no entry collective.
+    DispatchProfileMark<Profile>(profile, 2U);
     if (core >= 16U && core - 16U < GetDispatchGroupWidth(t.world)) {
-        InitializeTokenScatterPeerSignals(t.rank, core - 16U, 1U, 2U, sync);
+        InitializeTokenScatterPeerSignals(t.rank, core - 16U, t.generation, 2U, sync);
     }
-    aclshmemx_barrier_all_vec();
-    for (uint32_t offset = 0; offset < t.world * 16U; offset += 64U) {
-        dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(book) + offset);
-    }
+    PublishPeerAddresses(workspace, t, copy, slots);
+    DispatchProfileMark<Profile>(profile, 3U);
     if (core >= 32U) {
-        Scales(workspace, scales, destinations, t, copy, slots);
+        if (weights) {
+            PeerAuxPlan plan{destinations, weights,
+                             nullptr,      reinterpret_cast<GM_ADDR>(t.output_weights_address),
+                             nullptr,      t.address_stride};
+            DeepepSecondaryState unused{};
+            DispatchAuxPipeline::Run<Profile, false>(workspace, t, plan, slots, copy, wqe_buffer, unused);
+        }
+        // Independent inboxes, metadata, ready publication and local expansion.
+        // Weight completion drains its UB/events before scale reuses the scratch.
+        DispatchProfileMark<Profile>(profile, 31U);
+        if (t.fp8) {
+            PeerScales<Profile>(workspace, scales, destinations, t, copy, slots, wqe_buffer);
+        }
+        DispatchProfileMark<Profile>(profile, 4U);
+        DispatchProfileMark<Profile>(profile, 5U);
     } else {
-        MoonSecondaryState s{};
-        s.hidden = workspace + t.output;
+        DeepepSecondaryState s{};
+        if constexpr (Profile) {
+            s.profile = profile;
+            s.detail = detail.data();
+            s.detail_mode = t.detail_mode;
+        }
+        s.rotation_wqes = t.rotation_wqes;
+        s.hidden = reinterpret_cast<GM_ADDR>(t.output_address);
         s.workspace = workspace;
         s.book = book;
         s.sync = sync;
@@ -1120,33 +793,78 @@ __aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR
         s.core = core;
         s.lanes = t.world < 8U ? t.world : 8U;
         s.row_bytes = t.fp8 ? 7168U : 14336U;
-        s.magic = 1U;
-        MoonPrimaryState p{};
-        p.input = workspace + t.input;
+        s.magic = t.generation;
+        s.peer = true;
+        if (s.peer) {
+            s.book = reinterpret_cast<__gm__ uint64_t*>(workspace + t.peer_book);
+            s.clos_relay_mailbox = t.peer_table + t.plan_mailbox_offset;
+        }
+        DeepepPrimaryState p{};
+        p.input = reinterpret_cast<GM_ADDR>(t.input_address);
         p.destinations = destinations;
         p.secondary = &s;
         p.tokens = t.tokens;
         p.topk = t.topk;
         p.address_stride = t.address_stride;
-        const uint32_t local_first = MoonLocalFirst(t.world);
-        if (core < 7U) {
-            DispatchMoonLocalPeer(p, wqe, slots);
+        p.clos_peer_table = t.peer_table;
+        p.clos_peer_rows = t.peer_table + t.plan_rows_offset;
+        const uint32_t local_first = ascend_deepep::scale_clos::LocalFirst(t.world);
+        if (core == 7U) {
+            if (t.world > 8U) RunClosRelayAssist<Profile>(s, copy);
         } else if (core >= 8U && core < local_first) {
-            DispatchMoonCross(p, wqe, copy, slots);
+            if (t.world > 8U) DispatchClosSplitQp<Profile, true>(p, wqe, copy, slots);
+        } else if (core < 7U) {
+            if (core + 1U < s.lanes) {
+                const uint32_t peer = t.rank / 8U * 8U + (t.rank % 8U + core + 1U) % s.lanes;
+                EnsureDeepepPeerAddress(s, peer);
+            }
+            DispatchDeepepLocalPeer(p, wqe, slots);
+
         } else {
-            DispatchMoonLocalCopy(p, wqe, copy, slots);
+            DispatchDeepepLocalCopy(p, wqe, copy, slots);
         }
-        if (core < 8U || core >= local_first) {
-            Forward(s, forward, counts, t.tokens * t.topk, copy, slots);
+        DispatchProfileMark<Profile>(profile, 4U);
+        if (core < 7U || core >= local_first) {
+            if (s.peer) {
+                s.book = reinterpret_cast<__gm__ uint64_t*>(workspace + t.peer_book);
+                if (core < 7U)
+                    ForwardPeer<Profile, false>(s, t, copy, slots, wqe);
+                else
+                    ForwardPeer<Profile, true>(s, t, copy, slots, wqe);
+            }
         }
-        if (weights != nullptr) {
-            DispatchScatterWeightsSimt(weights, destinations, workspace, book, t.address_stride,
-                                       int64_t(t.tokens) * t.topk, core, 32U, 2U);
-        }
+        DispatchProfileMark<Profile>(profile, 5U);
     }
-    // Fixed participation: all 32/64 AIVs join, including empty work owners.
-    // Primary has quieted its QPs; secondary/scale UB slots have been drained.
-    aclshmemx_barrier_all_vec();
+    // Fixed participation: all 64 AIVs join, including empty work owners.
+    // Join ALL inbound writes before returning framework-owned live outputs.
+    DispatchProfileMark<Profile>(profile, 6U);
+    FinishPeerDispatch<Profile>(workspace, t, copy, detail.data());
+    DispatchProfileMark<Profile>(profile, 7U);
+    if constexpr (Profile) {
+        if (t.detail_profile) {
+            auto* d = detail.data();
+            d[17] = t.rotation_wqes;
+            d[18] = t.detail_mode;
+            d[19] = t.generation;
+            d[20] = 0x44504454U;
+            d[21] = t.rank;
+            d[22] = core;
+            d[23] = 2U;
+            d[28] = t.world;
+            d[29] = ascend_deepep::scale_clos::Qp1Workers(t.world);
+            auto* output = reinterpret_cast<__gm__ uint64_t*>(t.detail_profile) + uint64_t(core) * 32U;
+            for (uint32_t i = 0; i < 32U; ++i) output[i] = d[i];
+            dcci_cachelines(reinterpret_cast<__gm__ uint8_t*>(output), 256U);
+        }
+        auto* record = reinterpret_cast<__gm__ uint64_t*>(profile);
+        record[26] = 0x44504550U;
+        record[27] = t.rank;
+        record[28] = core;
+        record[29] = t.generation;
+        record[30] = 7U;
+        dcci_cachelines(reinterpret_cast<__gm__ uint8_t*>(record), 256U);
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+    }
 }
 #endif
 }  // namespace
@@ -1159,7 +877,17 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_ker
 {
     util_set_ffts_config(0U);
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
-    Dispatch(workspace, destinations, forward, counts, weights, scales, t);
+    Dispatch<false>(workspace, destinations, forward, counts, weights, scales, t);
+#endif
+}
+
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_profile_kernel(
+    GM_ADDR workspace, GM_ADDR destinations, GM_ADDR forward, GM_ADDR counts, GM_ADDR weights, GM_ADDR scales,
+    ascend_deepep::DispatchTiling t)
+{
+    util_set_ffts_config(0U);
+#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+    Dispatch<true>(workspace, destinations, forward, counts, weights, scales, t);
 #endif
 }
 
@@ -1168,6 +896,11 @@ extern "C" ASCEND_DEEPEP_EXPORT void dispatch_kernel_do(void* stream, uint8_t* w
                                                         uint8_t* scales, uint8_t* tiling)
 {
     const auto t = *reinterpret_cast<ascend_deepep::DispatchTiling*>(tiling);
-    dispatch_kernel<<<t.fp8 ? 64 : 32, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(192 * 1024), stream>>>(
-        workspace, destinations, forward, counts, weights, scales, t);
+    if (t.profile) {
+        dispatch_profile_kernel<<<64, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(192 * 1024), stream>>>(
+            workspace, destinations, forward, counts, weights, scales, t);
+        return;
+    }
+    dispatch_kernel<<<64, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(192 * 1024), stream>>>(workspace, destinations, forward,
+                                                                                counts, weights, scales, t);
 }

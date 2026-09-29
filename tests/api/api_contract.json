@@ -116,7 +116,7 @@
         "num_recv_tokens_per_expert_list"
       ],
       "ownership": "Routing plan belongs to one buffer and survives until the matching backward/recompute finishes.",
-      "metadata_version": 4,
+      "metadata_version": 6,
       "forward_list": {
         "shape": "[world_size,T*K,6]",
         "dtype": "int32",

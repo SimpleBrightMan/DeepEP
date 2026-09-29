@@ -6,10 +6,11 @@
 
 | 目录 | 用途 | 固定提交 |
 | --- | --- | --- |
-| `shmem/` | 通信 SDK，显式编译后供主仓库链接 | `2057780fe2b8a9d7cd97d5d60b3230493b235cfa` |
+| `shmem/` | 通信 SDK，PR858 shared Jetty 与端点选路修复 | `b68a7252f4279c45b28aed20cc31f8ddde08e8c3` |
 | `catlass/` | MegaMoE 编译时使用的模板头文件，不单独编译动态库 | `2b4bd7cbf7e67ebab23d7d5a99d472c83f90d9a1` |
 
 来源见根 [.gitmodules](../.gitmodules)，版本约束见 [dependencies.lock.json](../dependencies.lock.json)。
+SHMEM 使用 fork 的固定兼容提交；升级需重编 SDK 和 wheel，见[PR850 验证说明](../docs/shmem-pr850-validation.md)。
 两个子仓库的许可证均为 CANN Open Software License Agreement Version 2.0，原文保留在各自的 `LICENSE` 中。
 MegaMoE 源文件中的 CANN 版权和许可声明保留，许可全文归档于 [cann.LICENSE](cann.LICENSE)，并随启用 MegaMoE 的 wheel 分发。
 项目级许可证遵循[贡献指南](../CONTRIBUTING.md#许可证)中的约定，目前尚未选定。

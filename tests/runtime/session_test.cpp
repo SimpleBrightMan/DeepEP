@@ -79,6 +79,11 @@ void* aclshmem_malloc(size_t bytes)
     ++allocations;
     return allocation_failure ? nullptr : &storage;
 }
+// Match the aligned allocation API used by Session; reuse the existing fault-injection stub.
+void* aclshmem_align(size_t, size_t bytes)
+{
+    return aclshmem_malloc(bytes);
+}
 void aclshmem_free(void* value)
 {
     assert(value == &storage);

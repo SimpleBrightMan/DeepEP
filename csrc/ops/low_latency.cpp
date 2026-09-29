@@ -159,6 +159,7 @@ void bind_low_latency(py::module_& module)
         args.inputScales = fp8 ? get("scales", {b, (h + 127) / 128}, scale_dtype) : nullptr;
         session.workspace();  // Validate the owning context before launch.
         py::gil_scoped_release release;
+        session.invalidate_dispatch_controls();
         dispatch_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);
     });
     module.def("combine_low_latency", [](Session& session, py::dict tensors, int b, int h, int k, int e,
@@ -190,6 +191,7 @@ void bind_low_latency(py::module_& module)
         args.tilingData = get("tiling", {sizeof(CombineDedup::EpServerDedupCombineTilingData)}, "uint8");
         session.workspace();
         py::gil_scoped_release release;
+        session.invalidate_dispatch_controls();
         combine_server_dedup_kernel_do(reinterpret_cast<void*>(stream_address), &args);
     });
 }

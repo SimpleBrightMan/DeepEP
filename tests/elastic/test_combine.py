@@ -1,3 +1,12 @@
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# -----------------------------------------------------------------------------------------------------------
+
 """Installed-wheel expanded dispatch/combine functional precision test.
 
 NPU: python tests/elastic/test_combine.py --ep-size 2 --nproc-per-node 2 --output /tmp/combine-check
@@ -55,8 +64,8 @@ def assert_metadata_equal(actual, expected, label):
 
 
 def check_handle(handle, reference, rank):
-    if handle.metadata_only or handle.metadata_version != 4:
-        raise AssertionError(f"rank {rank}: expected payload dispatch metadata v4")
+    if handle.metadata_only or handle.metadata_version != 6:
+        raise AssertionError(f"rank {rank}: expected payload dispatch metadata v6")
     # Check counts first, then copy/compare only valid rows of padded lists.
     for name in (
         "forward_counts",
@@ -128,8 +137,8 @@ def worker(local_rank, args):
     info = json.loads(Path(deep_ep.__file__).with_name("_build_info.json").read_text())
     if "elastic-combine-expanded-v3" not in info.get("capabilities", []):
         raise RuntimeError("Installed wheel does not contain expanded Combine; rebuild/install first")
-    if "elastic-notify-metadata-v4" not in info.get("capabilities", []):
-        raise RuntimeError("Rebuild/install the wheel with Notify metadata v4")
+    if "elastic-notify-metadata-v6" not in info.get("capabilities", []):
+        raise RuntimeError("Rebuild/install the wheel with Notify metadata v6")
     torch.npu.set_device(local_rank)
     rank, world = _dispatch["_worker_identity"](local_rank, args)
     log = _dispatch["_progress_logger"]("combine", rank)
@@ -151,6 +160,7 @@ def worker(local_rank, args):
                 args.experts,
                 max(1, max(plan["rank_rows"])),
                 max(1, max(plan["gather_rows"])),
+                fp8=args.dispatch_dtype == "fp8",
             ),
         )
         log(f"route={mode} capacity_golden.done session_bytes={capacity}")
@@ -163,6 +173,7 @@ def worker(local_rank, args):
         num_max_tokens_per_rank=args.tokens,
         hidden=7168,
         num_topk=args.topk,
+        use_fp8_dispatch=args.dispatch_dtype == "fp8",
         explicitly_destroy=True,
     )
     log("buffer.init.done")
@@ -183,9 +194,26 @@ def worker(local_rank, args):
                 log(f"{context} inputs.begin")
                 indices = torch.tensor(routes[rank], dtype=torch.int64, device="npu") if handle is None else None
                 x = payload(rank, args.tokens, generation).npu()
+                fp8 = args.dispatch_dtype == "fp8"
+                scale_value = 0.5 if generation % 2 else 1.0
+                dispatch_input = (
+                    (
+                        (x.float() / scale_value).to(torch.float8_e4m3fn),
+                        torch.full((args.tokens, 56), scale_value, dtype=torch.float32, device="npu"),
+                    )
+                    if fp8
+                    else x
+                )
+                input_ids = torch.arange(args.tokens * args.topk) + rank * args.tokens * args.topk
+                input_weights = (
+                    None
+                    if args.without_weights
+                    else weight_payload(input_ids, generation).reshape(args.tokens, args.topk).npu()
+                )
                 log(f"{context} dispatch.enter mode={'fresh' if handle is None else 'cached'}")
-                recv, _, _, handle, event = buffer.dispatch(
-                    x,
+                recv, _, recv_weights, handle, event = buffer.dispatch(
+                    dispatch_input,
+                    topk_weights=input_weights,
                     topk_idx=indices,
                     num_experts=args.experts if handle is None else None,
                     handle=handle,
@@ -200,16 +228,40 @@ def worker(local_rank, args):
                 log(f"{context} dispatch_golden.begin (CPU)")
                 expected_recv = ((sources + torch.arange(7168)[None, :] + generation) % 7 - 3).to(torch.bfloat16)
                 log(f"{context} dispatch_golden.done")
-                _dispatch["assert_bytes"](recv, expected_recv, f"{context} dispatch input to experts", progress=log)
+                if fp8:
+                    _dispatch["assert_bytes"](
+                        recv[0],
+                        (expected_recv.float() / scale_value).to(torch.float8_e4m3fn),
+                        f"{context} FP8 hidden",
+                        progress=log,
+                    )
+                    _dispatch["assert_bytes"](
+                        recv[1],
+                        torch.full((len(entries), 56), scale_value, dtype=torch.float32),
+                        f"{context} FP8 scales",
+                        progress=log,
+                    )
+                else:
+                    _dispatch["assert_bytes"](recv, expected_recv, f"{context} dispatch input to experts", progress=log)
+                if input_weights is None:
+                    assert recv_weights is None
+                else:
+                    _dispatch["assert_bytes"](
+                        recv_weights,
+                        weight_payload(weight_ids, generation),
+                        f"{context} dispatch weights",
+                        progress=log,
+                    )
                 # Producer stream is deliberately distinct; Combine must honor its event.
                 log(f"{context} expert_compute.enqueue.begin")
                 producer = torch.npu.Stream()
                 with torch.npu.stream(producer):
                     event.current_stream_wait()
+                    expert_input = recv[0].float() * recv[1].repeat_interleave(128, dim=1) if fp8 else recv.float()
                     bias = torch.tensor(
                         [routes[s][t][k] % 3 - 1 + k % 3 - 1 for s, t, k in entries], dtype=torch.float32, device="npu"
                     )[:, None]
-                    expert = (recv.float() + bias).to(torch.bfloat16)
+                    expert = (expert_input + bias).to(torch.bfloat16)
                     weights = None if args.without_weights else weight_payload(weight_ids, generation).npu()
                     before = buffer.capture()
                 log(f"{context} expert_compute.enqueued; combine.enter")
@@ -245,7 +297,7 @@ def worker(local_rank, args):
                     _dispatch["profile_operator"](
                         args,
                         rank,
-                        f"{mode}-bf16-weights{int(weights is not None)}",
+                        f"{mode}-{args.dispatch_dtype}-weights{int(weights is not None)}",
                         invoke,
                         validate,
                         info,
@@ -310,6 +362,7 @@ def worker(local_rank, args):
                 topk=args.topk,
                 experts=args.experts,
                 route=args.route,
+                dispatch_dtype=args.dispatch_dtype,
                 with_weights=not args.without_weights,
                 source_sha256=info["source_sha256"],
             ),
@@ -705,6 +758,7 @@ int main() {
             *(["-target", "wasm32-wasi", "-fno-exceptions"] if use_wasi else []),
             "-std=c++17",
             "-O2",
+            "-UNDEBUG",
             "-I",
             str(root / "csrc"),
             "-I",
@@ -781,6 +835,12 @@ def main():
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--experts", type=int, default=1024)
     parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument(
+        "--dispatch-dtype",
+        choices=("bf16", "fp8"),
+        default="bf16",
+        help="FP8 always transports scales; expert/Combine payloads are BF16",
+    )
     parser.add_argument("--without-weights", action="store_true", help="Disable weight return, including profiling")
     parser.add_argument("--route", choices=("all", *_ROUTES, "sq_pressure"), default="all")
     parser.add_argument("--output", type=Path, required=True)

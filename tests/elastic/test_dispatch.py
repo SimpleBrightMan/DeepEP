@@ -1,3 +1,12 @@
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# -----------------------------------------------------------------------------------------------------------
+
 """Forward-list contract checks and installed-wheel, bitwise NPU dispatch validation.
 
 CPU: python -m pytest tests/elastic/test_dispatch.py -q
@@ -113,6 +122,7 @@ def build_notify_golden(routes, experts, chunk_tokens):
             {
                 "server_mask": [0] * tokens,
                 "dst": [invalid] * (tokens * topk),
+                "weight_return_meta": [-1] * rank_rows[source],
                 "forward_list": [[] for _ in range(world)],
                 "backward_list": [[] for _ in range(min(world, 8))],
                 "chunk_ranges": [[(0, 0) for _ in range(chunks)] for _ in range(world)],
@@ -131,6 +141,7 @@ def build_notify_golden(routes, experts, chunk_tokens):
                 peer = expert // local_experts
                 output_row = starts[expert] + expert_cursors[expert]
                 expert_cursors[expert] += 1
+                plans[peer]["weight_return_meta"][output_row] = (source * tokens + token) * topk + slot
                 server = peer // 8
                 plans[source]["server_mask"][token] |= 1 << server
                 by_server.setdefault(server, []).append((slot, peer, output_row))
@@ -236,8 +247,8 @@ def check_handle(handle, golden, rank, routes, experts):
     import torch
 
     plan = golden["plans"][rank]
-    if handle.metadata_only or handle.metadata_version != 4:
-        raise AssertionError("Expected expanded dispatch handle metadata v4")
+    if handle.metadata_only or handle.metadata_version != 6:
+        raise AssertionError("Expected expanded dispatch handle metadata v6")
     for name in (
         "server_mask",
         "dst",
@@ -341,8 +352,8 @@ def _launch(args, worker):
         or not 0 <= args.node_rank < args.ep_size // args.nproc_per_node
     ):
         raise ValueError("EP must be divisible by nproc-per-node; node-rank must be within the job")
-    if args.ep_size not in (2, 4, 8, 16, 32, 64, 128):
-        raise ValueError("Dispatch/combine EP must be a power of two from 2 to 128")
+    if args.ep_size not in (2, 4, 8, 16, 32, 64, 128, 256):
+        raise ValueError("Dispatch EP must be a power of two from 2 to 256")
     endpoint = args.shmem_ip_port or os.environ.get("DEEPEP_SHMEM_ENDPOINT")
     if not endpoint:
         master = os.environ.get("MASTER_ADDR", args.master_addr) if all(launched) else args.master_addr
@@ -380,7 +391,7 @@ def expert_rows(routes, experts, rank):
 def test_forward_list_covers_unique_expert_rows():
     # Exercise both primary core maps, cross-server forwarding, same-rank
     # duplicates, singleton records, empty ranks and non-power-of-two strides.
-    for world in (2, 8, 16, 64, 128):
+    for world in (2, 8, 16, 32, 64, 128):
         for mode in ("normal", "duplicates", "invalid", "empty", "hotspot"):
             tokens, topk, experts = 3, 6, world * 2
             routes = make_routes(world, tokens, topk, experts, 0, mode)
@@ -464,14 +475,19 @@ def test_dispatch_regions_and_encoding_bounds():
                 layout = dispatch_layout(world, 33, 6, 1024, rows, fp8)
                 assert layout["sync"] == workspace_layout(world, 33, 6)["workspace_bytes"]
                 assert rows <= layout["address_stride"] < 2 * rows
-                offsets = [layout[name] for name in ("sync", "book", "input", "output", "weights", "scales", "inbox")]
+                offsets = [
+                    layout[name]
+                    for name in ("sync", "book", "input", "output", "weights", "scales", "inbox", "peer_book", "done")
+                ]
                 assert offsets == sorted(offsets) and all(n % 512 == 0 for n in offsets)
                 row_bytes = 7168 if fp8 else 14336
                 assert layout["weights"] - layout["output"] >= rows * row_bytes
-                assert layout["workspace_bytes"] == layout["inbox"] + world * layout["inbox_stride"]
+                assert layout["peer_book"] == layout["inbox"] + world * layout["inbox_stride"]
+                assert layout["done"] == layout["peer_book"] + world * 512
+                assert layout["workspace_bytes"] == layout["done"] + world * 512
                 assert layout["num_bytes"] >= layout["workspace_bytes"]
                 assert layout["num_bytes"] % (2 << 20) == 0
-    for arguments in ((256, 1, 1, 1024, 1), (2, 1, 1, 1024, 3), (2, 1, 1, 1024, 0)):
+    for arguments in ((512, 1, 1, 1024, 1), (2, 1, 1, 1024, 3), (2, 1, 1, 1024, 0)):
         with pytest.raises(ValueError):
             dispatch_layout(*arguments)
 
@@ -794,8 +810,8 @@ def worker(local_rank, args):
     info = json.loads(Path(deep_ep.__file__).with_name("_build_info.json").read_text())
     if "elastic-dispatch-expanded-v1" not in info.get("capabilities", []):
         raise RuntimeError("Installed wheel does not contain payload dispatch")
-    if "elastic-notify-metadata-v4" not in info.get("capabilities", []):
-        raise RuntimeError("Rebuild/install the wheel with Notify metadata v4")
+    if "elastic-notify-metadata-v6" not in info.get("capabilities", []):
+        raise RuntimeError("Rebuild/install the wheel with Notify metadata v6")
     torch.npu.set_device(local_rank)
     modes = ("normal", "duplicates", "invalid", "empty", "hotspot") if args.route == "all" else (args.route,)
     dtypes = (False, True) if args.dtype == "both" else (args.dtype == "fp8",)
@@ -805,7 +821,9 @@ def worker(local_rank, args):
     # hint budgets four times average rows and is intentionally smaller at EP>4.
     log("capacity.begin")
     capacity = 2 * max(
-        dispatch_layout(world, args.tokens, args.topk, args.experts, world * args.tokens * args.topk, fp8)["num_bytes"]
+        dispatch_layout(
+            world, args.tokens, args.topk, args.experts, world * args.tokens * args.topk, fp8, weights=True
+        )["num_bytes"]
         for fp8 in dtypes
     )
     log(f"buffer.init.begin bytes={capacity}")

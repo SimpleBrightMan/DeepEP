@@ -46,7 +46,7 @@ endif()
 # Packaging consumes this file instead of maintaining another operator list.
 file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/capabilities.json" CONTENT [=[
 {
-  "capabilities": ["runtime-mte", "runtime-urma", "event", "elastic-notify-metadata-v4", "elastic-dispatch-expanded-v1", "elastic-combine-expanded-v3"],
+  "capabilities": ["runtime-mte", "runtime-urma", "event", "elastic-notify-metadata-v6", "elastic-dispatch-expanded-v1", "elastic-combine-expanded-v3"],
   "communication_operations": ["ElasticBuffer.dispatch", "ElasticBuffer.combine"]
 }
 ]=])

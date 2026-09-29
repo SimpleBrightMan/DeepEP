@@ -1,6 +1,7 @@
 """Explicitly build the pinned SHMEM submodule; pip/wheel never invokes this script."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,7 +28,26 @@ def cann_version(expected):
     return version
 
 
-def prepare(root=ROOT, *, rebuild=False, if_needed=False):
+def source_patches(source):
+    """Fingerprint tracked edits and untracked inputs without modifying Git."""
+
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(source), *args])
+
+    if not git("status", "--porcelain", "--untracked-files=normal").strip():
+        return []
+    digest = hashlib.sha256(git("diff", "HEAD", "--binary", "--no-ext-diff", "--no-textconv"))
+    for name in sorted(git("ls-files", "--others", "--exclude-standard", "-z").split(b"\0")):
+        if not name:
+            continue
+        path = source / os.fsdecode(name)
+        if path.is_symlink() or not path.resolve().is_relative_to(source.resolve()):
+            raise RuntimeError(f"Untracked SHMEM input must be a local regular file: {path}")
+        digest.update(name + b"\0" + hashlib.sha256(path.read_bytes()).digest())
+    return [{"kind": "local-worktree", "sha256": digest.hexdigest()}]
+
+
+def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=False):
     if platform.system() != "Linux":
         raise RuntimeError("SHMEM compilation requires Linux and the pinned CANN SDK")
     root = Path(root).resolve()
@@ -46,8 +66,12 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False):
     revision = git("rev-parse", "HEAD")
     if revision != lock["shmem"]["revision"]:
         raise RuntimeError("SHMEM revision differs from dependencies.lock.json; do not build a moving branch")
-    if git("status", "--porcelain", "--untracked-files=normal"):
-        raise RuntimeError("SHMEM has local changes; preserve/review them before building the pinned SDK")
+    patches = source_patches(source)
+    if patches and not allow_local_changes:
+        raise RuntimeError(
+            "SHMEM has local changes; pass --allow-local-changes to build them explicitly "
+            "(cluster launcher: --allow-local-shmem)"
+        )
 
     version = cann_version(lock["cann_version"])
     jobs = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL", "4")
@@ -66,10 +90,13 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False):
             "cann_version": version["Version"],
             "cann_timestamp": version.get("timestamp", "unknown"),
             "target": lock["target"],
-            "source_patches": [],
+            "source_patches": patches,
         }
         if identity.get("revision") != revision or identity.get("build") != expected_build:
-            raise RuntimeError("Existing SHMEM build identity changed; stop SDK users and rebuild explicitly")
+            raise RuntimeError(
+                "Existing SHMEM build identity changed; stop SDK users and rebuild explicitly "
+                "with --rebuild (cluster launcher: --rebuild-shmem)"
+            )
         # 复用也校验全部头文件/库哈希，不把存在 manifest 当成构建成功。
         import sys
 
@@ -85,6 +112,8 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False):
             "and pass --rebuild to regenerate it (then rebuild dependent wheels)"
         )
     print(f"[SHMEM] source={revision} CANN={version['Version']} target={lock['target']}", flush=True)
+    if patches:
+        print(f"[SHMEM] Building local source modifications: {json.dumps(patches)}", flush=True)
     git_executable = shutil.which("git")
     if git_executable is None:
         raise RuntimeError("Git is required to prepare SHMEM dependencies")
@@ -106,6 +135,8 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False):
             check=True,
         )
     sdk = source / "install/shmem"
+    if git("rev-parse", "HEAD") != revision or source_patches(source) != patches:
+        raise RuntimeError("SHMEM source changed during compilation; SDK identity was not recorded")
     manifest = record(
         sdk,
         revision,
@@ -113,7 +144,7 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False):
             "cann_version": version["Version"],
             "cann_timestamp": version.get("timestamp", "unknown"),
             "target": lock["target"],
-            "source_patches": [],
+            "source_patches": patches,
         },
     )
     print(f"[SHMEM] SDK identity: {manifest}", flush=True)
@@ -125,5 +156,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rebuild", action="store_true", help="Regenerate this submodule's build/install artifacts")
     parser.add_argument("--if-needed", action="store_true", help="Reuse a verified SDK from this CANN build")
+    parser.add_argument(
+        "--allow-local-changes",
+        action="store_true",
+        help="Build local edits on the pinned commit and record their source fingerprint",
+    )
     args = parser.parse_args()
-    prepare(rebuild=args.rebuild, if_needed=args.if_needed)
+    prepare(rebuild=args.rebuild, if_needed=args.if_needed, allow_local_changes=args.allow_local_changes)

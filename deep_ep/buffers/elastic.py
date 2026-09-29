@@ -1,3 +1,12 @@
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# -----------------------------------------------------------------------------------------------------------
+
 # API signatures adapted from DeepSeek DeepEP; see third-party/deepseek-deepep.LICENSE.
 """V2 expanded dispatch/combine and their Notify metadata orchestration."""
 
@@ -123,7 +132,7 @@ class EPHandle:
         self.trace = None
         self.hidden = None
         self.metadata_only = True
-        self.metadata_version = 4
+        self.metadata_version = 6
         self._buffer_token = None
         self._routing_versions = {}
 
@@ -216,7 +225,7 @@ class ElasticBuffer:
         """Two SHMEM arenas sized for 1024 experts and four times average rows.
 
         Heavier skew requires explicit num_bytes; dispatch checks actual counts
-        before payload launch. FP8 sizes include aggregate scales; combine
+        before payload launch. Size hints include weights and optional FP8 scales; combine
         uses BF16 expert and gateway rows in the reserved second half.
         """
         require_native("ElasticBuffer.get_buffer_size_hint")
@@ -596,7 +605,9 @@ class ElasticBuffer:
         Supports BF16 or (FP8 E4M3FN, FP32 [T,H/128] scales), H=7168,
         Fresh calls with resolved num_max_tokens_per_rank < 256 prefer LL;
         unsupported LL options use HT only before payload launch. HT supports
-        fresh/cached routing, num_qps=0/2 and fixed compute-unit counts.
+        fresh/cached expanded routing with expert_alignment=1, num_qps=0/2,
+        and num_compute_units=0/32 for BF16 or 0/64 for FP8. These hints do
+        not change the peer-table rear-core schedule.
         LL returns no expanded weights: its combine applies the saved weights
         internally, so expert output must not be preweighted. With CPU sync
         and an existing EP group LL returns exact R rows; otherwise it returns
@@ -718,7 +729,7 @@ class ElasticBuffer:
                         not isinstance(handle, EPHandle)
                         or handle._buffer_token is not self._handle_token
                         or handle.metadata_only
-                        or handle.metadata_version != 4
+                        or handle.metadata_version != 6
                     ):
                         raise ValueError("Cached handle must come from this buffer's successful payload dispatch")
                     if topk_idx is not None:
@@ -737,8 +748,6 @@ class ElasticBuffer:
                         raise ValueError("topk_idx must be contiguous int64 [T,K] on the buffer NPU")
                     topk = topk_idx.shape[1]
                 workspace_layout(runtime.world_size, tokens, topk, num_experts)
-                if runtime.world_size > 128:
-                    raise ValueError("Payload dispatch supports EP2..128; EP256 is Notify-only")
                 bound = self.num_max_tokens_per_rank
                 num_max_tokens_per_rank = (
                     (bound or tokens) if num_max_tokens_per_rank is None else num_max_tokens_per_rank
@@ -788,26 +797,30 @@ class ElasticBuffer:
                     False,
                 )
             error, tensors = None, {}
-            payload_signature = signature + [0]
+            payload_signature = signature + [0, int(runtime.native.peer_table), int(hasattr(handle, "_peer_plan"))]
             try:
                 rows, local_rows = handle.address_stride, handle.num_expanded_tokens
-                layout = dispatch_layout(runtime.world_size, tokens, topk, num_experts, rows, fp8)
+                layout = dispatch_layout(
+                    runtime.world_size, tokens, topk, num_experts, rows, fp8, weights=topk_weights is not None
+                )
                 if layout["workspace_bytes"] > runtime.capacity // 2:
                     raise ValueError(
                         f"Dispatch needs at least {2 * layout['num_bytes']} SHMEM bytes per rank for the actual receive counts"
                     )
                 native_layout = native.dispatch_layout(
-                    runtime.rank, runtime.world_size, tokens, topk, num_experts, rows, fp8
+                    runtime.rank, runtime.world_size, tokens, topk, num_experts, rows, fp8, topk_weights is not None
                 )
-                if any(layout[key] != value for key, value in native_layout.items()):
+                if native_layout.get("aggregate_protocol") != layout["aggregate_protocol"] or any(
+                    layout[key] != value for key, value in native_layout.items()
+                ):
                     raise RuntimeError("Python/native dispatch layouts differ; rebuild the installed package")
-                payload_signature[-1] = rows
+                payload_signature[-3] = rows
                 if previous_event is not None:
                     previous_event.current_stream_wait()
                 producer = EventHandle()
                 with npu.stream(runtime.stream):
                     producer.current_stream_wait()
-                    if handle.dispatch_dst is None:
+                    if getattr(handle, "dispatch_dst", None) is None:
                         # Preserve Notify's original stride/sentinel ABI for Combine.
                         raw = handle.dst.to(torch.int64)
                         flat = torch.where(raw < 0, ~raw, raw)
@@ -823,7 +836,11 @@ class ElasticBuffer:
                     out_scales = (
                         torch.empty((local_rows, 56), dtype=torch.float32, device=hidden.device) if fp8 else None
                     )
+                    peer_plan = getattr(handle, "_peer_plan", None)
+                    if runtime.native.peer_table and peer_plan is None:
+                        raise ValueError("Dispatch requires the peer table generated by Notify; recreate the handle")
                     tensors = dict(
+                        plan=peer_plan,
                         input=hidden,
                         output=out,
                         dst=handle.dispatch_dst,
@@ -834,7 +851,16 @@ class ElasticBuffer:
                         scales=scales,
                         output_scales=out_scales,
                     )
-                    retained = tuple(value for value in tensors.values() if value is not None) + (
+                    # Private benchmark hook; ordinary API calls do not allocate
+                    # profile buffers or create device timing events.
+                    diagnostics = getattr(self, "_dispatch_diagnostics", None)
+                    if diagnostics is not None:
+                        tensors["profile"] = diagnostics.get("profile")
+                        tensors["weight_profile"] = diagnostics.get("weight_profile")
+                        tensors["rotation_wqes"] = diagnostics.get("rotation_wqes", 4)
+                        tensors["detail_profile"] = diagnostics.get("detail_profile")
+                        tensors["detail_mode"] = diagnostics.get("detail_mode", 0)
+                    retained = tuple(value for value in tensors.values() if torch.is_tensor(value)) + (
                         handle.topk_idx,
                         *(getattr(handle, name) for name in _PERSISTENT),
                     )
@@ -849,7 +875,9 @@ class ElasticBuffer:
             runtime.notify_inflight = retained
             try:
                 with npu.stream(runtime.stream):
-                    native.dispatch(
+                    if diagnostics is not None:
+                        tensors["kernel_timing"] = True
+                    device_times = native.dispatch(
                         runtime.native,
                         tensors,
                         tokens,
@@ -860,11 +888,18 @@ class ElasticBuffer:
                         fp8,
                         runtime.stream.npu_stream,
                     )
+                    if diagnostics is not None:
+                        diagnostics["device_ms"] = device_times
                     handle.metadata_only = False
                     handle.num_compute_units = 64 if fp8 else 32
                     handle._routing_versions = {
                         name: (getattr(handle, name).data_ptr(), getattr(handle, name)._version)
-                        for name in ("topk_idx", "dispatch_dst", *_PERSISTENT)
+                        for name in (
+                            "topk_idx",
+                            "dispatch_dst",
+                            *_PERSISTENT,
+                            *(("_peer_plan",) if peer_plan is not None else ()),
+                        )
                     }
                     event = EventOverlap(EventHandle(), retained)
                 if not async_with_compute_stream:
@@ -938,7 +973,7 @@ class ElasticBuffer:
                     not isinstance(handle, EPHandle)
                     or handle._buffer_token is not self._handle_token
                     or handle.metadata_only
-                    or handle.metadata_version != 4
+                    or handle.metadata_version != 6
                 ):
                     raise ValueError("Combine needs this buffer's successful expanded payload dispatch handle")
                 if not handle.do_expand or handle.expert_alignment != 1:
@@ -1186,9 +1221,17 @@ class ElasticBuffer:
             runtime.notify_inflight = (indices, tensors)
             try:
                 with npu.stream(runtime.stream):
-                    native.notify(
+                    routing_diagnostics = getattr(self, "_routing_diagnostics", None)
+                    if routing_diagnostics is not None:
+                        tensors["kernel_timing"] = True
+                    notify_ms, prepare_ms = native.notify(
                         runtime.native, indices, tensors, tokens, topk, num_experts, runtime.stream.npu_stream
                     )
+                    if routing_diagnostics is not None:
+                        routing_diagnostics["notify_device_ms"] = notify_ms
+                        routing_diagnostics["prepare_device_ms"] = prepare_ms
+                        routing_diagnostics["plan_in_notify"] = True
+                    tensors.pop("kernel_timing", None)
                     runtime.stream.synchronize()
                     local_experts = num_experts // runtime.world_size
                     begin = runtime.rank * local_experts
@@ -1220,13 +1263,21 @@ class ElasticBuffer:
                     )
                     for name in _PERSISTENT:
                         setattr(result, name, tensors[name])
+                    if "_peer_plan" in tensors:
+                        result._peer_plan = tensors["_peer_plan"]
                     result.address_stride = max(1, max(rows))
                     result.rank, result.world_size = runtime.rank, runtime.world_size
                     result.num_tokens, result.num_topk = tokens, topk
                     result.chunk_tokens = 256
                     result._buffer_token = self._handle_token
                     result.trace = None
-                    retained = (indices, counts, prefix, *(tensors[name] for name in _PERSISTENT))
+                    retained = (
+                        indices,
+                        counts,
+                        prefix,
+                        *(tensors[name] for name in _PERSISTENT),
+                        *((tensors["_peer_plan"],) if "_peer_plan" in tensors else ()),
+                    )
                     event = EventOverlap(EventHandle(), retained)
                 if not async_with_compute:
                     event.current_stream_wait()

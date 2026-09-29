@@ -4,6 +4,8 @@
 #include "../common.hpp"
 #include "launch.hpp"
 #include "tiling.hpp"
+#include "../dispatch/tiling.hpp"
+#include "../dispatch/peer_order.hpp"
 
 using namespace AscendC;
 namespace {
@@ -1571,4 +1573,34 @@ extern "C" ASCEND_DEEPEP_EXPORT void notify_full_kernel_do(
 extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_barrier_kernel_do(void* stream, uint32_t num_cores)
 {
     notify_dispatch_barrier_kernel<<<num_cores, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>();
+}
+
+namespace {
+#include "../dispatch/peer_io.hpp"
+#include "../dispatch/peer_plan.hpp"
+}  // namespace
+
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_dispatch_peer_plan_kernel(
+    GM_ADDR workspace, GM_ADDR dst, GM_ADDR forward, GM_ADDR counts, GM_ADDR plan, ascend_deepep::DispatchTiling t,
+    uint64_t stride_offset)
+{
+    util_set_ffts_config(0U);
+#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+    // Decode Notify's actual row stride; the generated table stores unencoded rows.
+    GlobalTensor<int32_t> stride;
+    stride.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspace + stride_offset));
+    stride.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+    t.rows = stride.GetValue(0);
+    t.address_stride = t.rows;
+    PreparePeerPlan(workspace, dst, forward, counts, plan, t);
+#endif
+}
+extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_peer_plan_kernel_do(void* stream, uint8_t* workspace, uint8_t* dst,
+                                                                         uint8_t* forward, uint8_t* counts,
+                                                                         uint8_t* plan, uint8_t* tiling,
+                                                                         uint64_t stride_offset)
+{
+    const auto t = *reinterpret_cast<ascend_deepep::DispatchTiling*>(tiling);
+    notify_dispatch_peer_plan_kernel<<<32, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(4096), stream>>>(
+        workspace, dst, forward, counts, plan, t, stride_offset);
 }
