@@ -45,6 +45,8 @@ class ConfiguredBuild(build):
         )
         default_temp = self.build_temp is None
         super().finalize_options()
+        if not enabled("DEEPEP_BUILD_EP_GMM_FUSED"):
+            return
         # Registered only for the experiment; keep its default staging separate
         # from the core build while respecting explicit output directories.
         variant = "ep-gmm-fused-shared"
@@ -87,15 +89,26 @@ def source_fingerprint():
             "MANIFEST.in",
             "requirements-dev.txt",
             "requirements-build.txt",
+            ".gitmodules",
             "experiments/ep_gmm_fused/tests/requirements.txt",
             "third-party/deepseek-deepep.LICENSE",
+            "third-party/cann.LICENSE",
         )
     ]
-    for name in ("deep_ep", "csrc", "cmake", "scripts", "tests", "benchmarks", "experiments/ep_gmm_fused"):
+    for name in (
+        "deep_ep",
+        "csrc",
+        "cmake",
+        "scripts",
+        "tests",
+        "benchmarks",
+        "experiments/megamoe",
+        "experiments/ep_gmm_fused",
+    ):
         files.extend(
             path
             for path in (ROOT / name).rglob("*")
-            if (path.suffix in {".py", ".sh", ".cpp", ".hpp", ".h", ".cmake", ".json"} or path.name == "CMakeLists.txt")
+            if (path.suffix in {".sh", ".py", ".cpp", ".hpp", ".h", ".cmake", ".json"} or path.name == "CMakeLists.txt")
             and path.name != "_build_info.json"
         )
     digest = hashlib.sha256()
@@ -107,6 +120,28 @@ def source_fingerprint():
 
 def checked_run(argv, **kwargs):
     subprocess.run([str(arg) for arg in argv], check=True, timeout=1800, **kwargs)
+
+
+def validate_shmem_sdk(root, expected):
+    manifest = Path(root) / "deepep-sdk.json"
+    if not manifest.is_file():
+        raise RuntimeError("SHMEM SDK needs deepep-sdk.json; see scripts/record_shmem_sdk.py")
+    sdk = json.loads(manifest.read_text(encoding="utf-8"))
+    if sdk.get("revision") != expected["revision"]:
+        raise RuntimeError("SHMEM SDK source revision differs from dependencies.lock.json")
+    for relative, digest in expected["header_sha256_lf"].items():
+        data = (manifest.parent / "include" / relative).read_bytes().replace(b"\r\n", b"\n")
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise RuntimeError(f"SHMEM public API differs from the pinned SDK: {relative}")
+    for relative, digest in sdk["sha256"].items():
+        path = (manifest.parent / relative).resolve()
+        if not path.is_relative_to(manifest.parent.resolve()) or not path.is_file():
+            raise RuntimeError("Invalid SHMEM SDK manifest path")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise RuntimeError(f"SHMEM SDK checksum mismatch: {relative}")
+    if "lib/libshmem.so" not in sdk["sha256"] or not any(key.startswith("include/") for key in sdk["sha256"]):
+        raise RuntimeError("SHMEM SDK manifest must cover headers and libshmem.so")
+    return sdk
 
 
 def build_cache_key(configuration):
@@ -150,11 +185,17 @@ def build_configuration(environment=None):
         raise RuntimeError("Native wheels require Linux with an Ascend SDK")
     if env.get("DEEPEP_NPU_ARCH") != "Ascend950":
         raise RuntimeError("DEEPEP_NPU_ARCH must be Ascend950; other targets are unqualified")
-    if env.get("DEEPEP_BUILD_MEGAMOE", "OFF") != "OFF":
-        raise RuntimeError("MegaMoE is not implemented; DEEPEP_BUILD_MEGAMOE must be OFF")
+    beta = env.get("DEEPEP_BUILD_MEGAMOE", "OFF")
+    timer = env.get("DEEPEP_MEGAMOE_TIMER", "OFF")
+    if beta not in {"ON", "OFF"} or timer not in {"ON", "OFF"}:
+        raise RuntimeError("MegaMoE build options accept ON or OFF only")
+    if timer == "ON" and beta != "ON":
+        raise RuntimeError("MegaMoE timer requires DEEPEP_BUILD_MEGAMOE=ON")
     ep_gmm_fused = enabled("DEEPEP_BUILD_EP_GMM_FUSED", env)
     lineinfo = ep_gmm_fused and enabled("DEEPEP_LINEINFO", env)
     result = {"arch": "Ascend950", "python": sys.version, "machine": platform.machine()}
+    default_shmem = ROOT / "third-party/shmem/install/shmem"
+
     result["build_type"] = env.get("DEEPEP_BUILD_TYPE", "RelWithDebInfo" if lineinfo else "Release")
     if result["build_type"] not in {"Release", "RelWithDebInfo", "Debug"}:
         raise RuntimeError("DEEPEP_BUILD_TYPE must be Release, RelWithDebInfo or Debug")
@@ -162,9 +203,10 @@ def build_configuration(environment=None):
         ("ASCEND_HOME_PATH", "include/acl/acl.h"),
         ("SHMEM_ROOT", "include/host/shmem_host_def.h"),
     ):
-        value = env.get(name)
+        value = env.get(name, str(default_shmem) if name == "SHMEM_ROOT" else None)
         if not value or not (Path(value) / header).is_file():
-            raise RuntimeError(f"{name} must name an installed SDK containing {header}")
+            hint = "; for bundled SHMEM run python scripts/build_shmem.py first" if name == "SHMEM_ROOT" else ""
+            raise RuntimeError(f"{name} must name an installed SDK containing {header}{hint}")
         result[name] = str(Path(value).resolve())
     manifest = Path(result["SHMEM_ROOT"]) / "deepep-sdk.json"
     lock = json.loads((ROOT / "dependencies.lock.json").read_text(encoding="utf-8"))
@@ -193,6 +235,8 @@ def build_configuration(environment=None):
         if "lib/libshmem.so" not in hashes or not any(key.startswith("include/") for key in hashes):
             raise RuntimeError("SHMEM SDK manifest must cover headers and libshmem.so")
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        if beta == "ON":
+            raise
         warnings.warn(f"{exc}; continuing with SHMEM_ROOT={manifest.parent}", RuntimeWarning, stacklevel=2)
     library = manifest.parent / "lib/libshmem.so"
     if not library.is_file():
@@ -214,8 +258,8 @@ def build_configuration(environment=None):
         raise RuntimeError("pybind11 version differs from dependencies.lock.json")
     version_file = Path(result["ASCEND_HOME_PATH"]) / "compiler/version.info"
     versions = dict(line.split("=", 1) for line in version_file.read_text().splitlines() if "=" in line)
-    if versions.get("Version") != "9.2.0":
-        raise RuntimeError("This runtime build requires the CANN 9.2.0 qualification baseline")
+    if versions.get("Version") != lock["cann_version"]:
+        raise RuntimeError(f"This runtime build requires the CANN {lock['cann_version']} qualification baseline")
     result["cann"] = {
         "version": versions["Version"],
         "timestamp": versions.get("timestamp", "unknown"),
@@ -224,6 +268,22 @@ def build_configuration(environment=None):
     result["source_sha256"] = source_fingerprint()
     compiler, compiler_version = find_host_compiler(env)
     result["compiler_path"] = compiler
+    result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON"}
+    if beta == "ON":
+        catlass = Path(env.get("CATLASS_ROOT", str(ROOT / "third-party/catlass")))
+        if not (catlass / "include/catlass/gemm/tile/copy_l1_to_l0a.hpp").is_file():
+            raise RuntimeError(
+                "MegaMoE requires CATLASS: run git submodule update --init --recursive, "
+                "or set CATLASS_ROOT; see experiments/megamoe/README.md"
+            )
+        revision = subprocess.check_output(["git", "-C", str(catlass), "rev-parse", "HEAD"], text=True).strip()
+        if revision != lock["megamoe"]["catlass_revision"]:
+            raise RuntimeError("MegaMoE CATLASS revision differs from dependencies.lock.json")
+        import torch
+        import torch_npu
+
+        result["CATLASS_ROOT"] = str(catlass.resolve())
+        result["megamoe"].update(torch=torch.__version__, torch_npu=torch_npu.__version__, catlass=revision)
     result["compiler_sha256"] = hashlib.sha256(Path(compiler).read_bytes()).hexdigest()
     result["compiler_version_sha256"] = hashlib.sha256(compiler_version).hexdigest()
     print(f"Host C++ compiler: {compiler}", flush=True)
@@ -286,6 +346,16 @@ def build_configuration(environment=None):
     return result
 
 
+class VariantBuild(ConfiguredBuild):
+    def finalize_options(self):
+        # 隔离 ON/OFF 产物，避免连续构建把旧 Beta 模块打入基础 wheel。
+        beta = os.environ.get("DEEPEP_BUILD_MEGAMOE", "OFF") == "ON"
+        timer = os.environ.get("DEEPEP_MEGAMOE_TIMER", "OFF") == "ON"
+        variant = "megamoe-timer" if beta and timer else ("megamoe" if beta else "core")
+        self.build_base = str(Path(self.build_base) / variant)
+        super().finalize_options()
+
+
 class CMakeBuild(build_ext):
     def run(self):
         # Check before setuptools temporarily clears inplace during run().
@@ -297,6 +367,7 @@ class CMakeBuild(build_ext):
         import pybind11
 
         configuration = build_configuration()
+        megamoe = configuration.get("megamoe", {})
         ep_gmm_fused = configuration.get("ep_gmm_fused", {}).get("enabled", False)
         fingerprint = build_cache_key(configuration)
         directory = Path(self.build_temp).resolve() / fingerprint
@@ -320,6 +391,9 @@ class CMakeBuild(build_ext):
             f"-DCMAKE_CXX_COMPILER={configuration['compiler_path']}",
             f"-DASCEND_HOME_PATH={configuration['ASCEND_HOME_PATH']}",
             f"-DSHMEM_ROOT={configuration['SHMEM_ROOT']}",
+            f"-DDEEPEP_BUILD_MEGAMOE={'ON' if megamoe.get('enabled', False) else 'OFF'}",
+            f"-DDEEPEP_MEGAMOE_TIMER={'ON' if megamoe.get('timer', False) else 'OFF'}",
+            f"-DCATLASS_ROOT={configuration.get('CATLASS_ROOT', '')}",
             f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}",
             f"-DCMAKE_INSTALL_PREFIX={destination}",
         ]
@@ -348,6 +422,7 @@ class CMakeBuild(build_ext):
             not in {
                 "ASCEND_HOME_PATH",
                 "SHMEM_ROOT",
+                "CATLASS_ROOT",
                 "compiler_path",
                 "ep_gmm_fused_paths",
                 "cmake_path",

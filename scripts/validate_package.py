@@ -64,6 +64,24 @@ def inspect_wheel(path):
         if len([n for n in names if n.endswith("deepseek-deepep.LICENSE")]) != 1:
             raise RuntimeError("Wheel must include the adopted API's third-party license")
         info = json.loads(archive.read("deep_ep/_build_info.json"))
+        beta = info.get("megamoe", {}).get("enabled", False)
+        beta_names = [name for name in names if name.startswith("deep_ep_experimental/megamoe/")]
+        if beta:
+            required = {
+                "deep_ep_experimental/megamoe/api.py",
+                "deep_ep_experimental/megamoe/benchmark.py",
+                "deep_ep_experimental/megamoe/configs/smoke.json",
+                "deep_ep_experimental/megamoe/libmegamoe_kernel.so",
+            }
+            extensions = [
+                n for n in beta_names if n.startswith("deep_ep_experimental/megamoe/_C.") and n.endswith(".so")
+            ]
+            if len(extensions) != 1 or not required.issubset(names):
+                raise RuntimeError("Incomplete MegaMoE Beta wheel")
+            if not any(name.endswith("cann.LICENSE") for name in names):
+                raise RuntimeError("Missing CANN license for MegaMoE")
+        elif beta_names:
+            raise RuntimeError("MegaMoE Beta payload in an OFF wheel; use a fresh build directory")
         component = "deep_ep_experimental/ep_gmm_fused/"
         if any(component in n and not n.startswith(component) for n in names):
             raise RuntimeError("Wheel contains nested EP_GMM_FUSED staging artifacts")
@@ -159,6 +177,9 @@ def main():
         parser.error("EP roundtrip output must be outside the source tree")
     output.mkdir(parents=True, exist_ok=False)
     env = dict(os.environ, PYTHONNOUSERSITE="1", PYTHONUNBUFFERED="1")
+    # sdist 不包含子模块源码；两次构建必须使用原 checkout 的同一份依赖。
+    env.setdefault("SHMEM_ROOT", str(source / "third-party/shmem/install/shmem"))
+    env.setdefault("CATLASS_ROOT", str(source / "third-party/catlass"))
     env.pop("PYTHONPATH", None)
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     resolve_component_paths(env, source)
@@ -308,6 +329,13 @@ def main():
             "assert not torch.npu.is_initialized(); print('Installed shared EP_GMM_FUSED runtime verified')"
         )
     run([python, "-I", "-c", probe], output, env, 120)
+    if info.get("megamoe", {}).get("enabled"):
+        probe_beta = (
+            "import pathlib,sys; from deep_ep_experimental.megamoe.api import _extension; "
+            "m=_extension(); assert pathlib.Path(m.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve()); "
+            "assert callable(m.forward) and callable(m.buffer_size); print('Installed MegaMoE extension loaded; no device call')"
+        )
+        run([python, "-I", "-c", probe_beta], output, env, 120)
     # Copy tests, not the Python package: sys.path cannot select checkout code.
     shutil.copytree(source / "tests", output / "tests", ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copytree(

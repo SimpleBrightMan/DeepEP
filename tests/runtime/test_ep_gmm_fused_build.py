@@ -342,7 +342,7 @@ def test_lineinfo_only_affects_component_builds(build, sdk_environment, ep_gmm_f
         assert configuration["ep_gmm_fused"]["lineinfo"] is (ep_gmm_fused and lineinfo == "ON")
 
 
-@pytest.mark.parametrize("component", ["ep_gmm_fused", "megamoe", "nested"])
+@pytest.mark.parametrize("component", ["ep_gmm_fused", "other", "nested"])
 def test_disabled_component_check_leaves_other_experiments_alone(tmp_path, component):
     validator = load(ROOT / "scripts/validate_package.py")
     wheel = tmp_path / "test.whl"

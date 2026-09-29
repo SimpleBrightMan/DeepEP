@@ -112,6 +112,18 @@ int main(int argc, char** argv)
         assert(session.udma() && qp_count == 32);
         session.close();
         assert(!deepep::Session::busy());
+    } else if (mode == "megamoe") {
+        fails([]() { deepep::Session s(0, 256, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true); });
+        fails([]() { deepep::Session s(0, 2, 2ULL << 30, "tcp://127.0.0.1:19091", 30, false, true); });
+        fails([]() { deepep::Session s(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, true, true); });
+        assert(!deepep::Session::busy() && allocations == 0);
+        deepep::Session session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true);
+        assert(!session.udma() && qp_count == 0);
+        assert(session.workspace_address() == reinterpret_cast<uintptr_t>(session.workspace()));
+        assert(session.rank() == 0 && session.world() == 2);
+        session.close();
+        fails([&]() { session.workspace_address(); });
+        assert(!deepep::Session::busy());
     } else if (mode == "invalid") {
         fails([]() { deepep::Session s(0, 2, 3, "x", 0); });
         assert(!deepep::Session::busy() && allocations == 0);

@@ -37,7 +37,7 @@ def test_platform_and_architecture_rejected(build, monkeypatch):
         build.build_configuration({"DEEPEP_NPU_ARCH": "Ascend950"})
 
 
-@pytest.mark.parametrize("value", ["ON", "on", "yes", "1", ""])
+@pytest.mark.parametrize("value", ["on", "yes", "1", ""])
 def test_beta_never_silently_enabled(build, value):
     with pytest.raises(RuntimeError, match="MegaMoE"):
         build.build_configuration({"DEEPEP_NPU_ARCH": "Ascend950", "DEEPEP_BUILD_MEGAMOE": value})
@@ -46,6 +46,13 @@ def test_beta_never_silently_enabled(build, value):
 def test_missing_sdk_rejected(build):
     with pytest.raises(RuntimeError, match="ASCEND_HOME_PATH"):
         build.build_configuration({"DEEPEP_NPU_ARCH": "Ascend950"})
+
+
+def test_beta_requires_sdk_and_timer_requires_beta(build):
+    with pytest.raises(RuntimeError, match="ASCEND_HOME_PATH"):
+        build.build_configuration({"DEEPEP_NPU_ARCH": "Ascend950", "DEEPEP_BUILD_MEGAMOE": "ON"})
+    with pytest.raises(RuntimeError, match="MegaMoE"):
+        build.build_configuration({"DEEPEP_NPU_ARCH": "Ascend950", "DEEPEP_MEGAMOE_TIMER": "ON"})
 
 
 @pytest.mark.parametrize(
@@ -228,6 +235,39 @@ def test_elastic_wheel_requires_device_library(tmp_path, capability):
                 validator.inspect_wheel(wheel)
 
 
+@pytest.mark.parametrize(
+    "missing", [None, "deep_ep/libdeepep_kernels.so", "deep_ep_experimental/megamoe/libmegamoe_kernel.so"]
+)
+def test_combined_elastic_megamoe_wheel_requires_both_payloads(tmp_path, missing):
+    validator = load(ROOT / "scripts/validate_package.py")
+    info = {
+        "megamoe": {"enabled": True, "timer": True},
+        "capabilities": ["elastic-dispatch-expanded-v1", "elastic-combine-expanded-v3"],
+        "communication_operations": ["ElasticBuffer.dispatch", "ElasticBuffer.combine"],
+    }
+    members = {
+        "deep_ep/_C.fake.so",
+        "deep_ep/libdeepep_kernels.so",
+        "deep_ep/deepseek-deepep.LICENSE",
+        "deep_ep_experimental/megamoe/api.py",
+        "deep_ep_experimental/megamoe/benchmark.py",
+        "deep_ep_experimental/megamoe/configs/smoke.json",
+        "deep_ep_experimental/megamoe/_C.fake.so",
+        "deep_ep_experimental/megamoe/libmegamoe_kernel.so",
+        "deep_ep_experimental/megamoe/cann.LICENSE",
+    }
+    wheel = tmp_path / "combined.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("deep_ep/_build_info.json", json.dumps(info))
+        for name in sorted(members - {missing}):
+            archive.writestr(name, b"fixture")
+    if missing is None:
+        assert validator.inspect_wheel(wheel) == info
+    else:
+        with pytest.raises(RuntimeError, match="Device library|Incomplete MegaMoE"):
+            validator.inspect_wheel(wheel)
+
+
 def test_cache_survives_source_edits_but_not_toolchain_changes(build):
     configuration = {
         "source_sha256": "before",
@@ -257,7 +297,8 @@ def test_cache_survives_source_edits_but_not_toolchain_changes(build):
         assert build.build_cache_key({**configuration, name: value}) != key
 
 
-def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkeypatch, tmp_path):
+@pytest.mark.parametrize("beta,timer", [(False, False), (True, False), (True, True)])
+def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkeypatch, tmp_path, beta, timer):
     from setuptools import Distribution, Extension
 
     # This CPU-only test mocks the build tools, including their discovery paths.
@@ -267,6 +308,8 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     monkeypatch.setitem(sys.modules, "pybind11", pybind11)
 
     configuration = {
+        "megamoe": {"enabled": beta, "timer": timer},
+        "CATLASS_ROOT": "/private/catlass" if beta else "",
         "source_sha256": "current",
         "source_version": "1",
         "cmake_path": "/tools/cmake",
@@ -308,6 +351,8 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     command.build_extension(ext)
     assert "-DCMAKE_BUILD_TYPE=RelWithDebInfo" in calls[0]
     assert "-DDEEPEP_DEVICE_JOBS=6" in calls[0]
+    assert f"-DDEEPEP_BUILD_MEGAMOE={'ON' if beta else 'OFF'}" in calls[0]
+    assert f"-DDEEPEP_MEGAMOE_TIMER={'ON' if timer else 'OFF'}" in calls[0]
     assert f"-Dpybind11_DIR={pybind11_cmake_dir}" in calls[0]
     assert calls[1][-2:] == ["--parallel", "6"]
     assert not (destination / "libdeepep_notify.so").exists()
@@ -315,6 +360,8 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     info = json.loads((destination / "_build_info.json").read_text())
     assert info["capabilities"] == capabilities["capabilities"]
     assert info["source_sha256"] == "current"
+    assert info["megamoe"] == {"enabled": beta, "timer": timer}
+    assert "CATLASS_ROOT" not in info
     assert not {"cmake_path", "compiler_path", "python_executable", "build_environment"}.intersection(info)
 
 

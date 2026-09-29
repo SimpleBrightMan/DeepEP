@@ -1,0 +1,2 @@
+-r ../../../requirements-dev.txt
+numpy==1.26.4

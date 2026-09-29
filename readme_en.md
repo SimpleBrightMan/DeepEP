@@ -200,9 +200,15 @@ python -m pip install -v --no-build-isolation --no-deps .
 
 The package name is `ascend-deepep`; the Python import is `deep_ep`. See the [build guide](docs/build.md) for wheel packaging and multi-node installation.
 
-> 🚧 **TBD | MegaMoE installation**
->
-> MegaMoE build and installation command.
+### Install MegaMoE
+
+With matching Torch/torch_npu and CANN 9.2.0, run:
+
+```bash
+bash experiments/megamoe/scripts/build.sh
+```
+
+The script prepares dependencies and builds and installs a wheel with MegaMoE and timer support. Subsequent builds reuse the validated SHMEM SDK. Direct `pip wheel` builds keep MegaMoE disabled by default. See the [MegaMoE guide](experiments/megamoe/README.md) for multi-node configuration and validation. Device compilation, accuracy and performance qualification remain outstanding.
 
 ## Interfaces and examples
 

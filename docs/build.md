@@ -1,6 +1,7 @@
 # 构建、打包与安装
 
 当前 wheel 包含 Host 运行时、Notify 元数据、展开式 dispatch 和 BF16 combine kernel，接口限制见 [Elastic 文档](elastic.md)。
+MegaMoE 是可选的实验构建。
 详细范围、资源所有权和验收矩阵见[运行时设计](runtime-design.md)。
 包名为 `ascend-deepep`，导入名仍为 `deep_ep`；不要与其他提供 `deep_ep` 的包装在同一环境。
 
@@ -8,35 +9,62 @@
 
 - Linux、Python ≥3.11、C++17 编译器、CMake ≥3.20，以及 Make 或 Ninja；构建工具须在 PATH 中。
 - CANN 9.2.0 与配套驱动/框架，目标 Ascend950；其他组合尚未放开。
-- 预先构建固定提交的 SHMEM SDK（见 `dependencies.lock.json`），安装根包含 `include/`、
+- 由本仓子模块构建或使用外部固定提交的 SHMEM SDK（见 `dependencies.lock.json`），安装根包含 `include/`、
   `lib/libshmem.so` 以及 `src/device`、`src/device_simt` 等 Device 头文件。
 - 普通（HT）dispatch/combine 依赖 [SHMEM PR #851](https://gitcode.com/cann/shmem/pull/851)
   的 shared-jetty 支持，包括 Host 配置接口和 Device 共享队列状态；当前构建使用锁文件中固定的 PR 分支提交。
 - CANN 安装中须包含 `tools/bisheng_compiler/bin/bisheng`，Device 使用 `-xasc` 编译。
 - 普通 CPU 测试仅需 `requirements-dev.txt`；wheel 构建依赖固定在 `pyproject.toml`。
-- 本仓不自动下载/编译外部 SDK，不将驱动/CANN/SHMEM 打入 wheel。SDK 及其传递依赖必须由部署环境提供。
+- wheel 构建不自动下载/编译外部 SDK，不将驱动/CANN/SHMEM 打入 wheel。SDK 及其传递依赖必须由部署环境提供。
+
+## 可选 MegaMoE 构建
+
+MegaMoE 的构建和多机测试入口位于 `experiments/megamoe/scripts/`，
+命令、依赖和环境配置见 [MegaMoE 使用说明](../experiments/megamoe/README.md#2-编译安装)。
+基础包使用下面的通用构建流程，默认不启用 MegaMoE。
+
+## 分步骤构建（外部 SDK、打包或 CI）
+
+直接 pip/build 默认关闭 MegaMoE。从 Git checkout 首次准备：
 
 ```bash
-# 在仓库根目录执行，先激活已安装匹配 torch/torch_npu 的 Python 环境。
-source /path/to/ascend-toolkit/set_env.sh
+source "$CANN_ENV"
+git submodule update --init --recursive
+unset SHMEM_ROOT CATLASS_ROOT  # 使用仓内依赖；外部 SDK 用户见下文。
+python scripts/build_shmem.py
 export DEEPEP_NPU_ARCH=Ascend950
-export SHMEM_ROOT=/path/to/pinned/shmem-sdk
-source "$SHMEM_ROOT/set_env.sh"
-export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
-
-# 仅首次使用、且 SDK 中没有 deepep-sdk.json 时执行；已有 manifest 时跳过此命令。
-python scripts/record_shmem_sdk.py --sdk "$SHMEM_ROOT" \
-  --revision "$(python -c 'import json; print(json.load(open("dependencies.lock.json"))["shmem"]["revision"])')"
+export LD_LIBRARY_PATH="$PWD/third-party/shmem/install/shmem/lib:${LD_LIBRARY_PATH:-}"
 
 python -m pip install -r requirements-build.txt
 ```
 
+主构建默认查找 `third-party/shmem/install/shmem`；MegaMoE 启用时默认查找 `third-party/catlass`。
+准备脚本只构建锁定的原始 SHMEM，不打实验补丁；已有 build/install 时要求显式 `--rebuild`（会再生成这些构建产物）。
+更换 SDK 前停止使用它的作业，之后重建 wheel。完整边界及离线依赖见 [第三方依赖](../third-party/README.md)。
+
+已有外部 SDK 时跳过准备脚本，保留原来的覆盖方式：
+
+```bash
+export SHMEM_ROOT=/path/to/pinned/shmem-sdk
+source "$SHMEM_ROOT/set_env.sh"
+export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
+# 仅未登记身份的 SDK 运行一次；不能改 manifest 来绕过源码/二进制检查。
+python scripts/record_shmem_sdk.py --sdk "$SHMEM_ROOT" \
+  --revision "$(python -c 'import json; print(json.load(open("dependencies.lock.json"))["shmem"]["revision"])')"
+# 启用 MegaMoE 且不用仓内子模块时，再设置 CATLASS_ROOT=/path/to/pinned/catlass。
+```
+
+sdist 不携带子模块，解包后构建需显式设置 SHMEM_ROOT，以及 Beta 构建所需的 CATLASS_ROOT。
+下方自动化验证入口会将原 checkout 的默认依赖路径固定为绝对路径，确保 sdist 重建使用相同 SDK。
+
 版本声明由 SDK 提供方负责，脚本校验固定公共头文件、记录头文件及库的校验和；不把“头文件一致”等同于“二进制来源可信”。
-若 SDK 无法匹配，必须提供固定提交的构建，不能修改 manifest 绕过检查。
+基础构建对 SDK 身份或校验和不匹配发出警告，并记录实际头文件和库的校验和；缺少必需文件仍会失败。
+MegaMoE 构建及仓内 SDK 复用保持严格校验，SDK 必须与锁文件匹配，不能修改 manifest 绕过检查。
 
 `setup.py` 元数据查询不需要 SDK/框架。实际构建只经 `build_support.py` 调用根 CMake。
 不同工具链、SDK、Python 环境和构建模式使用不同指纹目录；源码哈希仅用于标识产物，
-不再因修改 Python、测试或单个 kernel 而切换整个构建目录。`DEEPEP_BUILD_MEGAMOE` 仅允许 OFF。
+不再因修改 Python、测试或单个 kernel 而切换整个构建目录。`DEEPEP_BUILD_MEGAMOE` 默认 OFF；
+ON 的实验构建见 [MegaMoE Beta](../experiments/megamoe/README.md)，尚待设备验收。
 安装产物没有构建机绝对 RPATH，使用部署环境的 SDK 路径；加载时核对实际 SHMEM 二进制身份。
 
 ## 日常构建与后续算子接入

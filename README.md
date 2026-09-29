@@ -200,9 +200,15 @@ python -m pip install -v --no-build-isolation --no-deps .
 
 发行包名为 `ascend-deepep`，Python 导入名为 `deep_ep`。Wheel 打包和多机安装见[构建指南](docs/build.md)。
 
-> 🚧 **待补充｜MegaMoE 安装**
->
-> MegaMoE 构建与安装命令。
+### 安装 MegaMoE
+
+在匹配 Torch/torch_npu 的环境中加载 CANN 9.2.0 后运行：
+
+```bash
+bash experiments/megamoe/scripts/build.sh
+```
+
+脚本准备依赖并构建、安装启用 MegaMoE 和 timer 的 wheel，日常重编复用已校验的 SHMEM。直接使用 `pip wheel` 时默认不构建 MegaMoE。多机配置和验证步骤见 [MegaMoE 使用说明](experiments/megamoe/README.md)；设备编译、精度与性能仍待验收。
 
 ## 接口与示例
 

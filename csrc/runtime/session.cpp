@@ -27,12 +27,14 @@ bool Session::busy()
     return occupied || aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED;
 }
 
-Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma)
+Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
+                 bool megamoe)
 {
     constexpr uint64_t alignment = 2ULL * 1024 * 1024;
-    if (size < 2 || size > 256 || (size & (size - 1)) || rank < 0 || rank >= size || bytes < alignment ||
-        bytes > 32ULL * 1024 * 1024 * 1024 || bytes % alignment != 0 || timeout < 1 || timeout > 300 ||
-        endpoint.empty() || endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN || endpoint.find('\0') != std::string::npos) {
+    if (size < 2 || size > (megamoe ? 128 : 256) || (!megamoe && (size & (size - 1))) || rank < 0 || rank >= size ||
+        bytes < alignment || bytes > (megamoe ? 1ULL : 32ULL) * 1024 * 1024 * 1024 || bytes % alignment != 0 ||
+        timeout < 1 || timeout > 300 || (megamoe && udma) || endpoint.empty() ||
+        endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN || endpoint.find('\0') != std::string::npos) {
         throw std::invalid_argument("Invalid rank, capacity, timeout or bootstrap endpoint");
     }
     std::lock_guard<std::mutex> guard(runtime_mutex);
@@ -201,6 +203,12 @@ void Session::check_context() const
     if (current != context_) {
         throw std::runtime_error("Use the runtime on its creating NPU context");
     }
+}
+
+uintptr_t Session::workspace_address() const
+{
+    check_context();
+    return reinterpret_cast<uintptr_t>(workspace_);
 }
 
 void Session::barrier()

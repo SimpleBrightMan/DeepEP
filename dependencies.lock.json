@@ -1,10 +1,11 @@
 {
   "schema_version": 1,
+  "cann_version": "9.2.0",
   "shmem": {
     "repository": "https://gitcode.com/cann/shmem",
     "ref": "refs/merge-requests/851/head",
     "revision": "2057780fe2b8a9d7cd97d5d60b3230493b235cfa",
-    "distribution": "external SDK; headers and library recorded by record_shmem_sdk.py",
+    "distribution": "pinned third-party/shmem submodule or external SDK; headers and library recorded by record_shmem_sdk.py",
     "header_sha256_lf": {
       "host/shmem_host_def.h": "659aaa719af9c38bafef72921a73cca325c3c30f0f43be30b6ba9f0535de6cf6",
       "host/init/shmem_host_init.h": "d1f35d7d15bd2121b7c4092c7c0a8c8dae1d7153166eb45628484e194c171419",
@@ -28,5 +29,10 @@
     "expanded-dispatch-low-latency",
     "expanded-combine-low-latency"
   ],
-  "qualification": "See docs/runtime-design.md; build success does not qualify EP operations"
+  "qualification": "See docs/runtime-design.md; build success does not qualify EP operations",
+  "megamoe": {
+    "catlass_repository": "https://gitcode.com/cann/catlass",
+    "catlass_revision": "2b4bd7cbf7e67ebab23d7d5a99d472c83f90d9a1",
+    "qualification": "CPU tests only; Ascend950 multi-rank validation required"
+  }
 }

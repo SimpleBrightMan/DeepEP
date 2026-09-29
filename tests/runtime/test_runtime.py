@@ -115,6 +115,29 @@ def test_invalid_endpoint(monkeypatch, value):
         _runtime.endpoint()
 
 
+def test_host_boot_id_is_read_from_proc(monkeypatch):
+    def read(path):
+        assert path.as_posix() == "/proc/sys/kernel/random/boot_id"
+        return " 11111111-2222-4333-8444-555555555555\n"
+
+    monkeypatch.setattr(_runtime.Path, "read_text", read)
+    assert _runtime._host_boot_id() == "11111111222243338444555555555555"
+
+
+@pytest.mark.parametrize("value", ["", "cpu1", "not-a-uuid", "\ufffd"])
+def test_invalid_host_boot_id_returns_collective_failure_marker(monkeypatch, value):
+    monkeypatch.setattr(_runtime.Path, "read_text", lambda _: value)
+    assert _runtime._host_boot_id() == ""
+
+
+def test_unreadable_host_boot_id_returns_collective_failure_marker(monkeypatch):
+    def unreadable(_):
+        raise PermissionError("proc is not readable")
+
+    monkeypatch.setattr(_runtime.Path, "read_text", unreadable)
+    assert _runtime._host_boot_id() == ""
+
+
 @pytest.mark.parametrize(
     "cls,options",
     [

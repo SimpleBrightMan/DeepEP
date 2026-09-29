@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 
-def record(sdk, revision):
+def record(sdk, revision, *, build_info=None):
     sdk = Path(sdk).resolve()
     lock = json.loads((Path(__file__).resolve().parents[1] / "dependencies.lock.json").read_text())
     expected = lock["shmem"]
@@ -30,7 +30,10 @@ def record(sdk, revision):
     manifest = sdk / "deepep-sdk.json"
     if manifest.exists():
         raise FileExistsError("SDK manifest already exists; do not overwrite an existing SDK identity")
-    manifest.write_text(json.dumps({"revision": revision, "sha256": hashes}, indent=2) + "\n")
+    identity = {"revision": revision, "sha256": hashes}
+    if build_info is not None:
+        identity["build"] = build_info
+    manifest.write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
     return manifest
 
 

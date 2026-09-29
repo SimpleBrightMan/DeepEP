@@ -13,7 +13,8 @@ namespace deepep {
 // and the SHMEM instance are owned here. Destruction is an explicit collective.
 class Session {
 public:
-    Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma = false);
+    Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma = false,
+            bool megamoe = false);
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
     ~Session() = default;  // Never start collectives from Python GC/interpreter exit.
@@ -28,6 +29,8 @@ public:
         return bytes_;
     }
     static bool busy();
+    // 仅借给可选 MegaMoE 扩展；内存仍由本 Session 独占并显式销毁。
+    uintptr_t workspace_address() const;
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
     static std::unique_ptr<Session> create_udma(int rank, int size, uint64_t heap_bytes, uint64_t workspace_bytes,
                                                 const std::string& endpoint, const std::vector<uint8_t>& uid_bytes);

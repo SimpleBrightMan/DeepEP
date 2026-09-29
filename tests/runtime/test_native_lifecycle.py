@@ -50,6 +50,7 @@ def lifecycle_binary(tmp_path_factory):
         "close-fault",
         "normal",
         "udma",
+        "megamoe",
         "low-latency",
         "ep16-small-workspace",
     ],

@@ -1,4 +1,5 @@
 #include <pybind11/pybind11.h>
+#include <memory>
 #include <dlfcn.h>
 #include "host/init/shmem_host_init.h"
 #include "runtime/session.hpp"
@@ -31,6 +32,15 @@ PYBIND11_MODULE(_C, module)
         .def("close", &deepep::Session::close, py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("closed", &deepep::Session::closed)
         .def_property_readonly("capacity", &deepep::Session::capacity);
+#ifdef DEEPEP_BUILD_MEGAMOE
+    module.def(
+        "create_megamoe_runtime",
+        [](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout) {
+            return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, false, true);
+        },
+        py::call_guard<py::gil_scoped_release>());
+    module.def("megamoe_workspace_address", &deepep::Session::workspace_address);
+#endif
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
     module.def("create_udma_runtime", &deepep::Session::create_udma, py::arg("rank"), py::arg("size"),
                py::arg("heap_bytes"), py::arg("workspace_bytes"), py::arg("endpoint"), py::arg("uid_bytes"),

@@ -31,6 +31,7 @@ compile_commands.json
 !.env.example
 *.log
 /benchmark-runs/
+/benchmark-golden/
 /api-contracts.xml
 /cpu-correctness.xml
 /source-tests.xml
@@ -40,6 +41,9 @@ Thumbs.db
 .idea/
 .vscode/
 
+# User-owned MegaMoE deployment configuration
+/experiments/megamoe/hosts*.json
+/experiments/megamoe/clusters*.json
 /.test-deps/
 /.venv-comm-gmm/
 /.venv-ep-gmm-fused/

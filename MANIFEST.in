@@ -1,4 +1,5 @@
 include VERSION CMakeLists.txt build_support.py dependencies.lock.json
+include .gitmodules
 include requirements-dev.txt pytest.ini
 include requirements-build.txt
 recursive-include cmake *.cmake CMakeLists.txt
@@ -9,6 +10,9 @@ recursive-include tests *.py *.json *.cpp *.h *.md
 recursive-include benchmarks *.py *.json *.csv *.md
 include third-party/*.md third-party/*.LICENSE
 recursive-include third-party/ascend-deepep *.py
+prune third-party/shmem
+prune third-party/catlass
+recursive-include experiments/megamoe *.sh *.py *.cpp *.hpp *.cmake CMakeLists.txt *.json *.md *.txt *.LICENSE
 include experiments/__init__.py
 include experiments/ep_gmm_fused/tests/requirements.txt
 recursive-include experiments/ep_gmm_fused *.py *.cpp *.hpp *.h *.cmake CMakeLists.txt *.md *.json LICENSE

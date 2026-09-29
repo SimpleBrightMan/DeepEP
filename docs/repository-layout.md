@@ -94,6 +94,8 @@ DeepEP/
 │   └── build_info.json.in  # 实际配套和能力的构建信息模板
 ├── third-party/
 │   ├── README.md  # 依赖来源、可选能力与版本说明
+│   ├── cann.LICENSE  # MegaMoE 源文件声明的 CANN 许可全文
+│   ├── deepseek-deepep.LICENSE  # 采用的 API 声明的 MIT 许可全文
 │   ├── shmem/  # （依赖）固定版本源码根或已安装 SHMEM SDK
 │   ├── catlass/  # （可选）由所选计算/架构组件使用
 │   └── catccos/  # （可选）由所选通算融合模板使用
@@ -154,27 +156,35 @@ DeepEP/
     └── megamoe/
         ├── README.md  # （Beta）Beta 定位、支持域和复现入口
         ├── CMakeLists.txt  # （Beta）独立目标与条件安装
+        ├── scripts/  # 实验构建、多机启动和远端执行；机器配置由使用者提供
+        │   ├── build.sh
+        │   ├── build.py
+        │   ├── batch_launch.py
+        │   └── batch_node.py
         ├── csrc/
-        │   ├── python_api.cpp  # （Beta）实验扩展注册入口
-        │   ├── forward.hpp  # （Beta）MegaMoE Host 操作声明
-        │   ├── forward.cpp  # （Beta）业务参数与启动组织
+        │   ├── bindings.cpp  # （Beta）独立 Torch 扩展注册入口
+        │   ├── forward.hpp  # （Beta）可复用 Plan 声明
+        │   ├── forward.cpp  # （Beta）资源准备、参数校验与启动
+        │   ├── kernel_launch.hpp  # Host / Device 共享的入口声明
         │   └── kernels/
-        │       ├── forward.cpp  # （Beta）融合 Device Kernel 入口
-        │       ├── dispatch_gmm.hpp  # （按需）Beta 内的分发与 GMM 组合；按具体模板分文件
-        │       ├── swiglu.hpp  # （按需）Beta 内的激活/量化实现；按实际代码体量分文件
-        │       ├── gmm_combine.hpp  # （按需）Beta 内的 GMM 与归并组合；按具体模板分文件
-        │       └── variants.json  # （Beta）Beta 变体声明
+        │       └── mega_moe/  # Prefill kernel 的 wave/stage/epilogue 组织
         ├── python/
         │   └── deep_ep_experimental/
         │       ├── __init__.py  # （Beta）独立实验命名空间
         │       └── megamoe/
         │           ├── __init__.py  # （Beta）实验功能导出
-        │           ├── _api.py  # （Beta）当前版本的调用包装
-        │           ├── benchmark.py  # （Beta）随包安装的性能体验入口
+        │           ├── api.py  # （Beta）DeepGEMM 风格主入口与资源 owner
+        │           ├── example.py  # torchrun 可直接运行的最小例子
+        │           ├── benchmark.py  # 同一公开 API 的精度/性能/独立打点
+        │           ├── reference.py  # 独立 NumPy 量化感知参考
+        │           ├── golden.py  # CPU 专家并行 Golden、缓存和混合误差判据
+        │           ├── validation.py  # 显式主机预检查
+        │           ├── timer/  # 原始数据的离线解析
         │           └── configs/
-        │               └── default.json  # （Beta）Beta 负载/策略示意
+        │               ├── smoke.json
+        │               └── deepseek_v4_pro.json
         └── tests/
-            └── test_forward.py  # （Beta）Beta 业务正确性与端到端用例
+            └── test_*.py  # CPU 控制流/参考/协议/打包回归；不等同于 NPU 验收
 ```
 
 ## 文档与导航
