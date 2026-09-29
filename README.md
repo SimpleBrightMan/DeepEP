@@ -1,29 +1,27 @@
-<h1 align="center">DeepEP</h1>
+# DeepEP
 
-<div align="center">
+---
 
-简体中文 | <a href="./readme_en.md">English</a>
+简体中文 | [English](readme_en.md)
 
-</div>
+**DeepEP 昇腾版本**（`Ascend/DeepEP`）是面向 Ascend NPU 混合专家模型（Mixture-of-Experts，MoE）推理的专家并行（Expert Parallelism，EP）通信库，提供高吞吐 **Prefill**、低时延 **Decode** 通信，以及实验性 **MegaMoE** 融合推理。
 
-<div align="center">
+## 最新进展
 
-[![Document](https://img.shields.io/badge/Document-DeepEP-blue)](docs/README.md)
-[![Platform](https://img.shields.io/badge/Platform-Ascend%20NPU-red)](https://www.hiascend.com/)
-[![Kernel](https://img.shields.io/badge/Kernel-AscendC-brightgreen)](csrc/kernels/README.md)
-[![Communication](https://img.shields.io/badge/Communication-SHMEM-lightgrey)](https://gitcode.com/cann/shmem)
+---
 
-</div>
+**DeepEP V2 昇腾版。** Prefill 与 Decode 共用 `deep_ep.ElasticBuffer` 接口，通过 `dispatch()` 和 `combine()` 完成 token 分发与结果归并。
 
-面向 Ascend NPU 的专家并行（Expert Parallelism，EP）通信库，为 MoE 训练和推理提供 token 分发、结果归并与路由布局支持。
+### 新增特性
 
-项目计划通过 `deep_ep` 提供原生 DeepEP 风格的 V1/V2 用户接口，以 AscendC 实现设备算子，以 SHMEM 作为首发通信基础。MegaMoE Beta 作为独立实验单元，探索通信与专家计算融合。
+- **高吞吐 Prefill：** 基于 URMA 的 dispatch/combine，集成 notify 与 Server 级 token 去重，覆盖 EP32/64/128/256。
+- **低时延 Decode：** 通过同一 V2 接口提供小批量 dispatch/combine，覆盖 EP64/128。
+- **MegaMoE Prefill（实验性）：** W4A8 通信与专家计算融合，覆盖 EP32/64/128。
+- **MegaMoE Decode（实验性）：** 小批量 W4A8 融合推理，覆盖 EP64/128，与 Prefill 共用同一个 MegaMoE 前向入口。
 
-> **项目处于早期开发阶段。** 已提供 API 契约、独立 CPU 参考、运行时和真实事件。[V2 expanded dispatch / combine](docs/elastic.md) 已接通 Notify、BF16/FP8 dispatch 和 BF16 combine；各规模仍需设备验收。V1 算法尚未实现。支持边界见接口文档，测试方法见[测试说明](tests/README.md)。
+### 架构
 
-## 架构
-
-以下为 DeepEP 的目标架构：连接上层 MoE 框架与 Ascend 设备实现，按接口契约、业务与执行准备、设备算子和平台依赖组织各层职责。各模块尚待实现与设备验证。
+DeepEP 通过 V2 接口连接推理框架与昇腾通信算子；MegaMoE 将 token 通信、专家计算、激活和量化整合为融合前向流程。
 
 <p align="center">
   <a href="figures/architecture.svg">
@@ -31,85 +29,294 @@
   </a>
 </p>
 
-核心 EP 计划通过 V1/V2 接口组织 token 分发与归并，可融合布局处理、数据重排和量化，专家计算由调用框架组织。MegaMoE Beta 计划使用独立实验性 API，以超大融合算子覆盖通信、专家计算及激活等 MoE 流程。
-
-设计中，两类业务按需共享运行上下文、资源和完成对象，并结合拓扑与执行策略选择实现。SHMEM 提供通信基础，CATLASS 和 CatCCOS 按所选算子需要引入。图中实线箭头表示调用或启动，虚线箭头表示支撑或依赖。
-
-## 规划功能
-
-| 功能 | 目标入口 | 当前状态 |
-| --- | --- | --- |
-| V1 专家通信 | `Buffer`；layout、dispatch、combine | 待实现 |
-| V1 低时延 | 专用 dispatch/combine 流程 | 待实现、单独验证 |
-| V2 专家通信 | `ElasticBuffer`、`EPHandle` | expanded dispatch 和 BF16 combine 已接通；设备资格待验证 |
-| 通信计算重叠 | 事件与异步选项 | 待实现 |
-| MegaMoE Beta | `deep_ep_experimental.megamoe` | 待实现、可选构建 |
-
-API 一致性覆盖导入、参数、返回布局、handle 复用和完成行为。功能资格以固定的原生 API 基线及目标设备验证记录为准，详见 [API 规划](docs/api.md)和[路线图](docs/roadmap.md)。
-
-## 目录结构
-
 ```text
 DeepEP/
-├── deep_ep/              # Python API 家族与完成包装
-├── csrc/                 # bindings、ops、runtime、execution、kernels、device
-├── cmake/                # Host/AscendC 构建与安装规则
-├── third-party/          # 固定版本依赖源码或 SDK 接入
-├── configs/              # 拓扑、执行策略、发行预设
-├── tests/                # API、V1/V2 正确性、集成验证
-├── benchmarks/           # 通信性能测量与结果记录
-├── examples/             # 完整公开 API 使用流程
-├── experiments/megamoe/  # 独立、可选的 Beta 实现单元
-├── docs/                 # 架构、API、构建、性能、开发说明
-└── figures/              # 文档图稿
+├── deep_ep/
+│   ├── buffers/             # Python 接口
+│   └── utils/               # 事件与公共工具
+├── csrc/
+│   ├── bindings/            # Python/C++ 绑定
+│   ├── runtime/             # 通信资源与生命周期
+│   └── kernels/             # Ascend C 通信算子
+├── experiments/
+│   └── megamoe/             # MegaMoE 融合推理
+├── cmake/                   # 构建与安装
+├── third-party/             # 依赖组件
+├── configs/                 # 部署与执行配置
+├── tests/                   # 正确性与回归测试
+├── benchmarks/              # 性能测试
+├── examples/                # 集成示例
+├── docs/                    # 详细文档
+└── figures/                 # 架构与性能图
 ```
 
-各模块 README 说明维护职责；[目录设计](docs/repository-layout.md)列出规划中的源码组织与文件分工。
-
-## 用户 API 与业务流程
-
-V1 目标流程为布局准备 → dispatch → 专家计算 → combine。V2 通过 `ElasticBuffer` 和 `EPHandle` 组织调用，专家计算消费对应返回布局。异步路径在读取通信结果前建立必要的完成依赖。
-
-专家计算由框架或选定融合实现负责。具体签名和目标语义见 [docs/api.md](docs/api.md)。当前 V2 已实现展开式数据传输与归约，支持范围和限制见 [Elastic 接口](docs/elastic.md)；V1 算法仍待实现。
+模块职责见[架构文档](docs/architecture.md)。
 
 ## 性能
 
-目前没有目标设备实测数据。标准 EP 分别报告 dispatch/combine 延迟，并说明带宽计算口径；MegaMoE 报告相同业务语义下的完整流程延迟及基线。每条结果记录源码版本、环境、拓扑、shape、精度、计时边界和复现命令。
+---
 
-已提供 [benchmark CLI](benchmarks/README.md)、无设备 dry-run、计时/统计引擎及 JSON/CSV 协议。原生测量适配器尚未接入，非 dry-run 会在设备初始化前拒绝执行；规划结果不是实测数据。设计见[benchmark 详细设计](docs/benchmark-design.md)，口径见[性能文档](docs/performance.md)，结果格式见 [CSV 模板](benchmarks/results/template.csv)。
+**测试环境：** Ascend950，CANN 9.2.0。
 
-## 环境与安装
+> 🚧 **待补充｜测试环境**
+>
+> 互联配置、框架版本与测试提交。
 
-目标环境包含 Ascend NPU、匹配的驱动/CANN/AscendC、SHMEM、Python、PyTorch 和 `torch_npu`。具体版本与设备支持待验证；CATLASS 和 CatCCOS 按实际实现选用。
+### 高吞吐算子
 
-获取仓库：
+**DeepEP V2 Prefill：** `Seq ≥ 4K`、`H = 7168`、`top-k = 6`。带宽为全 EP rank 聚合的逻辑有效带宽。
+
+> 🚧 **待补充｜Prefill 测试配置**
+>
+> 专家数、路由分布与每 rank token 数。
+
+| EP 规模 | dtype (Dispatch / Combine) | Dispatch 带宽（GB/s） | Combine 带宽（GB/s） |
+| --- | --- | --- | --- |
+| 32 | BF16 / BF16 | 🚧 待补充 | 🚧 待补充 |
+| 32 | FP8 / BF16 | 🚧 待补充 | 🚧 待补充 |
+| 64 | BF16 / BF16 | 🚧 待补充 | 🚧 待补充 |
+| 64 | FP8 / BF16 | 🚧 待补充 | 🚧 待补充 |
+| 128 | BF16 / BF16 | 🚧 待补充 | 🚧 待补充 |
+| 128 | FP8 / BF16 | 🚧 待补充 | 🚧 待补充 |
+| 256 | BF16 / BF16 | 🚧 待补充 | 🚧 待补充 |
+| 256 | FP8 / BF16 | 🚧 待补充 | 🚧 待补充 |
+
+![不同 EP 规模的 FP8 dispatch / BF16 combine 带宽](figures/performance_prefill.svg)
+
+#### Server 级去重
+
+Server 级去重减少同一 token 向相同目标 Server 的重复传输。
+
+> 🚧 **待补充｜Server 级去重测试配置**
+>
+> EP 规模、Server 分组与路由分布。
+
+| 指标 | 基线 | Server 级去重 |
+| --- | --- | --- |
+| 跨 Server 数据量（GB） | 🚧 待补充 | 🚧 待补充 |
+| Dispatch 时延（µs） | 🚧 待补充 | 🚧 待补充 |
+| Combine 时延（µs） | 🚧 待补充 | 🚧 待补充 |
+
+![Server 级去重时延对比](figures/performance_dedup.svg)
+
+### 低时延算子
+
+**DeepEP V2 Decode：** `BS = 32 / 96 / 256`、`H = 7168`、`top-k = 6`。各时延单元格中的三个数值按 BS `32 / 96 / 256` 的顺序填写。
+
+> 🚧 **待补充｜Decode 测试配置**
+>
+> 专家数与每 rank token 数。
+
+| EP 规模 | BS | dtype (Dispatch / Combine) | Dispatch 时延（µs） | Combine 时延（µs） |
+| --- | --- | --- | --- | --- |
+| 64 | 32 / 96 / 256 | BF16 / BF16 | 🚧 待补充 / 待补充 / 待补充 | 🚧 待补充 / 待补充 / 待补充 |
+| 64 | 32 / 96 / 256 | FP8 / BF16 | 🚧 待补充 / 待补充 / 待补充 | 🚧 待补充 / 待补充 / 待补充 |
+| 128 | 32 / 96 / 256 | BF16 / BF16 | 🚧 待补充 / 待补充 / 待补充 | 🚧 待补充 / 待补充 / 待补充 |
+| 128 | 32 / 96 / 256 | FP8 / BF16 | 🚧 待补充 / 待补充 / 待补充 | 🚧 待补充 / 待补充 / 待补充 |
+
+![不同 BS 的 FP8 dispatch / BF16 combine 时延](figures/performance_decode.svg)
+
+### MegaMoE 高吞吐算子——实验性
+
+**MegaMoE Prefill：** `Seq ≥ 4K`、`W4A8`。
+
+> 🚧 **待补充｜MegaMoE Prefill 测试配置**
+>
+> 完整模型、路由与量化配置。
+
+| EP 规模 | 融合 MoE 时延（µs） | Cube 利用率（%） | 通信掩盖率（%） |
+| --- | --- | --- | --- |
+| 32 | 🚧 待补充 | 🚧 待补充 | 🚧 待补充 |
+| 64 | 🚧 待补充 | 🚧 待补充 | 🚧 待补充 |
+| 128 | 🚧 待补充 | 🚧 待补充 | 🚧 待补充 |
+
+![MegaMoE Prefill 时延对比](figures/performance_megamoe_prefill.svg)
+
+### MegaMoE 低时延算子——实验性
+
+**MegaMoE Decode：** `BS = 96`、`W4A8`。
+
+> 🚧 **待补充｜MegaMoE Decode 测试配置**
+>
+> 完整模型、路由与量化配置。
+
+| EP 规模 | 融合 MoE 时延（µs） |
+| --- | --- |
+| 64 | 🚧 待补充 |
+| 128 | 🚧 待补充 |
+
+![MegaMoE Decode 时延对比](figures/performance_megamoe_decode.svg)
+
+测量口径与复现方法见[性能文档](docs/performance.md)。
+
+> 🚧 **待补充｜性能复现**
+>
+> Benchmark 命令、原始结果与对比基线配置。
+
+## 快速开始
+
+---
+
+### 环境要求
+
+| 组件 | 要求 |
+| --- | --- |
+| 平台 | Linux、Ascend950、CANN 9.2.0 |
+| Python | ≥ 3.11 |
+| 构建工具 | C++17、CMake ≥ 3.20、Make 或 Ninja、Ascend C/Bisheng |
+| 框架 | PyTorch 与 `torch_npu`；**🚧 待补充——配套版本** |
+| 通信 | [dependencies.lock.json](dependencies.lock.json) 固定版本的 SHMEM；**🚧 待补充——URMA 运行时版本** |
+| MegaMoE | CATLASS；依赖配置见 [MegaMoE 文档](experiments/megamoe/README.md) |
+
+### 安装 SHMEM 依赖
+
+按照[构建指南](docs/build.md)准备 SHMEM SDK，加载 CANN 与 SHMEM 环境：
+
+```bash
+source /path/to/ascend-toolkit/set_env.sh
+export SHMEM_ROOT=/path/to/shmem-sdk
+source "$SHMEM_ROOT/set_env.sh"
+export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
+```
+
+### 开发
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest tests/elastic/test_dispatch.py tests/elastic/test_combine.py -q
+```
+
+贡献要求见 [CONTRIBUTING.md](CONTRIBUTING.md)，NPU 测试命令见 [docs/elastic.md](docs/elastic.md)。
+
+### 安装
 
 ```bash
 git clone https://gitcode.com/Ascend/DeepEP.git
 cd DeepEP
+export DEEPEP_NPU_ARCH=Ascend950
+python -m pip install -r requirements-build.txt
+python -m pip install -v --no-build-isolation --no-deps .
 ```
 
-当前 wheel 包含 Host 运行时、Notify、BF16/FP8 dispatch 和 BF16 combine。环境准备、单机编译安装、共享目录构建 wheel 并逐节点安装，见[构建与打包](docs/build.md)；单机与多机的 ElasticBuffer 精度用例见 [Elastic 编译与运行](docs/elastic.md#编译与运行)。
+发行包名为 `ascend-deepep`，Python 导入名为 `deep_ep`。Wheel 打包和多机安装见[构建指南](docs/build.md)。
 
-## MegaMoE Beta
+> 🚧 **待补充｜MegaMoE 安装**
+>
+> MegaMoE 构建与安装命令。
 
-[experiments/megamoe/](experiments/megamoe/README.md)集中承载融合流程、原生扩展、Python 命名空间、配置、测试及性能入口。目标逻辑为 dispatch–GMM–激活–GMM–combine；Kernel 边界和可选量化由具体实现确定。
+## 接口与示例
 
-`DEEPEP_BUILD_MEGAMOE` 当前仅接受 `OFF`；开启会明确报错。Beta 接口与性能资格另行维护。
+---
 
-## 开发与测试
+| 场景 | 接口 |
+| --- | --- |
+| DeepEP Prefill / Decode | `deep_ep.ElasticBuffer.dispatch()` / `combine()` |
+| MegaMoE Prefill / Decode（实验性） | `deep_ep_experimental.megamoe.fp8_fp4_mega_moe()` |
 
-开发入口包括[架构](docs/architecture.md)、[开发指南](docs/development.md)和[贡献指南](CONTRIBUTING.md)。[测试规划](tests/README.md)覆盖 API 兼容性、数值正确性、资源所有权和安装；[示例](examples/README.md)将展示完整 V1/V2 流程，[性能入口](benchmarks/README.md)负责设备测量。
+### Buffer 初始化
 
-## 路线图
+设置 NPU 设备和 SHMEM endpoint 后，创建 EP 通信 Buffer：
 
-1. 实现根构建、依赖解析、包结构和产物收集。
-2. 对照固定 API 基线实现并验证 V1/V2 业务流程。
-3. 交付可选 MegaMoE Beta，提供正确性和可复现性能记录。
-4. 根据真实消费者和稳定契约提炼共享设备组件。
+```python
+from deep_ep import ElasticBuffer
 
-完成标准见[路线图与资格矩阵](docs/roadmap.md)。
+buffer = ElasticBuffer(
+    rank=rank,
+    world_size=ep_size,
+    num_max_tokens_per_rank=max_tokens_per_rank,
+    hidden=7168,
+    num_topk=6,
+    explicitly_destroy=True,
+)
+```
 
-## 贡献与许可
+### 推理 Prefill 示例
 
-贡献需说明对应调用流程、构建范围及正确性/性能证据，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。项目许可证尚待确定；已采用接口声明的来源及许可见 [third-party/](third-party/README.md)。
+`dispatch()` 完成路由准备与 token 分发；本地专家计算后，`combine()` 使用匹配的 `EPHandle` 归并结果。
+
+> 🚧 **待补充｜Prefill 示例**
+>
+> BF16 与 FP8 完整 Prefill 示例。
+
+### 推理 Decode 示例
+
+Decode 使用同一个 Buffer 及 `dispatch()` / `combine()` 方法，配置小批量输入。
+
+> 🚧 **待补充｜Decode 示例**
+>
+> EP64/EP128 完整 Decode 示例。
+
+### MegaMoE 示例
+
+MegaMoE Prefill 与 Decode 共用一个融合前向入口，复用通信 Buffer 和转换后的专家权重。
+
+> 🚧 **待补充｜MegaMoE 示例**
+>
+> 融合前向调用示例与完整参数。
+
+详见 [MegaMoE 文档](experiments/megamoe/README.md)。
+
+Tensor 布局、事件同步及 Buffer 生命周期见 [API 文档](docs/api.md)与 [Elastic 文档](docs/elastic.md)。
+
+### 环境变量
+
+| 变量 | 用途 |
+| --- | --- |
+| `DEEPEP_NPU_ARCH` | 构建目标：`Ascend950` |
+| `SHMEM_ROOT` | SHMEM SDK 目录 |
+| `DEEPEP_SHMEM_ENDPOINT` | EP 作业共享初始化 endpoint |
+| `ASCEND_RT_VISIBLE_DEVICES` | 分配给作业的 NPU 设备 |
+
+## 网络配置
+
+---
+
+同一个 EP 组使用共享的 SHMEM 初始化 endpoint，并配置 rank 与设备的映射。Server 级去重按配置的 Server 分组组织通信。
+
+> 🚧 **待补充｜网络配置**
+>
+> EP32/64/128/256 部署示例与 URMA 网络配置。
+
+## 实验性分支
+
+---
+
+### MegaMoE
+
+MegaMoE 将 dispatch、专家计算、激活/量化及 combine 融合为 W4A8 推理流程，覆盖 Prefill 与 Decode。配置和使用方法见 [experiments/megamoe/](experiments/megamoe/README.md)。
+
+## 社区分支
+
+---
+
+> 🚧 **待补充｜社区分支**
+>
+> 社区集成与分支。
+
+## 致谢
+
+---
+
+感谢 [DeepSeek DeepEP](https://github.com/deepseek-ai/DeepEP) 提供上游 EP 接口与工作流参考，以及参与本项目的昇腾通信和计算库贡献者。
+
+## 许可证
+
+---
+
+> 🚧 **待补充｜许可证**
+>
+> 项目许可证与第三方声明。
+
+## 引用（Citation）
+
+---
+
+如需引用本项目，请使用以下 BibTeX 条目：
+
+```bibtex
+@misc{ascend_deepep,
+  title        = {DeepEP on Ascend},
+  author       = {昇腾 DeepEP 团队},
+  howpublished = {\url{https://gitcode.com/Ascend/DeepEP}}
+}
+```

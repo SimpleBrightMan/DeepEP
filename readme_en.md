@@ -1,29 +1,27 @@
-<h1 align="center">DeepEP</h1>
+# DeepEP
 
-<div align="center">
+---
 
-<a href="./README.md">简体中文</a> | English
+[简体中文](README.md) | English
 
-</div>
+**DeepEP on Ascend** (`Ascend/DeepEP`) is an expert-parallel (EP) communication library for mixture-of-experts (MoE) inference on Ascend NPUs. It provides high-throughput **prefill** and low-latency **decode** communication, together with experimental **MegaMoE** fused inference.
 
-<div align="center">
+## News
 
-[![Document](https://img.shields.io/badge/Document-DeepEP-blue)](docs/README.md)
-[![Platform](https://img.shields.io/badge/Platform-Ascend%20NPU-red)](https://www.hiascend.com/)
-[![Kernel](https://img.shields.io/badge/Kernel-AscendC-brightgreen)](csrc/kernels/README.md)
-[![Communication](https://img.shields.io/badge/Communication-SHMEM-lightgrey)](https://gitcode.com/cann/shmem)
+---
 
-</div>
+**DeepEP V2 on Ascend.** Prefill and decode share the `deep_ep.ElasticBuffer` interface and its `dispatch()` / `combine()` operations.
 
-An expert-parallel communication library for Ascend NPUs, designed for token dispatch, result combine, and routing layouts in mixture-of-experts workloads.
+### New features
 
-The planned `deep_ep` package follows DeepEP V1/V2 user workflows. Device kernels use AscendC with SHMEM as the initial communication foundation. MegaMoE Beta is a separately organized experiment for communication and expert-compute fusion.
+- **High-throughput prefill:** URMA dispatch and combine, integrated notify, and server-level token deduplication for EP32/64/128/256.
+- **Low-latency decode:** small-batch dispatch and combine through the same V2 interface for EP64/128.
+- **MegaMoE prefill (experimental):** W4A8 fused communication and expert computation for EP32/64/128.
+- **MegaMoE decode (experimental):** small-batch W4A8 fused inference for EP64/128, using the same MegaMoE forward entry as prefill.
 
-> **Early development.** API contracts, CPU references, runtime resources and real events are available. [V2 expanded dispatch / combine](docs/elastic.md) connects Notify, BF16/FP8 dispatch and BF16 combine; supported scales still require device qualification. V1 algorithms remain unimplemented. See the interface document and [test guide](tests/README.md).
+### Architecture
 
-## Architecture
-
-The target architecture below connects MoE frameworks to Ascend devices through distinct responsibilities: public interfaces, operation semantics and execution preparation, device kernels, and platform dependencies. These modules await implementation and device validation.
+DeepEP connects inference frameworks to Ascend communication kernels through V2. MegaMoE integrates token communication, expert computation, activation, and quantization into a fused forward workflow.
 
 <p align="center">
   <a href="figures/architecture_en.svg">
@@ -31,83 +29,294 @@ The target architecture below connects MoE frameworks to Ascend devices through 
   </a>
 </p>
 
-Core EP is planned to expose V1/V2 interfaces for token dispatch and combine, which can integrate layout processing, data reordering and quantization. The calling framework handles expert computation. MegaMoE Beta is planned to provide an independent experimental API for a large fused MoE kernel spanning communication, expert computation and activation.
-
-In this design, both paths can share runtime contexts, resources and completion objects, with implementation choices informed by topology and execution policies. SHMEM provides the communication foundation; CATLASS and CatCCOS are selected by the kernels that use them. Solid arrows indicate calls or launches; dashed arrows indicate support or dependencies.
-
-## Planned features
-
-| Area | Target entry | Current status |
-| --- | --- | --- |
-| V1 EP | `Buffer`; layout, dispatch, combine | Planned |
-| V1 low latency | Dedicated dispatch/combine workflows | Planned; separate qualification |
-| V2 EP | `ElasticBuffer`, `EPHandle` | Planned |
-| Communication/computation overlap | Events and asynchronous options | Planned |
-| MegaMoE Beta | `deep_ep_experimental.megamoe` | Planned; optional build |
-
-Compatibility will be checked against a pinned upstream API revision, including imports, arguments, return layouts, handle reuse, and completion behavior. See the [API plan](docs/api.md) and [roadmap](docs/roadmap.md).
-
-## Repository layout
-
 ```text
 DeepEP/
-├── deep_ep/              # Python API families and completion helpers
-├── csrc/                 # Bindings, ops, runtime, execution, kernels, device
-├── cmake/                # Host/AscendC build and install rules
-├── third-party/          # Pinned dependency sources or SDK integration
-├── configs/              # Topologies, execution policies, release presets
-├── tests/                # API, V1/V2 correctness, integration
-├── benchmarks/           # Communication measurements and result records
-├── examples/             # Complete public API workflows
-├── experiments/megamoe/  # Self-contained optional Beta implementation
-├── docs/                 # Architecture, API, build, performance, development
-└── figures/              # Documentation diagrams
+├── deep_ep/
+│   ├── buffers/             # Python interfaces
+│   └── utils/               # Events and shared utilities
+├── csrc/
+│   ├── bindings/            # Python/C++ bindings
+│   ├── runtime/             # Communication resources and lifecycle
+│   └── kernels/             # Ascend C communication kernels
+├── experiments/
+│   └── megamoe/             # MegaMoE fused inference
+├── cmake/                   # Build and installation
+├── third-party/             # Dependencies
+├── configs/                 # Deployment and execution configuration
+├── tests/                   # Correctness and regression tests
+├── benchmarks/              # Performance benchmarks
+├── examples/                # Integration examples
+├── docs/                    # Detailed documentation
+└── figures/                 # Architecture and performance figures
 ```
 
-Directory READMEs describe module responsibilities. See the [repository layout](docs/repository-layout.md) for the planned source organization and file responsibilities.
-
-## API workflows
-
-The target V1 workflow is layout preparation → dispatch → expert computation → combine. V2 uses `ElasticBuffer` and `EPHandle`, with expert computation consuming the selected returned layout. Asynchronous consumers must establish the required completion dependency before reading communication results.
-
-The framework or a selected fusion implementation performs expert computation. The signature baseline and target semantics are documented in [docs/api.md](docs/api.md). V2 expanded data transport and reduction are implemented within the [Elastic interface limits](docs/elastic.md); V1 algorithms remain unimplemented.
+See the [architecture guide](docs/architecture.md) for module responsibilities.
 
 ## Performance
 
-No device measurements are available yet. The [benchmark CLI](benchmarks/README.md) provides framework-free dry-runs, a timing/aggregation engine, and versioned JSON/CSV output. A native measurement adapter is not implemented; measurement attempts fail before device initialization, and plans contain no measured metrics. EP results distinguish dispatch, combine, and directly measured roundtrip, using a stated logical-byte definition. MegaMoE full-workflow measurements remain separate. See the [detailed design](docs/benchmark-design.md), [measurement protocol](docs/performance.md), and [result template](benchmarks/results/template.csv).
+---
 
-## Requirements and installation
+**Environment:** Ascend950, CANN 9.2.0.
 
-The target environment includes Ascend NPUs, a matched driver/CANN/AscendC stack, SHMEM, Python, PyTorch, and `torch_npu`. Exact versions and device support remain to be validated. CATLASS and CatCCOS are optional dependencies selected by the implementation.
+> 🚧 **TBD | Test environment**
+>
+> interconnect configuration, framework versions, and benchmark commit.
 
-Clone the repository:
+### High-throughput kernels
+
+**DeepEP V2 prefill:** `Seq ≥ 4K`, `H = 7168`, `top-k = 6`. Bandwidth is the aggregate logical effective bandwidth across EP ranks.
+
+> 🚧 **TBD | Prefill configuration**
+>
+> expert count, routing distribution, and tokens per rank.
+
+| EP size | dtype (Dispatch / Combine) | Dispatch bandwidth (GB/s) | Combine bandwidth (GB/s) |
+| --- | --- | --- | --- |
+| 32 | BF16 / BF16 | 🚧 TBD | 🚧 TBD |
+| 32 | FP8 / BF16 | 🚧 TBD | 🚧 TBD |
+| 64 | BF16 / BF16 | 🚧 TBD | 🚧 TBD |
+| 64 | FP8 / BF16 | 🚧 TBD | 🚧 TBD |
+| 128 | BF16 / BF16 | 🚧 TBD | 🚧 TBD |
+| 128 | FP8 / BF16 | 🚧 TBD | 🚧 TBD |
+| 256 | BF16 / BF16 | 🚧 TBD | 🚧 TBD |
+| 256 | FP8 / BF16 | 🚧 TBD | 🚧 TBD |
+
+![FP8 dispatch and BF16 combine bandwidth by EP size](figures/performance_prefill_en.svg)
+
+#### Server-level deduplication
+
+Server-level deduplication reduces repeated token transfers to the same destination server.
+
+> 🚧 **TBD | Server-level deduplication configuration**
+>
+> EP size, server grouping, and routing distribution.
+
+| Metric | Baseline | Server-level deduplication |
+| --- | --- | --- |
+| Cross-server payload (GB) | 🚧 TBD | 🚧 TBD |
+| Dispatch latency (µs) | 🚧 TBD | 🚧 TBD |
+| Combine latency (µs) | 🚧 TBD | 🚧 TBD |
+
+![Server-level deduplication latency comparison](figures/performance_dedup_en.svg)
+
+### Low-latency kernels
+
+**DeepEP V2 decode:** `BS = 32 / 96 / 256`, `H = 7168`, `top-k = 6`. Latency values are listed in BS order: `32 / 96 / 256`.
+
+> 🚧 **TBD | Decode configuration**
+>
+> expert count and tokens per rank.
+
+| EP size | BS | dtype (Dispatch / Combine) | Dispatch latency (µs) | Combine latency (µs) |
+| --- | --- | --- | --- | --- |
+| 64 | 32 / 96 / 256 | BF16 / BF16 | 🚧 TBD / TBD / TBD | 🚧 TBD / TBD / TBD |
+| 64 | 32 / 96 / 256 | FP8 / BF16 | 🚧 TBD / TBD / TBD | 🚧 TBD / TBD / TBD |
+| 128 | 32 / 96 / 256 | BF16 / BF16 | 🚧 TBD / TBD / TBD | 🚧 TBD / TBD / TBD |
+| 128 | 32 / 96 / 256 | FP8 / BF16 | 🚧 TBD / TBD / TBD | 🚧 TBD / TBD / TBD |
+
+![FP8 dispatch and BF16 combine latency by batch size](figures/performance_decode_en.svg)
+
+### MegaMoE high-throughput kernels — experimental
+
+**MegaMoE prefill:** `Seq ≥ 4K`, `W4A8`.
+
+> 🚧 **TBD | MegaMoE prefill configuration**
+>
+> complete model, routing, and quantization configuration.
+
+| EP size | Fused MoE latency (µs) | Cube utilization (%) | Communication overlap (%) |
+| --- | --- | --- | --- |
+| 32 | 🚧 TBD | 🚧 TBD | 🚧 TBD |
+| 64 | 🚧 TBD | 🚧 TBD | 🚧 TBD |
+| 128 | 🚧 TBD | 🚧 TBD | 🚧 TBD |
+
+![MegaMoE prefill latency comparison](figures/performance_megamoe_prefill_en.svg)
+
+### MegaMoE low-latency kernels — experimental
+
+**MegaMoE decode:** `BS = 96`, `W4A8`.
+
+> 🚧 **TBD | MegaMoE decode configuration**
+>
+> complete model, routing, and quantization configuration.
+
+| EP size | Fused MoE latency (µs) |
+| --- | --- |
+| 64 | 🚧 TBD |
+| 128 | 🚧 TBD |
+
+![MegaMoE decode latency comparison](figures/performance_megamoe_decode_en.svg)
+
+Measurement definitions and reproduction instructions are described in the [performance guide](docs/performance.md).
+
+> 🚧 **TBD | Benchmark reproduction**
+>
+> benchmark commands, raw results, and comparison-baseline configuration.
+
+## Quick start
+
+---
+
+### Requirements
+
+| Component | Requirement |
+| --- | --- |
+| Platform | Linux, Ascend950, CANN 9.2.0 |
+| Python | ≥ 3.11 |
+| Build tools | C++17, CMake ≥ 3.20, Make or Ninja, Ascend C/Bisheng |
+| Framework | PyTorch and `torch_npu`; **🚧 TBD — package versions** |
+| Communication | SHMEM pinned in [dependencies.lock.json](dependencies.lock.json); **🚧 TBD — URMA runtime version** |
+| MegaMoE | CATLASS; dependency setup in the [MegaMoE guide](experiments/megamoe/README.md) |
+
+### Install SHMEM dependency
+
+Prepare the SHMEM SDK using the [build guide](docs/build.md), then load the CANN and SHMEM environment:
+
+```bash
+source /path/to/ascend-toolkit/set_env.sh
+export SHMEM_ROOT=/path/to/shmem-sdk
+source "$SHMEM_ROOT/set_env.sh"
+export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
+```
+
+### Development
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest tests/elastic/test_dispatch.py tests/elastic/test_combine.py -q
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [docs/elastic.md](docs/elastic.md) for NPU test commands.
+
+### Installation
 
 ```bash
 git clone https://gitcode.com/Ascend/DeepEP.git
 cd DeepEP
+export DEEPEP_NPU_ARCH=Ascend950
+python -m pip install -r requirements-build.txt
+python -m pip install -v --no-build-isolation --no-deps .
 ```
 
-The wheel includes the Host runtime, Notify, BF16/FP8 dispatch, and BF16 combine. See [build and packaging](docs/build.md) for environment preparation, local build/install, and building one shared wheel for installation on each node. See the [Elastic guide](docs/elastic.md) for single-node and multi-node precision tests.
+The package name is `ascend-deepep`; the Python import is `deep_ep`. See the [build guide](docs/build.md) for wheel packaging and multi-node installation.
 
-## MegaMoE Beta
+> 🚧 **TBD | MegaMoE installation**
+>
+> MegaMoE build and installation command.
 
-[experiments/megamoe/](experiments/megamoe/README.md) owns the planned fused workflow, native extension, Python namespace, configuration, tests, and benchmark entry. The target composition is dispatch–GMM–activation–GMM–combine. Kernel boundaries and optional quantization depend on the selected implementation.
+## Interfaces and examples
 
-`DEEPEP_BUILD_MEGAMOE` currently accepts only `OFF`; enabling it fails explicitly. Beta API and performance qualification will be versioned independently.
+---
 
-## Development and testing
+| Workload | Interface |
+| --- | --- |
+| DeepEP prefill / decode | `deep_ep.ElasticBuffer.dispatch()` / `combine()` |
+| MegaMoE prefill / decode (experimental) | `deep_ep_experimental.megamoe.fp8_fp4_mega_moe()` |
 
-Start with the [architecture](docs/architecture.md), [development guide](docs/development.md), and [contribution guide](CONTRIBUTING.md). The [test plan](tests/README.md) covers API compatibility, numerical correctness, resource ownership, and installation. [Examples](examples/README.md) will demonstrate complete V1/V2 workflows; [benchmarks](benchmarks/README.md) will measure device performance.
+### Buffer initialization
 
-## Roadmap
+Set the NPU device and SHMEM endpoint, then create the EP buffer:
 
-1. Implement the root build, dependency resolution, package layout, and artifact collection.
-2. Implement and qualify V1/V2 workflows against a pinned API baseline.
-3. Deliver and qualify the optional MegaMoE Beta with reproducible measurements.
-4. Extract shared device components where concrete consumers establish a stable contract.
+```python
+from deep_ep import ElasticBuffer
 
-See the [roadmap and qualification matrix](docs/roadmap.md) for completion criteria.
+buffer = ElasticBuffer(
+    rank=rank,
+    world_size=ep_size,
+    num_max_tokens_per_rank=max_tokens_per_rank,
+    hidden=7168,
+    num_topk=6,
+    explicitly_destroy=True,
+)
+```
 
-## Contributing and licensing
+### Example use in inference prefilling
 
-Contributions should include the affected workflow, build scope, and correctness/performance evidence; see [CONTRIBUTING.md](CONTRIBUTING.md). A project license is still to be selected. Attribution and licensing for the adopted interface declarations are recorded in [third-party/](third-party/README.md).
+`dispatch()` prepares routing metadata and distributes tokens. After local expert computation, `combine()` aggregates results using the matching `EPHandle`.
+
+> 🚧 **TBD | Prefill example**
+>
+> complete BF16 and FP8 prefill examples.
+
+### Example use in inference decoding
+
+Decode uses the same buffer and `dispatch()` / `combine()` methods with small-batch configurations.
+
+> 🚧 **TBD | Decode example**
+>
+> complete EP64/EP128 decode example.
+
+### MegaMoE example
+
+MegaMoE prefill and decode share one fused forward entry, with reusable buffers and converted expert weights.
+
+> 🚧 **TBD | MegaMoE example**
+>
+> fused-forward example and complete parameter list.
+
+See the [MegaMoE guide](experiments/megamoe/README.md).
+
+Tensor layouts, event synchronization, and buffer lifecycle are described in the [API guide](docs/api.md) and [Elastic guide](docs/elastic.md).
+
+### Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `DEEPEP_NPU_ARCH` | Build target: `Ascend950` |
+| `SHMEM_ROOT` | SHMEM SDK directory |
+| `DEEPEP_SHMEM_ENDPOINT` | Shared initialization endpoint for the EP job |
+| `ASCEND_RT_VISIBLE_DEVICES` | NPU devices assigned to the job |
+
+## Network configurations
+
+---
+
+Each EP group uses a shared SHMEM initialization endpoint and an explicit rank-to-device mapping. Server-level deduplication follows the configured server grouping.
+
+> 🚧 **TBD | Network configuration**
+>
+> EP32/64/128/256 deployment examples and URMA network settings.
+
+## Experimental branches
+
+---
+
+### MegaMoE
+
+MegaMoE combines dispatch, expert computation, activation/quantization, and combine into W4A8 fused inference for prefill and decode. See [experiments/megamoe/](experiments/megamoe/README.md) for configuration and usage.
+
+## Community forks
+
+---
+
+> 🚧 **TBD | Community forks**
+>
+> community integrations and forks.
+
+## Acknowledgement
+
+---
+
+We thank [DeepSeek DeepEP](https://github.com/deepseek-ai/DeepEP) for the upstream EP interface and workflow reference, and the Ascend communication and compute library contributors supporting this project.
+
+## License
+
+---
+
+> 🚧 **TBD | License**
+>
+> project license and third-party notices.
+
+## Citation
+
+---
+
+Please use the following BibTeX entry to cite this project:
+
+```bibtex
+@misc{ascend_deepep,
+  title        = {DeepEP on Ascend},
+  author       = {Ascend DeepEP Group},
+  howpublished = {\url{https://gitcode.com/Ascend/DeepEP}}
+}
+```
