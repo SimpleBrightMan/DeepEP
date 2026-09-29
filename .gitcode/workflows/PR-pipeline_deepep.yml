@@ -22,26 +22,14 @@ env:
   repo: ${{ atomgit.event.repository.name }}
   pr_id: ${{ atomgit.event.pull_request.number }}
   org_name: "Ascend"
-  img_master_arm: "pytorch_master_a2_aarch64_builder:20260804"
-  img_2_7_1_arm: "pytorch_2.7.1_a2_aarch64_builder:20260804"
-  img_2_9_0_arm: "pytorch_2.9.0_a2_aarch64_builder:20260901"
-  img_2_10_0_arm: "pytorch_2.10.0_a2_aarch64_builder:20260804"
-  img_2_11_0_arm: "pytorch_2.11.0_a2_aarch64_builder:20260804"
-  img_2_12_0_arm: "pytorch_2.12.0_a2_aarch64_builder:20260804"
-  img_2_13_0_arm: "pytorch_2.13.0_a2_aarch64_builder:20260804"
-  img_master_x86: "pytorch_master_a1_x86_64_builder:20260804"
-  img_2_7_1_x86: "pytorch_2.7.1_a1_x86_64_builder:20260804"
-  img_2_9_0_x86: "pytorch_2.9.0_a1_x86_64_builder:20260901"
-  img_2_10_0_x86: "pytorch_2.10.0_a1_x86_64_builder:20260704"
-  img_2_11_0_x86: "pytorch_2.11.0_a1_x86_64_builder:20260704"
-  img_2_12_0_x86: "pytorch_2.12.0_a1_x86_64_builder:20260704"
-  img_2_13_0_x86: "pytorch_2.13.0_a1_x86_64_builder:20260709"
 
 permissions:
   project: read
   repository: read
   id-token: write
   pr: write
+  note: write
+  action: read
 
 stages:
   stage_1:
@@ -50,9 +38,9 @@ stages:
     jobs:
       Detect_file_changes:
         name: Detect_file_changes
-        runs-on: [ self-hosted, x86, cpu=32 ]
+        runs-on: [ self-hosted, default, x86, cpu=8 ]
         container:
-          image: swr.cn-north-4.myhuaweicloud.com/pytorch_images_x86/pytorchx86:v_03
+          image: swr.cn-north-4.myhuaweicloud.com/atlas-ci/common:latest
         outputs:
           need_build_ut: ${{ steps.set-skip.outputs.need_build_ut }}
         steps:
@@ -108,7 +96,9 @@ stages:
       associate_pr_comment:
         name: associate_pr_comment
         select: selected_by_default
-        runs-on: [ self-hosted, x86, cpu=32 ]
+        runs-on: [ self-hosted, default, x86, cpu=8 ]
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/atlas-ci/common:latest
         steps:
           - name: associate-pr-comment
             uses: associate-pr-comment
@@ -130,9 +120,9 @@ stages:
       CPU_correctness:
         name: CPU API, reference, runtime and build preflight tests
         if: ${{ jobs.Detect_file_changes.outputs.need_build_ut == 'yes' }}
-        runs-on: [ self-hosted, x86, cpu=32 ]
+        runs-on: [ self-hosted, default, x86, cpu=16 ]
         container:
-          image: swr.cn-north-4.myhuaweicloud.com/mindspore/mindspore_python3.11:v0.1
+          image: swr.cn-north-4.myhuaweicloud.com/atlas-ci/common:latest
         steps:
           - name: checkout
             uses: checkout
@@ -159,9 +149,9 @@ stages:
       CodeCheck_pre_commit:
         name: Pre-commit checks
         # Run for documentation-only PRs too; all files keeps rule changes covered.
-        runs-on: [ self-hosted, x86, cpu=32 ]
+        runs-on: [ self-hosted, default, x86, cpu=16 ]
         container:
-          image: swr.cn-north-4.myhuaweicloud.com/mindspore/mindspore_python3.11:v0.1
+          image: swr.cn-north-4.myhuaweicloud.com/atlas-ci/common:latest
         steps:
           - name: checkout
             uses: checkout
@@ -174,7 +164,9 @@ stages:
 
       sca-pr:
         if : ${{ jobs.Detect_file_changes.outputs.need_build_ut == 'yes' }}
-        runs-on: [ self-hosted, x86, cpu=32 ]
+        runs-on: [ self-hosted, default, x86, cpu=8 ]
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/atlas-ci/common:latest
         steps:
           - name: checkout
             uses: checkout
@@ -185,7 +177,9 @@ stages:
 
       malicious-scan:
         if : ${{ jobs.Detect_file_changes.outputs.need_build_ut == 'yes' }}
-        runs-on: [ self-hosted, x86, cpu=32 ]
+        runs-on: [ self-hosted, default, x86, cpu=8 ]
+        container:
+          image: swr.cn-north-4.myhuaweicloud.com/atlas-ci/common:latest
         steps:
           - name: checkout
             uses: checkout
@@ -199,6 +193,9 @@ stages:
 post:
   jobs:
     query_pipeline:
+      runs-on: [ self-hosted, default, x86, cpu=8 ]
+      container:
+        image: swr.cn-north-4.myhuaweicloud.com/atlas-ci/common:latest
       steps:
         - name: query_pipeline
           id: query_pipeline
