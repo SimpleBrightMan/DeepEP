@@ -110,12 +110,14 @@ def test_wheel_rejects_missing_or_unexpected_contents(tmp_path, members, error):
 
 def test_lock_declares_operators_without_claiming_device_qualification():
     lock = json.loads((ROOT / "dependencies.lock.json").read_text())
-    assert lock["device_kernels"] == ["full-notify-metadata", "expanded-dispatch-urma-mte", "expanded-combine-urma-mte"]
-    assert len(lock["combine_reference"]["revision"]) == 40
-    assert len(lock["dispatch_reference"]["revision"]) == 40
-    assert len(lock["notify_reference"]["revision"]) == 40
+    assert lock["device_kernels"] == [
+        "full-notify-metadata",
+        "expanded-dispatch-urma-mte",
+        "expanded-combine-urma-mte",
+        "expanded-dispatch-low-latency",
+        "expanded-combine-low-latency",
+    ]
     assert len(lock["shmem"]["revision"]) == 40
-    assert len(lock["runtime_reference"]["revision"]) == 40
     assert len(lock["shmem"]["header_sha256_lf"]) == 6
 
 
@@ -236,3 +238,114 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     assert info["capabilities"] == capabilities["capabilities"]
     assert info["source_sha256"] == "current"
     assert not {"cmake_path", "compiler_path", "python_executable", "build_environment"}.intersection(info)
+
+
+def test_compiler_symlink_keeps_invocation_name(build, monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    cann, sdk = tmp_path / "cann", tmp_path / "sdk"
+    files = {
+        cann / "include/acl/acl.h": "",
+        cann / "compiler/version.info": "Version=9.2.0",
+        cann / "tools/bisheng_compiler/bin/bisheng": "device compiler",
+        sdk / "include/host/shmem_host_def.h": "host declarations",
+        sdk / "include/shmem.h": "public declarations",
+        sdk / "src/device/gm2gm/shmemi_device_cc.h": "device declarations",
+        sdk / "lib/libshmem.so": "installed library",
+    }
+    for path, data in files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(data)
+    # Keep SDK validation enabled with a matching synthetic lock and manifest.
+    import hashlib
+
+    lock = json.loads((ROOT / "dependencies.lock.json").read_text())
+    lock["shmem"]["header_sha256_lf"] = {
+        "host/shmem_host_def.h": hashlib.sha256(files[sdk / "include/host/shmem_host_def.h"].encode()).hexdigest()
+    }
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "dependencies.lock.json").write_text(json.dumps(lock))
+    (source / "VERSION").write_text((ROOT / "VERSION").read_text())
+    monkeypatch.setattr(build, "ROOT", source)
+    manifest = {
+        "revision": lock["shmem"]["revision"],
+        "sha256": {
+            str(path.relative_to(sdk)): hashlib.sha256(data.encode()).hexdigest()
+            for path, data in files.items()
+            if path.is_relative_to(sdk)
+        },
+    }
+    (sdk / "deepep-sdk.json").write_text(json.dumps(manifest))
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    wrapper = tools / "ccache"
+    wrapper.write_text('#!/bin/sh\ncase "$0" in */c++) echo "C++ compiler";; *) exit 1;; esac\n')
+    wrapper.chmod(0o755)
+    compiler = tools / "c++"
+    compiler.symlink_to(wrapper)
+    cmake = tools / "cmake"
+    cmake.write_text('#!/bin/sh\necho "cmake version test"\n')
+    cmake.chmod(0o755)
+    lock = json.loads((ROOT / "dependencies.lock.json").read_text())
+    monkeypatch.setitem(sys.modules, "pybind11", SimpleNamespace(__version__=lock["python_build"]["pybind11"]))
+    monkeypatch.setattr(build, "source_fingerprint", lambda: "test sources")
+    config = build.build_configuration(
+        {
+            "DEEPEP_NPU_ARCH": "Ascend950",
+            "ASCEND_HOME_PATH": str(cann),
+            "SHMEM_ROOT": str(sdk),
+            "PATH": str(tools),
+        }
+    )
+    assert config["compiler_path"] == str(compiler)
+    # The exact path passed to CMake must still dispatch as a C++ compiler.
+    assert subprocess.check_output([config["compiler_path"], "--version"], text=True).strip() == "C++ compiler"
+
+
+@pytest.mark.parametrize(
+    "available,expected",
+    [
+        (["c++", "g++", "clang++"], "c++"),
+        (["g++", "clang++"], "g++"),
+        (["clang++"], "clang++"),
+        (["bisheng++", "bisheng"], "bisheng++"),
+        (["bisheng"], "bisheng"),
+    ],
+)
+def test_auto_host_compiler_order(build, tmp_path, available, expected):
+    for name in available:
+        path = tmp_path / name
+        path.write_text('#!/bin/sh\necho "test C++ compiler"\n')
+        path.chmod(0o755)
+    compiler, _ = build.find_host_compiler({"PATH": str(tmp_path)})
+    assert compiler == str(tmp_path / expected)
+
+
+def test_host_compiler_fallback_and_explicit_override(build, tmp_path):
+    broken, good = tmp_path / "c++", tmp_path / "clang++"
+    broken.write_text("#!/bin/sh\nexit 1\n")
+    good.write_text('#!/bin/sh\necho "test clang"\n')
+    broken.chmod(0o755)
+    good.chmod(0o755)
+    env = {"PATH": str(tmp_path)}
+    assert build.find_host_compiler(env)[0] == str(good)
+    with pytest.raises(RuntimeError, match="Explicit CXX"):
+        build.find_host_compiler({**env, "CXX": str(broken)})
+    assert build.find_host_compiler({**env, "CXX": str(good)})[0] == str(good)
+    cache = tmp_path / "ccache"
+    cache.write_text('#!/bin/sh\necho "ccache version"\n')
+    cache.chmod(0o755)
+    with pytest.raises(RuntimeError, match="standalone cache launcher"):
+        build.find_host_compiler({**env, "CXX": str(cache)})
+
+
+def test_host_compiler_cann_path_and_missing(build, tmp_path):
+    env = {"PATH": str(tmp_path), "ASCEND_HOME_PATH": str(tmp_path / "cann")}
+    with pytest.raises(RuntimeError, match="No runnable Host C[+][+] compiler"):
+        build.find_host_compiler(env)
+    compiler = tmp_path / "cann/tools/bisheng_compiler/bin/bisheng"
+    compiler.parent.mkdir(parents=True)
+    compiler.write_text('#!/bin/sh\necho "bisheng"\n')
+    compiler.chmod(0o755)
+    assert build.find_host_compiler(env)[0] == str(compiler)

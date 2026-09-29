@@ -58,5 +58,5 @@ repos:
       - id: codespell
         files: \.(md|rst|txt|py|c|h|cpp|hpp|cc|hh|cxx|hxx|asc|ya?ml|toml)$
         exclude: ^third-party/(?!README\.md$)
-        # AGRS、CANN 和 Clos 拓扑是有效的技术术语。
-        args: ["--ignore-words-list=agrs,cann,clos"]
+        # AGRS、CANN 和 Clos 是技术术语；EnQue 是 SDK API 名。
+        args: ["--ignore-words-list=agrs,cann,clos,EnQue"]

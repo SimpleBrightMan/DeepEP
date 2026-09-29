@@ -50,6 +50,8 @@ def lifecycle_binary(tmp_path_factory):
         "close-fault",
         "normal",
         "udma",
+        "low-latency",
+        "ep16-small-workspace",
     ],
 )
 def test_native_lifecycle_faults(lifecycle_binary, case):

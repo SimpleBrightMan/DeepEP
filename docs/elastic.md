@@ -1,15 +1,41 @@
 # Elastic dispatch / combine 接口与限制
 
-`ElasticBuffer.dispatch` 先执行 Notify 生成路由元数据，再搬运 payload；
-`ElasticBuffer.combine` 使用同一个 `EPHandle` 将专家输出归约回源 rank。
-本文件统一说明这三个 kernel，不再提供独立 Notify 测试入口。
+`ElasticBuffer.dispatch` 按解析后的 `M=num_max_tokens_per_rank` 选路：
+M<256 优先低时延（LL），否则高吞吐（HT）。LL 不支持而 HT 支持完整调用时仅在
+payload 启动前转 HT；两者均不支持正常报错。满足LL选路条件但工作区不等于8 GiB时直接报错，
+不因容量错误回退HT。combine 只看 `handle.is_low_latency`。
+M 的默认值依次取调用参数、非零 Buffer 上限、实际 B，kernel tiling 始终使用实际 B。
 
-Python 调用流程集中在 `deep_ep/buffers/elastic.py`：公开 `dispatch()`、`combine()`
-方法直接执行对应流程，私有 `_notify()` 负责 fresh 路由元数据。
-三者的空间布局和 size hint 统一放在同目录的 `_elastic_layout.py`；
-`deep_ep/_runtime.py`、`_native.py` 继续提供 V1/V2 共用的资源与原生扩展加载功能。
+## LL 路径
 
-## 支持范围
+LL dispatch/combine 位于本仓库 `csrc/kernels/dispatch` 和 `combine`，EP 为16/32/64/128。
+构造只申请用户指定的 `num_bytes`，不选择HT/LL，也不额外追加内存。使用LL必须显式传入
+`num_bytes=8 << 30`（8589934592字节），dispatch选中LL后检查实际容量，不等于8 GiB即报错。
+构造时用 `aclrtMemset` 将整个申请区清零；8 GiB且EP16/32/64/128时保留全rank初始化边界。
+LL直接使用工作区基址，`commArgs.peerMems` 不再偏移HT区域。HT仍按原容量/分区规则使用自己的Buffer。
+同一个Buffer不交错运行HT和LL；不会在dispatch时重新清零、扩容或重建Session。
+设备kernel、通信协议、bank轮转及repeated combine调用约定不改，不增加逐调用barrier。
+
+LL dispatch要求真实FP32 topk_weights，公开第三项为None，source_weights保存在handle。
+无论是否CPU同步，handle中的`expert_recv_counts`、`num_unaligned_recv_tokens_per_expert`和
+`psum_num_recv_tokens_per_expert`均为None；kernel计数输出仅保留为内部临时缓冲区，
+不执行输出计数的类型转换、累积和或CPU回读。CPU同步路径获取精确R的计数流程保持不变。
+**LL combine内部加权，专家输出不得预乘路由权重。** HT仍按下文返回展开weights并归约
+调用者给定的专家输出。调用者应根据最终handle.is_low_latency安排唯一一次乘权。
+
+- `do_cpu_sync=True/None`且有已有EP group：计数向量all_reduce取得R，返回[R,H]。
+- `do_cpu_sync=False`或没有group：返回[C,H]，C=P*M*min(K,E/P)，尾部不是有效token。
+- LL combine直接使用与handle行数匹配的专家输出：同步路径[R,H]无需扩容至C_B=P*B*min(K,E/P)，R=0不读取输入；容量路径[C,H]保持兼容，不裁切输入。BF16/FP16均适用，FP8 dispatch后专家输出仍须为16位。
+- 计数仅用现有HCCL/Gloo group，不创建group、不复用HT Notify、不回读CPU专家列表。
+- 统一handle字段集合；LL不使用的HT字段为None。精确设备专家计数在所有模式都保留。
+- LL支持BF16/FP16及FP8输入。FP8 scales须为连续[B,ceil(H/128)]：INT32表示四个per-32 E8M0 scale的打包，FP32表示一个per-128 scale。dispatch按位搬运并保留scales dtype，不量化、不转换分组；调用方负责payload与scales匹配及下游GEMM格式兼容。满足LL选择条件的FP32 scales现在走LL；其他条件和已有格式保持不变。
+- LL只支持A=1和原默认调度/流选项。fresh的异步请求可在HT完整支持时转HT，LL handle
+  的combine则正常报不支持；LL cached不支持，不翻转handle后端或回退combine。
+
+下文描述 HT 路径，
+不能把HT的输入/权重/事件支持范围直接当作LL支持范围。
+
+## HT 支持范围
 
 | 项目 | 当前约束 |
 | --- | --- |
@@ -93,7 +119,8 @@ handle 绑定创建它的 buffer，禁止修改其内部 Tensor；完整 dispatc
 
 ElasticBuffer 构造时初始化一个 MTE+URMA SHMEM Session 并分配对称工作区，combine 复用它。
 前半区用于 Notify/dispatch，后半区用于 combine；显式 `num_bytes` 必须包含两半，
-各 rank 相同、2 MiB 对齐、总量不超过 32 GiB。`get_buffer_size_hint` 已包含两半，
+各 rank 相同、2 MiB 对齐、HT容量不超过 32 GiB。对称堆总量就是num_bytes；
+`get_buffer_size_hint` 仍只计算HT需求，不自动返回LL的8 GiB。HT的hint已包含两半，
 默认接收/gather 行预算为 `min(EP,4)*T*K`；严重热点需要更大的显式容量。
 真实行数超过容量时在 payload launch 前报错，不会自动扩容。
 SHMEM 之外还会分配元数据和输出 Tensor，因此 hint 不代表全部显存用量。
@@ -180,3 +207,15 @@ CPU 检查可运行 `python -m pytest tests/elastic/test_dispatch.py tests/elast
 combine 的 Host 回归使用 C++17 编译器（或已安装的 ziglang）执行实际 kernel 判断函数，
 验证等待条件；不验证 AIV 并发、通信时序或设备性能。缺少编译器时该项跳过。
 真实 kernel 的编译和精度必须在 Linux/CANN/NPU 上用上面两个入口验收。
+
+## LL 专用 ST
+
+LL 正确性及性能入口见 [LL 系统测试](../tests/elastic/test_ep_low_latency.py)，使用 `--help` 查看参数。性能测量读取 profiler 的 kernel 耗时；真实设备结果仍需在目标环境验证。
+
+LL 的 `token_type`、`destination_index`、`relay_read_index`、`source_mask` 和
+`source_weights` 使用 `empty` 分配，由 dispatch kernel 填充有效内容；combine 按实际计数、
+token 类型和 source mask 消费。未使用的行或槽位不承诺为零或 -1。
+
+LL 的 Tensor 参数仅校验 Tensor 类型、shape/dim、dtype 和连续性，不在包装层检查
+CPU/NPU 位置、Tensor 与当前设备的一致性或 requires_grad。调用方负责传入正确设备上的数据；
+这不增加 CPU kernel 或 autograd 支持。公共 Runtime 保留通信配置一致性检查，但不再根据 hostname、可见设备映射或本地 NPU 编号判断跨 rank 设备唯一性；调用方负责正确绑定设备。EventOverlap 对所保留 Tensor 的设备检查保持不变。

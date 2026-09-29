@@ -202,3 +202,54 @@ assert len(deep_ep.__all__) == 6
         timeout=30,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("mismatch", [None, "capacity", "timeout", "endpoint", "busy", "engine"])
+def test_bootstrap_without_host_device_checks(monkeypatch, mismatch):
+    pytest.importorskip("torch")
+    import torch.distributed as dist
+
+    monkeypatch.setattr(_runtime, "endpoint", lambda: "tcp://xxx.xxx.xxx.xxx:xxxxx")
+    monkeypatch.setattr(_runtime, "_OWNER", None)
+    monkeypatch.setattr(_runtime, "rank_and_world", lambda *args: (0, 2))
+    monkeypatch.setattr(dist, "get_backend", lambda group: "gloo")
+    created = []
+    native = SimpleNamespace(
+        runtime_busy=lambda: False,
+        Runtime=lambda *args: created.append(args) or SimpleNamespace(close=lambda: None),
+    )
+    monkeypatch.setattr(_runtime, "require_native", lambda operation: native)
+    monkeypatch.setattr(
+        _runtime,
+        "npu_api",
+        lambda: SimpleNamespace(
+            current_device=lambda: 0, Stream=lambda **kwargs: SimpleNamespace(synchronize=lambda: None)
+        ),
+    )
+
+    def gather(peers, local, group):
+        # Only collective resource settings remain; no host name or device index.
+        assert local.numel() == 5
+        assert local.tolist()[:2] == [2 << 20, 120]
+        assert local.tolist()[3:] == [0, 0]
+        peers[0].copy_(local)
+        peers[1].copy_(local)
+        if mismatch:
+            peers[1][{"capacity": 0, "timeout": 1, "endpoint": 2, "busy": 3, "engine": 4}[mismatch]] += 1
+
+    monkeypatch.setattr(dist, "all_gather", gather)
+    if mismatch:
+        message = {
+            "capacity": "workspace capacity",
+            "timeout": "timeout",
+            "endpoint": "bootstrap endpoint",
+            "busy": "already owns",
+            "engine": "runtime engines",
+        }[mismatch]
+        with pytest.raises((ValueError, RuntimeError), match=message):
+            _runtime.Runtime(object(), 2 << 20)
+        assert not created
+    else:
+        runtime = _runtime.Runtime(object(), 2 << 20)
+        assert len(created) == 1
+        runtime.close()

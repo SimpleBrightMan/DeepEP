@@ -55,6 +55,34 @@ def build_cache_key(configuration):
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
 
 
+def find_host_compiler(env):
+    """Select an executable without resolving compiler-wrapper symlinks."""
+    explicit = env.get("CXX")
+    candidates = [explicit] if explicit else ["c++", "g++", "clang++", "bisheng++", "bisheng"]
+    if not explicit and env.get("ASCEND_HOME_PATH"):
+        directory = Path(env["ASCEND_HOME_PATH"]) / "tools/bisheng_compiler/bin"
+        candidates.extend(str(directory / name) for name in ("bisheng++", "bisheng"))
+    failures = []
+    for name in candidates:
+        compiler = shutil.which(name, path=env.get("PATH"))
+        if compiler is None:
+            failures.append(f"{name}: not found")
+            continue
+        # c++ -> ccache is valid; selecting bare ccache is not a compiler.
+        if Path(compiler).name in {"ccache", "sccache"}:
+            failures.append(f"{name}: select a C++ compiler, not a standalone cache launcher")
+            continue
+        compiler = str(Path(compiler).absolute())
+        try:
+            version = subprocess.check_output([compiler, "--version"], stderr=subprocess.STDOUT, timeout=30)
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            failures.append(f"{name}: --version failed ({type(exc).__name__})")
+            continue
+        return compiler, version
+    prefix = "Explicit CXX is unusable" if explicit else "No runnable Host C++ compiler found"
+    raise RuntimeError(f"{prefix}. Set CXX to a C++17 compiler executable. Tried: " + "; ".join(failures))
+
+
 def build_configuration(environment=None):
     env = os.environ if environment is None else environment
     if platform.system() != "Linux":
@@ -108,14 +136,11 @@ def build_configuration(environment=None):
     }
     result["source_version"] = (ROOT / "VERSION").read_text().strip()
     result["source_sha256"] = source_fingerprint()
-    compiler = shutil.which(env.get("CXX", "c++"), path=env.get("PATH"))
-    if compiler is None:
-        raise RuntimeError("CXX must select an installed C++ compiler executable")
-    result["compiler_path"] = str(Path(compiler).resolve())
+    compiler, compiler_version = find_host_compiler(env)
+    result["compiler_path"] = compiler
     result["compiler_sha256"] = hashlib.sha256(Path(compiler).read_bytes()).hexdigest()
-    result["compiler_version_sha256"] = hashlib.sha256(
-        subprocess.check_output([compiler, "--version"], stderr=subprocess.STDOUT, timeout=30)
-    ).hexdigest()
+    result["compiler_version_sha256"] = hashlib.sha256(compiler_version).hexdigest()
+    print(f"Host C++ compiler: {compiler}", flush=True)
     cmake = shutil.which("cmake", path=env.get("PATH"))
     if cmake is None:
         raise RuntimeError("CMake must be installed and available on PATH")

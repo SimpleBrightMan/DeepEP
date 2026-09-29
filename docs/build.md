@@ -39,6 +39,13 @@ python -m pip install -r requirements-build.txt
 
 ## 日常构建与后续算子接入
 
+Host 编译器优先使用 `CXX` 指定的可执行文件；未设置时依次查找 PATH 中的
+`c++`、`g++`、`clang++`、`bisheng++`、`bisheng`，再查找 CANN 的
+`tools/bisheng_compiler/bin`。自动探测会跳过无法执行 `--version` 的候选；
+显式指定的 `CXX` 无效则报错。保留 `c++ -> ccache` 等符号链接的调用名称，
+不要把 `CXX` 设成裸 `ccache`。编译器是否满足 C++17 和链接要求仍由 CMake/实际构建验证。
+日志会输出选中的 Host 编译器路径，Device kernel 继续使用 CANN Bisheng。
+
 单机编译并安装仍使用：
 
 ```bash

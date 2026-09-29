@@ -24,14 +24,17 @@ find_path(DEVICE_RT_INCLUDE rt.h HINTS
     NO_DEFAULT_PATH)
 add_library(deepep_kernels SHARED "${DEEPEP_SOURCE_DIR}/csrc/kernels/notify/notify.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/dispatch/dispatch.cpp"
-    "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/combine.cpp")
+    "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/combine.cpp"
+    "${DEEPEP_SOURCE_DIR}/csrc/kernels/dispatch/low_latency.cpp"
+    "${DEEPEP_SOURCE_DIR}/csrc/kernels/combine/low_latency.cpp")
 target_compile_options(deepep_kernels PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O2>" -xasc --npu-arch=dav-3510
     --cce-auto-infer-kernel-type=false
     "-ffile-prefix-map=${DEEPEP_SOURCE_DIR}=."
     "-ffile-prefix-map=${ASCEND_HOME_PATH}=CANN_SDK"
     "-ffile-prefix-map=${SHMEM_ROOT}=SHMEM_SDK")
 target_compile_definitions(deepep_kernels PRIVATE CATLASS_ARCH=3510 USE_SIMT L2_CACHE_HINT)
-target_include_directories(deepep_kernels PRIVATE "${_sdk_include}" "${_arch_include}"
+target_include_directories(deepep_kernels PRIVATE
+    "${_sdk_include}" "${_arch_include}"
     "${_tikcpp}" "${_tikcpp}/tikcfw"
     "${_tikcpp}/tikcfw/impl" "${_tikcpp}/tikcfw/interface"
     "${SHMEM_ROOT}/include" "${SHMEM_ROOT}/src" "${SHMEM_ROOT}/src/device"

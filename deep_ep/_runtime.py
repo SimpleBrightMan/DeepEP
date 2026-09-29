@@ -3,7 +3,6 @@
 import hashlib
 import ipaddress
 import os
-import socket
 import threading
 import warnings
 from contextlib import nullcontext
@@ -76,6 +75,7 @@ class Runtime:
         npu = npu_api()
         self.device = npu.current_device()
         self.group = group
+        self.low_latency_comm_args = None
         self.closed = False
         with _LOCK:
             busy = _OWNER is not None or native.runtime_busy()
@@ -94,9 +94,6 @@ class Runtime:
                         timeout,
                         digest(address),
                         int(busy),
-                        digest(socket.gethostname()),
-                        digest(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")),
-                        self.device,
                         int(udma),
                     ],
                     dtype=torch.int64,
@@ -109,15 +106,8 @@ class Runtime:
                     raise RuntimeError("A rank already owns a SHMEM runtime; destroy it collectively first")
                 if any(value[:3] != values[0][:3] for value in values):
                     raise ValueError("Ranks disagree on workspace capacity, timeout or bootstrap endpoint")
-                if any(value[7] != values[0][7] for value in values):
+                if any(value[4] != values[0][4] for value in values):
                     raise ValueError("Ranks disagree on MTE/URMA runtime engines")
-                hosts = {value[4] for value in values}
-                for host in hosts:
-                    local = [value for value in values if value[4] == host]
-                    if len({value[5] for value in local}) != 1:
-                        raise ValueError("Ranks on one host must use a common visible-device mapping")
-                    if len({value[6] for value in local}) != len(local):
-                        raise ValueError("Each rank on one host must use a distinct local NPU")
             self.rank, self.world_size = rank, size
             self.capacity = capacity
             self.notify_lock = threading.RLock()
@@ -130,6 +120,9 @@ class Runtime:
                 else native.Runtime(rank, size, capacity, address, timeout)
             )
             _OWNER = self
+            if capacity == 8 << 30 and 16 <= size <= 128:
+                # LL peers must finish initialization before any payload writes.
+                self.native.barrier()
 
     def ensure_alive(self):
         if self.closed:
@@ -146,6 +139,7 @@ class Runtime:
             self.stream.synchronize()
             self.native.close()
             self.notify_inflight = None
+            self.low_latency_comm_args = None
             self.closed = True
             _OWNER = None
 

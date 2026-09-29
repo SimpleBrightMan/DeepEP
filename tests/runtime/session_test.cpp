@@ -6,10 +6,12 @@
 #include <string>
 
 namespace {
-int initialized = 0, allocations = 0, frees = 0, finalized = 0, barriers = 0;
+int initialized = 0, allocations = 0, frees = 0, finalized = 0, barriers = 0, memsets = 0;
 int init_status = 0, memset_status = 0, finalize_status = 0;
 bool allocation_failure = false;
 int qp_count = 0;
+int expected_world = 2;
+uint64_t expected_bytes = 2 << 20;
 int storage = 0, context_token = 0, another_context = 0;
 void* current_context = &context_token;
 template <class Action>
@@ -33,8 +35,10 @@ const char* aclrtGetSocName()
 {
     return "Ascend950";
 }
-int aclrtMemset(void*, size_t, int, size_t)
+int aclrtMemset(void* destination, size_t maximum, int value, size_t count)
 {
+    assert(destination == &storage && maximum == expected_bytes && count == expected_bytes && value == 0);
+    ++memsets;
     return memset_status;
 }
 int aclshmemx_init_status()
@@ -43,7 +47,7 @@ int aclshmemx_init_status()
 }
 int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
 {
-    assert(attr->n_pes == 2 && attr->local_mem_size == (2 << 20));
+    assert(attr->n_pes == expected_world && attr->local_mem_size == expected_bytes);
     assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | (qp_count ? ACLSHMEM_DATA_OP_UDMA : 0)));
     if (init_status == 0) {
         initialized = 2;
@@ -64,8 +68,9 @@ int aclshmem_finalize()
     }
     return finalize_status;
 }
-void* aclshmem_malloc(size_t)
+void* aclshmem_malloc(size_t bytes)
 {
+    assert(bytes == expected_bytes);
     ++allocations;
     return allocation_failure ? nullptr : &storage;
 }
@@ -84,7 +89,20 @@ int main(int argc, char** argv)
     assert(argc == 2);
     const std::string mode = argv[1];
     auto create = []() { return deepep::Session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30); };
-    if (mode == "udma") {
+    if (mode == "low-latency") {
+        expected_world = 16;
+        expected_bytes = 8ULL << 30;
+        deepep::Session session(0, 16, expected_bytes, "tcp://xxx.xxx.xxx.xxx:xxxxx", 30, true);
+        assert(session.capacity() == expected_bytes && session.workspace() == &storage && memsets == 1);
+        session.close();
+        assert(frees == 1 && finalized == 1 && !deepep::Session::busy());
+    } else if (mode == "ep16-small-workspace") {
+        expected_world = 16;
+        deepep::Session session(0, 16, expected_bytes, "tcp://xxx.xxx.xxx.xxx:xxxxx", 30, true);
+        assert(session.capacity() == (2 << 20));
+        session.close();
+        assert(frees == 1 && finalized == 1 && !deepep::Session::busy());
+    } else if (mode == "udma") {
         deepep::Session session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, true);
         assert(session.udma() && qp_count == 6);
         session.close();

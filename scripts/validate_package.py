@@ -59,7 +59,7 @@ def inspect_wheel(path):
             raise RuntimeError("Wheel must contain exactly one native extension")
         if "deep_ep/_build_info.json" not in names:
             raise RuntimeError("Missing build identity")
-        if any(n.startswith(("tests/", "benchmarks/", "ascend_deepep/")) for n in names):
+        if any(n.startswith(("tests/", "benchmarks/", "csrc/")) for n in names):
             raise RuntimeError("Unexpected package content")
         if len([n for n in names if n.endswith("deepseek-deepep.LICENSE")]) != 1:
             raise RuntimeError("Wheel must include the adopted API's third-party license")

@@ -5,6 +5,7 @@
 #include "ops/notify.hpp"
 #include "ops/dispatch.hpp"
 #include "ops/combine.hpp"
+#include "ops/low_latency.hpp"
 
 namespace py = pybind11;
 PYBIND11_MODULE(_C, module)
@@ -29,4 +30,5 @@ PYBIND11_MODULE(_C, module)
     deepep::bind_notify(module);
     deepep::bind_dispatch(module);
     deepep::bind_combine(module);
+    deepep::bind_low_latency(module);
 }

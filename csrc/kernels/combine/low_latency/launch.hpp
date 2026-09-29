@@ -1,0 +1,12 @@
+#pragma once
+#include <cstdint>
+#include <type_traits>
+namespace deepep {
+struct EpServerDedupCombineKernelArgs {
+    uint8_t *commArgs, *expertOut, *destinationIndex, *sendCounts, *expertScales;
+    uint8_t *tokenType, *relayReadIndex, *sourceMask, *yOut, *tilingData;
+};
+static_assert(std::is_standard_layout<EpServerDedupCombineKernelArgs>::value, "combine launch ABI");
+static_assert(sizeof(EpServerDedupCombineKernelArgs) == 80, "combine launch ABI");
+}  // namespace deepep
+extern "C" void combine_server_dedup_kernel_do(void* stream, const deepep::EpServerDedupCombineKernelArgs* args);
