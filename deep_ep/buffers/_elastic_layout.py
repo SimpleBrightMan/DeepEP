@@ -27,7 +27,7 @@ def workspace_layout(world, tokens, topk, experts=1024):
 
     fcap = tokens * topk
     bcap = world * fcap
-    chunks = (tokens + 255) // 256
+    chunks = (tokens + 255) // 256 + min(4, tokens) - 1
     lanes = min(world, 8)
     cstride, fstride, bstride = align(experts * 4), align(64 + fcap * 24), align(64 + bcap * 24)
     regions = (
@@ -42,10 +42,11 @@ def workspace_layout(world, tokens, topk, experts=1024):
         ("backward_task_offsets", align(lanes * world * chunks * 4)),
         ("forward_tile_offsets", align(world * ((tokens + 31) // 32) * 4)),
         ("gather_tile_offsets", align(world * ((fcap + 31) // 32) * 4)),
-        ("backward_source_offsets", align(lanes * world * 4)),
+        ("backward_group_offsets", align(lanes * (world // min(world, 64)) * chunks * 2 * 4)),
+        ("source_chunk_masks", align(world * chunks * 4)),
         ("expert_totals", align(experts * 4)),
         ("address_stride", 512),
-        ("local_prefix_segments", align(chunks * ((experts + world + 15) // 16 * 16) * 4)),
+        ("local_prefix_segments", align(((tokens + 255) // 256) * ((experts + world + 15) // 16 * 16) * 4)),
     )
     layout, cursor = {}, 0
     for name, size in regions:
@@ -100,8 +101,12 @@ def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256):
     integer("chunk_tokens", chunk_tokens, 1, 10240)
     if world * world * tokens * topk >= 2**31:
         raise ValueError("Combine metadata indexing exceeds int32")
-    chunks = (tokens + chunk_tokens - 1) // chunk_tokens
-    slots = 3 * world + 96 + world * chunks * 9
+    chunks = (tokens + chunk_tokens - 1) // chunk_tokens + min(4, tokens, chunk_tokens) - 1
+    groups = world // min(world, 64)
+    resident = ((world * chunks * 8 + 31) // 32 + (groups * chunks * 4 + 31) // 32) * 32
+    if resident > 44 * 1024:
+        raise ValueError("Combine chunk ranges/masks exceed the resident 44 KiB UB capacity")
+    slots = 3 * world + 96 + groups * chunks * 8 + 64 + world * chunks * 2 + 64
     cursor, result = slots * 512, {"control_slot_num": slots}
     for name, count in (
         ("expert_input", rows),
@@ -112,6 +117,13 @@ def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256):
     ):
         result[name] = cursor
         cursor += (count * 14336 + 511) // 512 * 512
+    for name, size in (
+        ("weight_recv", tokens * topk * 4),
+        ("weight_local_done", 64 * 512),
+        ("weight_done", world * 512),
+    ):
+        result[name] = cursor
+        cursor += (size + 511) // 512 * 512
     result["workspace_bytes"] = cursor
     return result
 

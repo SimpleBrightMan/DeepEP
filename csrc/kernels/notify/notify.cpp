@@ -12,6 +12,13 @@ constexpr uint32_t kSimtThreads = 128U;
 constexpr uint32_t kSimtCores = 32U;
 constexpr uint32_t kTileTokens = ascend_deepep::kNotifyLocalTopkTileTokens;
 constexpr uint32_t kMetaFields = ascend_deepep::kNotifyLocalTopkRouteMetaFields;
+// Wire fields pack rank <= 255 and top-k positions <= 15.
+// Forward column 0 stores token_end; source rank is the partition index.
+// Weight return IDs encode (src_rank * tokens + token_id) * topk + topk_id.
+constexpr uint32_t kWireRankMask = 0xffU;
+constexpr uint32_t kWireTopkMask = 0xfU;
+constexpr uint32_t kWirePrimaryTopkShift = 8U;
+constexpr uint32_t kWireSecondaryTopkShift = 12U;
 
 template <uint32_t CoreCount = kSimtCores>
 __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkTokensVf(
@@ -451,13 +458,10 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardTilesVf(
     const uint32_t tiles = (uint64_t(tokens) + kForwardTile - 1U) / kForwardTile;
     const uint32_t worker = threadIdx.x * CoreCount + core;
     for (uint32_t tile = worker; tile < tiles; tile += (CoreCount * kNotifySimtThreads)) {
-        // Count 阶段保存数量，Write 阶段保存各 gateway 在本 tile 内的写入游标。
-        int32_t cursor[256];
-        for (uint32_t gateway = 0; gateway < world; ++gateway) {
-            if constexpr (Write) {
-                cursor[gateway] = asc_ldcg(offsets + uint64_t(gateway) * tiles + tile);
-            } else {
-                cursor[gateway] = 0;
+        // Each tile owns its GM cursor; Write consumes the prefix in place.
+        if constexpr (!Write) {
+            for (uint32_t gateway = 0; gateway < world; ++gateway) {
+                asc_stcg(offsets + uint64_t(gateway) * tiles + tile, int32_t(0));
             }
         }
         const uint32_t begin = tile * kForwardTile;
@@ -501,7 +505,9 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardTilesVf(
                 if (!direct && k == primary) {
                     continue;
                 }
-                const uint32_t index = uint32_t(cursor[gateway]++);
+                auto* cursor = offsets + uint64_t(gateway) * tiles + tile;
+                const uint32_t index = uint32_t(asc_ldcg(cursor));
+                asc_stcg(cursor, int32_t(index + 1U));
                 if constexpr (SavePlan) {
                     // 沿 token/slot 原顺序确定行号，后续写线程的调度不改变排列。
                     plan_ub[plan_index] = int32_t(index);
@@ -529,18 +535,13 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardTilesVf(
                         }
                     }
                     auto* out = packets + uint64_t(gateway) * packet_words + 16U + uint64_t(index) * 6U;
-                    asc_stcg(out, int32_t(rank));
+                    asc_stcg(out, int32_t(rank | (primary << kWirePrimaryTopkShift) | (k << kWireSecondaryTopkShift)));
                     asc_stcg(out + 1U, int32_t(token));
                     asc_stcg(out + 2U, primary_row);
                     asc_stcg(out + 3U, direct ? -1 : expert / int32_t(experts / world));
                     asc_stcg(out + 4U, peer_row);
                     asc_stcg(out + 5U, int32_t(-1));
                 }
-            }
-        }
-        if constexpr (!Write) {
-            for (uint32_t gateway = 0; gateway < world; ++gateway) {
-                asc_stcg(offsets + uint64_t(gateway) * tiles + tile, cursor[gateway]);
             }
         }
     }
@@ -655,7 +656,8 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardRowsVf(
                                      local_token % kForwardTile];
         }
         auto* out = packets + uint64_t(gateway) * packet_words + 16U + uint64_t(index) * 6U;
-        asc_stcg(out, int32_t(rank));
+        asc_stcg(out, int32_t(rank | (uint32_t(row[2]) << kWirePrimaryTopkShift) |
+                              (uint32_t(route % topk) << kWireSecondaryTopkShift)));
         asc_stcg(out + 1U, int32_t(token));
         asc_stcg(out + 2U, primary_row);
         asc_stcg(out + 3U, direct ? -1 : expert / int32_t(experts / world));
@@ -777,7 +779,8 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyGatherPrefixVf(__gm__ int32
 template <uint32_t CoreCount = kSimtCores>
 __simt_vf__ __launch_bounds__(128) inline void NotifyBuildForwardRowsVf(
     __gm__ int32_t* packets, __gm__ int32_t* offsets, __gm__ int32_t* prefix, __gm__ int32_t* forward,
-    __gm__ int32_t* counts, uint32_t rank, uint32_t world, uint32_t capacity, uint64_t packet_words, uint32_t core)
+    __gm__ int32_t* counts, __gm__ int32_t* weight_return_meta, uint32_t rank, uint32_t world, uint32_t capacity,
+    uint64_t packet_words, uint32_t core, uint32_t tokens, uint32_t topk)
 {
     const uint32_t tiles = (uint64_t(capacity) + kForwardTile - 1U) / kForwardTile;
     const uint32_t worker = threadIdx.x * CoreCount + core;
@@ -795,25 +798,51 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyBuildForwardRowsVf(
         auto* row = packet + 16U + uint64_t(i) * 6U;
         auto* out = forward + (uint64_t(source) * capacity + i) * 6U;
         const int32_t local_gather = asc_ldcg(out + 5U);
-        for (uint32_t field = 0; field < 5U; ++field) {
+        const uint32_t wire_source = uint32_t(asc_ldcg(row));
+        const int32_t source_rank = int32_t(wire_source & kWireRankMask);
+        const int32_t token = asc_ldcg(row + 1U);
+        // Column 0 is filled with token_end by NotifyChunkRangesVf.
+        for (uint32_t field = 1; field < 5U; ++field) {
             asc_stcg(out + field, asc_ldcg(row + field));
         }
         const uint64_t task = uint64_t(source) * tiles + i / kForwardTile;
         asc_stcg(out + 5U, local_gather >= 0 ? source_base + asc_ldcg(offsets + task) + local_gather : -1);
+        // A primary is repeated in its token's secondary records. Only the
+        // first record owns its metadata, including across thread/tile splits.
+        if (i == 0U || asc_ldcg(row - 6U + 1U) != token) {
+            const uint32_t slot = (wire_source >> kWirePrimaryTopkShift) & kWireTopkMask;
+            asc_stcg(weight_return_meta + asc_ldcg(row + 2U),
+                     int32_t((uint64_t(source_rank) * tokens + token) * topk + slot));
+        }
+        // Local secondaries have no backward record. Remote secondaries are
+        // written by NotifyCollectBackwardVf on their expert rank instead.
+        if (asc_ldcg(row + 3U) == int32_t(rank)) {
+            const uint32_t slot = (wire_source >> kWireSecondaryTopkShift) & kWireTopkMask;
+            asc_stcg(weight_return_meta + asc_ldcg(row + 4U),
+                     int32_t((uint64_t(source_rank) * tokens + token) * topk + slot));
+        }
     }
     asc_threadfence();
 }
 
 template <uint32_t CoreCount = kSimtCores>
-__simt_vf__ __launch_bounds__(128) inline void NotifyChunkRangesVf(__gm__ int32_t* packets, __gm__ int32_t* ranges,
+__simt_vf__ __launch_bounds__(128) inline void NotifyChunkRangesVf(__gm__ int32_t* packets, __gm__ int32_t* forward,
+                                                                   uint32_t capacity, __gm__ int32_t* ranges,
                                                                    __gm__ int32_t* masks, uint32_t rank, uint32_t world,
                                                                    uint32_t chunks, uint32_t chunk_tokens,
-                                                                   uint64_t packet_words, uint32_t core)
+                                                                   uint32_t tokens, uint64_t packet_words,
+                                                                   uint32_t core)
 {
     for (uint64_t task = threadIdx.x * CoreCount + core; task < uint64_t(world) * chunks;
          task += (CoreCount * kNotifySimtThreads)) {
         const uint32_t source = task / chunks;
         const uint32_t chunk = task % chunks;
+        const uint32_t first = tokens < chunk_tokens ? tokens : chunk_tokens;
+        const uint32_t splits = first < 4U ? first : 4U;
+        const uint32_t token_begin_bound =
+            chunk < splits ? (chunk * first + splits - 1U) / splits : (chunk + 1U - splits) * chunk_tokens;
+        const uint32_t token_end_bound =
+            chunk < splits ? ((chunk + 1U) * first + splits - 1U) / splits : (chunk + 2U - splits) * chunk_tokens;
         auto* packet = packets + uint64_t(source) * packet_words;
         const uint32_t count = uint32_t(asc_ldcg(packet));
         uint32_t begin = 0;
@@ -822,7 +851,7 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyChunkRangesVf(__gm__ int32_
         while (begin < end) {
             const uint32_t mid = begin + (end - begin) / 2U;
             const uint32_t token = uint32_t(asc_ldcg(packet + 16U + uint64_t(mid) * 6U + 1U));
-            if (uint64_t(token) < uint64_t(chunk) * chunk_tokens) {
+            if (uint32_t(token) < token_begin_bound) {
                 begin = mid + 1U;
             } else {
                 end = mid;
@@ -830,16 +859,31 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyChunkRangesVf(__gm__ int32_
         }
         end = begin;
         int32_t mask = 0;
+        uint32_t token_begin = begin;
+        int32_t previous_token = -1;
         while (end < count) {
             auto* row = packet + 16U + uint64_t(end) * 6U;
-            if (uint64_t(asc_ldcg(row + 1U)) >= (uint64_t(chunk) + 1U) * chunk_tokens) {
+            const int32_t token = asc_ldcg(row + 1U);
+            if (uint32_t(token) >= token_end_bound) {
                 break;
+            }
+            if (token != previous_token) {
+                for (uint32_t i = token_begin; i < end; ++i) {
+                    asc_stcg(forward + (uint64_t(source) * capacity + i) * 6U, int32_t(end));
+                }
+                token_begin = end;
+                previous_token = token;
             }
             const int32_t peer = asc_ldcg(row + 3U);
             if (peer >= 0 && peer != int32_t(rank)) {
                 mask |= 1 << (peer % 8);
             }
             ++end;
+        }
+        // A token never crosses raw-token chunks. Each column-0 cell has
+        // exactly one writer; the other columns are built from packets above.
+        for (uint32_t i = token_begin; i < end; ++i) {
+            asc_stcg(forward + (uint64_t(source) * capacity + i) * 6U, int32_t(end));
         }
         asc_stcg(ranges + task * 2U, int32_t(begin));
         asc_stcg(ranges + task * 2U + 1U, int32_t(end));
@@ -882,67 +926,66 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyCountBackwardTasksVf(__gm__
 }
 
 template <uint32_t CoreCount = kSimtCores>
-__simt_vf__ __launch_bounds__(128) inline void NotifyPrefixBackwardChunksVf(__gm__ int32_t* offsets,
-                                                                            __gm__ int32_t* source_offsets,
-                                                                            uint32_t world, uint32_t chunks,
-                                                                            uint32_t core)
+__simt_vf__ __launch_bounds__(128) inline void NotifyPrefixBackwardChunksVf(
+    __gm__ int32_t* offsets, __gm__ int32_t* group_offsets, __gm__ int32_t* source_masks, __gm__ int32_t* group_masks,
+    uint32_t rank, uint32_t world, uint32_t chunks, uint32_t core)
 {
-    // 每个 (lane, source) 由一个线程负责，只扫描自己的 chunk 计数。
     const uint32_t lanes = world < 8U ? world : 8U;
-    for (uint32_t task = threadIdx.x * CoreCount + core; task < lanes * world;
-         task += (CoreCount * kNotifySimtThreads)) {
-        int32_t total = 0;
-        for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
-            auto* slot = offsets + uint64_t(task) * chunks + chunk;
+    const uint32_t groups = world / (world < 64U ? world : 64U);
+    // One owner per (lane, chunk, group). Sources stay in ascending rank order.
+    for (uint32_t task = threadIdx.x * CoreCount + core; task < lanes * chunks * groups;
+         task += CoreCount * kNotifySimtThreads) {
+        const uint32_t lane = task / (chunks * groups);
+        const uint32_t chunk = task / groups % chunks, group = task % groups;
+        int32_t total = 0, mask = 0;
+        for (uint32_t source = 0; source < world; ++source) {
+            if (first_hit_schedule::CombineGroup(rank, world, source) != group) {
+                continue;
+            }
+            auto* slot = offsets + (uint64_t(lane) * world + source) * chunks + chunk;
             const int32_t count = asc_ldcg(slot);
             asc_stcg(slot, total);
             total += count;
+            if (lane == 0U) {
+                mask |= asc_ldcg(source_masks + uint64_t(source) * chunks + chunk);
+            }
         }
-        // 零 chunk 也覆盖 source 总数，重复调用不依赖清零。
-        asc_stcg(source_offsets + task, total);
+        asc_stcg(group_offsets + uint64_t(task) * 2U, total);
+        if (lane == 0U) {
+            asc_stcg(group_masks + group * chunks + chunk, mask);
+        }
     }
     asc_threadfence();
 }
 
 template <uint32_t CoreCount = kSimtCores>
-__simt_vf__ __launch_bounds__(128) inline void NotifyPrefixBackwardTasksVf(__gm__ int32_t* source_offsets,
-                                                                           __gm__ int64_t* packets, uint32_t rank,
-                                                                           uint32_t world, uint32_t chunks,
-                                                                           uint64_t packet_words, uint32_t core)
+__simt_vf__ __launch_bounds__(128) inline void NotifyPrefixBackwardTasksVf(__gm__ int32_t* group_offsets,
+                                                                           __gm__ int64_t* packets, uint32_t world,
+                                                                           uint32_t chunks, uint64_t packet_words,
+                                                                           uint32_t core)
 {
-    // 每个 lane 只扫描 source 总数，保持 remote -> group -> source -> chunk 的包内顺序。
-    // source 起点与上一步的 chunk 内偏移相加，即为最终写入位置。
     const uint32_t lanes = world < 8U ? world : 8U;
-    const uint32_t groups = world / (world < 16U ? world : 16U);
-    const uint32_t worker = threadIdx.x * CoreCount + core;
-    if (worker < lanes) {
-        const uint32_t lane = worker;
+    const uint32_t groups = world / (world < 64U ? world : 64U);
+    const uint32_t lane = threadIdx.x * CoreCount + core;
+    if (lane < lanes) {
         uint32_t total = 0U;
-        for (uint32_t locality = 0; locality < 2U; ++locality) {
-            for (uint32_t group = 0; group < groups; ++group) {
-                for (uint32_t source = 0; source < world; ++source) {
-                    if (uint32_t(source / 8U == rank / 8U) != locality ||
-                        first_hit_schedule::Group(rank, world, source) != group) {
-                        continue;
-                    }
-                    auto* slot = source_offsets + uint64_t(lane) * world + source;
-                    const uint32_t count = uint32_t(asc_ldcg(slot));
-                    asc_stcg(slot, int32_t(total));
-                    total += count;
-                }
-            }
+        for (uint32_t task = 0; task < chunks * groups; ++task) {
+            auto* slot = group_offsets + (uint64_t(lane) * chunks * groups + task) * 2U;
+            const uint32_t count = uint32_t(asc_ldcg(slot));
+            asc_stcg(slot, int32_t(total));
+            total += count;
+            asc_stcg(slot + 1U, int32_t(total));
         }
-        auto* packet = packets + uint64_t(lane) * packet_words;
-        asc_stcg(packet, int64_t(total));
+        asc_stcg(packets + uint64_t(lane) * packet_words, int64_t(total));
     }
     asc_threadfence();
 }
 
 template <uint32_t CoreCount = kSimtCores>
 __simt_vf__ __launch_bounds__(128) inline void NotifyWriteBackwardTasksVf(
-    __gm__ int32_t* forward, __gm__ int32_t* ranges, __gm__ int32_t* offsets, __gm__ int32_t* source_offsets,
-    __gm__ int64_t* packets, uint32_t rank, uint32_t world, uint32_t chunks, uint32_t packet_capacity,
-    uint64_t packet_words, uint32_t core)
+    __gm__ int32_t* forward, __gm__ int32_t* ranges, __gm__ int32_t* offsets, __gm__ int32_t* group_offsets,
+    __gm__ int64_t* packets, __gm__ int32_t* forward_packets, uint32_t rank, uint32_t world, uint32_t chunks,
+    uint32_t topk, uint32_t packet_capacity, uint64_t packet_words, uint64_t forward_packet_words, uint32_t core)
 {
     // 各任务独占 prefix 分配的区间。chunk 尾标记也由同一个任务写入。
     const uint32_t lanes = world < 8U ? world : 8U;
@@ -957,8 +1000,10 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyWriteBackwardTasksVf(
         const uint32_t begin = uint32_t(asc_ldcg(ranges + range_index * 2U));
         const uint32_t end = uint32_t(asc_ldcg(ranges + range_index * 2U + 1U));
         const uint32_t peer = rank / 8U * 8U + lane;
-        uint32_t output =
-            uint32_t(asc_ldcg(offsets + task)) + uint32_t(asc_ldcg(source_offsets + uint64_t(lane) * world + source));
+        const uint32_t groups = world / (world < 64U ? world : 64U);
+        const uint32_t group = first_hit_schedule::CombineGroup(rank, world, source);
+        auto* bounds = group_offsets + ((uint64_t(lane) * chunks + chunk) * groups + group) * 2U;
+        uint32_t output = uint32_t(asc_ldcg(offsets + task)) + uint32_t(asc_ldcg(bounds));
         __gm__ int64_t* last = nullptr;
         auto* packet = packets + uint64_t(lane) * packet_words;
         for (uint32_t i = begin; i < end; ++i) {
@@ -967,13 +1012,19 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyWriteBackwardTasksVf(
                 continue;
             }
             auto* out = packet + 8U + uint64_t(output++) * 3U;
-            asc_stcg(out, int64_t(source));
+            // forward_recv remains intact until this exchange has finished.
+            // Its record order matches the restored, persisted forward list.
+            const uint32_t wire_source =
+                uint32_t(asc_ldcg(forward_packets + uint64_t(source) * forward_packet_words + 16U + uint64_t(i) * 6U));
+            const uint32_t topk_id = (wire_source >> kWireSecondaryTopkShift) & kWireTopkMask;
+            const uint32_t weight_offset = uint32_t(asc_ldcg(row + 1U)) * topk + topk_id;
+            asc_stcg(out, int64_t(uint64_t(source) | (uint64_t(weight_offset) << 32U)));
             asc_stcg(out + 1U, int64_t(asc_ldcg(row + 4U)));
             asc_stcg(out + 2U, int64_t(asc_ldcg(row + 5U)));
             last = out + 2U;
         }
-        if (last != nullptr) {
-            const uint64_t flag = uint64_t(source * chunks + chunk + 1U) << 32U;
+        if (last != nullptr && output == uint32_t(asc_ldcg(bounds + 1U))) {
+            const uint64_t flag = uint64_t(group * chunks + chunk + 1U) << 32U;
             asc_stcg(last, int64_t(uint64_t(asc_ldcg(last)) | flag));
         }
     }
@@ -983,7 +1034,8 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyWriteBackwardTasksVf(
 template <uint32_t CoreCount = kSimtCores>
 __simt_vf__ __launch_bounds__(128) inline void NotifyCollectBackwardVf(
     __gm__ int64_t* packets, __gm__ int64_t* backward, __gm__ int32_t* counts, __gm__ int32_t* gather_recv,
-    __gm__ int32_t* gather_rows, uint32_t world, uint32_t capacity, uint64_t packet_words, uint32_t core)
+    __gm__ int32_t* gather_rows, __gm__ int32_t* weight_return_meta, uint32_t world, uint32_t topk, uint32_t capacity,
+    uint64_t packet_words, uint32_t core, uint32_t tokens)
 {
     const uint32_t worker = threadIdx.x * CoreCount + core;
     for (uint32_t lane = 0; lane < (world < 8U ? world : 8U); ++lane) {
@@ -993,7 +1045,16 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyCollectBackwardVf(
             asc_stcg(counts + lane, int32_t(count));
         }
         for (uint64_t word = worker; word < uint64_t(count) * 3U; word += (CoreCount * kNotifySimtThreads)) {
-            asc_stcg(backward + uint64_t(lane) * capacity * 3U + word, asc_ldcg(packet + 8U + word));
+            int64_t value = asc_ldcg(packet + 8U + word);
+            if (word % 3U == 0U) {
+                const uint32_t source = uint32_t(value);
+                const uint32_t weight_offset = uint32_t(uint64_t(value) >> 32U);
+                // Read the published packet, not another thread's new output.
+                asc_stcg(weight_return_meta + asc_ldcg(packet + 8U + word + 1U),
+                         int32_t(uint64_t(source) * tokens * topk + weight_offset));
+                value = int64_t(source);
+            }
+            asc_stcg(backward + uint64_t(lane) * capacity * 3U + word, value);
         }
     }
     for (uint32_t peer = worker; peer < world; peer += (CoreCount * kNotifySimtThreads)) {
@@ -1095,7 +1156,7 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
                                   GM_ADDR gateways_address, GM_ADDR local_dst, GM_ADDR mask, GM_ADDR dst,
                                   GM_ADDR forward, GM_ADDR forward_counts, GM_ADDR backward, GM_ADDR backward_counts,
                                   GM_ADDR ranges, GM_ADDR masks, GM_ADDR rank_rows, GM_ADDR gather_rows,
-                                  const NotifyTiling& t)
+                                  GM_ADDR weight_return_meta, const NotifyTiling& t)
 {
     const uint32_t core = GetBlockIdx();
     TPipe pipe;
@@ -1125,7 +1186,7 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
     auto* backward_task_offsets = reinterpret_cast<__gm__ int32_t*>(workspace + t.backward_task_offsets);
     auto* forward_offsets = reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_tile_offsets);
     auto* gather_offsets = reinterpret_cast<__gm__ int32_t*>(workspace + t.gather_tile_offsets);
-    auto* backward_source_offsets = reinterpret_cast<__gm__ int32_t*>(workspace + t.backward_source_offsets);
+    auto* backward_group_offsets = reinterpret_cast<__gm__ int32_t*>(workspace + t.backward_group_offsets);
     auto* expert_totals = reinterpret_cast<__gm__ int32_t*>(workspace + t.expert_totals);
     auto* address_stride = reinterpret_cast<__gm__ int32_t*>(workspace + t.address_stride);
     auto* local_segments = reinterpret_cast<__gm__ int32_t*>(workspace + t.local_prefix_segments);
@@ -1141,7 +1202,7 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
             PipeBarrier<PIPE_V>();
         }
         if (t.cache_parse_routes != 0U) {
-            // bases UB 在 forward 阶段前空闲；当前 shape 的 route 缓存占 6KiB，hist 占 17KiB。
+            // bases UB is available for cached routes until the forward phase.
             auto* routes_ub = reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr());
             asc_vf_call<ParseLocalTopkTokensVf<CoreCount>>(
                 dim3(128), reinterpret_cast<__gm__ ascend_deepep::topk_idx_t*>(input),
@@ -1398,15 +1459,17 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
     SyncAll<true>();
     asc_vf_call<NotifyBuildForwardRowsVf<CoreCount>>(
         dim3(128), reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv), gather_offsets, prefix,
-        reinterpret_cast<__gm__ int32_t*>(forward), reinterpret_cast<__gm__ int32_t*>(forward_counts), t.rank, t.world,
-        t.forward_capacity, t.forward_stride / 4U, core);
+        reinterpret_cast<__gm__ int32_t*>(forward), reinterpret_cast<__gm__ int32_t*>(forward_counts),
+        reinterpret_cast<__gm__ int32_t*>(weight_return_meta), t.rank, t.world, t.forward_capacity,
+        t.forward_stride / 4U, core, t.tokens, t.topk);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
     // chunk 信息直接读取接收包，不依赖其他核写完 forward 表。
     asc_vf_call<NotifyChunkRangesVf<CoreCount>>(
         dim3(128), reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv),
-        reinterpret_cast<__gm__ int32_t*>(ranges), reinterpret_cast<__gm__ int32_t*>(masks), t.rank, t.world, t.chunks,
-        t.chunk_tokens, t.forward_stride / 4U, core);
+        reinterpret_cast<__gm__ int32_t*>(forward), t.forward_capacity, reinterpret_cast<__gm__ int32_t*>(ranges),
+        reinterpret_cast<__gm__ int32_t*>(workspace + t.source_chunk_masks), t.rank, t.world, t.chunks, t.chunk_tokens,
+        t.tokens, t.forward_stride / 4U, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
     SyncAll<true>();
@@ -1416,21 +1479,24 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
     SyncAll<true>();
-    asc_vf_call<NotifyPrefixBackwardChunksVf<CoreCount>>(dim3(128), backward_task_offsets, backward_source_offsets,
-                                                         t.world, t.chunks, core);
+    asc_vf_call<NotifyPrefixBackwardChunksVf<CoreCount>>(
+        dim3(128), backward_task_offsets, backward_group_offsets,
+        reinterpret_cast<__gm__ int32_t*>(workspace + t.source_chunk_masks), reinterpret_cast<__gm__ int32_t*>(masks),
+        t.rank, t.world, t.chunks, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
     SyncAll<true>();
-    asc_vf_call<NotifyPrefixBackwardTasksVf<CoreCount>>(dim3(128), backward_source_offsets,
+    asc_vf_call<NotifyPrefixBackwardTasksVf<CoreCount>>(dim3(128), backward_group_offsets,
                                                         reinterpret_cast<__gm__ int64_t*>(workspace + t.backward_send),
-                                                        t.rank, t.world, t.chunks, t.backward_stride / 8U, core);
+                                                        t.world, t.chunks, t.backward_stride / 8U, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
     SyncAll<true>();
     asc_vf_call<NotifyWriteBackwardTasksVf<CoreCount>>(
         dim3(128), reinterpret_cast<__gm__ int32_t*>(forward), reinterpret_cast<__gm__ int32_t*>(ranges),
-        backward_task_offsets, backward_source_offsets, reinterpret_cast<__gm__ int64_t*>(workspace + t.backward_send),
-        t.rank, t.world, t.chunks, t.forward_capacity, t.backward_stride / 8U, core);
+        backward_task_offsets, backward_group_offsets, reinterpret_cast<__gm__ int64_t*>(workspace + t.backward_send),
+        reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv), t.rank, t.world, t.chunks, t.topk,
+        t.forward_capacity, t.backward_stride / 8U, t.forward_stride / 4U, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
     SyncAll<true>();
@@ -1449,7 +1515,8 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
         dim3(128), reinterpret_cast<__gm__ int64_t*>(workspace + t.backward_recv),
         reinterpret_cast<__gm__ int64_t*>(backward), reinterpret_cast<__gm__ int32_t*>(backward_counts),
         reinterpret_cast<__gm__ int32_t*>(workspace + t.gather_recv), reinterpret_cast<__gm__ int32_t*>(gather_rows),
-        t.world, t.backward_capacity, t.backward_stride / 8U, core);
+        reinterpret_cast<__gm__ int32_t*>(weight_return_meta), t.world, t.topk, t.backward_capacity,
+        t.backward_stride / 8U, core, t.tokens);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
 }
@@ -1470,35 +1537,35 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_full_
     GM_ADDR input, GM_ADDR workspace, GM_ADDR meta, GM_ADDR hist, GM_ADDR bases, GM_ADDR prefix, GM_ADDR counts,
     GM_ADDR gateways, GM_ADDR local_dst, GM_ADDR mask, GM_ADDR dst, GM_ADDR forward, GM_ADDR forward_counts,
     GM_ADDR backward, GM_ADDR backward_counts, GM_ADDR ranges, GM_ADDR masks, GM_ADDR rank_rows, GM_ADDR gather_rows,
-    ascend_deepep::NotifyTiling t)
+    GM_ADDR weight_return_meta, ascend_deepep::NotifyTiling t)
 {
 #if !defined(CATLASS_ARCH) || CATLASS_ARCH == 3510
     util_set_ffts_config(0U);
     // 核数在入口选择编译期特化，SIMT 热循环中的除法仍可优化成常量移位。
     if (t.num_cores == 64U) {
         FullNotify<64U>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask, dst, forward,
-                        forward_counts, backward, backward_counts, ranges, masks, rank_rows, gather_rows, t);
+                        forward_counts, backward, backward_counts, ranges, masks, rank_rows, gather_rows,
+                        weight_return_meta, t);
     } else {
         FullNotify<32U>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask, dst, forward,
-                        forward_counts, backward, backward_counts, ranges, masks, rank_rows, gather_rows, t);
+                        forward_counts, backward, backward_counts, ranges, masks, rank_rows, gather_rows,
+                        weight_return_meta, t);
     }
 #endif
 }
 
-extern "C" ASCEND_DEEPEP_EXPORT void notify_full_kernel_do(void* stream, uint8_t* input, uint8_t* workspace,
-                                                           uint8_t* meta, uint8_t* hist, uint8_t* bases,
-                                                           uint8_t* prefix, uint8_t* counts, uint8_t* gateways,
-                                                           uint8_t* local_dst, uint8_t* mask, uint8_t* dst,
-                                                           uint8_t* forward, uint8_t* forward_counts, uint8_t* backward,
-                                                           uint8_t* backward_counts, uint8_t* ranges, uint8_t* masks,
-                                                           uint8_t* rank_rows, uint8_t* gather_rows, uint8_t* tiling)
+extern "C" ASCEND_DEEPEP_EXPORT void notify_full_kernel_do(
+    void* stream, uint8_t* input, uint8_t* workspace, uint8_t* meta, uint8_t* hist, uint8_t* bases, uint8_t* prefix,
+    uint8_t* counts, uint8_t* gateways, uint8_t* local_dst, uint8_t* mask, uint8_t* dst, uint8_t* forward,
+    uint8_t* forward_counts, uint8_t* backward, uint8_t* backward_counts, uint8_t* ranges, uint8_t* masks,
+    uint8_t* rank_rows, uint8_t* gather_rows, uint8_t* weight_return_meta, uint8_t* tiling)
 {
     // SIMD 主核调用的 SIMT VF 也访问这些 TPipe buffer，必须在启动时声明动态 UB 范围。
     const auto& config = *reinterpret_cast<ascend_deepep::NotifyTiling*>(tiling);
     notify_full_kernel<<<config.num_cores, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(ascend_deepep::kNotifyDynamicUbBytes),
                          stream>>>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask, dst,
                                    forward, forward_counts, backward, backward_counts, ranges, masks, rank_rows,
-                                   gather_rows, config);
+                                   gather_rows, weight_return_meta, config);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_barrier_kernel_do(void* stream, uint32_t num_cores)

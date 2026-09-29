@@ -65,9 +65,9 @@ def inspect_wheel(path):
             raise RuntimeError("Wheel must include the adopted API's third-party license")
         info = json.loads(archive.read("deep_ep/_build_info.json"))
         kernel_capabilities = {
-            "elastic-notify-metadata-v1",
+            "elastic-notify-metadata-v4",
             "elastic-dispatch-expanded-v1",
-            "elastic-combine-expanded-v1",
+            "elastic-combine-expanded-v3",
         }
         if kernel_capabilities.intersection(info.get("capabilities", [])):
             if "deep_ep/libdeepep_kernels.so" not in names:

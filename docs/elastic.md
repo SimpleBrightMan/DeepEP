@@ -39,7 +39,7 @@ LL dispatch要求真实FP32 topk_weights，公开第三项为None，source_weigh
 
 | 项目 | 当前约束 |
 | --- | --- |
-| 环境 | Ascend950、CANN 9.2、`dependencies.lock.json` 固定的 SHMEM SDK |
+| 环境 | Ascend950、CANN 9.2；SHMEM 依赖 [PR #851](https://gitcode.com/cann/shmem/pull/851) 的 shared-jetty 支持，构建版本由 `dependencies.lock.json` 固定 |
 | EP | dispatch / combine：2、4、8、16、32、64、128；内部 Notify 上限 256 不代表完整链路支持 EP256 |
 | 拓扑 | 所有 rank 的 SHMEM 工作区可通过超节点 MTE 映射；连续 8 rank 为一个逻辑 server，可跨主机 |
 | Shape | H=7168，1≤T≤10240，1≤K≤16，EP≤E≤1024，E 能被 EP 整除 |

@@ -115,7 +115,22 @@
         "num_max_tokens_per_rank",
         "num_recv_tokens_per_expert_list"
       ],
-      "ownership": "Routing plan belongs to one buffer and survives until the matching backward/recompute finishes."
+      "ownership": "Routing plan belongs to one buffer and survives until the matching backward/recompute finishes.",
+      "metadata_version": 4,
+      "forward_list": {
+        "shape": "[world_size,T*K,6]",
+        "dtype": "int32",
+        "fields": ["token_end", "token_id", "primary_row", "secondary_rank", "secondary_row", "gather_row"],
+        "token_end": "Exclusive row end within the source partition, repeated on every row of the same token."
+      },
+      "backward_list_order": ["token_chunk", "gateway_group", "src_rank", "gather_row"],
+      "weight_return_meta": {
+        "shape": "[num_expanded_tokens]",
+        "dtype": "int32",
+        "encoding": "(src_rank * T + token_id) * K + topk_id",
+        "topk_id": "Original top-k position, not expert ID.",
+        "storage": "View of framework-owned [world_size*T*K] storage; cached routing must remain unchanged."
+      }
     },
     "events": {
       "Buffer.capture": "EventOverlap",

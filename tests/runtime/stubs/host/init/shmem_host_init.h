@@ -25,3 +25,4 @@ int aclshmemx_init_status();
 int aclshmemx_init_attr(int, aclshmemx_init_attr_t*);
 int aclshmem_finalize();
 int aclshmemx_set_qp_num(data_op_engine_type_t, uint32_t);
+int aclshmemx_set_shared_jetty(data_op_engine_type_t, bool);

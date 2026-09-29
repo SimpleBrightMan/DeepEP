@@ -19,6 +19,12 @@ ascend_deepep::PutCombineTiling layout(int rank, int world, int tokens, int topk
         throw std::invalid_argument("Invalid expanded Combine shape");
     }
     const auto t = ascend_deepep::MakeCombineTiling(rank, world, tokens, topk, rows, gathered, chunk);
+    const uint64_t range_bytes = uint64_t(world) * t.chunks_per_group * 8U;
+    const uint64_t mask_bytes = uint64_t(t.total_chunk_num) * 4U;
+    if ((range_bytes + 31U) / 32U * 32U + (mask_bytes + 31U) / 32U * 32U >
+        ascend_deepep::combine_config::kGatewayControlUbBytes) {
+        throw std::invalid_argument("Combine chunk ranges/masks exceed the resident 44 KiB UB capacity");
+    }
     if (ascend_deepep::CombineWorkspaceBytes(t) > (16ULL << 30)) {
         throw std::invalid_argument("Combine exceeds its half of the 32 GiB session limit");
     }
@@ -58,6 +64,9 @@ void bind_combine(py::module_& module)
         result["server_partial"] = t.server_partial_offset_bytes;
         result["returned_partial"] = t.returned_partial_offset_bytes;
         result["output"] = t.output_offset_bytes;
+        result["weight_recv"] = t.weight_recv_offset_bytes;
+        result["weight_local_done"] = t.weight_local_done_offset_bytes;
+        result["weight_done"] = t.weight_done_offset_bytes;
         result["workspace_bytes"] = ascend_deepep::CombineWorkspaceBytes(t);
         return result;
     });
@@ -84,7 +93,16 @@ void bind_combine(py::module_& module)
         auto* backward_counts = pointer(tensors["backward_counts"], {std::min(session.world(), 8)}, "int32", device);
         auto* mask = pointer(tensors["server_mask"], {tokens}, "int64", device);
         auto* ranges = pointer(tensors["chunk_ranges"], {session.world(), t.chunks_per_group, 2}, "int32", device);
-        auto* masks = pointer(tensors["chunk_masks"], {session.world(), t.chunks_per_group}, "int32", device);
+        auto* masks =
+            pointer(tensors["chunk_masks"], {session.world() / t.group_size, t.chunks_per_group}, "int32", device);
+        uint8_t *weights = nullptr, *weight_meta = nullptr, *weight_output = nullptr;
+        t.with_weights = tensors.contains("weights");
+        t.weight_rows = uint32_t(local_rows);
+        if (t.with_weights) {
+            weights = pointer(tensors["weights"], {local_rows}, "float32", device);
+            weight_meta = pointer(tensors["weight_return_meta"], {local_rows}, "int32", device);
+            weight_output = pointer(tensors["weight_output"], {tokens, topk}, "float32", device);
+        }
         auto stream = reinterpret_cast<aclrtStream>(stream_address);
         py::gil_scoped_release release;
         // Before overwriting even input storage, all peers have finished the
@@ -92,10 +110,14 @@ void bind_combine(py::module_& module)
         notify_dispatch_barrier_kernel_do(stream, 64U);
         copy(workspace + t.expert_input_offset_bytes, input, uint64_t(local_rows) * 14336U, stream);
         combine_prepare_kernel_do(stream, workspace, reinterpret_cast<uint8_t*>(&t));
-        combine_kernel_do(stream, workspace, forward, counts, backward, backward_counts, mask, ranges, masks,
-                          reinterpret_cast<uint8_t*>(&t));
+        combine_kernel_do(stream, workspace, forward, counts, backward, backward_counts, mask, ranges, masks, weights,
+                          weight_meta, reinterpret_cast<uint8_t*>(&t));
         notify_dispatch_barrier_kernel_do(stream, 64U);
         copy(output, workspace + t.output_offset_bytes, uint64_t(tokens) * 14336U, stream);
+        if (t.with_weights) {
+            copy(weight_output, workspace + t.weight_recv_offset_bytes, uint64_t(tokens) * topk * sizeof(float),
+                 stream);
+        }
     });
 }
 }  // namespace deepep

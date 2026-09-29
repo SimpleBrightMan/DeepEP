@@ -6,6 +6,9 @@ NPU: python tests/elastic/test_dispatch.py --ep-size 2 --nproc-per-node 2 \
 """
 
 import argparse
+import csv
+import math
+import statistics
 import json
 import os
 from pathlib import Path
@@ -59,7 +62,7 @@ def group_steps(rank, world):
     steps = [0] * world
     for group in range(world // min(world, 16)):
         for index in range(min(world, 16)):
-            steps[group_peer(rank, world, group, index)] = group
+            steps[group_peer(rank, world, group, index)] = (group * min(world, 16) + index) // min(world, 64)
     return steps
 
 
@@ -76,7 +79,19 @@ def build_notify_golden(routes, experts, chunk_tokens):
     ):
         raise ValueError("routes must have a common [tokens, topk] shape")
     local_experts = experts // world
-    chunks = (tokens + chunk_tokens - 1) // chunk_tokens
+    splits = min(4, tokens, chunk_tokens)
+    first = min(tokens, chunk_tokens)
+    chunks = (tokens + chunk_tokens - 1) // chunk_tokens + splits - 1
+
+    def token_chunk(token):
+        return token * splits // first if token < first else token // chunk_tokens + splits - 1
+
+    def chunk_end(chunk):
+        return (
+            (chunk + 1) * first // splits + bool((chunk + 1) * first % splits)
+            if chunk < splits
+            else min((chunk + 2 - splits) * chunk_tokens, tokens)
+        )
 
     counts = [0] * experts
     for rows in routes:
@@ -101,7 +116,7 @@ def build_notify_golden(routes, experts, chunk_tokens):
                 "forward_list": [[] for _ in range(world)],
                 "backward_list": [[] for _ in range(min(world, 8))],
                 "chunk_ranges": [[(0, 0) for _ in range(chunks)] for _ in range(world)],
-                "chunk_masks": [0] * (world * chunks),
+                "chunk_masks": [0] * (world // min(world, 64) * chunks),
             }
         )
 
@@ -139,14 +154,22 @@ def build_notify_golden(routes, experts, chunk_tokens):
 
     for gateway, plan in enumerate(plans):
         for source, block in enumerate(plan["forward_list"]):
+            begin = 0
+            while begin < len(block):
+                end = begin + 1
+                while end < len(block) and block[end][1] == block[begin][1]:
+                    end += 1
+                for row in range(begin, end):
+                    block[row] = (end, *block[row][1:])
+                begin = end
             cursor = 0
             for chunk in range(chunks):
                 begin = cursor
-                token_end = min((chunk + 1) * chunk_tokens, tokens)
+                token_end = chunk_end(chunk)
                 while cursor < len(block) and block[cursor][1] < token_end:
                     peer = block[cursor][3]
                     if peer >= 0 and peer != gateway:
-                        plan["chunk_masks"][source * chunks + chunk] |= 1 << (peer % 8)
+                        plan["chunk_masks"][group_steps(gateway, world)[source] * chunks + chunk] |= 1 << (peer % 8)
                     cursor += 1
                 plan["chunk_ranges"][source][chunk] = (begin, cursor)
         for lane, block in enumerate(plan["backward_list"]):
@@ -155,22 +178,21 @@ def build_notify_golden(routes, experts, chunk_tokens):
             ordered = list(enumerate(block))
             ordered.sort(
                 key=lambda item: (
-                    item[1][0] // 8 == gateway_peer // 8,
+                    token_chunk(item[1][3]),
                     gateway_steps[item[1][0]],
                     item[1][0],
-                    item[1][3] // chunk_tokens,
                     item[0],
                 )
             )
             block[:] = [item[1] for item in ordered]
             for index, (source, row, reduce_row, token) in enumerate(block):
-                key = source * chunks + token // chunk_tokens + 1
+                key = gateway_steps[source] * chunks + token_chunk(token) + 1
                 next_key = 0
                 if index + 1 == len(block):
                     next_key = key
                 else:
                     next_source, _, _, next_token = block[index + 1]
-                    candidate = next_source * chunks + next_token // chunk_tokens + 1
+                    candidate = gateway_steps[next_source] * chunks + token_chunk(next_token) + 1
                     if candidate != key:
                         next_key = key
                 block[index] = (source, row, reduce_row | (next_key << 32))
@@ -199,6 +221,8 @@ def make_routes(world, tokens, topk, experts, generation, mode):
                 row = [-1] * topk
             if mode == "hotspot":
                 row = [experts - 1] * topk
+            if mode == "sq_pressure":
+                row = [0 if source in (8, 20, 48, 52, 80, 84, 112, 116) else -1] * topk
             if mode in ("local_duplicates", "local_experts"):
                 local = experts // world
                 peer = (source + token) % world
@@ -212,8 +236,8 @@ def check_handle(handle, golden, rank, routes, experts):
     import torch
 
     plan = golden["plans"][rank]
-    if handle.metadata_only or handle.metadata_version != 1:
-        raise AssertionError("Expected expanded dispatch handle v1")
+    if handle.metadata_only or handle.metadata_version != 4:
+        raise AssertionError("Expected expanded dispatch handle metadata v4")
     for name in (
         "server_mask",
         "dst",
@@ -236,6 +260,19 @@ def check_handle(handle, golden, rank, routes, experts):
             expected = torch.tensor(plan[name][row], dtype=actual.dtype).reshape(count, actual.shape[-1])
             if not torch.equal(actual[row, :count], expected):
                 raise AssertionError(f"rank {rank}: {name}[{row}] mismatch")
+    weight_meta = handle.weight_return_meta
+    weight_meta_cpu = weight_meta.cpu()
+    expected_weight_meta = torch.tensor(
+        [(s * handle.num_tokens + t) * handle.num_topk + k for s, t, k in expert_rows(routes, experts, rank)],
+        dtype=torch.int32,
+    )
+    if (
+        weight_meta.dtype != torch.int32
+        or weight_meta.device.type != "npu"
+        or not weight_meta.is_contiguous()
+        or not torch.equal(weight_meta_cpu, expected_weight_meta)
+    ):
+        raise AssertionError(f"rank {rank}: weight_return_meta mismatch")
     totals = [0] * experts
     for source in routes:
         for row in source:
@@ -330,14 +367,14 @@ def _worker_identity(local_rank, args):
 def expert_rows(routes, experts, rank):
     """Independent destination order: local expert, source rank, token, top-k slot."""
     local = experts // len(routes)
-    return [
-        (source, token, slot)
-        for expert in range(rank * local, (rank + 1) * local)
-        for source, tokens in enumerate(routes)
-        for token, row in enumerate(tokens)
-        for slot, selected in enumerate(row)
-        if selected == expert
-    ]
+    begin = rank * local
+    buckets = [[] for _ in range(local)]
+    for source, tokens in enumerate(routes):
+        for token, row in enumerate(tokens):
+            for slot, selected in enumerate(row):
+                if begin <= selected < begin + local:
+                    buckets[selected - begin].append((source, token, slot))
+    return [entry for bucket in buckets for entry in bucket]
 
 
 def test_forward_list_covers_unique_expert_rows():
@@ -369,14 +406,52 @@ def test_forward_list_covers_unique_expert_rows():
                         begin, end = len(records) * worker // workers, len(records) * (worker + 1) // workers
                         covered.extend(range(begin, end))
                         for record in records[begin:end]:
-                            src, token, primary_row, peer, row, _ = record
-                            assert src == source and primary[gateway][primary_row] == (source, token)
+                            _, token, primary_row, peer, row, _ = record
+                            assert primary[gateway][primary_row] == (source, token)
                             if peer >= 0:
                                 assert gateway // 8 == peer // 8
                                 write(peer, row, primary[gateway][primary_row])
                     assert covered == list(range(len(records)))
             for rank in range(world):
                 assert output[rank] == [(source, token) for source, token, _ in expert_rows(routes, experts, rank)]
+
+
+def test_dispatch_destination_initialization():
+    import ast
+    from types import SimpleNamespace
+
+    path = Path(__file__).resolve().parents[2] / "deep_ep/buffers/elastic.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    # Execute the production initialization block without requiring an NPU.
+    branch = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(statement, ast.Assign)
+            and any(isinstance(target, ast.Attribute) and target.attr == "dispatch_dst" for target in statement.targets)
+            for statement in node.body
+        )
+    )
+    code = compile(ast.Module(body=[branch], type_ignores=[]), str(path), "exec")
+
+    class ScalarTensor(int):
+        def to(self, dtype):
+            return self
+
+    torch = SimpleNamespace(
+        int32="int32", int64="int64", where=lambda condition, yes, no: ScalarTensor(yes if condition else no)
+    )
+    for raw, expected in ((0, 0), (2, 2), (3, 4), (5, 6), (-1, -1), (-4, -5), (-6, -7), (-(1 << 31), -(1 << 31))):
+        handle = SimpleNamespace(dispatch_dst=None, dst=ScalarTensor(raw))
+        scope = dict(handle=handle, rows=3, layout={"address_stride": 4}, torch=torch)
+        exec(code, scope)
+        assert isinstance(handle.dispatch_dst, ScalarTensor)
+        assert handle.dispatch_dst == expected
+        cached = handle.dispatch_dst
+        handle.dst = object()  # Cached calls must not read/re-encode the Notify tensor.
+        exec(code, scope)
+        assert handle.dispatch_dst is cached
 
 
 def test_dispatch_regions_and_encoding_bounds():
@@ -443,23 +518,248 @@ def weights_for(source, tokens, topk, generation):
     return ((torch.arange(tokens * topk).reshape(tokens, topk) + source * 3 + generation) % 31 + 1).float() / 32
 
 
-def expected_payload(routes, experts, rank, generation, fp8):
+def expected_payload(routes, experts, rank, generation, fp8, *, entries=None):
     import torch
 
-    entries = expert_rows(routes, experts, rank)
-    tokens, topk = len(routes[0]), len(routes[0][0])
-    source_payload = [payload(source, tokens, generation, fp8) for source in range(len(routes))]
-    source_weights = [weights_for(source, tokens, topk, generation) for source in range(len(routes))]
-    # Byte indexing supports CPU builds that do not implement FP8 index/stack.
-    if entries:
-        hidden_bytes = torch.stack([source_payload[s][0][t].view(torch.uint8) for s, t, _ in entries])
-        hidden = hidden_bytes.view(source_payload[0][0].dtype)
-        scales = torch.stack([source_payload[s][1][t] for s, t, _ in entries])
-        weights = torch.stack([source_weights[s][t, k] for s, t, k in entries])
-    else:
-        hidden = torch.empty((0, 7168), dtype=source_payload[0][0].dtype)
-        scales, weights = torch.empty((0, 56), dtype=torch.float32), torch.empty((0,), dtype=torch.float32)
+    if entries is None:
+        entries = expert_rows(routes, experts, rank)
+    topk = len(routes[0][0])
+    dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    hidden = torch.empty((len(entries), 7168), dtype=dtype)
+    scales = torch.empty((len(entries), 56), dtype=torch.float32)
+    weights = torch.empty((len(entries),), dtype=torch.float32)
+    if not entries:
+        return hidden, scales, weights
+    columns = torch.arange(7168, dtype=torch.int32)[None, :]
+    # Quantize the 127 distinct rows once; gather bytes to preserve FP8 rounding.
+    phases = torch.arange(127, dtype=torch.int32)[:, None]
+    lookup = (((phases + columns * 3) % 127 - 63).float() / 16).to(dtype).view(torch.uint8)
+    scale_columns = torch.arange(56, dtype=torch.int32)[None, :]
+    for begin in range(0, len(entries), 256):
+        end = min(begin + 256, len(entries))
+        coordinates = torch.tensor(entries[begin:end], dtype=torch.int32)
+        source, token, slot = (coordinates[:, i : i + 1] for i in range(3))
+        phase = ((source * 13 + token * 7 + generation * 11) % 127).flatten().long()
+        hidden[begin:end].view(torch.uint8).copy_(lookup.index_select(0, phase))
+        scales[begin:end] = ((source + token + scale_columns + generation) % 7 + 1).float() / 8
+        weights[begin:end] = ((token * topk + slot + source * 3 + generation) % 31 + 1).flatten().float() / 32
     return hidden, scales, weights
+
+
+_PROFILE_KERNELS = {"notify": "notify_full_kernel", "dispatch": "dispatch_kernel", "combine": "combine_kernel"}
+
+
+def add_profile_args(parser, operations):
+    parser.add_argument("--profile-op", choices=operations, help="Profile device kernels after precision validation")
+    parser.add_argument("--profile-warmup", type=int, default=5)
+    parser.add_argument("--profile-iters", type=int, default=10)
+
+
+def validate_profile_args(parser, args):
+    if args.profile_warmup < 0 or args.profile_iters < 1:
+        parser.error("--profile-warmup must be >=0 and --profile-iters must be >=1")
+
+
+def _statistics(kernel, durations):
+    return dict(
+        kernel=kernel,
+        unit="us",
+        samples=len(durations),
+        durations_us=durations,
+        avg_us=statistics.mean(durations),
+        median_us=statistics.median(durations),
+        min_us=min(durations),
+        max_us=max(durations),
+    )
+
+
+def read_kernel_summary(directory, operator, expected_samples):
+    """Select one CSV source only; retain all samples and reject incomplete captures."""
+    kernel = _PROFILE_KERNELS[operator]
+    wanted = {kernel}
+    if operator == "combine":
+        wanted.add("combine_prepare_kernel")
+    for pattern in ("kernel_details*.csv", "op_summary*.csv", "task_time*.csv"):
+        tables = []
+        for path in sorted(Path(directory).rglob(pattern)):
+            values = {name: [] for name in wanted}
+            with path.open(encoding="utf-8-sig", newline="") as stream:
+                reader = csv.DictReader(stream)
+                headers = {key.strip(): key for key in reader.fieldnames or ()}
+                name_key = next((headers[k] for k in ("Name", "Op Name", "Kernel Name") if k in headers), None)
+                units = [
+                    (f"{prefix}({unit})", scale)
+                    for unit, scale in (("us", 1.0), ("ns", 0.001), ("ms", 1000.0))
+                    for prefix in ("Duration", "Task Duration")
+                ]
+                duration = next(((headers[k], scale) for k, scale in units if k in headers), None)
+                if name_key is None or duration is None:
+                    continue
+                duration_key, scale = duration
+                for row in reader:
+                    name = (row.get(name_key) or "").strip()
+                    if name not in wanted:
+                        continue
+                    try:
+                        value = float(row[duration_key]) * scale
+                    except (ValueError, TypeError) as exc:
+                        raise ValueError(f"Invalid duration for {name} in {path}") from exc
+                    if not math.isfinite(value) or value <= 0:
+                        raise ValueError(f"Invalid duration for {name} in {path}: {value}")
+                    values[name].append(value)
+            if values[kernel]:
+                tables.append((path, values))
+        if not tables:
+            continue
+        if len(tables) != 1:
+            raise ValueError(f"Ambiguous {kernel} capture: {len(tables)} {pattern} tables under {directory}")
+        path, values = tables[0]
+        for name in wanted:
+            if len(values[name]) != expected_samples:
+                raise ValueError(f"{name}: expected {expected_samples} samples, found {len(values[name])} in {path}")
+        summary = _statistics(kernel, values[kernel])
+        summary.update(
+            expected_samples=expected_samples, source_csv=str(path.resolve()), metric="device_kernel_duration"
+        )
+        if operator == "combine":
+            summary["prepare"] = _statistics("combine_prepare_kernel", values["combine_prepare_kernel"])
+        return summary
+    raise ValueError(f"No {kernel} duration records found in {directory}")
+
+
+def capture_calls(profiler, invoke, synchronize, warmup, iterations, log):
+    """One warmup step and one active step, with exactly the requested call counts."""
+    last = None
+    if warmup:
+        log(f"profile warmup.begin calls={warmup}")
+        for _ in range(warmup):
+            last = invoke()
+        synchronize()
+        profiler.step()
+    log(f"profile capture.begin calls={iterations}")
+    for _ in range(iterations):
+        last = invoke()
+    synchronize()
+    profiler.step()
+    return last
+
+
+def profile_operator(args, rank, scenario, invoke, validate, build_info, log):
+    """Capture rank-local kernel durations after warmup."""
+    import torch
+    import torch_npu
+
+    directory = args.output / "profile" / args.profile_op / scenario / f"rank_{rank}" / str(time.time_ns())
+    directory.mkdir(parents=True, exist_ok=False)
+    metadata = dict(
+        operator=args.profile_op,
+        rank=rank,
+        world_size=args.ep_size,
+        scenario=scenario,
+        tokens=args.tokens,
+        topk=args.topk,
+        experts=args.experts,
+        hidden=7168,
+        warmup=args.profile_warmup,
+        iterations=args.profile_iters,
+        torch_version=str(torch.__version__),
+        torch_npu_version=str(torch_npu.__version__),
+        ascend_home_path=os.environ.get("ASCEND_HOME_PATH"),
+        build_info=build_info,
+    )
+    toolkit = Path(os.environ.get("ASCEND_HOME_PATH", "/nonexistent"))
+    metadata["cann_version_files"] = {
+        str(path): path.read_text(encoding="utf-8", errors="replace")
+        for path in (toolkit / "version.cfg", toolkit / "version.info")
+        if path.is_file()
+    }
+    (directory / "capture.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    log(f"profile op={args.profile_op} scenario={scenario} output={directory}")
+    torch.npu.synchronize()
+    profiler = torch_npu.profiler
+    with profiler.profile(
+        activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
+        schedule=profiler.schedule(wait=0, warmup=int(args.profile_warmup > 0), active=1, repeat=1),
+        on_trace_ready=profiler.tensorboard_trace_handler(str(directory)),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_modules=False,
+        with_flops=False,
+        experimental_config=profiler._ExperimentalConfig(
+            export_type=[profiler.ExportType.Text],
+            profiler_level=profiler.ProfilerLevel.Level0,
+            aic_metrics=profiler.AiCMetrics.AiCoreNone,
+            data_simplification=False,
+        ),
+    ) as capture:
+        last = capture_calls(capture, invoke, torch.npu.synchronize, args.profile_warmup, args.profile_iters, log)
+    torch.npu.synchronize()
+    validate(last)
+    summary = read_kernel_summary(directory, args.profile_op, args.profile_iters)
+    summary.update(metadata, precision_checked=True)
+    (directory / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    log(
+        f"profile kernel={summary['kernel']} samples={summary['samples']} avg_us={summary['avg_us']:.3f} "
+        f"median_us={summary['median_us']:.3f} min_us={summary['min_us']:.3f} max_us={summary['max_us']:.3f}"
+    )
+    if "prepare" in summary:
+        log(f"profile combine_prepare_kernel avg_us={summary['prepare']['avg_us']:.3f} excluded_from_combine=1")
+    return summary
+
+
+def notify_profile_call(buffer, handle, experts):
+    """Prepare the existing native Notify entry independently of payload dispatch."""
+    import torch
+    from deep_ep._native import require_native
+    from deep_ep._runtime import runtime_of
+
+    runtime = runtime_of(buffer)
+    native = require_native("notify profiling")
+    specification = native.notify_layout(runtime.rank, runtime.world_size, handle.num_tokens, handle.num_topk, experts)
+    if specification["workspace_bytes"] > runtime.capacity // 2:
+        raise ValueError("Notify profile exceeds the reserved SHMEM half")
+    native.notify_check_mapping(runtime.native)
+    indices = handle.topk_idx
+    with torch.npu.stream(runtime.stream):
+        outputs = {
+            name: torch.empty(shape, dtype=getattr(torch, dtype), device=indices.device)
+            for name, (shape, dtype) in specification["tensors"].items()
+        }
+    torch.npu.synchronize()
+
+    def invoke():
+        with torch.npu.stream(runtime.stream):
+            native.notify(
+                runtime.native, indices, outputs, handle.num_tokens, handle.num_topk, experts, runtime.stream.npu_stream
+            )
+        return outputs
+
+    def validate(result):
+        # The baseline handle has already passed the independent CPU golden.
+        for name in (
+            "server_mask",
+            "dst",
+            "forward_counts",
+            "backward_counts",
+            "chunk_ranges",
+            "chunk_masks",
+            "rank_rows",
+            "gather_rows",
+            "expert_totals",
+        ):
+            if not torch.equal(result[name].cpu(), getattr(handle, name).cpu()):
+                raise AssertionError(f"profile notify: {name} differs from validated metadata")
+        for name, counts in (("forward_list", "forward_counts"), ("backward_list", "backward_counts")):
+            for lane, count in enumerate(getattr(handle, counts).cpu().tolist()):
+                if not torch.equal(result[name][lane, :count].cpu(), getattr(handle, name)[lane, :count].cpu()):
+                    raise AssertionError(f"profile notify: {name}[{lane}] differs from validated metadata")
+        if not torch.equal(
+            result["weight_return_meta"][: handle.num_expanded_tokens].cpu(), handle.weight_return_meta.cpu()
+        ):
+            raise AssertionError("profile notify: weight_return_meta differs from validated metadata")
+
+    return invoke, validate
 
 
 def main():
@@ -474,7 +774,9 @@ def main():
     )
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--output", type=Path, required=True)
+    add_profile_args(parser, ("notify", "dispatch"))
     args = parser.parse_args()
+    validate_profile_args(parser, args)
     if not __debug__ or os.environ.get("PYTHONOPTIMIZE") or args.repeat < 2:
         parser.error("Enable assertions and use --repeat >=2")
     _launch(args, worker)
@@ -492,6 +794,8 @@ def worker(local_rank, args):
     info = json.loads(Path(deep_ep.__file__).with_name("_build_info.json").read_text())
     if "elastic-dispatch-expanded-v1" not in info.get("capabilities", []):
         raise RuntimeError("Installed wheel does not contain payload dispatch")
+    if "elastic-notify-metadata-v4" not in info.get("capabilities", []):
+        raise RuntimeError("Rebuild/install the wheel with Notify metadata v4")
     torch.npu.set_device(local_rank)
     modes = ("normal", "duplicates", "invalid", "empty", "hotspot") if args.route == "all" else (args.route,)
     dtypes = (False, True) if args.dtype == "both" else (args.dtype == "fp8",)
@@ -517,13 +821,14 @@ def worker(local_rank, args):
     log("buffer.init.done")
     checks, previous_output = 0, None
     try:
-        for fp8 in dtypes:
-            for mode in modes:
+        for mode in modes:
+            log(f"route={mode} routes_and_notify_golden.begin (CPU)")
+            routes = make_routes(world, args.tokens, args.topk, args.experts, 0, mode)
+            notify_golden = build_notify_golden(routes, args.experts, 256)
+            entries = expert_rows(routes, args.experts, rank)
+            log(f"route={mode} routes_and_notify_golden.done")
+            for fp8 in dtypes:
                 context = f"dtype={'fp8' if fp8 else 'bf16'} route={mode}"
-                log(f"{context} routes_and_notify_golden.begin (CPU)")
-                routes = make_routes(world, args.tokens, args.topk, args.experts, 0, mode)
-                notify_golden = build_notify_golden(routes, args.experts, 256)
-                log(f"{context} routes_and_notify_golden.done")
                 for with_weights in (False, True):
                     handle = None
                     for generation in range(args.repeat):
@@ -567,7 +872,7 @@ def worker(local_rank, args):
                             raise AssertionError("Cached dispatch replaced its routing handle")
                         log(f"{iteration} payload_golden.begin (CPU)")
                         expected, expected_scales, expected_weights = expected_payload(
-                            routes, args.experts, rank, generation, fp8
+                            routes, args.experts, rank, generation, fp8, entries=entries
                         )
                         log(f"{iteration} payload_golden.done")
                         data = output[0] if fp8 else output
@@ -579,6 +884,43 @@ def worker(local_rank, args):
                             assert_bytes(weights, expected_weights, "weights")
                         elif weights is not None:
                             raise AssertionError("Weights returned when none were supplied")
+                        if args.profile_op and generation == 0 and (args.profile_op != "notify" or not with_weights):
+                            if args.profile_op == "notify":
+                                invoke, validate = notify_profile_call(buffer, handle, args.experts)
+                            else:
+
+                                def invoke():
+                                    result = buffer.dispatch(
+                                        x,
+                                        topk_weights=w,
+                                        handle=handle,
+                                        do_expand=True,
+                                        async_with_compute_stream=True,
+                                    )
+                                    result[-1].current_stream_wait()
+                                    return result
+
+                                def validate(result):
+                                    received, _, returned_weights, returned_handle, _ = result
+                                    if returned_handle is not handle:
+                                        raise AssertionError("Profile dispatch replaced the routing handle")
+                                    assert_bytes(received[0] if fp8 else received, expected, "profile dispatch hidden")
+                                    if fp8:
+                                        assert_bytes(received[1], expected_scales, "profile dispatch scales")
+                                    if use_weights:
+                                        assert_bytes(returned_weights, expected_weights, "profile dispatch weights")
+                                    elif returned_weights is not None:
+                                        raise AssertionError("Profile dispatch unexpectedly returned weights")
+
+                            profile_operator(
+                                args,
+                                rank,
+                                f"{mode}-{'fp8' if fp8 else 'bf16'}-weights{int(use_weights)}",
+                                invoke,
+                                validate,
+                                info,
+                                log,
+                            )
                         if previous_output is not None:
                             for prior, expected_prior in previous_output:
                                 assert_bytes(prior, expected_prior, "retained output across cached/fresh calls")
@@ -684,6 +1026,26 @@ def test_hand_computed_routes():
     duplicate = build_notify_golden([[[0, 0]], [[-1, -1]]], 4, 256)
     assert duplicate["rank_rows"] == [2, 0]
     assert duplicate["plans"][0]["dst"] == [0, ~1]
+
+
+def test_group_chunk_order_and_token_ends():
+    # Every source sends six tokens to gateway 0, with two contributions on
+    # rank 1 and one extra local contribution. Two tokens per raw chunk.
+    routes = [[[0, 2, 0, 2] for _ in range(6)] for _ in range(32)]
+    golden = build_notify_golden(routes, 64, 2)
+    for source in range(32):
+        forward = golden["plans"][0]["forward_list"][source]
+        assert [row[0] for row in forward] == [end for end in (3, 6, 9, 12, 15, 18) for _ in range(3)]
+    # One 32-rank group. First raw chunk [0,2) splits into [0,1), [1,2).
+    expected = []
+    for token_ids in ((0,), (1,), (2, 3), (4, 5)):
+        for source in range(32):
+            expected.extend((source, token, slot) for token in token_ids for slot in (1, 3))
+    backward = golden["plans"][1]["backward_list"][0]
+    entries = expert_rows(routes, 64, 1)
+    assert [entries[row] for _, row, _ in backward] == expected
+    tails = {63: 1, 127: 2, 255: 3, 383: 4}
+    assert [packed >> 32 for _, _, packed in backward] == [tails.get(i, 0) for i in range(len(backward))]
 
 
 def test_installed_import_ignores_checkout_and_pythonpath(tmp_path):

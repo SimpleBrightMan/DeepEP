@@ -36,12 +36,10 @@ __aicore__ inline void NativeStore(__gm__ T* destination, LocalTensor<T> ub, uin
 }  // namespace
 
 namespace {
-// URMA primary scheduler ported from ascend_deepep_personal_v1_pr.
 // Payload sources and destinations are offsets in this Session SHMEM heap.
 // Keep peer ownership,
 // group credits, dual-QP SO completion and local output-copy scheduling together.
 #if (defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)) && CATLASS_ARCH == 3510
-// Adapted from zhu-wangyi/ascend-moonep urma_weight_test c0378d370bbd093fcc251f11acf1dfa0632f1262.
 // Preserve cross-server group/credit and dual-QP 3:1. Secondary is in dispatch.cpp.
 // Adaptation: stable Notify rows and symmetric workspace offsets, no expert migration.
 namespace DispatchMoonep {
@@ -138,6 +136,12 @@ static_assert(kUdmaWqeScratchBytes + kMteUbBytes + kLocalCopyTileBytes + kSlotSe
               kAivUbCapacityBytes - 8 * 1024);
 
 constexpr uint32_t kVectorSlotSelectCountAlign = 64;
+// Local MESH QPs remain peer-private in the shared-Clos SHMEM backend.
+// Cross QPs are physical shared SQs, so each sending AIV owns one pair.
+__aicore__ inline uint32_t DispatchPhysicalQp(uint32_t rank, uint32_t peer, uint32_t slot)
+{
+    return rank / 8U == peer / 8U ? slot : 2U * (GetBlockIdx() - 8U) + slot;
+}
 __aicore__ inline uint32_t GetChunkQpSlot(int64_t chunk_index, uint32_t active_qp_count)
 {
     if (active_qp_count == 2) {
@@ -264,12 +268,9 @@ __aicore__ inline int32_t GetGroupDstRank(int32_t rank, int32_t world_size, uint
         const uint32_t frame_toggle = GetDispatchFrameToggle(group);
         const uint32_t subround = GetDispatchFrameSubround(group);
 
-        //
         const uint32_t group_row_delta = subround / 2U;
         const uint32_t group_side_delta = subround % 2U;
 
-        //
-        //
         const uint32_t destination_frame = source_frame ^ source_group_side ^ frame_toggle;
         const uint32_t destination_group_row = (source_group_row + group_row_delta) % kDispatchGroupRowBlocks;
         const uint32_t destination_group_side = source_group_side ^ group_side_delta;
@@ -435,8 +436,8 @@ __aicore__ inline void PublishPeerCompletionSignal(int32_t dst_rank, int32_t cur
             continue;
         }
         aclshmemx_udma_qp_put_nbi<uint64_t, PIPE_MTE3, kUdmaSyncSoCqeConfig>(
-            signal_flag, completion_value, reinterpret_cast<__ubuf__ uint64_t*>(udma_wqe_buffer), 1, dst_rank, qp_idx,
-            EVENT_ID0);
+            signal_flag, completion_value, reinterpret_cast<__ubuf__ uint64_t*>(udma_wqe_buffer), 1, dst_rank,
+            DispatchPhysicalQp(current_rank, dst_rank, qp_idx), EVENT_ID0);
     }
 }
 
@@ -579,7 +580,7 @@ __aicore__ inline void IssueMoonPrimaryTile(MoonPrimaryState& p, int32_t dst_ran
     const uint32_t route_tile = dst_rank / 8 == current_rank / 8 ? slotChunkCount : 1024U;
     const int64_t chunk_index = chunk_start / route_tile;
     const uint32_t qp_slot = GetChunkQpSlot(chunk_index, dst_rank / 8 == current_rank / 8 ? 1U : active_qp_count);
-    const uint32_t qp_idx = kActiveUdmaQpIndices[qp_slot];
+    const uint32_t qp_idx = DispatchPhysicalQp(current_rank, dst_rank, kActiveUdmaQpIndices[qp_slot]);
 
     const int64_t remaining_count = route_count - chunk_start;
     const uint32_t chunk_count =
@@ -738,8 +739,8 @@ __aicore__ inline void DispatchMoonCross(MoonPrimaryState& p, __ubuf__ uint8_t* 
         // Both QPs are retired by their permanent owner before its sequence advances.
         for (uint32_t j = 0; j < sequences; ++j)
             if (ready[j] && group[j] < groups && peers[j] / 8 != s.rank / 8) {
-                aclshmemx_udma_qp_quiet(peers[j], kActiveUdmaQpIndices[0]);
-                aclshmemx_udma_qp_quiet(peers[j], kActiveUdmaQpIndices[1]);
+                aclshmemx_udma_qp_quiet(peers[j], DispatchPhysicalQp(s.rank, peers[j], kActiveUdmaQpIndices[0]));
+                aclshmemx_udma_qp_quiet(peers[j], DispatchPhysicalQp(s.rank, peers[j], kActiveUdmaQpIndices[1]));
             }
         if (strict) {
             SyncActiveAivs(owner, 8U, GetGroupSyncPhaseToken(s.magic, strict_group, groups, kGroupSyncDonePhase),
@@ -847,7 +848,7 @@ __simt_vf__ __launch_bounds__(kWeightSimtThreadCount) inline void DispatchScatte
         }  // invalid route, NOT duplicate destination zero
         const uint32_t sign_mask = 0U - (encoded_bits >> 31U);
         const uint32_t flat_destination = encoded_bits ^ sign_mask;
-        // The unchanged Notify encoding always uses a power-of-two stride.
+        // dispatch_dst is repacked with a power-of-two stride.
         const uint32_t destination_rank = flat_destination >> route_shift;
         const uint32_t destination_local_offset = flat_destination & (address_stride - 1U);
 

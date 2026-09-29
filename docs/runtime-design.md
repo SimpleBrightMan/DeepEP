@@ -3,8 +3,7 @@
 ## 范围与非目标
 
 本批交付可构建、可安装、可检查来源的 `ascend-deepep` wheel，导入名保持 `deep_ep`。
-参考运行时固定到 [personal_v1 的 b41ee585](https://gitcode.com/lishaoxun/ascend_deepep/tree/b41ee585ed69f405d715ef3d59f5750c558884fa)，
-保留其框架事件与 SHMEM 资源分层思路，不整体搬入算法、构建目录或预编译二进制。
+运行时将框架事件与 SHMEM 资源分层管理。
 
 当前实现 Host 资源、完整 Notify 和受限的 [V2 expanded dispatch / combine](elastic.md)。
 ElasticBuffer 在同一 SHMEM session 中启用 MTE+URMA，legacy Buffer 保留 MTE 配置。
@@ -20,6 +19,7 @@ Notify/dispatch/combine 使用独立的 bisheng `-xasc` target，Host 扩展保�
 
 - Python ≥3.11、Linux；当前编译基线 CANN 9.2.0，目标 Ascend950。
 - Python 构建依赖和 SHMEM 来源写入 `dependencies.lock.json`。
+- 普通（HT）dispatch/combine 的 shared-jetty 支持依赖 [SHMEM PR #851](https://gitcode.com/cann/shmem/pull/851)，当前锁定该 PR 分支的确定提交。
 - CANN、SHMEM 由部署环境提供，不联网拉取、不重新分发驱动/SDK，不自动安装其他 `deep_ep` 包。
 - SHMEM 提供方须确认固定提交的构建来源；`record_shmem_sdk.py` 检查固定公共头文件并记录 SDK 内容校验和。
   头文件校验不能证明二进制的源码来源，提供方声明与后续实测都必需。

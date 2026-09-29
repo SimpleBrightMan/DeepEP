@@ -128,7 +128,8 @@ struct NotifyTiling {
     uint64_t backward_task_offsets;
     uint64_t forward_tile_offsets;
     uint64_t gather_tile_offsets;
-    uint64_t backward_source_offsets;
+    uint64_t backward_group_offsets;
+    uint64_t source_chunk_masks;
     uint64_t expert_totals;
     uint64_t address_stride;
     uint64_t local_prefix_segments;
@@ -148,7 +149,9 @@ inline NotifyTiling MakeNotifyTiling(uint32_t rank, uint32_t world, uint32_t tok
     t.experts = experts;
     t.chunk_tokens = chunk_tokens;
     t.hidden = hidden;
-    t.chunks = (uint64_t(tokens) + chunk_tokens - 1U) / chunk_tokens;
+    const uint32_t first = tokens < chunk_tokens ? tokens : chunk_tokens;
+    const uint32_t splits = first < 4U ? first : 4U;
+    t.chunks = tokens ? (uint64_t(tokens) + chunk_tokens - 1U) / chunk_tokens + splits - 1U : 0U;
     t.forward_capacity = tokens ? uint64_t(tokens) * topk : 1U;
     t.backward_capacity = uint64_t(world) * t.forward_capacity;
     t.cache_forward_inputs = NotifyForwardInputsFitUb(tokens, topk, experts, num_cores) ? 1U : 0U;
@@ -176,8 +179,10 @@ inline NotifyTiling MakeNotifyTiling(uint32_t rank, uint32_t world, uint32_t tok
     const uint64_t send_tiles = (uint64_t(tokens) + kNotifyForwardTileRows - 1U) / kNotifyForwardTileRows;
     const uint64_t recv_tiles = (uint64_t(t.forward_capacity) + kNotifyForwardTileRows - 1U) / kNotifyForwardTileRows;
     t.gather_tile_offsets = t.forward_tile_offsets + align512(uint64_t(world) * send_tiles * 4U);
-    t.backward_source_offsets = t.gather_tile_offsets + align512(uint64_t(world) * recv_tiles * 4U);
-    t.expert_totals = t.backward_source_offsets + align512(uint64_t(lanes) * world * 4U);
+    t.backward_group_offsets = t.gather_tile_offsets + align512(uint64_t(world) * recv_tiles * 4U);
+    const uint32_t groups = world / (world < 64U ? world : 64U);
+    t.source_chunk_masks = t.backward_group_offsets + align512(uint64_t(lanes) * groups * t.chunks * 2U * 4U);
+    t.expert_totals = t.source_chunk_masks + align512(uint64_t(world) * t.chunks * 4U);
     t.address_stride = t.expert_totals + align512(uint64_t(experts) * 4U);
     t.local_prefix_segments = t.address_stride + 512U;
     const uint64_t local_tiles = (uint64_t(tokens) + kNotifyLocalTopkTileTokens - 1U) / kNotifyLocalTopkTileTokens;

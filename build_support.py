@@ -8,6 +8,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import warnings
 
 from setuptools.command.build_ext import build_ext
 
@@ -104,25 +105,48 @@ def build_configuration(environment=None):
             raise RuntimeError(f"{name} must name an installed SDK containing {header}")
         result[name] = str(Path(value).resolve())
     manifest = Path(result["SHMEM_ROOT"]) / "deepep-sdk.json"
-    if not manifest.is_file():
-        raise RuntimeError("SHMEM SDK needs deepep-sdk.json; see scripts/record_shmem_sdk.py")
-    sdk = json.loads(manifest.read_text(encoding="utf-8"))
     lock = json.loads((ROOT / "dependencies.lock.json").read_text(encoding="utf-8"))
-    if sdk.get("revision") != lock["shmem"]["revision"]:
-        raise RuntimeError("SHMEM SDK source revision differs from dependencies.lock.json")
-    for relative, expected in lock["shmem"]["header_sha256_lf"].items():
-        data = (manifest.parent / "include" / relative).read_bytes().replace(b"\r\n", b"\n")
-        if hashlib.sha256(data).hexdigest() != expected:
-            raise RuntimeError(f"SHMEM public API differs from the pinned SDK: {relative}")
-    for relative, expected in sdk["sha256"].items():
-        path = (manifest.parent / relative).resolve()
-        if not path.is_relative_to(manifest.parent.resolve()) or not path.is_file():
-            raise RuntimeError("Invalid SHMEM SDK manifest path")
-        if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-            raise RuntimeError(f"SHMEM SDK checksum mismatch: {relative}")
-    if "lib/libshmem.so" not in sdk["sha256"] or not any(key.startswith("include/") for key in sdk["sha256"]):
-        raise RuntimeError("SHMEM SDK manifest must cover headers and libshmem.so")
-    result["shmem"] = sdk
+    sdk = {}
+    try:
+        if not manifest.is_file():
+            raise RuntimeError("SHMEM SDK has no deepep-sdk.json")
+        sdk = json.loads(manifest.read_text(encoding="utf-8"))
+        if not isinstance(sdk, dict):
+            raise ValueError("Invalid SHMEM SDK manifest")
+        if sdk.get("revision") != lock["shmem"]["revision"]:
+            raise RuntimeError("SHMEM SDK source revision differs from dependencies.lock.json")
+        for relative, expected in lock["shmem"]["header_sha256_lf"].items():
+            data = (manifest.parent / "include" / relative).read_bytes().replace(b"\r\n", b"\n")
+            if hashlib.sha256(data).hexdigest() != expected:
+                raise RuntimeError(f"SHMEM public API differs from the pinned SDK: {relative}")
+        hashes = sdk.get("sha256")
+        if not isinstance(hashes, dict):
+            raise ValueError("Invalid SHMEM SDK manifest checksums")
+        for relative, expected in hashes.items():
+            path = (manifest.parent / relative).resolve()
+            if not path.is_relative_to(manifest.parent.resolve()) or not path.is_file():
+                raise RuntimeError("Invalid SHMEM SDK manifest path")
+            if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                raise RuntimeError(f"SHMEM SDK checksum mismatch: {relative}")
+        if "lib/libshmem.so" not in hashes or not any(key.startswith("include/") for key in hashes):
+            raise RuntimeError("SHMEM SDK manifest must cover headers and libshmem.so")
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        warnings.warn(f"{exc}; continuing with SHMEM_ROOT={manifest.parent}", RuntimeWarning, stacklevel=2)
+    library = manifest.parent / "lib/libshmem.so"
+    if not library.is_file():
+        raise RuntimeError(f"SHMEM SDK is missing {library}")
+    files = sorted(
+        path for path in (manifest.parent / "include").rglob("*") if path.suffix in {".h", ".hpp"} and path.is_file()
+    )
+    files.append(library)
+    # Record actual inputs so replacing an unpinned SDK invalidates the build cache.
+    result["shmem"] = {
+        "revision": sdk.get("revision", "unknown") if isinstance(sdk, dict) else "unknown",
+        "sha256": {
+            path.relative_to(manifest.parent).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in files
+        },
+    }
     result["pybind11"] = __import__("pybind11").__version__
     if result["pybind11"] != lock["python_build"]["pybind11"]:
         raise RuntimeError("pybind11 version differs from dependencies.lock.json")

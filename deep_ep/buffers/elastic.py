@@ -27,6 +27,7 @@ _PERSISTENT = (
     "rank_rows",
     "gather_rows",
     "expert_totals",
+    "weight_return_meta",
 )
 
 
@@ -111,6 +112,7 @@ class EPHandle:
         self.rank_rows = None
         self.gather_rows = None
         self.expert_totals = None
+        self.weight_return_meta = None
         self.dispatch_dst = None
         self.address_stride = None
         self.rank = None
@@ -121,7 +123,7 @@ class EPHandle:
         self.trace = None
         self.hidden = None
         self.metadata_only = True
-        self.metadata_version = 1
+        self.metadata_version = 4
         self._buffer_token = None
         self._routing_versions = {}
 
@@ -170,7 +172,7 @@ class ElasticBuffer:
             or num_allocated_qps not in (0, 6)
             or num_device_timeout_secs != 100
         ):
-            raise NotImplementedError("ElasticBuffer dispatch supports default options and num_allocated_qps=0/6")
+            raise NotImplementedError("ElasticBuffer supports default options and num_allocated_qps=0/6")
         if type(use_fp8_dispatch) is not bool:
             raise TypeError("use_fp8_dispatch must be bool")
         if explicitly_destroy is not True:
@@ -716,7 +718,7 @@ class ElasticBuffer:
                         not isinstance(handle, EPHandle)
                         or handle._buffer_token is not self._handle_token
                         or handle.metadata_only
-                        or handle.metadata_version != 1
+                        or handle.metadata_version != 4
                     ):
                         raise ValueError("Cached handle must come from this buffer's successful payload dispatch")
                     if topk_idx is not None:
@@ -805,7 +807,7 @@ class ElasticBuffer:
                 producer = EventHandle()
                 with npu.stream(runtime.stream):
                     producer.current_stream_wait()
-                    if not hasattr(handle, "dispatch_dst"):
+                    if handle.dispatch_dst is None:
                         # Preserve Notify's original stride/sentinel ABI for Combine.
                         raw = handle.dst.to(torch.int64)
                         flat = torch.where(raw < 0, ~raw, raw)
@@ -914,20 +916,20 @@ class ElasticBuffer:
         runtime.ensure_alive()
         native, npu = require_native("ElasticBuffer.combine"), npu_api()
         with runtime.notify_lock:
-            error, signature, retained = None, [0] * 6, ()
+            error, signature, retained = None, [0] * 7, ()
             try:
                 if runtime.notify_failed:
                     raise RuntimeError("A previous communication launch failed; restart the distributed job")
                 if type(async_with_compute_stream) is not bool or type(allocate_on_comm_stream) is not bool:
                     raise TypeError("Stream options must be bool")
-                if topk_weights is not None or bias is not None:
-                    raise NotImplementedError("Combine currently supports topk_weights=None and bias=None")
+                if bias is not None:
+                    raise NotImplementedError("Combine currently supports bias=None")
                 if previous_event_before_epilogue is not None or allocate_on_comm_stream:
                     raise NotImplementedError("Epilogue events and allocate_on_comm_stream are unavailable")
                 if type(num_compute_units) is not int or num_compute_units not in (0, 64):
                     raise ValueError("Combine uses 64 AIVs; num_compute_units=0/64")
                 if type(num_qps) is not int or num_qps not in (0, 2):
-                    raise ValueError("Combine uses two QPs per peer; num_qps=0/2")
+                    raise ValueError("Combine uses two QPs per cross sender; num_qps=0/2")
                 if previous_event is not None and (
                     not isinstance(previous_event, EventHandle) or previous_event._device != runtime.device
                 ):
@@ -936,7 +938,7 @@ class ElasticBuffer:
                     not isinstance(handle, EPHandle)
                     or handle._buffer_token is not self._handle_token
                     or handle.metadata_only
-                    or handle.metadata_version != 1
+                    or handle.metadata_version != 4
                 ):
                     raise ValueError("Combine needs this buffer's successful expanded payload dispatch handle")
                 if not handle.do_expand or handle.expert_alignment != 1:
@@ -961,6 +963,17 @@ class ElasticBuffer:
                         "x must be contiguous BF16 [num_expanded_tokens,7168] on the buffer NPU without grad"
                     )
                 tokens, topk, chunk = handle.num_tokens, handle.num_topk, handle.chunk_tokens
+                if topk_weights is not None and (
+                    not isinstance(topk_weights, torch.Tensor)
+                    or topk_weights.dtype != torch.float32
+                    or topk_weights.device != x.device
+                    or tuple(topk_weights.shape) != (local_rows,)
+                    or not topk_weights.is_contiguous()
+                    or topk_weights.requires_grad
+                ):
+                    raise ValueError(
+                        "topk_weights must be contiguous FP32 [num_expanded_tokens] on the buffer NPU without grad"
+                    )
                 if previous_event is not None:
                     previous_event.current_stream_wait()
                 producer = EventHandle()
@@ -990,11 +1003,21 @@ class ElasticBuffer:
                         )
                     }
                     tensors.update(input=x, output=output)
+                    output_weights = None
+                    if topk_weights is not None:
+                        output_weights = torch.empty((tokens, topk), dtype=torch.float32, device=x.device)
+                        tensors.update(
+                            weights=topk_weights,
+                            weight_output=output_weights,
+                            weight_return_meta=handle.weight_return_meta,
+                        )
                     retained = (x, output, handle.topk_idx, *(getattr(handle, name) for name in _PERSISTENT))
+                    if output_weights is not None:
+                        retained += (topk_weights, output_weights)
                     for tensor in retained:
                         tensor.record_stream(runtime.stream)
                     runtime.stream.synchronize()
-                signature = [tokens, topk, chunk, rows, gathered, runtime.capacity]
+                signature = [tokens, topk, chunk, rows, gathered, runtime.capacity, int(topk_weights is not None)]
             except Exception as exc:
                 error = exc
             _collective_check(runtime, error, signature)
@@ -1016,7 +1039,7 @@ class ElasticBuffer:
                 if not async_with_compute_stream:
                     event.current_stream_wait()
                 runtime.notify_inflight = None
-                return output, None, event
+                return output, output_weights, event
             except Exception:
                 runtime.notify_failed = True
                 raise
@@ -1173,6 +1196,9 @@ class ElasticBuffer:
                     prefix = counts.cumsum(0, dtype=torch.int32)
                     count_list = counts.cpu().tolist()
                     rows = tensors["rank_rows"].cpu().tolist()
+                    # Keep the allocation alive through this contiguous view.
+                    # Padding is unwritten; only actual expanded rows are valid.
+                    tensors["weight_return_meta"] = tensors["weight_return_meta"][: rows[runtime.rank]]
                     # num_recv_tokens (deduplicated layout) is unavailable; expanded count is exact.
                     result = EPHandle(
                         True,

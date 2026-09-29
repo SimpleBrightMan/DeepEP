@@ -31,15 +31,26 @@ Specs specs(const ascend_deepep::NotifyTiling& t)
 {
     const int64_t p = t.world, n = t.tokens, k = t.topk, e = t.experts;
     const int64_t f = t.forward_capacity, b = t.backward_capacity, c = t.chunks, l = std::min(p, int64_t(8));
-    return {{"meta", {{n, k, 6}, "int32"}},      {"hist", {{((n + 15) / 16) * ((e + p + 15) / 16 * 16)}, "int32"}},
-            {"bases", {{e}, "int32"}},           {"prefix", {{p + 1}, "int32"}},
-            {"counts", {{e}, "int32"}},          {"gateways", {{p}, "int32"}},
-            {"local_dst", {{n, k}, "int32"}},    {"server_mask", {{n}, "int64"}},
-            {"dst", {{n, k}, "int32"}},          {"forward_list", {{p, f, 6}, "int32"}},
-            {"forward_counts", {{p}, "int32"}},  {"backward_list", {{l, b, 3}, "int64"}},
-            {"backward_counts", {{l}, "int32"}}, {"chunk_ranges", {{p, c, 2}, "int32"}},
-            {"chunk_masks", {{p, c}, "int32"}},  {"rank_rows", {{p}, "int32"}},
-            {"gather_rows", {{p}, "int32"}},     {"expert_totals", {{e}, "int32"}}};
+    return {{"meta", {{n, k, 6}, "int32"}},
+            {"hist", {{((n + 15) / 16) * ((e + p + 15) / 16 * 16)}, "int32"}},
+            {"bases", {{e}, "int32"}},
+            {"prefix", {{p + 1}, "int32"}},
+            {"counts", {{e}, "int32"}},
+            {"gateways", {{p}, "int32"}},
+            {"local_dst", {{n, k}, "int32"}},
+            {"server_mask", {{n}, "int64"}},
+            {"dst", {{n, k}, "int32"}},
+            {"forward_list", {{p, f, 6}, "int32"}},
+            {"forward_counts", {{p}, "int32"}},
+            {"backward_list", {{l, b, 3}, "int64"}},
+            {"backward_counts", {{l}, "int32"}},
+            {"chunk_ranges", {{p, c, 2}, "int32"}},
+            {"chunk_masks", {{p / std::min(p, int64_t(64)), c}, "int32"}},
+            {"rank_rows", {{p}, "int32"}},
+            {"gather_rows", {{p}, "int32"}},
+            {"expert_totals", {{e}, "int32"}},
+            // R is only known after Notify. Every route can land on one rank.
+            {"weight_return_meta", {{b}, "int32"}}};
 }
 uint8_t* tensor_pointer(py::handle tensor, const Shape& shape, const std::string& dtype, int device)
 {
@@ -91,7 +102,7 @@ void bind_notify(py::module_& module)
                               ptr.at("server_mask"), ptr.at("dst"), ptr.at("forward_list"), ptr.at("forward_counts"),
                               ptr.at("backward_list"), ptr.at("backward_counts"), ptr.at("chunk_ranges"),
                               ptr.at("chunk_masks"), ptr.at("rank_rows"), ptr.at("gather_rows"),
-                              reinterpret_cast<uint8_t*>(&t));
+                              ptr.at("weight_return_meta"), reinterpret_cast<uint8_t*>(&t));
         notify_dispatch_barrier_kernel_do(stream, 32);
         const auto bytes = uint64_t(experts) * sizeof(int32_t);
         if (aclrtMemcpyAsync(ptr.at("expert_totals"), bytes, workspace + t.expert_totals, bytes,

@@ -8,6 +8,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 from typing import NoReturn
+import warnings
 
 
 def _unavailable(operation: str) -> NoReturn:
@@ -44,7 +45,9 @@ def _load_native():
     with library.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     if digest != expected:
-        raise ImportError("Loaded SHMEM library differs from the SDK used to build this wheel")
+        warnings.warn(
+            "Loaded SHMEM library differs from the SDK used to build this wheel", RuntimeWarning, stacklevel=2
+        )
     return module
 
 

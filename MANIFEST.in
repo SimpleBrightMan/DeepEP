@@ -8,3 +8,4 @@ recursive-include scripts *.py
 recursive-include tests *.py *.json *.cpp *.h
 recursive-include benchmarks *.py *.json *.csv *.md
 recursive-include third-party *.md *.LICENSE
+recursive-include third-party/ascend-deepep *.py

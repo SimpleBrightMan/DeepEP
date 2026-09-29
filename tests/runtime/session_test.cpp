@@ -54,9 +54,14 @@ int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
     }
     return init_status;
 }
+int aclshmemx_set_shared_jetty(data_op_engine_type_t engine, bool enabled)
+{
+    assert(engine == ACLSHMEM_DATA_OP_UDMA && enabled);
+    return 0;
+}
 int aclshmemx_set_qp_num(data_op_engine_type_t engine, uint32_t count)
 {
-    assert(engine == ACLSHMEM_DATA_OP_UDMA && count == 6 && initialized == 0);
+    assert(engine == ACLSHMEM_DATA_OP_UDMA && count == 32 && initialized == 0);
     qp_count = count;
     return 0;
 }
@@ -104,7 +109,7 @@ int main(int argc, char** argv)
         assert(frees == 1 && finalized == 1 && !deepep::Session::busy());
     } else if (mode == "udma") {
         deepep::Session session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, true);
-        assert(session.udma() && qp_count == 6);
+        assert(session.udma() && qp_count == 32);
         session.close();
         assert(!deepep::Session::busy());
     } else if (mode == "invalid") {

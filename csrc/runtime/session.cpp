@@ -60,9 +60,10 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     // reserved until a new process is launched; do not finalize foreign state.
     occupied = true;
     if (udma) {
-        // Payload owns QP0/1 per peer. Retain the primary scheduler's six-QP
-        // resource contract; the other control slots are workspace cachelines.
-        check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 6), "aclshmemx_set_qp_num");
+        // Both payload operators reserve one QP pair per cross sender (16).
+        // The SDK shares Clos SQs across peers; local MESH QPs stay private.
+        check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 32), "aclshmemx_set_qp_num");
+        check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, true), "aclshmemx_set_shared_jetty");
     }
     check(aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attr), "aclshmemx_init_attr");
     try {

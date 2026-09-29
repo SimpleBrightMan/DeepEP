@@ -10,6 +10,8 @@
 - CANN 9.2.0 与配套驱动/框架，目标 Ascend950；其他组合尚未放开。
 - 预先构建固定提交的 SHMEM SDK（见 `dependencies.lock.json`），安装根包含 `include/`、
   `lib/libshmem.so` 以及 `src/device`、`src/device_simt` 等 Device 头文件。
+- 普通（HT）dispatch/combine 依赖 [SHMEM PR #851](https://gitcode.com/cann/shmem/pull/851)
+  的 shared-jetty 支持，包括 Host 配置接口和 Device 共享队列状态；当前构建使用锁文件中固定的 PR 分支提交。
 - CANN 安装中须包含 `tools/bisheng_compiler/bin/bisheng`，Device 使用 `-xasc` 编译。
 - 普通 CPU 测试仅需 `requirements-dev.txt`；wheel 构建依赖固定在 `pyproject.toml`。
 - 本仓不自动下载/编译外部 SDK，不将驱动/CANN/SHMEM 打入 wheel。SDK 及其传递依赖必须由部署环境提供。
@@ -24,7 +26,7 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
 
 # 仅首次使用、且 SDK 中没有 deepep-sdk.json 时执行；已有 manifest 时跳过此命令。
 python scripts/record_shmem_sdk.py --sdk "$SHMEM_ROOT" \
-  --revision df2fa21daa43a6bc4c44672af9192a1247c31999
+  --revision "$(python -c 'import json; print(json.load(open("dependencies.lock.json"))["shmem"]["revision"])')"
 
 python -m pip install -r requirements-build.txt
 ```

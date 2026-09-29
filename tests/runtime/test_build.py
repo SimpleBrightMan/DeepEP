@@ -48,22 +48,100 @@ def test_missing_sdk_rejected(build):
         build.build_configuration({"DEEPEP_NPU_ARCH": "Ascend950"})
 
 
-def test_sdk_manifest_required(build, tmp_path):
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "missing",
+        "json",
+        "list",
+        "revision",
+        "header",
+        "checksum",
+        "coverage",
+        "path",
+        "missing_library",
+        "missing_device_header",
+    ],
+)
+def test_sdk_identity_warning(build, monkeypatch, tmp_path, fault):
+    import hashlib
+    import warnings
+    from types import SimpleNamespace
+
     cann, sdk = tmp_path / "cann", tmp_path / "shmem"
-    (cann / "include/acl").mkdir(parents=True)
-    (cann / "include/acl/acl.h").touch()
-    (sdk / "include/host").mkdir(parents=True)
-    (sdk / "include/host/shmem_host_def.h").touch()
+    files = {
+        cann / "include/acl/acl.h": "",
+        cann / "compiler/version.info": "Version=9.2.0",
+        cann / "tools/bisheng_compiler/bin/bisheng": "compiler",
+        sdk / "include/host/shmem_host_def.h": "host",
+        sdk / "include/shmem.h": "public",
+        sdk / "src/device/gm2gm/shmemi_device_cc.h": "device",
+        sdk / "lib/libshmem.so": "library",
+    }
+    for path, value in files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value)
+    lock = json.loads((ROOT / "dependencies.lock.json").read_text())
+    lock["shmem"]["header_sha256_lf"] = {"host/shmem_host_def.h": hashlib.sha256(b"host").hexdigest()}
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "dependencies.lock.json").write_text(json.dumps(lock))
+    (source / "VERSION").write_text("test")
+    monkeypatch.setattr(build, "ROOT", source)
+    monkeypatch.setattr(build, "source_fingerprint", lambda: "test")
+    monkeypatch.setattr(build, "find_host_compiler", lambda env: (sys.executable, b"test"))
+    monkeypatch.setattr(build.shutil, "which", lambda *args, **kwargs: sys.executable)
+    monkeypatch.setattr(build.subprocess, "check_output", lambda *args, **kwargs: "cmake version test")
+    monkeypatch.setitem(sys.modules, "pybind11", SimpleNamespace(__version__=lock["python_build"]["pybind11"]))
+    identity = {
+        "revision": lock["shmem"]["revision"],
+        "sha256": {
+            str(path.relative_to(sdk).as_posix()): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in files
+            if path.is_relative_to(sdk) and not path.is_relative_to(sdk / "src")
+        },
+    }
+    if fault == "revision":
+        identity["revision"] = "custom"
+    elif fault == "header":
+        (sdk / "include/host/shmem_host_def.h").write_text("changed header")
+    elif fault == "checksum":
+        (sdk / "lib/libshmem.so").write_text("changed library")
+    elif fault == "coverage":
+        identity["sha256"] = {}
+    elif fault == "path":
+        identity["sha256"]["../outside"] = "0" * 64
+    manifest = sdk / "deepep-sdk.json"
+    if fault != "missing":
+        manifest.write_text("invalid json" if fault == "json" else "[]" if fault == "list" else json.dumps(identity))
+    if fault == "missing_library":
+        (sdk / "lib/libshmem.so").unlink()
+    elif fault == "missing_device_header":
+        (sdk / "src/device/gm2gm/shmemi_device_cc.h").unlink()
     env = {
         "DEEPEP_NPU_ARCH": "Ascend950",
         "ASCEND_HOME_PATH": str(cann),
         "SHMEM_ROOT": str(sdk),
     }
-    with pytest.raises(RuntimeError, match="deepep-sdk.json"):
-        build.build_configuration(env)
-    (sdk / "deepep-sdk.json").write_text('{"revision":"wrong"}')
-    with pytest.raises(RuntimeError, match="revision"):
-        build.build_configuration(env)
+    with warnings.catch_warnings(record=True) as messages:
+        warnings.simplefilter("always")
+        if fault in ("missing_library", "missing_device_header"):
+            with pytest.raises(RuntimeError, match="missing"):
+                build.build_configuration(env)
+            return
+        result = build.build_configuration(env)
+    assert bool(messages) == (fault is not None)
+    assert all("continuing with SHMEM_ROOT=" in str(message.message) for message in messages)
+    assert (
+        result["shmem"]["sha256"]["lib/libshmem.so"]
+        == hashlib.sha256((sdk / "lib/libshmem.so").read_bytes()).hexdigest()
+    )
+    assert result["shmem"]["revision"] == ("unknown" if fault in ("missing", "json", "list") else identity["revision"])
+    assert manifest.exists() == (fault != "missing")
+    before = build.build_cache_key(result)
+    result["shmem"]["sha256"]["lib/libshmem.so"] = "0" * 64
+    assert build.build_cache_key(result) != before
 
 
 def test_metadata_no_sdk_or_framework(tmp_path):
@@ -122,7 +200,7 @@ def test_lock_declares_operators_without_claiming_device_qualification():
 
 
 @pytest.mark.parametrize(
-    "capability", ["elastic-notify-metadata-v1", "elastic-dispatch-expanded-v1", "elastic-combine-expanded-v1"]
+    "capability", ["elastic-notify-metadata-v4", "elastic-dispatch-expanded-v1", "elastic-combine-expanded-v3"]
 )
 def test_elastic_wheel_requires_device_library(tmp_path, capability):
     validator = load(ROOT / "scripts/validate_package.py")

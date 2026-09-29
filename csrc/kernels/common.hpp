@@ -9,6 +9,11 @@ __aicore__ inline constexpr uint32_t Width(uint32_t world)
 {
     return world < 16U ? world : 16U;
 }
+__aicore__ inline constexpr uint32_t Index(uint32_t rank, uint32_t world)
+{
+    return world == 128U ? (rank / 8U % 4U) * 4U + rank % 4U
+                         : (rank / (world / 2U)) * (Width(world) / 2U) + rank % (Width(world) / 2U);
+}
 __aicore__ inline constexpr uint32_t Peer(uint32_t rank, uint32_t world, uint32_t group, uint32_t index,
                                           bool incoming = false)
 {
@@ -38,5 +43,10 @@ __aicore__ inline constexpr uint32_t Group(uint32_t rank, uint32_t world, uint32
     const uint32_t half = world / 2U, half_width = Width(world) / 2U;
     const uint32_t groups = world / Width(world), own = rank % half / half_width;
     return (peer % half / half_width + groups - own) % groups;
+}
+// Combine aggregates the existing topology order into groups of up to 64.
+__aicore__ inline constexpr uint32_t CombineGroup(uint32_t rank, uint32_t world, uint32_t peer)
+{
+    return (Group(rank, world, peer) * Width(world) + Index(peer, world)) / (world < 64U ? world : 64U);
 }
 }  // namespace first_hit_schedule
