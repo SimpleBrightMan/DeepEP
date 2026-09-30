@@ -252,13 +252,60 @@ Decode 使用同一个 Buffer 及 `dispatch()` / `combine()` 方法，配置小�
 
 ### MegaMoE 示例
 
-MegaMoE Prefill 与 Decode 共用一个融合前向入口，复用通信 Buffer 和转换后的专家权重。
+MegaMoE 将 token 分发、两次专家矩阵计算、SwiGLU、量化和结果归并融合为一次前向调用。Prefill 与 Decode 共用以下接口。
 
-> 🚧 **待补充｜MegaMoE 示例**
->
-> 融合前向调用示例与完整参数。
+下面展示 FP8 输入、FP4 权重、每卡 1 个共享专家的集成流程。通过 `torchrun` 启动，所有 rank 设置相同的 `DEEPEP_SHMEM_ENDPOINT=tcp://<主节点IPv4>:<空闲端口>`，端口与 `MASTER_PORT` 分开。
+模型需提供当前 NPU 上的 `x_fp8`、`x_sf`、`topk_idx`、`topk_weights`，以及原始 ND 布局的路由和共享专家 `(weight, scale)` 权重对；形状与类型见 [MegaMoE 输入和权重布局](experiments/megamoe/README.md)。
 
-详见 [MegaMoE 文档](experiments/megamoe/README.md)。
+```python
+import os
+import torch
+import torch_npu  # 注册 NPU 后端
+from deep_ep_experimental.megamoe import (
+    StoreGroup, SymmBuffer, fp8_fp4_mega_moe, transform_weights_for_mega_moe,
+)
+
+torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+group = StoreGroup.from_env()
+try:
+    # 初始化一次：384 个路由专家，每卡额外 1 个共享专家。
+    buffer = SymmBuffer(
+        group, num_experts=384, num_max_tokens_per_rank=4096,
+        num_topk=6, hidden=7168, intermediate_hidden=3072,
+        num_shared_experts=1, mma_type="fp8xfp4",
+        ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
+    )
+    w1, w2 = transform_weights_for_mega_moe(l1_weights, l2_weights)
+    shared_w1, shared_w2 = transform_weights_for_mega_moe(
+        shared_l1_weights, shared_l2_weights, shared=True,
+    )
+
+    # 每次调用前填入输入：各 rank 的 num_tokens 相同，且不超过预分配上限。
+    num_tokens = x_fp8.shape[0]
+    buffer.x[:num_tokens].copy_(x_fp8)                 # FP8 E4M3 [B, H]
+    buffer.x_sf[:num_tokens].copy_(x_sf)              # E8M0 [B, H / 32]
+    buffer.topk_idx[:num_tokens].copy_(topk_idx)      # int32 [B, K]
+    buffer.topk_weights[:num_tokens].copy_(topk_weights)  # FP32 [B, K]
+    buffer.validate_inputs(num_tokens)  # 输入检查和准备放在性能计时之外。
+    buffer.prepare(num_tokens)
+    y = torch.empty((num_tokens, 7168), dtype=torch.bfloat16, device="npu")
+    fp8_fp4_mega_moe(
+        y, w1, w2, buffer,
+        shared_l1_weights=shared_w1, shared_l2_weights=shared_w2,
+    )  # 结果写入 y，返回 None。
+    torch.npu.synchronize()
+
+    # 可继续复用 buffer 和转换后的权重；所有调用完成后，各 rank 同序释放。
+    group.barrier("before SHMEM teardown")
+    buffer.destroy()
+    group.close()
+except BaseException as error:
+    group.abort(f"MegaMoE: {type(error).__name__}: {error}")
+    raise
+```
+
+不使用共享专家时，将 `num_shared_experts` 设为 `0`，省略共享权重的转换及传参。转换后的权重应完整保留并复用。
+包含输入生成和多进程运行步骤的示例见 [example.py](experiments/megamoe/python/deep_ep_experimental/megamoe/example.py)，完整接口约束见 [MegaMoE 文档](experiments/megamoe/README.md)。
 
 Tensor 布局、事件同步及 Buffer 生命周期见 [API 文档](docs/api.md)与 [Elastic 文档](docs/elastic.md)。
 

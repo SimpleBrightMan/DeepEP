@@ -118,17 +118,16 @@ Server-level deduplication reduces repeated token transfers to the same destinat
 
 ### MegaMoE high-throughput kernels — experimental
 
-**MegaMoE prefill:** `Seq ≥ 4K`, `W4A8`.
+**MegaMoE prefill:** `BS = 4096` per rank, `W4A8`.
 
-> 🚧 **TBD | MegaMoE prefill configuration**
->
-> complete model, routing, and quantization configuration.
+Configuration: H=7168, SwiGLU intermediate dimension I=3072, 384 routed experts, one additional shared expert per rank, TopK=6, balanced routing, FP8 inputs, and FP4 weights.
+See [`deepseek_v4_pro_shared1`](experiments/megamoe/python/deep_ep_experimental/megamoe/configs/deepseek_v4_pro_shared1.json).
 
-| EP size | Fused MoE latency (µs) | Cube utilization (%) | Communication overlap (%) |
+| EP size | Fused MoE latency (µs) | MFU (%) | Communication overlap (%) |
 | --- | --- | --- | --- |
-| 32 | 🚧 TBD | 🚧 TBD | 🚧 TBD |
-| 64 | 🚧 TBD | 🚧 TBD | 🚧 TBD |
-| 128 | 🚧 TBD | 🚧 TBD | 🚧 TBD |
+| 32 | 5091 | 90.13 | 95.14 |
+| 64 | 5331 | 90.24 | 92.91 |
+| 128 | 5141 | 90.48 | 94.81 |
 
 ![MegaMoE prefill latency comparison](figures/performance_megamoe_prefill_en.svg)
 
@@ -136,14 +135,12 @@ Server-level deduplication reduces repeated token transfers to the same destinat
 
 **MegaMoE decode:** `BS = 96`, `W4A8`.
 
-> 🚧 **TBD | MegaMoE decode configuration**
->
-> complete model, routing, and quantization configuration.
+The model, routing, and quantization configuration is the same as above, with BS=96 and one additional shared expert per rank.
 
 | EP size | Fused MoE latency (µs) |
 | --- | --- |
-| 64 | 🚧 TBD |
-| 128 | 🚧 TBD |
+| 64 | 242 |
+| 128 | 270 |
 
 ![MegaMoE decode latency comparison](figures/performance_megamoe_decode_en.svg)
 
@@ -254,13 +251,60 @@ Decode uses the same buffer and `dispatch()` / `combine()` methods with small-ba
 
 ### MegaMoE example
 
-MegaMoE prefill and decode share one fused forward entry, with reusable buffers and converted expert weights.
+MegaMoE fuses token dispatch, two expert matrix multiplications, SwiGLU, quantization, and combine into one forward call. Prefill and decode use the same interface.
 
-> 🚧 **TBD | MegaMoE example**
->
-> fused-forward example and complete parameter list.
+The integration snippet below uses FP8 inputs, FP4 weights, and one shared expert per rank. Launch with `torchrun` and set the same `DEEPEP_SHMEM_ENDPOINT=tcp://<master-IPv4>:<unused-port>` on every rank, using a port distinct from `MASTER_PORT`.
+The model supplies `x_fp8`, `x_sf`, `topk_idx`, `topk_weights`, and raw ND `(weight, scale)` pairs for routed and shared experts on the current NPU. See the [MegaMoE input and weight layouts](experiments/megamoe/README.md) for shapes and dtypes.
 
-See the [MegaMoE guide](experiments/megamoe/README.md).
+```python
+import os
+import torch
+import torch_npu  # Register the NPU backend.
+from deep_ep_experimental.megamoe import (
+    StoreGroup, SymmBuffer, fp8_fp4_mega_moe, transform_weights_for_mega_moe,
+)
+
+torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
+group = StoreGroup.from_env()
+try:
+    # Initialize once: 384 routed experts and one shared expert per rank.
+    buffer = SymmBuffer(
+        group, num_experts=384, num_max_tokens_per_rank=4096,
+        num_topk=6, hidden=7168, intermediate_hidden=3072,
+        num_shared_experts=1, mma_type="fp8xfp4",
+        ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
+    )
+    w1, w2 = transform_weights_for_mega_moe(l1_weights, l2_weights)
+    shared_w1, shared_w2 = transform_weights_for_mega_moe(
+        shared_l1_weights, shared_l2_weights, shared=True,
+    )
+
+    # Fill inputs before each call; all ranks use the same num_tokens, within buffer capacity.
+    num_tokens = x_fp8.shape[0]
+    buffer.x[:num_tokens].copy_(x_fp8)                 # FP8 E4M3 [B, H]
+    buffer.x_sf[:num_tokens].copy_(x_sf)              # E8M0 [B, H / 32]
+    buffer.topk_idx[:num_tokens].copy_(topk_idx)      # int32 [B, K]
+    buffer.topk_weights[:num_tokens].copy_(topk_weights)  # FP32 [B, K]
+    buffer.validate_inputs(num_tokens)  # Validate and prepare outside the timed region.
+    buffer.prepare(num_tokens)
+    y = torch.empty((num_tokens, 7168), dtype=torch.bfloat16, device="npu")
+    fp8_fp4_mega_moe(
+        y, w1, w2, buffer,
+        shared_l1_weights=shared_w1, shared_l2_weights=shared_w2,
+    )  # Writes into y and returns None.
+    torch.npu.synchronize()
+
+    # Reuse the buffer and prepared weights; after all calls, release in the same order on every rank.
+    group.barrier("before SHMEM teardown")
+    buffer.destroy()
+    group.close()
+except BaseException as error:
+    group.abort(f"MegaMoE: {type(error).__name__}: {error}")
+    raise
+```
+
+For routed experts only, set `num_shared_experts=0` and omit shared-weight conversion and arguments. Keep the returned weight pairs intact and reuse them.
+See [example.py](experiments/megamoe/python/deep_ep_experimental/megamoe/example.py) for input generation and a runnable multi-process example, and the [MegaMoE guide](experiments/megamoe/README.md) for the full interface contract.
 
 Tensor layouts, event synchronization, and buffer lifecycle are described in the [API guide](docs/api.md) and [Elastic guide](docs/elastic.md).
 
