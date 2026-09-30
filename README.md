@@ -118,17 +118,17 @@ Server 级去重减少同一 token 向相同目标 Server 的重复传输。
 
 ### MegaMoE 高吞吐算子——实验性
 
-**MegaMoE Prefill：** `Seq ≥ 4K`、`W4A8`。
+**MegaMoE Prefill：** 每卡 `BS = 4096`、`W4A8`。
 
-> 🚧 **待补充｜MegaMoE Prefill 测试配置**
->
-> 完整模型、路由与量化配置。
+配置：H=7168、SwiGLU 中间维度 I=3072、384 个路由专家、每卡额外 1 个共享专家、TopK=6、balanced 路由，FP8 输入与 FP4 权重。
+使用配置
+[`deepseek_v4_pro_shared1`](experiments/megamoe/python/deep_ep_experimental/megamoe/configs/deepseek_v4_pro_shared1.json)。
 
-| EP 规模 | 融合 MoE 时延（µs） | Cube 利用率（%） | 通信掩盖率（%） |
+| EP 规模 | 融合 MoE 时延（µs） | MFU（%） | 通信掩盖率（%） |
 | --- | --- | --- | --- |
-| 32 | 🚧 待补充 | 🚧 待补充 | 🚧 待补充 |
-| 64 | 🚧 待补充 | 🚧 待补充 | 🚧 待补充 |
-| 128 | 🚧 待补充 | 🚧 待补充 | 🚧 待补充 |
+| 32 | 5091 | 90.13 | 95.14 |
+| 64 | 5331 | 90.24 | 92.91 |
+| 128 | 5141 | 90.48 | 94.81 |
 
 ![MegaMoE Prefill 时延对比](figures/performance_megamoe_prefill.svg)
 
@@ -136,14 +136,12 @@ Server 级去重减少同一 token 向相同目标 Server 的重复传输。
 
 **MegaMoE Decode：** `BS = 96`、`W4A8`。
 
-> 🚧 **待补充｜MegaMoE Decode 测试配置**
->
-> 完整模型、路由与量化配置。
+模型、路由与量化配置同上，每卡 BS=96，每卡额外 1 个共享专家。
 
 | EP 规模 | 融合 MoE 时延（µs） |
 | --- | --- |
-| 64 | 🚧 待补充 |
-| 128 | 🚧 待补充 |
+| 64 | 242 |
+| 128 | 270 |
 
 ![MegaMoE Decode 时延对比](figures/performance_megamoe_decode.svg)
 
