@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
+
 # 性能测量与复现
 
 仓库包含 HT、LL kernel 测量入口和通用 benchmark 协议，计时和统计口径各不相同。运行方式见[测试入口](../tests/README.md)与 [benchmark 工具](../benchmarks/README.md)。

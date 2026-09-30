@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """Precision policies, upstream dtype emulation and dual-reference comparison.
 
 The acceptance ratios follow ``昇腾算子精度标准2.1``.  CPU float arithmetic is

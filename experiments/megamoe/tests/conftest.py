@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Tests run from source without an installed experimental extension."""
 
 from pathlib import Path

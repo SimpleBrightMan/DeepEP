@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Shared V1/V2 resource owner; no EP algorithms are enabled by this module."""
 
 import hashlib

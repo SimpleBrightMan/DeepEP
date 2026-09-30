@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 # MegaMoE is an optional Torch-bound extension. The core _C keeps its original ABI.
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Headers.cmake")
 ascend_deepep_find_mega_moe_headers()

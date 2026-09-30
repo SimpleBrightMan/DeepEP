@@ -1,4 +1,5 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Copyright (c) 2026, Lu Lu
+# Modified by zhu-mingzhe71 2026
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "EP_GMM_FUSED requires Linux and the Ascend950 CANN toolkit")
 endif()

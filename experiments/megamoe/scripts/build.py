@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Prepare pinned dependencies, build and install one wheel in the active Python environment."""
 
 import argparse

@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """Strict, framework-free workload configuration and logical byte accounting."""
 
 from dataclasses import asdict, dataclass, fields

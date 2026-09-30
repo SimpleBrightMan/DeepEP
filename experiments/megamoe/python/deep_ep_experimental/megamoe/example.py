@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Minimal runnable public API example; launch with torchrun on at least two NPUs."""
 
 import argparse

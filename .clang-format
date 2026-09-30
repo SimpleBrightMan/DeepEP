@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 # C/C++/AscendC 使用四空格缩进、120 列行宽和函数大括号换行。
 BasedOnStyle: Google
 ColumnLimit: 120

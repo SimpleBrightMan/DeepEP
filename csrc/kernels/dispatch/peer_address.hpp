@@ -1,8 +1,6 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Licensed under CANN Open Software License Agreement Version 2.0.
- * See LICENSE in the root of this repository.
- */
+// Copyright (c) 2026, Lu Lu
+// Modified by huangxiaolan 2026
+
 #pragma once
 #include "peer_protocol.hpp"
 

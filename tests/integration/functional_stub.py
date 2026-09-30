@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by nino888 2026
+
 """Synchronous, all-rank V1 functional stub. No devices or native fallback.
 
 This test adapter models rank-deduplicated BF16 dispatch/combine, not the

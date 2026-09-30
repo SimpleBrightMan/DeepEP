@@ -1,8 +1,5 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Licensed under the CANN Open Software License Agreement Version 2.0.
- * See third-party/cann.LICENSE for details.
- */
+// Copyright (c) 2026, Lu Lu
+// Modified by SimpleBright_Man 2026
 #ifndef MEGA_MOE_COUNT_ARRIVAL_H
 #define MEGA_MOE_COUNT_ARRIVAL_H
 

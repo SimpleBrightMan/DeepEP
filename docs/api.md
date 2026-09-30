@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
+
 # API 与运行时
 
 `deep_ep.ElasticBuffer` 提供 V2 dispatch/combine。高吞吐（HT）和低时延（LL）使用相同方法，输入、权重、布局及路径选择见 [Elastic 接口](elastic.md)。本页说明核心 `deep_ep` 的公共对象、初始化、资源生命周期和兼容范围。MegaMoE 的 `SymmBuffer/StoreGroup` 和 EpGmmFused 的 UDMA 域使用独立接口，分别见 [MegaMoE](../experiments/megamoe/README.md)与 [EpGmmFused](../experiments/ep_gmm_fused/README.md)。

@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by lishaoxun 2026
+
 """Explicit torchrun qualification of resource lifecycle and real event ordering.
 
 This is not an EP communication or performance test. Run only on reserved NPUs.

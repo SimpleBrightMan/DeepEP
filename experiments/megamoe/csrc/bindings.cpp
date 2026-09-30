@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by SimpleBright_Man 2026
+
 #include "forward.hpp"
 #include "shmem.h"
 #include "kernels/mega_moe/common/ascend_timer_v2.hpp"

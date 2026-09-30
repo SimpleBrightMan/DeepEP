@@ -1,4 +1,8 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 include VERSION CMakeLists.txt build_support.py dependencies.lock.json
+include LICENSE
 include .gitmodules
 include requirements-dev.txt pytest.ini
 include requirements-build.txt

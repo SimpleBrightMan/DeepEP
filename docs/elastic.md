@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
+
 # Elastic dispatch / combine
 
 `ElasticBuffer` 通过 `dispatch()` 分发 token，通过 `combine()` 归并专家输出。两者使用匹配的 `EPHandle`。本页说明当前代码的调用约束；资源生命周期见 [API 指南](api.md)，设备运行命令见[测试入口](../tests/README.md)。

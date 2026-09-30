@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by zhu-mingzhe71 2026
+
 """python -m experiments.ep_gmm_fused.tests.run {accuracy,bench,profile,report}."""
 
 import argparse

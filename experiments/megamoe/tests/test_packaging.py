@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Artifact shape tests, not native binary compilation."""
 
 import importlib.util

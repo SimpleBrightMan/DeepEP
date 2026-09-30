@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """Lazy, explicitly requested HCCL setup. Import/collection touches no device."""
 
 from contextlib import contextmanager

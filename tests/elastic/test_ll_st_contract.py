@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by ryan_li 2026
+
 """CPU checks for the LL device ST launcher, reference and measurement contract."""
 
 import importlib.util

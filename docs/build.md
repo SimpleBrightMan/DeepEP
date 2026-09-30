@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
+
 # 构建、打包与安装
 
 wheel 包含 Host 运行时、Notify 及 HT/LL dispatch/combine kernel。输入和执行约束见 [Elastic 接口](elastic.md)，资源与事件见 [API 指南](api.md)。

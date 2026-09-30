@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by candy_cloud_fly 2026
+
 #ifndef DISPATCH_SERVER_DEDUP_RECEIVE_TASKS_H
 #define DISPATCH_SERVER_DEDUP_RECEIVE_TASKS_H
 

@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
+
 # 贡献指南
 
 欢迎参与昇腾实现、测试、性能基准和文档的开发。开始前请阅读[架构说明](docs/architecture.md)和[开发指南](docs/development.md)。
@@ -35,4 +40,4 @@ API 契约、资源/事件、HT dispatch/combine 和 LL 的测试入口见[测�
 
 ## 许可证
 
-引入依赖源码时保留版权、许可证及来源信息。采用的接口声明来源记录在[第三方依赖说明](third-party/README.md)中。
+Lu Lu 持有权利的项目内容采用 [BSD 2-Clause 许可证](LICENSE)。引入依赖源码时应保留原版权和许可证信息，并在相应文件头及依赖文档中记录来源。采用的接口声明来源记录在[第三方依赖说明](third-party/README.md)中。

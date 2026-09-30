@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026 Huawei Technologies Co., Ltd.
+Modified by zhu-mingzhe71 2026
+-->
+
 # CatCCOS UDMA overlay
 
 The build uses the official CatCCOS repository at revision

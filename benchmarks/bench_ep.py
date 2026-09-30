@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """python -m benchmarks.bench_ep --dry-run (no framework or device required)."""
 
 import argparse

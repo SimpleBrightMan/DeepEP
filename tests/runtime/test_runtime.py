@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Control-path fault injection; these tests do not establish NPU qualification."""
 
 import importlib

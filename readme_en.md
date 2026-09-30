@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
+
 # DeepEP
 
 ---
@@ -357,9 +362,7 @@ We thank [DeepSeek DeepEP](https://github.com/deepseek-ai/DeepEP) for the upstre
 
 ---
 
-> 🚧 **TBD | License**
->
-> project license and third-party notices.
+Project material for which Lu Lu holds the relevant rights is licensed under the [BSD 2-Clause License](LICENSE). Other source material retains its own copyright notices and license texts.
 
 ## Citation
 

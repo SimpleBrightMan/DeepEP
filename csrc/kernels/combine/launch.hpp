@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by lishaoxun 2026
+
 #pragma once
 #include "../notify/launch.hpp"
 extern "C" ASCEND_DEEPEP_EXPORT void combine_prepare_kernel_do(void* stream, uint8_t* workspace, uint8_t* tiling);

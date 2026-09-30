@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by candy_cloud_fly 2026
+
 #ifndef COMBINE_DEDUP_EP_SERVER_DEDUP_PARTIAL_H
 #define COMBINE_DEDUP_EP_SERVER_DEDUP_PARTIAL_H
 

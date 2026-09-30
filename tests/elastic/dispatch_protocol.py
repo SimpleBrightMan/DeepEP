@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by huangxiaolan 2026
+
 """Check the installed packet protocol before allocating GM or starting SHMEM."""
 
 from pathlib import Path

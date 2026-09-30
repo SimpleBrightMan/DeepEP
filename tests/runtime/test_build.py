@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by huangxiaolan 2026
+
 """Build preflight and artifact checks runnable without SDKs or devices."""
 
 import importlib.util

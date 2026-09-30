@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by candy_cloud_fly 2026
+
 #pragma once
 // Existing ascendEP dispatch controls end before 764 KiB. Keep its 2 MiB
 // data boundary and fixed 4 GiB bank stride; do not import upstream offsets.

@@ -1,7 +1,5 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Licensed under CANN Open Software License Agreement Version 2.0.
- */
+// Copyright (c) 2026, Lu Lu
+// Modified by SimpleBright_Man 2026
 #ifndef MEGA_MOE_CATLASS_GROUPED_MATMUL_H
 #define MEGA_MOE_CATLASS_GROUPED_MATMUL_H
 

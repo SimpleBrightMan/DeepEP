@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Installed-package accuracy/performance runner. Launch with torchrun, not st/run.sh."""
 
 import argparse

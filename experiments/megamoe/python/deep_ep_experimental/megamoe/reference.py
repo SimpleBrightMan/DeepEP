@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Small NumPy oracle; no custom operators and no communication implementation.
 
 Finite test data only. BF16/GMM output rounding and MXFP8 intermediate rounding

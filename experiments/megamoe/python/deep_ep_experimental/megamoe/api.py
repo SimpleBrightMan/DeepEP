@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Thin inference-only API; all algorithm selection remains in the native layer."""
 
 from __future__ import annotations

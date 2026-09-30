@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by huangxiaolan 2026
+
 """Bounded CPU diagnostics for the independent peer-table payload oracle."""
 
 import numpy as np

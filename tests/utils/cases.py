@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """Deterministic global inputs, with deliberately unequal token counts."""
 
 from dataclasses import dataclass

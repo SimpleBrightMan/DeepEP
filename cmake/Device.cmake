@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by lishaoxun 2026
+
 # Keep Bisheng in its own build tree, separate from the Host C++ compiler.
 set(DEEPEP_DEVICE_BINARY_DIR "${CMAKE_BINARY_DIR}/device")
 set(DEEPEP_DEVICE_LIBRARY "${DEEPEP_DEVICE_BINARY_DIR}/libdeepep_kernels.so")

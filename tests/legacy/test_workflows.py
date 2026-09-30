@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by nino888 2026
+
 """Pending V1 BF16 communication qualification; opt in with --run-device."""
 
 import pytest

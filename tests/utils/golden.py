@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """Versioned golden manifest construction for the EP reference matrix."""
 
 from dataclasses import replace

@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """Semantic comparisons, independent of native handle/metadata layouts."""
 
 from collections import Counter

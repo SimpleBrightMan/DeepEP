@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Remote stages for batch_launch.py; paths/configuration come from the shared run manifest."""
 
 import argparse

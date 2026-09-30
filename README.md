@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
+
 # DeepEP
 
 ---
@@ -358,9 +363,7 @@ MegaMoE 将 dispatch、专家计算、激活/量化及 combine 融合为 W4A8 �
 
 ---
 
-> 🚧 **待补充｜许可证**
->
-> 项目许可证与第三方声明。
+Lu Lu 持有权利的项目内容采用 [BSD 2-Clause 许可证](LICENSE)。其他来源代码保留各自的版权声明和许可证文本。
 
 ## 引用（Citation）
 

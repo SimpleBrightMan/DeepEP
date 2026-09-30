@@ -1,7 +1,5 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Licensed under CANN Open Software License Agreement Version 2.0.
- */
+// Copyright (c) 2026, Lu Lu
+// Modified by SimpleBright_Man 2026
 #ifndef MEGA_MOE_CATLASS_RESOURCE_H
 #define MEGA_MOE_CATLASS_RESOURCE_H
 #include "catlass/arch/arch.hpp"

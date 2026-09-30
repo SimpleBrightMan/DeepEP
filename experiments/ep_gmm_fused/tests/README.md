@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by zhu-mingzhe71 2026
+-->
+
 # EP_GMM_FUSED 验证工程
 
 从仓库根运行。设备 worker 会排除当前仓库的两个包源码路径，

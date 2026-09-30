@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """Compare declarations with the offline, platform-adapted API contract."""
 
 import copy

@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
+
 # 性能结果记录（schema_version=1）
 
 本页定义通用 benchmark 的结果协议，不适用于 HT/LL ST 的 summary/profiler 格式。[template.csv](template.csv) 仅含表头，单元测试的合成样本不纳入结果仓库。当前通用 CLI 只生成规划结果；`measured` 字段描述已实现的序列化协议，不表示 native 测量入口已接入。

@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """One native configure/build/install path; no network or device side effects."""
 
 import hashlib

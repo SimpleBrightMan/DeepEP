@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by candy_cloud_fly 2026
+
 #ifndef DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_LAYOUT_H
 #define DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_LAYOUT_H
 

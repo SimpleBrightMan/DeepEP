@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Decode selected ranks only. Raw buffers are never modified."""
 
 import argparse

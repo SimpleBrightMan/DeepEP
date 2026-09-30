@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """Measurement protocol, rank aggregation and versioned result serialization."""
 
 import csv

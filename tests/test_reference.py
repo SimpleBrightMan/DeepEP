@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """Hand-calculated anchors and all-rank mathematical invariants."""
 
 from dataclasses import replace

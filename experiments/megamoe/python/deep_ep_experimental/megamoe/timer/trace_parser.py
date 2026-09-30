@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Create Chrome/Perfetto/MindStudio JSON and a compact stage summary."""
 
 import argparse

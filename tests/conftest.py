@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """Explicit device opt-in and pre-device capability gates."""
 
 import os

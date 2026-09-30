@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """DeepEP resource/event interfaces; imports do not require Torch or an NPU SDK.
 
 Installed native wheels provide resources, events, and ElasticBuffer EP operations.

@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 # API signatures adapted from DeepSeek DeepEP; see third-party/deepseek-deepep.LICENSE.
 """V1 API with native resource primitives; EP algorithms remain unavailable."""
 

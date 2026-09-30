@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Decode raw per-rank MegaMoe timer buffers into readable CSV files."""
 
 import argparse

@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by nino888 2026
+
 """Public-API adapter for generalized BF16/FP8 EP qualification.
 
 No backend emulation or exception-to-skip fallback. Native calls and completion

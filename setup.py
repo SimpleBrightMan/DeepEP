@@ -1,11 +1,5 @@
-# -----------------------------------------------------------------------------------------------------------
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
-# CANN Open Software License Agreement Version 2.0 (the "License").
-# Please refer to the License for details. You may not use this file except in compliance with the License.
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
-# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026, Lu Lu
+# Modified by huangxiaolan 2026
 
 """Metadata hooks do not import frameworks, probe devices or configure CMake."""
 
@@ -48,7 +42,8 @@ setup(
     name="ascend-deepep",
     version=(ROOT / "VERSION").read_text(encoding="utf-8").strip(),
     description="DeepEP for Ascend: native runtime and optional communication/GMM operators",
-    license_files=["third-party/deepseek-deepep.LICENSE"] + (["third-party/cann.LICENSE"] if beta_enabled else []),
+    license_files=["LICENSE", "third-party/deepseek-deepep.LICENSE"]
+    + (["third-party/cann.LICENSE"] if beta_enabled else []),
     python_requires=">=3.11",
     packages=packages,
     package_dir=package_dir,

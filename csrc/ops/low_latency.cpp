@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by ryan_li 2026
+
 #include "ops/low_latency.hpp"
 #include <pybind11/stl.h>
 #include <climits>

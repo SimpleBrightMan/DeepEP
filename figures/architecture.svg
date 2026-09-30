@@ -1,3 +1,7 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
 <svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1022" viewBox="0 0 1400 1022" role="img" aria-labelledby="diagram-title diagram-description">
 <title id="diagram-title">DeepEP 软件架构</title>
 <desc id="diagram-description">DeepEP 的核心 EP 接口、实验性 MegaMoE API、执行与运行支撑、Ascend C 算子，以及通信组件和昇腾平台依赖。</desc>

@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """Layered EP matrices for CPU reference and NPU qualification.
 
 The reference matrix isolates dimensions and remains practical on CPU. The

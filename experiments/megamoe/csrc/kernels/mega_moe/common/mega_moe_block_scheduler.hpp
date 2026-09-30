@@ -1,7 +1,5 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * Licensed under the CANN Open Software License Agreement Version 2.0.
- */
+// Copyright (c) 2026, Lu Lu
+// Modified by SimpleBright_Man 2026
 #pragma once
 
 #include "catlass/gemm/block/block_swizzle.hpp"

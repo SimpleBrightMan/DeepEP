@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by huangxiaolan 2026
+
 cmake_minimum_required(VERSION 3.20)
 project(deepep_runtime LANGUAGES CXX)
 if(CMAKE_CONFIGURATION_TYPES)

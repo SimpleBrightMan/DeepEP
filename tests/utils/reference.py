@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """All-rank CPU oracle; no Torch, collectives, backend handles or device metadata.
 
 Semantics follow the pinned DeepSeek reference (see third-party/README.md).

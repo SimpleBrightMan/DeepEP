@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by zhu-mingzhe71 2026
+
 """Route construction and assertions, independent of the operator implementation."""
 
 import numpy as np

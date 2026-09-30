@@ -1,4 +1,5 @@
-# Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
+# Copyright (c) 2026, Lu Lu
+# Modified by zhu-mingzhe71 2026
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 find_package(Torch REQUIRED)

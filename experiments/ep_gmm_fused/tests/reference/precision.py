@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by zhu-mingzhe71 2026
+
 """Pinned BF16 mixed-tolerance policy; FP64 is used only for error statistics."""
 
 import numpy as np

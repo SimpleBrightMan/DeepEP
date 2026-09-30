@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by nino888 2026
+
 """Run the six functional smoke scenarios; this does not qualify a device."""
 
 import argparse

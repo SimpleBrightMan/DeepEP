@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by huangxiaolan 2026
+
 """Explicitly build the pinned SHMEM submodule; pip/wheel never invokes this script."""
 
 import argparse

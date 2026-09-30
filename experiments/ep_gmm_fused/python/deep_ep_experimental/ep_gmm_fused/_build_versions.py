@@ -1,4 +1,5 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Modified by zhu-mingzhe71 2026
 """Pinned source revisions used to build this binary package."""
 
 CATCCOS_COMMIT = "878c2e0a504be8c49c03b5e1157a7c714a628e29"

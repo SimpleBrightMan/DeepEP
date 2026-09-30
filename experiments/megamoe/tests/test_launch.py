@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Validate launch plans and build subprocess environments without SSH or devices."""
 
 import importlib.util

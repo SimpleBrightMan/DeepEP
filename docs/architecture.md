@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
+
 # 架构与源码组织
 
 DeepEP 的 Python 接口负责参数、路由 handle 与框架流依赖；C++ Host 层负责设备参数和启动；Device kernel 执行 token 通信与归并。模型侧提供路由、专家计算及与通信路径匹配的乘权操作。

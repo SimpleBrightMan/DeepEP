@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by huangxiaolan 2026
+
 #include "kernel_operator.h"
 #include "simt_api/device_functions.h"
 #include "shmem.h"

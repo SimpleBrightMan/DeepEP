@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Record or verify a prebuilt SDK; never download/build dependencies.
 
 Header checks establish the expected public API, not binary provenance. The SDK

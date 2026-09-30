@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by lishaoxun 2026
+
 """Check collection gates, lifecycle failures and output matching on CPU."""
 
 from dataclasses import replace

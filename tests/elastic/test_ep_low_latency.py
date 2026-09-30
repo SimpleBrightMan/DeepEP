@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by ryan_li 2026
+
 """Installed-wheel LL functional/performance ST, modeled on DeepEP test_ep.py.
 
 Run explicitly; ordinary pytest never initializes NPU devices from this module.

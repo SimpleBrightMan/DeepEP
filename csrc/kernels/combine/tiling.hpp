@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by lishaoxun 2026
+
 #pragma once
 #include <cstdint>
 

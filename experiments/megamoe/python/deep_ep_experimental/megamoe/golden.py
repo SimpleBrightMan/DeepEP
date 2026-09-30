@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Prepare reusable CPU Golden before torchrun; no NPU or distributed collectives."""
 
 import argparse

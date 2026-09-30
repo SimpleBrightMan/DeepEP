@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Launch MegaMoE on explicitly configured hosts sharing one checkout."""
 
 import argparse

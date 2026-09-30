@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
+
 # 开发指南
 
 本文面向代码和文档贡献者。模块职责见[架构说明](architecture.md)，公共调用约束见 [API 指南](api.md)与 [Elastic 接口](elastic.md)。

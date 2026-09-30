@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by SimpleBright_Man 2026
+
 #ifndef ASCEND_DEEPEP_MEGA_MOE_ASCEND_TIMER_V2_H
 #define ASCEND_DEEPEP_MEGA_MOE_ASCEND_TIMER_V2_H
 

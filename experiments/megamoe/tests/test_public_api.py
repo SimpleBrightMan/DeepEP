@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Execute public wrappers using CPU storage doubles; this does not simulate the NPU kernel."""
 
 import contextlib

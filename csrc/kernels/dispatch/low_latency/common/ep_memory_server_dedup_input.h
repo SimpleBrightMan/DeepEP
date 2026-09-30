@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by candy_cloud_fly 2026
+
 #ifndef ASCEND_EP_SERVER_DEDUP_INPUT_H
 #define ASCEND_EP_SERVER_DEDUP_INPUT_H
 

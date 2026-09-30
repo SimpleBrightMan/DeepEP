@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by lishaoxun 2026
+
 """An API-only checkout must never report successful communication or completion."""
 
 import inspect

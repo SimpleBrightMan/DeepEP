@@ -1,4 +1,5 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Copyright (c) 2026, Lu Lu
+# Modified by zhu-mingzhe71 2026
 """Host-only search space and wire format for the compiled Ascend950 kernels.
 
 Like CatCCOS tests/dynamic_tiling, search enumerates compiled MMAD variants and

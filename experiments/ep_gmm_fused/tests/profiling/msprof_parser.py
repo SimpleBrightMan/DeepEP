@@ -1,4 +1,5 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Copyright (c) 2026, Lu Lu
+# Modified by zhu-mingzhe71 2026
 """Parse per-device msprof rows and report duration imbalance (not launch skew)."""
 
 from __future__ import annotations

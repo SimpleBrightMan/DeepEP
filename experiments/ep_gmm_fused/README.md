@@ -1,9 +1,14 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
+
 # EpGmmFused Beta
 
 Ascend950 上的两个 BF16 通算融合算子：`alltoallv_gmm`（AllToAllV → GMM）和
 `gmm_alltoallv`（GMM → AllToAllV）。源码迁自
 [ops-transformer MR 11602](https://gitcode.com/cann/ops-transformer/merge_requests/11602)，
-固定提交、原始文件哈希见 [upstream.json](upstream.json)，许可见 [NOTICE](NOTICE.md)。
+固定提交、原始文件哈希见 [upstream.json](upstream.json)；迁入代码保留原有文件头和 [CatCCOS 许可文本](csrc/catccos_overlay/LICENSE)。
 
 本目录包含内核、Host、Python API 和设备验证工具。根构建按 `DEEPEP_BUILD_EP_GMM_FUSED`
 选择完整实验单元。设备算术和 UDMA 完成协议沿用原 PR；Linux/CANN 原生构建、
@@ -198,4 +203,4 @@ from deep_ep_experimental.ep_gmm_fused import (
 - [编译辅助](../../cmake/ascend/) 提供本模块的 AscendC 工具链和算子编译规则。
 - [依赖准备脚本](../../scripts/prepare_ep_gmm_fused_dependencies.sh) 准备源码和固定版本 SDK，下载目录不纳入本仓提交。
 
-本组件跟随主仓的许可证安排；当前主仓尚未选定项目许可证。第三方依赖声明见 [NOTICE](NOTICE.md)。
+本组件中由 Lu Lu 持有权利的代码采用根目录 [BSD 2-Clause 许可证](../../LICENSE)。迁入代码保留原有版权声明和许可证文本。

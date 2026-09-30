@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by Joyce_An 2026
+
 """Private native-adapter contract. PR3 does not implement a communication backend."""
 
 from importlib import import_module

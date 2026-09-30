@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Concurrent host protocol tests; no NPU/Gloo/HCCL is used."""
 
 from concurrent.futures import ThreadPoolExecutor

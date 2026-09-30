@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by huangxiaolan 2026
+
 // Link-time SDK doubles test ownership decisions, never ABI/device support.
 #include "runtime/session.hpp"
 #include "host/init/shmem_host_init.h"

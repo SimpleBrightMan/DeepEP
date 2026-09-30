@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by huangxiaolan 2026
+
 #pragma once
 #include <cstdint>
 #define ASCEND_DEEPEP_EXPORT __attribute__((visibility("default")))

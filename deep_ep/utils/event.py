@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by nino888 2026
+
 # API signatures adapted from DeepSeek DeepEP; see third-party/deepseek-deepep.LICENSE.
 """Real framework events; empty or fabricated handles never report completion."""
 

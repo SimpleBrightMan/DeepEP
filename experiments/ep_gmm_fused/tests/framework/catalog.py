@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by zhu-mingzhe71 2026
+
 """Deterministic, executable training and directed coverage catalog."""
 
 from collections import Counter

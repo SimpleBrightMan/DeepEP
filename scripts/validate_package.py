@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by huangxiaolan 2026
+
 """Build wheel/sdist, install into a fresh venv, and test outside the checkout.
 
 No packages are installed into the caller's environment. --system-site-packages

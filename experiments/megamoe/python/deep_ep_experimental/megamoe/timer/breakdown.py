@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Rank-local pipeline intervals and overlap breakdown."""
 
 from collections import defaultdict

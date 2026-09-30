@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  */
+// Modified by zhu-mingzhe71 2026
 
 #include <ATen/ATen.h>
 #include <c10/core/DeviceGuard.h>

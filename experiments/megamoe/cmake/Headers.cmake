@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 # Resolve the Tensor API used by the stage and epilogue adapters. These
 # headers may be installed in different CANN operator packages.
 function(ascend_deepep_find_mega_moe_headers)

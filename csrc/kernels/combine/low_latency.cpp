@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by ryan_li 2026
+
 #include <cstdint>
 
 #include "kernel_operator.h"

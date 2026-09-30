@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by candy_cloud_fly 2026
+
 """CPU checks for LL Host contracts; these do not qualify device kernels."""
 
 from types import SimpleNamespace

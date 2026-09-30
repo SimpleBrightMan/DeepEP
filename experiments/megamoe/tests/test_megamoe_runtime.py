@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """MegaMoE bootstrap checks with mocked native and collective backends."""
 
 from types import SimpleNamespace

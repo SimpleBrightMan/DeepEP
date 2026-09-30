@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Additional packaging coverage for source metadata and the optional component."""
 
 import hashlib

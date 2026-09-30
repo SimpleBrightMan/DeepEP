@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by lishaoxun 2026
+
 """Lazy native loading. Importing deep_ep never imports a framework or driver."""
 
 import importlib

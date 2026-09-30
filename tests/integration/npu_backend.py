@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by nino888 2026
+
 """NPU-only adapters. Framework collectives are explicit, never a fallback."""
 
 from dataclasses import dataclass

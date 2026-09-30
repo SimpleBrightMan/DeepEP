@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
+
 # 设备算子
 
 - `notify/notify.cpp`：路由元数据计算与交换。

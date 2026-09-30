@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """TCPStore host coordination for MegaMoE; no ProcessGroup or device transport."""
 
 from contextlib import contextmanager

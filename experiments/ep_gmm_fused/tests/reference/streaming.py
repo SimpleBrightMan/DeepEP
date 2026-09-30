@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by zhu-mingzhe71 2026
+
 """Bounded-RAM full-output reference; each source is generated once per check.
 
 Disk-backed BF16-rounded FP32 inputs preserve the legacy RNG stream.

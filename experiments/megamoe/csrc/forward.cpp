@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by SimpleBright_Man 2026
+
 #include "forward.hpp"
 #include "kernel_launch.hpp"
 

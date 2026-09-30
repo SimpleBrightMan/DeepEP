@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # 在 Python 启动前优先使用当前 Conda 的运行库，避免加载过旧的系统 libstdc++。

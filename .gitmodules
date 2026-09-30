@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by huangxiaolan 2026
+
 [submodule "third-party/shmem"]
 	path = third-party/shmem
 	url = https://gitcode.com/cann/shmem.git

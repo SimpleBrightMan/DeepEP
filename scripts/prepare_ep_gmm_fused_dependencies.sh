@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# Copyright (c) 2026, Lu Lu
+# Modified by zhu-mingzhe71 2026
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

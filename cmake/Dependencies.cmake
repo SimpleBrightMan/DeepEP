@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by lishaoxun 2026
+
 foreach(sdk ASCEND_HOME_PATH SHMEM_ROOT)
     if(NOT IS_DIRECTORY "${${sdk}}")
         message(FATAL_ERROR "${sdk} must identify an installed SDK")

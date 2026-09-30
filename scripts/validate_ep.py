@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by nino888 2026
+
 """Run installed native EP or explicit NPU Tensor stubs without rebuilding.
 
 Requires two explicitly reserved devices. Tests are staged outside the source

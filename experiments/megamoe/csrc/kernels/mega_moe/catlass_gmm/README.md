@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by SimpleBright_Man 2026
+-->
+
 # MegaMoE A8W4 CATLASS GMM
 
 GMM 使用 CATLASS 的 `PackedMxA8W4TileCopyTla`、MX MMAD 和 NZ 权重反量化。

@@ -8,6 +8,7 @@
  * BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE. See
  * third-party/cann.LICENSE for the full text of the License.
  */
+// Modified by SimpleBright_Man 2026
 
 #ifndef MEGA_MOE_CATLASS_BLOCK_MMAD_A8W4_HPP
 #define MEGA_MOE_CATLASS_BLOCK_MMAD_A8W4_HPP

@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by lishaoxun 2026
+
 #include "ops/combine.hpp"
 #include <pybind11/stl.h>
 #include <algorithm>

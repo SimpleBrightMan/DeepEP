@@ -1,3 +1,6 @@
+// Copyright (c) 2026, Lu Lu
+// Modified by candy_cloud_fly 2026
+
 #pragma once
 #include "ep_memory_server_dedup_combine_config.h"
 #include "ep_memory_server_dedup_buffer_layout.h"

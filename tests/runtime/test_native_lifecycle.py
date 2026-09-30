@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Compile the production lifecycle against link-time fault-injection doubles."""
 
 from pathlib import Path

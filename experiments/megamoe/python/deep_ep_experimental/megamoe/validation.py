@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """Explicit host-side preflight, never a hidden scan in the kernel hot path."""
 
 import math

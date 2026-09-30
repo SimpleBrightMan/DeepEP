@@ -1,3 +1,8 @@
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by Joyce_An 2026
+-->
+
 # 测试入口
 
 从仓库根目录运行以下命令。CPU 测试不占用 NPU；设备系统测试使用已安装的 wheel，安装步骤见[构建指南](../docs/build.md)。测试通过的范围以实际执行的入口、配置和 rank 结果为准。

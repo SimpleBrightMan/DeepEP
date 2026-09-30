@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by SimpleBright_Man 2026
+
 """CPU Golden equivalence, cache lifecycle and small-report-only accuracy."""
 
 import copy

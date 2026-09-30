@@ -1,6 +1,11 @@
-EpGmmFused follows Ascend/DeepEP's project licensing policy. The main repository
-has not yet selected a project license; see CONTRIBUTING.md. This component does
-not independently select the CANN Open Software License for project-owned code.
+<!--
+Copyright (c) 2026, Lu Lu
+Modified by zhu-mingzhe71 2026
+-->
+
+EpGmmFused follows the root repository's licensing policy. Material owned by
+Lu Lu is covered by the root BSD 2-Clause license; migrated source retains its
+original notices and license.
 
 `upstream.json` records a temporary development snapshot and source hashes before
 migration. It is historical provenance, not a released dependency, a current file

@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by zhu-mingzhe71 2026
+
 """No imports from the DUT: route order, BF16 rounding and CPU FP32 test oracle."""
 
 import numpy as np

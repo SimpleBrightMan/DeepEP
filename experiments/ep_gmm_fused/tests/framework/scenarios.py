@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Lu Lu
+# Modified by zhu-mingzhe71 2026
+
 """Lifecycle scenarios run inside one already-initialized UDMA domain."""
 
 from dataclasses import replace
