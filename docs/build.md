@@ -1,34 +1,34 @@
 # 构建、打包与安装
 
-当前 wheel 包含 Host 运行时、Notify 元数据、展开式 dispatch 和 BF16 combine kernel，接口限制见 [Elastic 文档](elastic.md)。
-MegaMoE 是可选的实验构建。
-详细范围、资源所有权和验收矩阵见[运行时设计](runtime-design.md)。
+wheel 包含 Host 运行时、Notify 及 HT/LL dispatch/combine kernel。输入和执行约束见 [Elastic 接口](elastic.md)，资源与事件见 [API 指南](api.md)。
+MegaMoE 和 EpGmmFused 通过独立开关选择构建，见下文实验组件说明。
 包名为 `ascend-deepep`，导入名仍为 `deep_ep`；不要与其他提供 `deep_ep` 的包装在同一环境。
 
 ## 前置条件
 
 - Linux、Python ≥3.11、C++17 编译器、CMake ≥3.20，以及 Make 或 Ninja；构建工具须在 PATH 中。
-- CANN 9.2.0 与配套驱动/框架，目标 Ascend950；其他组合尚未放开。
+- CANN 9.2.0 与配套驱动/框架，目标 Ascend950；构建仅接受该 CANN 版本与目标架构。
 - 由本仓子模块构建或使用外部固定提交的 SHMEM SDK（见 `dependencies.lock.json`），安装根包含 `include/`、
   `lib/libshmem.so` 以及 `src/device`、`src/device_simt` 等 Device 头文件。
-- 普通（HT）dispatch/combine 依赖 [SHMEM PR #851](https://gitcode.com/cann/shmem/pull/851)
-  的 shared-jetty 支持，包括 Host 配置接口和 Device 共享队列状态；当前构建使用锁文件中固定的 PR 分支提交。
+- 普通（HT）dispatch/combine 依赖 SHMEM 的 shared-jetty 支持，包括 Host 配置接口和 Device 共享队列状态；使用锁文件固定的 `cann/shmem` dev 提交，不直接跟随分支最新版本。
 - CANN 安装中须包含 `tools/bisheng_compiler/bin/bisheng`，Device 使用 `-xasc` 编译。
 - 普通 CPU 测试仅需 `requirements-dev.txt`；wheel 构建依赖固定在 `pyproject.toml`。
 - wheel 构建不自动下载/编译外部 SDK，不将驱动/CANN/SHMEM 打入 wheel。SDK 及其传递依赖必须由部署环境提供。
 
-## 可选 MegaMoE 构建
+## 可选实验组件
 
 MegaMoE 的构建和多机测试入口位于 `experiments/megamoe/scripts/`，
 命令、依赖和环境配置见 [MegaMoE 使用说明](../experiments/megamoe/README.md#2-编译安装)。
-基础包使用下面的通用构建流程，默认不启用 MegaMoE。
+EpGmmFused 通过 `DEEPEP_BUILD_EP_GMM_FUSED=ON` 构建 AllToAllV → GMM 和 GMM → AllToAllV，
+需要单独准备 CatCCOS、其 CATLASS 依赖及 SHMEM SDK，见 [EpGmmFused 使用说明](../experiments/ep_gmm_fused/README.md#构建)。
+基础包使用下面的通用构建流程，两个实验组件默认均关闭。
 
 ## 分步骤构建（外部 SDK、打包或 CI）
 
-直接 pip/build 默认关闭 MegaMoE。从 Git checkout 首次准备：
+先激活已安装匹配 Torch/torch_npu 的 Python 环境。以下命令在仓库根目录执行，使用仓内固定版本依赖：
 
 ```bash
-source "$CANN_ENV"
+source /path/to/ascend-toolkit/set_env.sh
 git submodule update --init --recursive
 unset SHMEM_ROOT CATLASS_ROOT  # 使用仓内依赖；外部 SDK 用户见下文。
 python scripts/build_shmem.py
@@ -39,10 +39,10 @@ python -m pip install -r requirements-build.txt
 ```
 
 主构建默认查找 `third-party/shmem/install/shmem`；MegaMoE 启用时默认查找 `third-party/catlass`。
-准备脚本只构建锁定的原始 SHMEM，不打实验补丁；已有 build/install 时要求显式 `--rebuild`（会再生成这些构建产物）。
+准备脚本默认要求 SHMEM 源码干净且提交与锁文件一致；已有 build/install 时要求显式 `--rebuild`（会再生成这些构建产物）。
 更换 SDK 前停止使用它的作业，之后重建 wheel。完整边界及离线依赖见 [第三方依赖](../third-party/README.md)。
 
-已有外部 SDK 时跳过准备脚本，保留原来的覆盖方式：
+已有外部 SDK 时，加载 CANN 环境、设置 `DEEPEP_NPU_ARCH=Ascend950` 并安装 `requirements-build.txt` 后，跳过子模块准备和 SHMEM 构建，改用：
 
 ```bash
 export SHMEM_ROOT=/path/to/pinned/shmem-sdk
@@ -54,7 +54,7 @@ python scripts/record_shmem_sdk.py --sdk "$SHMEM_ROOT" \
 # 启用 MegaMoE 且不用仓内子模块时，再设置 CATLASS_ROOT=/path/to/pinned/catlass。
 ```
 
-sdist 不携带子模块，解包后构建需显式设置 SHMEM_ROOT，以及 Beta 构建所需的 CATLASS_ROOT。
+sdist 不携带子模块，解包后构建需显式设置 SHMEM_ROOT，以及启用 MegaMoE 时所需的 CATLASS_ROOT；EpGmmFused 的外部源码路径按其构建说明设置。
 下方自动化验证入口会将原 checkout 的默认依赖路径固定为绝对路径，确保 sdist 重建使用相同 SDK。
 
 版本声明由 SDK 提供方负责，脚本校验固定公共头文件、记录头文件及库的校验和；不把“头文件一致”等同于“二进制来源可信”。
@@ -63,11 +63,11 @@ MegaMoE 构建及仓内 SDK 复用保持严格校验，SDK 必须与锁文件匹
 
 `setup.py` 元数据查询不需要 SDK/框架。实际构建只经 `build_support.py` 调用根 CMake。
 不同工具链、SDK、Python 环境和构建模式使用不同指纹目录；源码哈希仅用于标识产物，
-不再因修改 Python、测试或单个 kernel 而切换整个构建目录。`DEEPEP_BUILD_MEGAMOE` 默认 OFF；
-ON 的实验构建见 [MegaMoE Beta](../experiments/megamoe/README.md)，尚待设备验收。
+修改 Python、测试或单个 kernel 不切换整个构建目录。`DEEPEP_BUILD_MEGAMOE` 默认 OFF；
+ON 的构建与使用方式见 [MegaMoE 文档](../experiments/megamoe/README.md)。
 安装产物没有构建机绝对 RPATH，使用部署环境的 SDK 路径；加载时核对实际 SHMEM 二进制身份。
 
-## 日常构建与后续算子接入
+## 编译与安装
 
 Host 编译器优先使用 `CXX` 指定的可执行文件；未设置时依次查找 PATH 中的
 `c++`、`g++`、`clang++`、`bisheng++`、`bisheng`，再查找 CANN 的
@@ -96,7 +96,7 @@ python -m pip install --force-reinstall --no-deps /path/to/shared/wheels/实际�
 `pip wheel` 只编译打包，不安装。第一条仅执行一次，第二条在每个独立 Python 环境执行；
 使用本次生成的实际文件名，不要硬编码旧版本，也不要在多台机器同时编译同一共享 checkout。
 每台运行节点都需要加载匹配的 CANN/SHMEM 环境并设置运行时共享 endpoint，详见
-[Elastic 单机/多机运行命令](elastic.md#编译与运行)。
+[单机/多机测试](../tests/README.md)。
 
 若需要同时交付源码包与 wheel，可在安装构建依赖后执行
 `python -m build --sdist --wheel --no-isolation`，产物位于 `dist/`；该命令同样不会安装。
@@ -120,8 +120,7 @@ export DEEPEP_BUILD_TYPE=RelWithDebInfo  # Release / RelWithDebInfo / Debug
 - `cmake/device/CMakeLists.txt`：Bisheng 源文件列表及编译选项，生成 `libdeepep_kernels.so`。
 - `cmake/Dependencies.cmake`：Host/Device 共用的 CANN 和 SHMEM 库定位。
 
-新增算子时，在 Device 子工程登记 kernel 源文件，在根工程增加 Host 封装及能力声明，
-并添加 Python/native 绑定。不需要新建每算子子工程或修改 Python 构建器的算子列表。
+新增算子涉及的源码注册和检查项见[开发指南](development.md)。
 编译器依赖信息负责追踪公共头文件；无改动、仅改 Python/测试时，不重新编译原生目标。
 修改一个 kernel 时仅编译受影响的对象并重新链接，修改公共头文件时重编依赖它的对象。
 
@@ -155,24 +154,15 @@ python scripts/validate_package.py --output /path/to/another-new-directory \
 ```
 
 设备编号和端口为示例，必须替换为本作业已预留资源。不要复用已有任务的通信端口。
-支持显式选择 EP2/4/8 的资源测试；只有实际完成的规模才能记入资格。
+支持显式选择 EP2/4/8 的资源测试；结果仅覆盖实际执行的规模。
 每个 rank 的成功结果、JUnit XML 和 `validation.json` 一并保留；失败不会写成功摘要。
 
-`--runtime-ranks` 只验证资源、事件与生命周期，不是 dispatch/combine 正确性或带宽。
-当前 V2 算子精度请在安装后运行 `tests/elastic/test_dispatch.py` 和 `tests/elastic/test_combine.py`，
-完整的 dispatch → 模拟专家计算 → combine 由后者覆盖，命令见 [Elastic 文档](elastic.md#编译与运行)。
-普通 pytest 和本脚本默认的构建安装检查不会自动执行这两个 NPU 用例。
+`--runtime-ranks` 只验证资源、事件与生命周期，不是 dispatch/combine 正确性或带宽。安装后分别运行 HT dispatch、HT combine 和 LL 系统测试，命令集中在[测试入口](../tests/README.md)。普通 pytest 和默认构建安装检查不自动执行设备 ST。
 
-`--ep-roundtrip npu-stub|native` 以及 `scripts/validate_ep.py` 属于另一套 V1 验证入口：
-前者中的 npu-stub 使用真实 NPU Tensor 和 HCCL 参考通信，native 则要求尚未实现的三个 `Buffer` 操作。
-当前 wheel 仅声明两个 `ElasticBuffer` 操作，因此不要用 `--ep-roundtrip native` 验收当前 V2。
-这套入口的完整命令和结果边界见 [NPU 集成测试](npu-roundtrip.md)。
-正式发布前仍需许可证确认、受支持配套环境审批以及后续算法批次的独立资格验证。
+`--ep-roundtrip npu-stub` 可在构建安装后追加双卡 NPU Tensor/HCCL 参考闭环；使用同一组两张已分配设备。该入口不是 DeepEP 原生通信验收。`--ep-roundtrip native` 要求 V1 Buffer 通信方法，不能用于当前 V2 算子，详细边界见[参考闭环说明](../tests/README.md#cpu-与-npu-参考闭环)。
 
-## CI 接入
+## CI 与产物
 
-现有 `compile` 流水线自动运行 CPU 契约、构建预检、Python/原生资源故障注入与回归测试。
-原生 fault-injection 的编译要求 Linux/g++；不是 CANN ABI 或设备测试。
-原生构建/设备 runner 还需维护者配置 SDK、框架和独占设备资源，当前不伪造 runner 标签或镜像。
-对应 runner 的必选门禁命令就是上面的 `validate_package.py`；依赖或能力缺失应失败，不应改成 skip。
-归档 `source-tests.xml`、`installed-tests.xml`、`validation.json` 和每个 rank 的输出；wheel/sdist 作为独立产物留存。
+GitCode 的 `compile` 流水线运行 pre-commit，并按变更范围运行 CPU API、参考、运行时和构建预检。CPU fault-injection 使用 Linux/g++，不等于 CANN ABI 或 NPU 测试。具体作业和触发方式见[开发指南](development.md#提交前检查与-ci)。
+
+在具备 CANN、SHMEM、框架与已分配 NPU 的环境执行本页验证命令。保留 `source-tests.xml`、`installed-tests.xml`、`validation.json` 和逐 rank 输出，wheel/sdist 作为独立产物归档。安装成功、CPU 通过和设备算子通过分别记录，不互相替代。

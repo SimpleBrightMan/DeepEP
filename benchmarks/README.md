@@ -1,12 +1,12 @@
-# EP benchmark
+# EP benchmark 工具
 
-提供配置检查、确定性负载规划、完成边界计时引擎、逐轮 rank MAX 聚合和 JSON/CSV 结果记录。本通用框架当前没有原生测量适配器或设备实测数据；非 dry-run 命令会在设备初始化前明确失败，不以参考实现或模拟耗时代替通信测量。
+通用入口提供配置检查、确定性负载规划和 JSON/CSV 结果协议。当前支持无设备 dry-run；native 测量适配器未接入，非 dry-run 返回非零，不以模拟时间代替通信测量。
 
-LL 已有独立的公开 API ST 性能入口，见 [LL ST](../tests/elastic/test_ep_low_latency.py)：默认执行正确性及 kernel 耗时测量。它不使用本通用框架，且当前尚无设备实测结果。
+HT 和 LL 有独立的设备正确性与 kernel 测量入口，运行方式见[测试说明](../tests/README.md)，统计口径见[性能说明](../docs/performance.md)。
 
-## 无设备使用
+## 无设备运行
 
-从仓库根目录运行，Python 3.11+，无需 Torch、NumPy 或 NPU：
+从仓库根目录使用 Python 3.11+，无需 Torch、NumPy 或 NPU：
 
 ```bash
 python -m benchmarks.bench_ep --help
@@ -14,34 +14,51 @@ python -m benchmarks.bench_ep --list-scenarios
 python -m benchmarks.bench_ep --dry-run --preset smoke
 python -m benchmarks.bench_ep --dry-run --preset upstream-bf16
 python -m benchmarks.bench_ep --dry-run --preset upstream-fp8
-python -m benchmarks.bench_ep --dry-run --operation roundtrip --tokens-per-rank 16,0 --route duplicate --output-dir benchmark-runs/plan-001
+python -m benchmarks.bench_ep --dry-run --operation roundtrip \
+  --tokens-per-rank 16,0 --route duplicate --output-dir benchmark-runs/plan-001
 ```
 
-`--config <file.json>` 与 `--preset` 二选一，显式 CLI 字段覆盖所选配置，其余使用默认值。`--tokens-per-rank` 必须逐一列出全部 rank 的实际 token 数。权重开关为 `--with-weights` / `--no-with-weights`。已有输出目录不会覆盖。
+`--config <file.json>` 与 `--preset` 二选一，显式 CLI 字段覆盖配置。指定输出目录时必须使用新路径。dry-run 输出 `status=planned`，保存配置和计划，不生成时延、带宽或性能 CSV。`upstream-*` 只是固定上游典型规模的规划样本，不是设备支持或性能基线。
 
-dry-run 输出 `status=planned`，仅保存 `config.json` 和 `plan.json`，不生成时延、带宽或 CSV 性能摘要。`upstream-*` 预设是固定上游典型规模的**规划样本**，不代表全功能覆盖或性能基线。
+## 配置
 
-## 测量入口
+| 字段 | 含义与取值 |
+| --- | --- |
+| `api` | `legacy` 或 `elastic` |
+| `operation` | `dispatch`、`combine` 或 `roundtrip` |
+| `dtype` | dispatch 的 `bf16` 或 `fp8`（E4M3FN）；combine 输入/输出为 BF16 |
+| `layout` | `ordinary` 或 `expanded` |
+| `dispatch_mode` | `fresh` 或 `cached` |
+| `world_size`、`tokens_per_rank` | rank 数及每个 rank 的实际 token 数；允许部分 rank 为 0，全局至少一个 token |
+| `hidden`、`topk`、`experts` | H、K、E；E 可被 EP 整除，K≤E |
+| `alignment` | 1 或 128 |
+| `with_weights` | 独立 FP32 值通道；CLI 使用 `--with-weights/--no-with-weights` |
+| `route` | `balanced`、`skew`、`duplicate` 或 `masked` |
+| `seed` | 确定性输入和路由的种子 |
+| `warmup`、`iterations` | 通用计时协议的预热与采样次数 |
 
-原生后端及其私有适配器实现并通过功能资格后，可使用以下命令形式：
+`--tokens-per-rank` 逐一列出全部 rank 的 token 数。legacy 规划仅接受普通 BF16、alignment=1；FP8 的 H 须被 128 整除；elastic combine/roundtrip 的 H 须被 256 整除。**规划器接受的配置不等于当前 native 算子支持的配置。** 设备限制见 [Elastic 接口](../docs/elastic.md)。
 
-```bash
-torchrun --standalone --nproc-per-node=2 -m benchmarks.bench_ep \
-  --config benchmarks/configs/smoke.json --revision <full-source-commit-sha> \
-  --output-dir benchmark-runs/run-001
+JSON 不超过 64 KiB，拒绝重复/未知键、错误类型和非法范围。规划器上限为 EP≤1024、H/E≤65536、K≤256、全局 token≤1048576、路由槽位≤8388608、预热/采样次数≤10000、保留样本≤1000000。这些用于限制规划计算量。
+
+## 确定性负载
+
+对源 rank r、token t、列 c 和路由槽位 s：
+
+```text
+x(r,t,c) = ((seed + 13*r + 7*t + c) % 127 - 63) / 16
+w(r,t,s) = ((seed + 19*r + 7*t + 3*s) % 127) / 128
+e(r,t,s) = (seed + 17*r + 7*t + s) % E
 ```
 
-当前执行会报 `native benchmark adapter is not implemented` 并返回 2。不提供绕过能力门禁或模拟测量的参数。退出码 0 表示规划成功或全部测量步骤完成；配置、能力、正确性和运行时错误返回非零。详细错误只写本地 stderr，结构化失败输出不携带异常文本。
+hidden 值可被 BF16 精确表示；FP8 先生成 BF16，再按固定参考的每 128 列 scale 编码。`with_weights=false` 不改变 hidden 字节数。
 
-## 文件职责
+`balanced` 使用轮转 expert 公式，不保证每个配置严格均匀；`skew` 将目标压到 rank 0；`duplicate` 在 K>1 时复制槽位 0 到槽位 1；`masked` 按固定公式将部分槽位置 -1。有效行和逻辑流量由配置与路由计算，不读取内部 handle 来生成预期答案。
 
-- `bench_ep.py`：CLI、预设、能力门禁和会话生命周期。
-- `_config.py`：严格配置、输入/路由公式及逻辑字节数。
-- `_backend.py`：固定第一方适配器入口与私有协议；不实现通信。
-- `_utils.py`：预热、完成边界计时、正确性投票、统计和结果持久化。
-- `configs/`：smoke、上游典型 BF16/FP8 规模。
-- `results/`：版本化字段说明与 CSV 模板，不含实测数据。
+## 输出与退出
 
-自动调优、V1 低时延专用接口、异步重叠吞吐和 MegaMoE 融合流程不在本入口范围内。
+计划文件包含规范化配置、配置指纹、所需能力、计时定义和逻辑字节数。结果协议见 [results/README.md](results/README.md)，与 LL ST 的输出格式分开。
 
-[详细设计](../docs/benchmark-design.md) · [测量口径](../docs/performance.md) · [CPU 协议测试](../tests/test_benchmark.py)
+退出码 0 表示规划成功；当前请求 native 测量返回 2，错误为缺少 native benchmark adapter。参数、配置或输出路径错误也返回非零。结构化失败结果只记录错误类型，详细错误位于 stderr。
+
+`_config.py` 实现配置及字节计算，`_utils.py` 实现通用计时、统计和序列化，`_backend.py` 定义内部适配协议。可运行 `python -m pytest tests/test_benchmark.py -q` 检查这些协议；CPU 合成样本不作为性能数据发布。

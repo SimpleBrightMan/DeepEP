@@ -1,6 +1,6 @@
 # 性能结果记录（schema_version=1）
 
-[template.csv](template.csv) 仅含表头。当前没有设备测量数据，单元测试的合成样本不纳入结果仓库。
+本页定义通用 benchmark 的结果协议，不适用于 HT/LL ST 的 summary/profiler 格式。[template.csv](template.csv) 仅含表头，单元测试的合成样本不纳入结果仓库。当前通用 CLI 只生成规划结果；`measured` 字段描述已实现的序列化协议，不表示 native 测量入口已接入。
 
 ## 输出状态与文件
 
@@ -18,8 +18,8 @@
 | --- | --- |
 | `schema_version` | 整数 1；不兼容语义变化需升级版本 |
 | `status` | planned / measured / failed |
-| `config` | 全量规范化负载配置，字段与约束见[设计](../../docs/benchmark-design.md) |
-| `config_fingerprint` | 上述配置排序 JSON 的 64 位 SHA256 |
+| `config` | 全量规范化负载配置，字段与约束见[配置说明](../README.md#配置) |
+| `config_fingerprint` | 上述配置排序 JSON 的 SHA-256 摘要，64 个十六进制字符（256 bit） |
 | `required_capabilities` | 排序的能力字符串数组 |
 | `timing` | 时钟、完成边界、包括/排除项、聚合/百分位、缓存策略与操作定义 |
 | `traffic` | definition/includes/excludes；每个源 rank 的行数、dispatch/combine 字节数，以及所选操作全 rank effective_bytes |
@@ -36,8 +36,8 @@
 
 CSV 一次实验一行，保留旧字段并追加 schema、状态、后端、双方向 dtype、布局、缓存模式、alignment、权重开关、路由、mean/min/max、带宽统计口径和完整配置指纹。字段顺序由测试与模板同时锁定。不适用的 nodes/build_info_path/policy_path/num_aiv 等留空；基线提交/延迟/speedup 未测量时留空。
 
-raw_results_path 与 environment_path 都指向随目录归档的 `result.json`；配置位于 `config.json`。摘要中的 launcher 和新输出目录使用占位符，复现时按实际公开拓扑补齐，所有 rank 使用同一份配置与源码 SHA。
+raw_results_path 与 environment_path 都指向随目录归档的 `result.json`；配置位于 `config.json`。协议模板中的 launcher 和输出目录是字段示意，不是可直接执行的命令。发布实测记录时附上实际公开拓扑对应的命令，并保持所有 rank 的配置与源码 SHA 一致。
 
 同配置的 record_id 相同，区分重复实验还需 measured_at、revision、metadata；不要只用 record_id 当全局唯一键。公开前检查所有字段，仅保留可共享信息，不上传完整进程环境、访问凭据或本地机器路径。
 
-[测量口径](../../docs/performance.md) · [详细设计与适配器契约](../../docs/benchmark-design.md)
+[测量口径](../../docs/performance.md) · [配置与工具](../README.md)

@@ -29,7 +29,7 @@
     "expanded-dispatch-low-latency",
     "expanded-combine-low-latency"
   ],
-  "qualification": "See docs/runtime-design.md; build success does not qualify EP operations",
+  "qualification": "See docs/api.md; build success does not qualify EP operations",
   "megamoe": {
     "catlass_repository": "https://gitcode.com/cann/catlass",
     "catlass_revision": "2b4bd7cbf7e67ebab23d7d5a99d472c83f90d9a1",

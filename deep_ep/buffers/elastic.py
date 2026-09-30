@@ -138,7 +138,7 @@ class EPHandle:
 
 
 class ElasticBuffer:
-    """Own a restricted native resource session; see docs/runtime-design.md."""
+    """Own a restricted native resource session; see docs/api.md."""
 
     def __init__(
         self,

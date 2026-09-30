@@ -1,84 +1,60 @@
-# DeepEP 精度标准、Golden 与比较方法
+# 精度、Golden 与比较方法
 
-本文固定 reference tests 的精度口径。它区分通信语义正确性、浮点计算精度和设备资格，避免用小规模精确样本替代真实数值验收。
+精度检查分为通信搬运、浮点归约和参考计算三个层次。本页说明仓库实际比较方法；CPU 参考或测试适配器通过，不等于真实设备算子通过。
 
-## 1. 依据与适用范围
+## 各入口的判据
 
-- 精度标准：工作区《昇腾算子精度标准2.1》，按浮点计算 L2 标准执行。
-- 用例规则：工作区《算子精度测试工程指导》，覆盖 dtype、shape/边界、参数正交、均匀/正态分布及已知易错场景。
-- 上游语义：DeepSeek DeepEP 提交 `a56d6156febcd9976e55adc85b5155bfac9f28f8`。该提交的 V2 测试使用 BF16 激活，也覆盖按 token、每 128 列缩放的 `float8_e4m3fn` dispatch，随后恢复为 BF16；top-k 索引使用原生构建选择的整数宽度，top-k weights 为 FP32。
+| 入口或输出 | 比较方式 |
+| --- | --- |
+| HT dispatch 的有效路由、计数、payload/scales 和 weights | 与独立参考逐项或按位比较，保留重复槽位 |
+| HT combine 系统测试 | 使用有界整数构造专家输出，精确比较完整归约结果；独立回传的权重按位比较 |
+| LL dispatch 系统测试 | 检查实际 LL 路径、有效行、payload/scales、返回字段及行数约定 |
+| LL combine 系统测试 | BF16/FP8 场景使用 `rtol=0.01, atol=0.03125`；FP16 场景使用 `rtol=0.003, atol=0.004` |
+| CPU 参考与 V1 测试适配器 | 独立 FP64 Golden、固定 dtype 路径模拟与双标杆比较 |
 
-当前 Ascend 原生后端仍未实现，因此 CPU 测试只证明参考、生成器与判定器自洽。只有在目标设备上运行并保存全 rank 结果后，才能声明设备通过。
+HT 的精确整数用例不代表任意浮点分布均无误差；LL ST 也没有把所有输出交给通用双标杆比较器。禁止把 `combine(dispatch(x)) == x` 作为通用条件：普通布局按目标 rank 去重，expanded 按有效槽位展开，归约重数取决于路由。
 
-## 2. 三类输出的判定
+HT 模型侧应用 gate，LL combine 内部应用 gate；均只应用一次。具体返回布局和有效区域见 [Elastic 接口](elastic.md)。padding、容量尾部和未定义槽位不进入数值比较。
 
-| 输出 | 分类 | 判定 |
-| --- | --- | --- |
-| route/index、每 expert 计数、handle 布局 | 非计算/整数 | 有效区域逐项或二进制一致；保留重复槽位重数 |
-| dispatch 的 BF16 或 FP8 payload/scale | 非计算 | 与同 dtype 标杆逐位一致；padding 与未定义槽位不进入比较 |
-| combine 浮点输出 | 浮点计算 | CPU 高精度 Golden + 上游同 dtype 标杆双标杆比较 |
-| top-k weights/value channel | 搬移或独立归并 | 搬移路径逐位一致；发生浮点归并时使用双标杆 |
+## 双标杆指标
 
-禁止把 `combine(dispatch(x)) == x` 当作通用正确性条件。普通布局按目标 rank 去重，展开布局按有效 slot 展开；重复 expert slot 会改变归并重数。
+实现位于 [tests/utils/precision.py](../tests/utils/precision.py)。设实际输出为 a、FP64 Golden 为 g，独立 dtype 路径结果为 b。第二标杆来自 CPU 模拟时，报告明确标记其来源，不称为设备实采结果。
 
-## 3. 双标杆指标
+按 dtype 的小值阈值 τ 将元素分为：普通值域 `S={i: abs(g_i)≥τ}`，小值域 `Q={i: abs(g_i)<τ}`。仅在 S 上分别计算 a、b 的三项误差：
 
-CPU FP64 数学参考为 Golden，固定参考实现的独立结果为第二标杆；未采集独立设备结果时，必须明确标为固定 dtype 路径模拟值。对 NPU 和第二标杆分别计算：
+```text
+MARE = max_i(abs(a_i - g_i) / (abs(g_i) + 1e-7))
+MERE = mean_i(abs(a_i - g_i) / (abs(g_i) + 1e-7))
+RMSE = sqrt(mean_i((a_i - g_i)^2))
+i ∈ S
+```
 
-- `MARE = max(abs(actual - golden) / (abs(golden) + 1e-7))`
-- `MERE = mean(abs(actual - golden) / (abs(golden) + 1e-7))`
-- `RMSE = sqrt(mean((actual - golden)^2))`
+S 为空时三项均为 0。每项误差比为 `metric(a,g) / max(metric(b,g), err)`；L2 对 MARE/MERE/RMSE 的比值上限分别为 2、1.2、1.2，并非原始误差上限。
 
-误差比为 `NPU 指标 / max(第二标杆指标, err)`。L2 通过线为 MARE `<= 2`、MERE `<= 1.2`、RMSE `<= 1.2`。
-
-小值域单独统计，不允许被整体平均掩盖：
-
-| dtype | `abs(golden)` 小值阈值 | 绝对误差阈值 `err` |
+| dtype | 小值阈值 τ | 小值绝对误差阈值 err |
 | --- | ---: | ---: |
 | BF16 | `2^-8` | `2^-16` |
 | FP8 E4M3FN | `2^-4` | `2^-6` |
 
-小值域错误数比 `ErrorCount_npu / max(ErrorCount_benchmark, 1)` 必须 `<= 2`。NaN/Inf 不进入上述除法；其类别和符号按标准单独匹配。本仓当前生成器只生成有限值，比较器遇到非有限值会拒绝，防止静默通过。
+Q 中统计 `abs(a_i-g_i)>err` 的元素数 ErrorCount。`ErrorCount(a)/max(ErrorCount(b),1)` 不超过 2 才通过。比较器拒绝 NaN/Inf，不提供非有限值类别或符号匹配；不能将有限输入测试外推到这些情况。
 
-单次用例不通过后才进入复检：更换随机种子至少 200 次（推荐 1000 次），Bootstrap 2000 次，取误差比中位数的 95% 置信区间；`CI_lower > 1.0` 或样本数少于 200 时失败。`bootstrap_median_recheck` 提供固定 seed 的可复现实现。复检不能覆盖路由、shape、计数、数据破坏或非有限值错误。
+`bootstrap_median_recheck` 对至少 200 个误差比样本执行复检，默认 Bootstrap 2000 次，计算中位数的 95% 置信区间；样本不足或 `CI_lower>1.0` 时失败。它是独立工具，不会自动替代 ST 的失败结论，也不用于覆盖路由、shape、计数或数据破坏错误。
 
-## 4. 资格矩阵
+## 参考数据与矩阵
 
-`tests/utils/matrix.py` 继承“框架合入”的分层规划，维护两个互不混淆的矩阵。
+[tests/utils/matrix.py](../tests/utils/matrix.py) 与路由参考包含小规模 EP、不同 hidden、零/不等长 token、重复与无效路由、均匀/正态分布、小值和离群值。它们用于检查参考函数和比较器，不是当前产品的支持矩阵；其中 EP1、H256 或 alignment128 等 case 不能直接用于当前 HT payload。
 
-CPU 参考矩阵使用 pairwise 场景控制运行量，并覆盖：
+参考语义固定到 DeepSeek DeepEP `a56d6156febcd9976e55adc85b5155bfac9f28f8`，来源见[第三方说明](../third-party/README.md)。BF16/FP8 模拟明确标出 dtype 舍入和 FP8 每 128 列缩放；实际 LL 的 INT32 打包 scales 另由 LL ST 检查，不与该模拟格式混用。
 
-- EP：1、2、4、8；experts：8、64、256。
-- hidden：16、127、128、256、7168，包含对齐和非对齐边界。
-- 每 rank token：1、15、16、17、33、不等长 rank，以及上游默认最大值 4096。
-- top-k：1、2、4、6、8。
-- dtype：BF16 和 FP8 E4M3FN；FP8 遵循上游每 128 列缩放与 BF16 恢复语义。
-- 数值分布：正确性均匀分布 `[-5, 5]`、稳定性近似正态分布（均值 `[-100, 100]`、标准差 `[1, 25]`）、dtype 小值域，以及每 1000 个元素至少一个的乘性离群点；生成公式无全局随机状态，可由 case 配置完全重建。
-- 路由：本地/跨 rank、mask、重复目标、倾斜、空 expert、零 token rank等预设场景继续由 `ROUTES` 套件覆盖。
+参考闭环使用 `f_e(x)=(e+1)/8*x+(e-3)/64`。专家乘加、gate 和跨 rank 累加按各适配器约定的 BF16/FP32 路径执行，FP64 Golden 直接从原始输入生成。故障注入检查漏贡献、重复乘权、错误顺序、shape 和非有限值等问题。
 
-NPU 资格矩阵只使用固定上游 V2 combine 可接受的 `H % 256 == 0` shape，覆盖 EP 1/2/4/8、alignment 1/128、BF16/FP8、T=4096 边界和上游默认 H=7168/K=6/E=256。不同 EP 必须通过独立的 `torchrun --nproc-per-node` 执行；两 rank 小算例不能代替 EP4/EP8 资格。
-
-这不是所有维度的笛卡尔积。设备发布资格还应根据目标模型补充真实 shape，并记录平台、CANN/驱动、源码提交、命令和所有 rank 结果。
-
-## 5. Golden 生成和防篡改
-
-运行：
+## Golden 维护
 
 ```bash
 python -m tests.golden.generate
 python -m pytest tests/test_precision.py -q
 ```
 
-生成文件 `tests/golden/deepep_reference_v2.json` 包含 schema、上游提交、完整 CPU reference case 配置、设备资格 case 配置、有效 route slot 数、普通/展开布局行数、expert count 摘要、CPU FP64 combine 摘要、上游 dtype 标杆摘要及标杆相对 Golden 的误差指标。
+生成器更新 `tests/golden/deepep_reference_v2.json`，包含参考版本、case 配置、路由与布局摘要、FP64 答案摘要、dtype 模拟摘要和误差指标。输入由确定性公式重建，以规范 JSON 的 SHA-256 锁定；MERE/RMSE 使用 `math.fsum` 保持跨 Python 版本的归约一致性。
 
-MERE/RMSE 的浮点归约显式使用 `math.fsum`，避免 Python 3.11 与 3.12 的内置 `sum` 算法差异导致 Golden 指标末位不一致（见 [Python 版本说明](https://docs.python.org/3.12/library/functions.html#sum)）。这不放宽精度阈值或 Golden 一致性检查；测试另用精确有理数累加核对小误差项。
-
-Golden 不保存海量张量文本；输入由公开、无随机状态的整数公式完全重建，结果用规范 JSON 的 SHA-256 锁定。修改公式、路由语义、dtype 舍入或归并答案都会使回归失败。更新 Golden 必须同时审核生成器变更，禁止只替换摘要来消除失败。
-
-设备结果不得写回覆盖 CPU Golden。应作为独立 capture 文件输入同一比较器，并保留 rank、case、dtype、shape 和来源标识。独立设备标杆可替换 manifest 中的 dtype 模拟值，但必须使用同一输入和固定参考实现版本。
-
-## 6. 当前边界
-
-- 已完成：纯 Python 高精度参考、BF16/E4M3FN dtype 模拟、双标杆 L2 比较器、小值域规则、Bootstrap 复检、版本化 Golden、参数矩阵、故障注入和可收集的 V1/V2 设备用例。
-- 待真实后端完成后执行：全 rank NPU capture、独立设备第二标杆、NaN/Inf 设备行为、alignment 128/padding、跨节点拓扑、至少 200 次失败复检与压力运行。
-- BF16/FP8 是固定上游 V2 EP 测试明确覆盖的 activation 路径；不得从 Python 签名存在推导 FP16/FP32 activation 已获支持。索引和权重 dtype 仍分别按原生 `topk_idx_t` 与 FP32 验证。
+修改生成公式、路由、舍入或归并规则时，同时审查生成器与 Golden 差异，不能只替换摘要消除测试失败。设备结果单独保存，不覆盖 CPU Golden。记录 case、rank、dtype、shape、源码、环境与比较方法；所有参与 rank 均通过才记为对应配置通过。

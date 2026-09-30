@@ -1,22 +1,18 @@
 # 文档导航
 
-本目录提供项目架构、接口、构建、性能及开发指南。功能进展和设备支持状态统一记录在[路线图](roadmap.md)中。
+按安装、调用、测试和开发任务选择文档。项目概览见[中文首页](../README.md)或 [English README](../readme_en.md)。
 
-| 文档 | 内容 |
+| 阅读任务 | 文档 |
 | --- | --- |
-| [architecture.md](architecture.md) | 分层职责、调用链与依赖关系 |
-| [repository-layout.md](repository-layout.md) | 源码目录规划与文件职责 |
-| [api.md](api.md) | API 对标范围、工作流与基线要求 |
-| [api-contracts.md](api-contracts.md) | 已提供的接口声明、默认值差异、明确失败及验证设计 |
-| [build.md](build.md) | 构建主链、产物、安装及依赖锁定 |
-| [runtime-design.md](runtime-design.md) | 原生资源/事件生命周期、支持边界及安装验证 |
-| [elastic.md](elastic.md) | Notify 元数据、dispatch / combine 接口限制、SHMEM 空间及单机/多机测试命令 |
-| [performance.md](performance.md) | EP/Beta 测量口径与复现记录 |
-| [benchmark-design.md](benchmark-design.md) | EP benchmark 配置、计时/统计引擎、结果协议及原生适配器契约 |
-| [precision.md](precision.md) | 精度标准、BF16/FP8 双标杆、Golden 与资格矩阵 |
-| [functional-roundtrip.md](functional-roundtrip.md) | 显式功能桩、V1 小型前向闭环、精度与后端隔离 |
-| [npu-roundtrip.md](npu-roundtrip.md) | 真实 NPU Tensor、外层运行选项与后续原生算子验收入口 |
-| [development.md](development.md) | 源码导航、文件粒度与实现次序 |
-| [roadmap.md](roadmap.md) | 开发阶段、功能状态与验证要求 |
-
-用户入口：[中文首页](../README.md) / [English README](../readme_en.md)。
+| 配置环境、构建和安装 wheel | [构建指南](build.md) |
+| 创建 Buffer、管理事件与资源、了解上游兼容范围 | [API 指南](api.md) |
+| 使用 dispatch/combine，核对 HT/LL 的输入、权重和容量约束 | [Elastic 接口](elastic.md) |
+| 使用 AllToAllV → GMM 和 GMM → AllToAllV 融合算子 | [EpGmmFused](../experiments/ep_gmm_fused/README.md) |
+| 了解 MegaMoE 融合计算流程 | [MegaMoE](../experiments/megamoe/README.md) |
+| 定位 Python、Host、Device 调用链 | [架构说明](architecture.md) |
+| 运行 CPU 检查和 NPU 系统测试 | [测试入口](../tests/README.md) |
+| 理解各测试的精度判据和 Golden | [精度说明](precision.md) |
+| 测量 kernel 耗时、解释统计和带宽 | [性能说明](performance.md) |
+| 规划 benchmark 负载、读取通用结果格式 | [benchmark 工具](../benchmarks/README.md)、[结果格式](../benchmarks/results/README.md) |
+| 修改代码、运行格式检查和 CI | [贡献指南](../CONTRIBUTING.md)、[开发指南](development.md) |
+| 查阅依赖版本、参考来源和第三方许可 | [第三方说明](../third-party/README.md) |

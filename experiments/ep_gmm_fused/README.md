@@ -60,7 +60,7 @@ fi
 后者忽略当前目录、`PYTHONPATH` 和用户级包目录，不作为日常必需参数。
 
 根构建固定 CatCCOS `878c2e0a504be8c49c03b5e1157a7c714a628e29`、其 CATLASS gitlink，
-SHMEM 沿用主线 `dependencies.lock.json` 中的 `2057780fe2b8a9d7cd97d5d60b3230493b235cfa`。
+SHMEM 沿用主线 [dependencies.lock.json](../../dependencies.lock.json) 固定的提交。
 `SHMEM_SOURCE_PATH` 为同一提交的干净源码，提供 device 私有头；`SHMEM_ROOT` 为已记录身份的外部 SDK。
 `CATCCOS_SOURCE_PATH` 可显式指定；提交不匹配、源码脏或子模块不匹配时停止。
 准备脚本校验并复用已有 SDK；默认本地 SDK 尚无身份记录时，按锁定提交构建 Ascend950 SDK 并生成 manifest。

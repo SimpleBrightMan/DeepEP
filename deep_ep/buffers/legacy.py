@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 class Buffer:
-    """Own a restricted native resource session; see docs/runtime-design.md."""
+    """Own a restricted native resource session; see docs/api.md."""
 
     def __init__(
         self,
@@ -37,7 +37,7 @@ class Buffer:
         Scale-up/out describe domains, not transport engines. Memory-transport
         flags do not enable every scale-up backend. num_qps_per_rank is a
         reserved compatibility value, not a shared DMA queue/channel count.
-        See docs/api-contracts.md for the transport configuration boundary.
+        See docs/api.md for the transport configuration boundary.
         """
         require_native("Buffer.__init__")
         if (

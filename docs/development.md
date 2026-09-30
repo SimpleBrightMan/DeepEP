@@ -1,55 +1,34 @@
 # 开发指南
 
-本文说明源码组织、命名约定与测试分工。文件职责见[目录设计](repository-layout.md)，开发进展见[路线图](roadmap.md)。
+本文面向代码和文档贡献者。模块职责见[架构说明](architecture.md)，公共调用约束见 [API 指南](api.md)与 [Elastic 接口](elastic.md)。
 
-## 从一次 API 调用定位代码
+## 定位与修改实现
 
-```text
-deep_ep/buffers/          参数处理与返回组织
-csrc/bindings/           原生注册与转换
-csrc/ops/                业务、布局和 handle 语义
-csrc/execution/          plan、variants、launcher
-csrc/kernels/            完整设备实现及私有辅助
-csrc/runtime/            共享上下文、资源和事件
-```
+从 `deep_ep/buffers/elastic.py` 的公开方法进入，经 `csrc/bindings/module.cpp` 定位 `csrc/ops` Host 封装和 `csrc/kernels` 实现。资源由 Python Runtime 与 `csrc/runtime/session` 管理，事件位于 `deep_ep/utils/event.py`。
 
-`deep_ep/__init__.py` 汇总导出，当前 `csrc/bindings/module.cpp` 汇总资源层原生注册；后续算法注册仍保持单一扩展入口。Beta 在 `experiments/megamoe/` 中建立自己的入口与构建目标。
+新增或修改算子时，同步检查 Python 参数、Host 校验、tiling/工作区、kernel 参数、绑定、构建清单及能力声明。核心 EP 的 Device 源文件登记在 `cmake/device/CMakeLists.txt`，Host 源文件和绑定由根工程编译；不需要为每个算子建立独立 Python 构建器。
 
-## 文件粒度与命名
+单算子的辅助实现放在邻接目录；同族共享代码放在算法族内，只有存在共同调用方和契约时才提取跨算子组件。沿用现有模块和头文件约定，不为目录完整性建立空模块。公共参数使用通信域、数据和资源含义命名，具体硬件机制留在后端实现中。
 
-- `legacy`、`elastic` 表达接口家族；支持状态另行记录。
-- 第一方 C++/AscendC 使用 `.cpp/.hpp`。小型实现可采用内联头或邻接私有函数。
-- 单算子辅助留在 Kernel 邻接位置，同族共享留在对应算法族；跨算子组件满足共同契约后进入 `device/`。
-- `runtime` 表达持续资源；`execution` 表达单次准备与启动。
-- `topologies` 表达多设备资源连接；`policies` 表达算法执行选项；`release` 表达发行功能与配套。
-- `.gitkeep` 仅用于保存空目录；目录有真实文件后可移除。
+MegaMoE 的融合计算、量化和完整前向验证集中到其[独立说明](../experiments/megamoe/README.md)，不套用单独 EP 通信的性能口径。EpGmmFused 的可选构建目标和算子验证见[组件说明](../experiments/ep_gmm_fused/README.md#开发与构建接入)。
 
-## 新增实现
+## 变更验证
 
-先固定相关 API 基线和完整业务用例，再定义输入/输出、handle 与完成条件。添加 ops、Kernel 和合法变体时，同步补齐参数声明、编译清单、能力索引与测试。绑定负责注册和转换，业务及算法留在对应实现模块。
+接口变化同时更新机器可读契约、使用文档和相应测试。资源/事件变化检查创建、失败、等待和销毁；kernel 变化检查参数、有效区域、容量边界及数值。各入口和命令见[测试说明](../tests/README.md)。
 
-源码依赖、Host/Device 编译域与安装清单应能逐项对应。核心与 Beta 通过根构建解析同一组有效依赖；正式配置只使用经过验证的支持域。
+文档或注释修改执行链接、路径、格式和示例参数检查。只有描述或行为涉及设备时才需要相应设备验证；没有运行的项目在变更说明中如实记录。
 
-## 测试分工
+## 文档与图稿维护
 
-| 目录 | 验证责任 |
-| --- | --- |
-| `tests/api/` | 公开对象、签名、返回与完整调用契约 |
-| `tests/legacy/` | V1 dispatch/combine、低时延和复用路径 |
-| `tests/elastic/` | V2 布局、handle、dispatch/combine |
-| `tests/integration/` | 安装、依赖加载、资源生命周期与框架接入 |
-| `tests/utils/` | 分布式环境辅助与业务正确性参考 |
-| `experiments/megamoe/tests/` | Beta 业务正确性与完整流程 |
+面向使用者写已明确的行为、约束、命令和结果解释；面向开发者写源码职责与验证方法。保持中英文首页的含义、链接及图表对应，避免复制多份详细支持表。
 
-`examples/` 展示用户流程，`benchmarks/` 测量性能。计时和启动等窄辅助可复用，业务参考与场景配置由对应测试或实验维护。
+图稿放在 `figures/`，使用自包含 SVG，不依赖外部字体文件或网络资源。中英文架构图分别为 `architecture.svg` 和 `architecture_en.svg`。更新图稿时同步检查引用、文字与实际职责；性能图的数值、单位、测试配置及统计口径与表格一致。
 
-## 文档维护
-
-检查 Markdown 相对链接、目录路径、UTF-8 编码、SVG 有效性与 `git diff --check`。保持中英文首页的功能状态与使用说明一致。此类静态检查不能替代 API、构建或设备测试。
+检查 Markdown 本地链接及锚点、代码路径、UTF-8/LF、SVG XML 和 `git diff --check`。删除或合并文档时，也更新源码 docstring、错误信息和配置中的路径引用。
 
 ## 提交前检查与 CI
 
-[`.pre-commit-config.yaml`](../.pre-commit-config.yaml) 是本地与 CI 共用的检查入口。框架版本固定在 `requirements-dev.txt`，hook 固定到提交 SHA。使用 Python 3.11 按[贡献指南](../CONTRIBUTING.md)安装开发依赖并运行 `pre-commit install` 后，每次提交会检查暂存文件。
+[`.pre-commit-config.yaml`](../.pre-commit-config.yaml) 是本地与 CI 共用的检查入口。开发检查工具版本固定在 `requirements-dev.txt`，hook 固定到提交 SHA。使用 Python 3.11 按[贡献指南](../CONTRIBUTING.md)安装开发依赖并运行 `pre-commit install` 后，每次提交会检查暂存文件。
 
 | 检查 | 范围与约定 |
 | --- | --- |

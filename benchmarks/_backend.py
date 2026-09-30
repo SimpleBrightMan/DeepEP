@@ -5,7 +5,7 @@ from typing import Protocol
 
 
 class BenchmarkRuntime(Protocol):
-    """Private protocol v1; see docs/benchmark-design.md for operation semantics.
+    """Private protocol v1; see docs/performance.md for operation semantics.
 
     A context-managed factory owns only resources it creates. All collective
     operations and teardown must have bounded timeouts. No adapter is supplied

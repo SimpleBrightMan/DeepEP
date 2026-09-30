@@ -14,7 +14,7 @@
 
 ### 新增特性
 
-- **高吞吐 Prefill：** 基于 URMA 的 dispatch/combine，集成 notify 与 Server 级 token 去重，覆盖 EP32/64/128/256。
+- **高吞吐 Prefill：** 基于 URMA 的 dispatch/combine，集成 notify 与 Server 级 token 去重，支持 EP32/64/128，EP256 当前仅支持 dispatch；具体支持范围见 [Elastic 文档](docs/elastic.md)。
 - **低时延 Decode：** 通过同一 V2 接口提供小批量 dispatch/combine，覆盖 EP64/128。
 - **MegaMoE Prefill（实验性）：** W4A8 通信与专家计算融合，覆盖 EP32/64/128。
 - **MegaMoE Decode（实验性）：** 小批量 W4A8 融合推理，覆盖 EP64/128，与 Prefill 共用同一个 MegaMoE 前向入口。
@@ -37,9 +37,11 @@ DeepEP/
 ├── csrc/
 │   ├── bindings/            # Python/C++ 绑定
 │   ├── runtime/             # 通信资源与生命周期
+│   ├── ops/                 # Host 校验与算子启动
 │   └── kernels/             # Ascend C 通信算子
 ├── experiments/
-│   └── megamoe/             # MegaMoE 融合推理
+│   ├── megamoe/             # MegaMoE 融合推理
+│   └── ep_gmm_fused/        # 通信与矩阵乘融合算子
 ├── cmake/                   # 构建与安装
 ├── third-party/             # 依赖组件
 ├── configs/                 # 部署与执行配置
@@ -78,8 +80,8 @@ DeepEP/
 | 64 | FP8 / BF16 | 🚧 待补充 | 🚧 待补充 |
 | 128 | BF16 / BF16 | 🚧 待补充 | 🚧 待补充 |
 | 128 | FP8 / BF16 | 🚧 待补充 | 🚧 待补充 |
-| 256 | BF16 / BF16 | 🚧 待补充 | 🚧 待补充 |
-| 256 | FP8 / BF16 | 🚧 待补充 | 🚧 待补充 |
+| 256 | BF16 / — | 🚧 待补充 | 不支持 |
+| 256 | FP8 / — | 🚧 待补充 | 不支持 |
 
 ![不同 EP 规模的 FP8 dispatch / BF16 combine 带宽](figures/performance_prefill.svg)
 
@@ -184,7 +186,7 @@ python -m pip install -r requirements-dev.txt
 python -m pytest tests/elastic/test_dispatch.py tests/elastic/test_combine.py -q
 ```
 
-贡献要求见 [CONTRIBUTING.md](CONTRIBUTING.md)，NPU 测试命令见 [docs/elastic.md](docs/elastic.md)。
+贡献要求见 [CONTRIBUTING.md](CONTRIBUTING.md)，NPU 测试命令见[测试说明](tests/README.md)。
 
 ### 安装
 
@@ -219,7 +221,7 @@ bash experiments/megamoe/scripts/build.sh
 
 ### Buffer 初始化
 
-设置 NPU 设备和 SHMEM endpoint 后，创建 EP 通信 Buffer：
+以下为 HT 初始化片段，假定已设置 NPU 设备和 SHMEM endpoint，且 `max_tokens_per_rank > 256`：
 
 ```python
 from deep_ep import ElasticBuffer
@@ -234,6 +236,8 @@ buffer = ElasticBuffer(
 )
 ```
 
+LL 需显式设置 `num_bytes=8 << 30` 并使用不大于 256 的 token 上限，其他条件见 [Elastic 文档](docs/elastic.md)。使用结束后，各 rank 集体调用 `buffer.destroy()`。
+
 ### 推理 Prefill 示例
 
 `dispatch()` 完成路由准备与 token 分发；本地专家计算后，`combine()` 使用匹配的 `EPHandle` 归并结果。
@@ -244,7 +248,7 @@ buffer = ElasticBuffer(
 
 ### 推理 Decode 示例
 
-Decode 使用同一个 Buffer 及 `dispatch()` / `combine()` 方法，配置小批量输入。
+Decode 使用同一套 `ElasticBuffer` 接口及 `dispatch()` / `combine()` 方法，按实际执行路径配置 Buffer。
 
 > 🚧 **待补充｜Decode 示例**
 >
@@ -322,7 +326,7 @@ Tensor 布局、事件同步及 Buffer 生命周期见 [API 文档](docs/api.md)
 
 ---
 
-同一个 EP 组使用共享的 SHMEM 初始化 endpoint，并配置 rank 与设备的映射。Server 级去重按配置的 Server 分组组织通信。
+同一个 EP 组使用共享的 SHMEM 初始化 endpoint，并配置 rank 与设备的映射。当前实现按连续 8 rank 划分逻辑 Server 进行去重；逻辑 Server 不一定与物理主机一一对应。
 
 > 🚧 **待补充｜网络配置**
 >

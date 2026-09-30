@@ -14,7 +14,7 @@
 
 ### New features
 
-- **High-throughput prefill:** URMA dispatch and combine, integrated notify, and server-level token deduplication for EP32/64/128/256.
+- **High-throughput prefill:** URMA dispatch and combine, integrated notify, and server-level token deduplication, supporting EP32/64/128. EP256 currently supports dispatch only; see the [Elastic guide](docs/elastic.md) for the detailed support matrix.
 - **Low-latency decode:** small-batch dispatch and combine through the same V2 interface for EP64/128.
 - **MegaMoE prefill (experimental):** W4A8 fused communication and expert computation for EP32/64/128.
 - **MegaMoE decode (experimental):** small-batch W4A8 fused inference for EP64/128, using the same MegaMoE forward entry as prefill.
@@ -37,9 +37,11 @@ DeepEP/
 ├── csrc/
 │   ├── bindings/            # Python/C++ bindings
 │   ├── runtime/             # Communication resources and lifecycle
+│   ├── ops/                 # Host validation and kernel launch
 │   └── kernels/             # Ascend C communication kernels
 ├── experiments/
-│   └── megamoe/             # MegaMoE fused inference
+│   ├── megamoe/             # MegaMoE fused inference
+│   └── ep_gmm_fused/        # Fused communication and grouped matmul
 ├── cmake/                   # Build and installation
 ├── third-party/             # Dependencies
 ├── configs/                 # Deployment and execution configuration
@@ -78,8 +80,8 @@ See the [architecture guide](docs/architecture.md) for module responsibilities.
 | 64 | FP8 / BF16 | 🚧 TBD | 🚧 TBD |
 | 128 | BF16 / BF16 | 🚧 TBD | 🚧 TBD |
 | 128 | FP8 / BF16 | 🚧 TBD | 🚧 TBD |
-| 256 | BF16 / BF16 | 🚧 TBD | 🚧 TBD |
-| 256 | FP8 / BF16 | 🚧 TBD | 🚧 TBD |
+| 256 | BF16 / — | 🚧 TBD | Unsupported |
+| 256 | FP8 / — | 🚧 TBD | Unsupported |
 
 ![FP8 dispatch and BF16 combine bandwidth by EP size](figures/performance_prefill_en.svg)
 
@@ -183,7 +185,7 @@ python -m pip install -r requirements-dev.txt
 python -m pytest tests/elastic/test_dispatch.py tests/elastic/test_combine.py -q
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and [docs/elastic.md](docs/elastic.md) for NPU test commands.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines and the [test guide](tests/README.md) for NPU test commands.
 
 ### Installation
 
@@ -218,7 +220,7 @@ The script prepares dependencies and builds and installs a wheel with MegaMoE an
 
 ### Buffer initialization
 
-Set the NPU device and SHMEM endpoint, then create the EP buffer:
+The following HT initialization assumes the NPU device and SHMEM endpoint are set, with `max_tokens_per_rank > 256`:
 
 ```python
 from deep_ep import ElasticBuffer
@@ -233,6 +235,8 @@ buffer = ElasticBuffer(
 )
 ```
 
+For LL, explicitly set `num_bytes=8 << 30` and use a token bound no greater than 256; other requirements are listed in the [Elastic guide](docs/elastic.md). Call `buffer.destroy()` collectively when finished.
+
 ### Example use in inference prefilling
 
 `dispatch()` prepares routing metadata and distributes tokens. After local expert computation, `combine()` aggregates results using the matching `EPHandle`.
@@ -243,7 +247,7 @@ buffer = ElasticBuffer(
 
 ### Example use in inference decoding
 
-Decode uses the same buffer and `dispatch()` / `combine()` methods with small-batch configurations.
+Decode uses the same `ElasticBuffer` API and `dispatch()` / `combine()` methods, with a buffer configured for the selected path.
 
 > 🚧 **TBD | Decode example**
 >
@@ -321,7 +325,7 @@ Tensor layouts, event synchronization, and buffer lifecycle are described in the
 
 ---
 
-Each EP group uses a shared SHMEM initialization endpoint and an explicit rank-to-device mapping. Server-level deduplication follows the configured server grouping.
+Each EP group uses a shared SHMEM initialization endpoint and an explicit rank-to-device mapping. The current implementation groups consecutive sets of eight ranks into logical servers for server-level deduplication; a logical server need not match a physical host.
 
 > 🚧 **TBD | Network configuration**
 >

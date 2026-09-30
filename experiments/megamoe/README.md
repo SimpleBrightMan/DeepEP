@@ -1,6 +1,6 @@
 # MegaMoE Prefill Beta
 
-公开入口：`deep_ep_experimental.megamoe`。W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度，仍需在目标 NPU 环境验证精度和性能。
+公开入口：`deep_ep_experimental.megamoe`。W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度。
 构建和多机测试入口位于本目录的 `scripts/`；机器地址及环境配置由使用者提供。
 
 ## 1. 输入、输出与公开接口
@@ -253,7 +253,7 @@ python -m pytest experiments/megamoe/tests -q
 ```
 
 保留公开 API、数值参考、Golden 缓存、打包、主机协调与计时解析测试。
-CPU 测试通过不代表设备验收；当前仍需在匹配的 Ascend950 环境完成：
+CPU 检查不启动设备 kernel，也不作为设备验证结果。Ascend950 设备验证记录按以下维度区分：
 
 - MegaMoE 开启/关闭、timer 开启/关闭的构建安装验证。
 - BF16/FP8 输入、不同路由、共享专家、容量边界和多次调用的精度验证。
