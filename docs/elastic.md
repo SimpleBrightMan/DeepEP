@@ -1,7 +1,7 @@
 # Elastic dispatch / combine 接口与限制
 
 `ElasticBuffer.dispatch` 按解析后的 `M=num_max_tokens_per_rank` 选路：
-M<256 优先低时延（LL），否则高吞吐（HT）。LL 不支持而 HT 支持完整调用时仅在
+M<=256 优先低时延（LL），否则高吞吐（HT）。LL 不支持而 HT 支持完整调用时仅在
 payload 启动前转 HT；两者均不支持正常报错。满足LL选路条件但工作区不等于8 GiB时直接报错，
 不因容量错误回退HT。combine 只看 `handle.is_low_latency`。
 M 的默认值依次取调用参数、非零 Buffer 上限、实际 B，kernel tiling 始终使用实际 B。

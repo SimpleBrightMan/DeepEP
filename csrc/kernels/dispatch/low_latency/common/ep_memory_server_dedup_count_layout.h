@@ -8,32 +8,32 @@
 #ifndef DISPATCH_SERVER_DEDUP_ALL_CORE_COUNT_BS_THRESHOLD
 #define DISPATCH_SERVER_DEDUP_ALL_CORE_COUNT_BS_THRESHOLD 512U
 #endif
-// Edit and rebuild Host plus kernel to change this build-time behavior.
-#define DISPATCH_SERVER_DEDUP_ENABLE 1
-static_assert(DISPATCH_SERVER_DEDUP_ENABLE == 0 || DISPATCH_SERVER_DEDUP_ENABLE == 1,
-              "DISPATCH_SERVER_DEDUP_ENABLE must be 0 or 1");
+#include "ep_memory_server_dedup_mode.h"
 
 namespace DispatchDedup {
 constexpr uint32_t kEpServerDedupCoreNum = 64U;
-constexpr bool kEpServerDedupEnable = DISPATCH_SERVER_DEDUP_ENABLE != 0;
 #ifndef DISPATCH_SERVER_DEDUP_SEND_CORE_NUM
 #define DISPATCH_SERVER_DEDUP_SEND_CORE_NUM 32U
 #endif
 constexpr uint32_t kEpServerDedupSendCoreNum = DISPATCH_SERVER_DEDUP_SEND_CORE_NUM;
 static_assert(kEpServerDedupSendCoreNum >= 16U && kEpServerDedupSendCoreNum <= 48U &&
-                  kEpServerDedupSendCoreNum % 8U == 0U,
-              "DISPATCH_SERVER_DEDUP_SEND_CORE_NUM must be 16, 24, 32, 40 or 48");
+                  kEpServerDedupSendCoreNum % 4U == 0U,
+              "DISPATCH_SERVER_DEDUP_SEND_CORE_NUM must be 16..48 in steps of 4");
 constexpr uint32_t kEpServerDedupRecvCoreNum = kEpServerDedupCoreNum - kEpServerDedupSendCoreNum;
 // BS below this threshold uses all 64 cores for Count; otherwise only receivers.
 constexpr uint32_t kEpServerDedupAllCoreCountBsThreshold = DISPATCH_SERVER_DEDUP_ALL_CORE_COUNT_BS_THRESHOLD;
 constexpr uint32_t kEpServerDedupMaxExperts = 1024U;
 constexpr uint32_t kEpServerDedupCountRecordBytes = 32U;
+constexpr uint32_t kEpServerDedupCountGmStride = 512U;
 constexpr uint32_t kEpServerDedupCountUbBytes = 190U * 1024U;
 // Persistent per-AIV state lives only in window 0's prefix, never in the
 // selected ping-pong bank. Keep identical count offsets in both windows.
 constexpr uint64_t kEpServerDedupMagicStride = 512U;
 constexpr uint64_t kEpServerDedupControlPrefixBytes = kEpServerDedupCoreNum * kEpServerDedupMagicStride;
 static_assert(kEpServerDedupControlPrefixBytes == 32U * 1024U, "64 isolated magic slots");
+static_assert(kEpServerDedupCountGmStride % kEpServerDedupCountRecordBytes == 0U &&
+                  kEpServerDedupControlPrefixBytes % kEpServerDedupCountGmStride == 0U,
+              "GM count slots must be aligned whole records");
 constexpr uint64_t kEpServerDedupPeerBytes = 8ULL * 1024U * 1024U * 1024U;
 constexpr uint64_t kEpServerDedupWindowBytes = kEpServerDedupPeerBytes / 2U;
 constexpr uint64_t kEpServerDedupControlBytes = 2ULL * 1024U * 1024U;
@@ -75,7 +75,7 @@ DISPATCH_DEDUP_EP_DEDUP_INLINE EpServerDedupCountLayout DispatchServerDedupCount
     const uint64_t matrixBytes =
         uint64_t(kEpServerDedupRecvCoreNum) * kEpServerDedupRecvCoreNum * kEpServerDedupCountRecordBytes;
     layout.cntOffset = kEpServerDedupControlPrefixBytes;
-    layout.cumsumOffset = uint64_t(experts) * kEpServerDedupCountRecordBytes;
+    layout.cumsumOffset = uint64_t(experts) * kEpServerDedupCountGmStride;
     layout.prefixOffset = layout.cumsumOffset + matrixBytes;
     layout.prefixStride = (uint64_t(experts) * sizeof(int32_t) + 31U) / 32U * 32U;
     layout.cumsumFlagOffset = layout.prefixOffset + kEpServerDedupRecvCoreNum * layout.prefixStride;

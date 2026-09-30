@@ -340,7 +340,7 @@ class ElasticBuffer:
         b, h = hidden.shape
         if (
             type(capacity) is not int
-            or not b <= capacity < 256
+            or not b <= capacity <= 256
             or runtime.world_size not in (16, 32, 64, 128)
             or topk_weights is None
         ):
@@ -438,7 +438,9 @@ class ElasticBuffer:
                         "source_weights": torch.empty((b, k), dtype=torch.float32, device=hidden.device),
                         "comm_args": runtime.low_latency_comm_args,
                         "tiling": self._upload_low_latency(
-                            native.low_latency_dispatch_tiling(runtime.world_size, b, h, k, num_experts, dtype),
+                            native.low_latency_dispatch_tiling(
+                                runtime.world_size, b, h, k, num_experts, dtype, capacity
+                            ),
                             hidden.device,
                         ),
                     }
@@ -535,7 +537,9 @@ class ElasticBuffer:
         native, npu = require_native("ElasticBuffer.combine"), npu_api()
         b, k, h, e = handle.num_tokens, handle.num_topk, handle.hidden, handle.num_experts
         dtype = str(x.dtype).removeprefix("torch.")
-        tiling = native.low_latency_combine_tiling(runtime.world_size, b, h, k, e, dtype)
+        tiling = native.low_latency_combine_tiling(
+            runtime.world_size, b, h, k, e, dtype, handle.num_max_tokens_per_rank
+        )
         with runtime.notify_lock:
             if runtime.notify_failed:
                 raise RuntimeError("A previous communication launch failed; restart the distributed job")
@@ -603,7 +607,7 @@ class ElasticBuffer:
         """Return (expanded_x, None, expanded_weights, handle, event).
 
         Supports BF16 or (FP8 E4M3FN, FP32 [T,H/128] scales), H=7168,
-        Fresh calls with resolved num_max_tokens_per_rank < 256 prefer LL;
+        Fresh calls with resolved num_max_tokens_per_rank <= 256 prefer LL;
         unsupported LL options use HT only before payload launch. HT supports
         fresh/cached expanded routing with expert_alignment=1, num_qps=0/2,
         and num_compute_units=0/32 for BF16 or 0/64 for FP8. These hints do

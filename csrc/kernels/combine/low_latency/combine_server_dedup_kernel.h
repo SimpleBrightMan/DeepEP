@@ -21,11 +21,12 @@ public:
     __aicore__ inline void Init(GM_ADDR commArgs, GM_ADDR expertOut, GM_ADDR assistInfoForCombine, GM_ADDR sendCounts,
                                 GM_ADDR expertScales, GM_ADDR tokenType, GM_ADDR relayReadIndex, GM_ADDR sourceMask,
                                 GM_ADDR yOut, uint32_t bs, uint32_t h, uint32_t topK, uint32_t experts, uint8_t dtype,
-                                uint8_t quantMode, int64_t magic)
+                                uint8_t quantMode, int64_t magic, bool enableDedup = true)
     {
         (void)quantMode;
         core_ = GetBlockIdx();
         args_ = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs);
+        enableDedup_ = enableDedup;
         h_ = h;
         topK_ = topK;
         bs_ = bs;
@@ -97,16 +98,20 @@ public:
 
     __aicore__ inline void Process()
     {
-        CopyLocalPendingTokens();
+        if (enableDedup_) CopyLocalPendingTokens();
         if (core_ >= kEpServerDedupCombineSendCoreNum) {
-            if (core_ >= 56U) {
-                NotifyServerCard();
-                // Notification has been issued; do not add an MTE3 drain.
+            if (enableDedup_) {
+                if (core_ >= 56U) {
+                    NotifyServerCard();
+                    // Notification has been issued; do not add an MTE3 drain.
+                }
+                WaitServerReady();
+                ReturnPartialTokens();
+                const uint32_t retiredOutputs = AggregateSourceTokens();
+                DrainSharedOutputs(retiredOutputs);
+            } else {
+                AggregateSourceTokensM6();
             }
-            WaitServerReady();
-            ReturnPartialTokens();
-            const uint32_t retiredOutputs = AggregateSourceTokens();
-            DrainSharedOutputs(retiredOutputs);
         } else {
             ReturnDirectTokens();
             // Retain the full drain after direct-return DMA completion.
@@ -118,14 +123,27 @@ public:
     }
 
 private:
+    __aicore__ inline void AggregateSourceTokensM6()
+    {
+        ServerDedupSourceAggregate aggregate;
+        // Count DMA has retired. Auto uses the same final-stage scratch view as
+        // M5, but owns its output events because M4 did not run on this launch.
+        aggregate.InitDirectShared(
+            arena_.Get<uint8_t>()[kEpServerDedupCombineResidentUbBytes],
+            args_->peerMems[args_->rank] + window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET, weightsAddr_,
+            outputAddr_, bs_, h_, topK_, dtype_, core_ - kEpServerDedupCombineSendCoreNum,
+            kEpServerDedupCombineRecvCoreNum, workspace_);
+        aggregate.Process();
+        aggregate.DrainM6();
+    }
     __aicore__ inline uint32_t AggregateSourceTokens()
     {
         ServerDedupSourceAggregate aggregate;
-        aggregate.Init(args_->rank, arena_.Get<uint8_t>()[kEpServerDedupCombineResidentUbBytes],
+        aggregate.Init(arena_.Get<uint8_t>()[kEpServerDedupCombineResidentUbBytes],
                        args_->peerMems[args_->rank] + window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET,
                        masksAddr_, weightsAddr_, outputAddr_, bs_, h_, topK_, dtype_,
                        core_ - kEpServerDedupCombineSendCoreNum, kEpServerDedupCombineRecvCoreNum, workspace_,
-                       partialTasks_);
+                       partialTasks_, enableDedup_);
         return aggregate.Process();
     }
     __aicore__ inline void DrainSharedOutputs(uint32_t retiredOutputs = 0U)
@@ -223,14 +241,21 @@ private:
     {
         selected_ = 0U;
         if (tokens_ == 0U) return;
-        DataCopyPad(typeUb_, types_, {1U, tokens_ * 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0});
-        Sync<HardEvent::MTE2_V>();
-        Compares(maskUb_, typeUb_, int32_t(1), CMPMODE::EQ, (tokens_ + 63U) / 64U * 64U);
-        CreateVecIndex(indexUb_, int32_t(0), tokens_);
-        PipeBarrier<PIPE_V>();
-        GatherMask(packedUb_, indexUb_, maskUb_.ReinterpretCast<uint32_t>(), true, tokens_, {1U, 1U, 0U, 0U},
-                   selected_);
-        Sync<HardEvent::V_S>();
+        if (enableDedup_) {
+            DataCopyPad(typeUb_, types_, {1U, tokens_ * 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0});
+            Sync<HardEvent::MTE2_V>();
+            Compares(maskUb_, typeUb_, int32_t(1), CMPMODE::EQ, (tokens_ + 63U) / 64U * 64U);
+            CreateVecIndex(indexUb_, int32_t(0), tokens_);
+            PipeBarrier<PIPE_V>();
+            GatherMask(packedUb_, indexUb_, maskUb_.ReinterpretCast<uint32_t>(), true, tokens_, {1U, 1U, 0U, 0U},
+                       selected_);
+            Sync<HardEvent::V_S>();
+        } else {
+            // Every row is a direct row without the dedup token type table.
+            CreateVecIndex(packedUb_, int32_t(0), tokens_);
+            selected_ = tokens_;
+            Sync<HardEvent::V_S>();
+        }
         if (selected_ == 0U) return;  // no routing reads for a type2/type3-only rank
         const uint32_t chunk = tokens_ < kEpServerDedupCombineTableRows ? tokens_ : kEpServerDedupCombineTableRows;
         CreateVecIndex(typeUb_, int32_t(0), chunk);
@@ -246,7 +271,12 @@ private:
         PipeBarrier<PIPE_V>();
         // Keep two persistent compact arrays: ranks in typeUb_, original rows
         // in packedUb_. indexUb_ becomes the per-server compact output list.
-        GatherMask(typeUb_, indexUb_, maskUb_.ReinterpretCast<uint32_t>(), true, tokens_, {1U, 1U, 0U, 0U}, selected_);
+        if (enableDedup_) {
+            GatherMask(typeUb_, indexUb_, maskUb_.ReinterpretCast<uint32_t>(), true, tokens_, {1U, 1U, 0U, 0U},
+                       selected_);
+        } else {
+            Muls(typeUb_, indexUb_, int32_t(1), tokens_);
+        }
         Sync<HardEvent::V_S>();
         ServerDedupRankMask(maskUb_, tableUb_.ReinterpretCast<uint8_t>(), typeUb_, 0, int32_t(args_->rankSize),
                             uint32_t(selected_));
@@ -399,6 +429,7 @@ private:
     GM_ADDR weightsAddr_ = nullptr;
     GM_ADDR masksAddr_ = nullptr;
     GM_ADDR outputAddr_ = nullptr;
+    bool enableDedup_ = false;
     uint32_t bs_ = 0, experts_ = 0;
     uint8_t dtype_ = 0;
     uint32_t core_ = 0, h_ = 0, topK_ = 0, blocks_ = 0, resultStride_ = 0, tokens_ = 0, lanes_ = 0, laneBytes_ = 0,

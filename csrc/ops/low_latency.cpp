@@ -93,12 +93,14 @@ void bind_low_latency(py::module_& module)
         }
         return bytes(args);
     });
-    module.def("low_latency_dispatch_tiling", [](int p, int b, int h, int k, int e, const std::string& dtype) {
+    module.def("low_latency_dispatch_tiling", [](int p, int b, int h, int k, int e, const std::string& dtype,
+                                                 int num_max_tokens_per_rank) {
         const bool fp8 = dtype == "float8_e4m3fn";
         layout(p, b, h, k, e, fp8);
         DispatchDedup::EpServerDedupTilingData data{};
         data.bs = b;
         data.h = h;
+        data.numMaxTokensPerRank = num_max_tokens_per_rank;
         data.topK = k;
         data.moeExpertNum = e;
         data.expertTokenNumsType = 1;
@@ -109,19 +111,21 @@ void bind_low_latency(py::module_& module)
         data.expandXOutDtype = data.dtype;
         return bytes(data);
     });
-    module.def("low_latency_combine_tiling", [](int p, int b, int h, int k, int e, const std::string& dtype) {
-        CombineDedup::Layout plan{};
-        if ((dtype != "bfloat16" && dtype != "float16") || !CombineDedup::BuildLayout(p, b, h, k, e, plan)) {
-            throw std::invalid_argument("LL combine exceeds dtype, topology, UB or workspace limits");
-        }
-        CombineDedup::EpServerDedupCombineTilingData data{};
-        data.bs = b;
-        data.h = h;
-        data.topK = k;
-        data.moeExpertNum = e;
-        data.dtype = dtype_code(dtype);
-        return bytes(data);
-    });
+    module.def("low_latency_combine_tiling",
+               [](int p, int b, int h, int k, int e, const std::string& dtype, int num_max_tokens_per_rank) {
+                   CombineDedup::Layout plan{};
+                   if ((dtype != "bfloat16" && dtype != "float16") || !CombineDedup::BuildLayout(p, b, h, k, e, plan)) {
+                       throw std::invalid_argument("LL combine exceeds dtype, topology, UB or workspace limits");
+                   }
+                   CombineDedup::EpServerDedupCombineTilingData data{};
+                   data.bs = b;
+                   data.h = h;
+                   data.numMaxTokensPerRank = num_max_tokens_per_rank;
+                   data.topK = k;
+                   data.moeExpertNum = e;
+                   data.dtype = dtype_code(dtype);
+                   return bytes(data);
+               });
     module.def("dispatch_low_latency", [](Session& session, py::dict tensors, int b, int h, int k, int e, int rows,
                                           const std::string& dtype, uintptr_t stream_address) {
         dtype_code(dtype);

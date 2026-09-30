@@ -15,8 +15,9 @@ struct EpServerDedupCombineTilingData {
     uint16_t moeExpertNum;
     uint8_t topK;
     uint8_t dtype;
+    uint16_t numMaxTokensPerRank;
     uint8_t quantMode;
-    uint8_t reserved[3];
+    uint8_t reserved;
 };
 static_assert(std::is_standard_layout<EpServerDedupCombineTilingData>::value, "standard layout tiling");
 static_assert(sizeof(EpServerDedupCombineTilingData) == 16, "Combine tiling is 16 bytes");
@@ -26,7 +27,8 @@ static_assert(offsetof(EpServerDedupCombineTilingData, h) == 4, "H offset");
 static_assert(offsetof(EpServerDedupCombineTilingData, moeExpertNum) == 8, "E offset");
 static_assert(offsetof(EpServerDedupCombineTilingData, topK) == 10, "K offset");
 static_assert(offsetof(EpServerDedupCombineTilingData, dtype) == 11, "dtype offset");
-static_assert(offsetof(EpServerDedupCombineTilingData, quantMode) == 12, "quantMode offset");
-static_assert(offsetof(EpServerDedupCombineTilingData, reserved) == 13, "reserved zeros offset");
+static_assert(offsetof(EpServerDedupCombineTilingData, numMaxTokensPerRank) == 12, "per-rank capacity offset");
+static_assert(offsetof(EpServerDedupCombineTilingData, quantMode) == 14, "quantMode offset");
+static_assert(offsetof(EpServerDedupCombineTilingData, reserved) == 15, "reserved zero offset");
 }  // namespace CombineDedup
 #endif

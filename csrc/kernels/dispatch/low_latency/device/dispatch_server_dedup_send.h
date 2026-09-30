@@ -23,10 +23,12 @@ public:
     // 摘要：绑定输入输出和本核 token 分片，并按 magic 奇偶选择本轮通信窗口。
     __aicore__ inline void Init(const __gm__ DispatchDedup::CommArgs* args, GM_ADDR x, GM_ADDR ids, GM_ADDR weights,
                                 GM_ADDR sourceMask, GM_ADDR sourceWeights, uint32_t bs, uint32_t h, uint32_t k,
-                                uint32_t experts, TPipe* pipe, int64_t magic = 0, GM_ADDR inputScales = nullptr)
+                                uint32_t experts, TPipe* pipe, int64_t magic = 0, GM_ADDR inputScales = nullptr,
+                                bool enableDedup = true)
     {
         args_ = args;
         pipe_ = pipe;
+        enableDedup_ = enableDedup;
         bs_ = bs;
         h_ = h;
         k_ = k;
@@ -50,7 +52,7 @@ public:
     {
         // 1. 无 token 分片的发送核直接返回；有任务的核复用 SendCnt 释放出的 scratch。
         // reservedBytes 对应仍可能被计数发送读取的 UB，不能当作可用空间覆盖。
-        if (count_ == 0U) return;
+        if (enableDedup_ && count_ == 0U) return;
         scratch_ = &scratch;
         TQue<QuePosition::VECIN, 1> input;
         TBufPool<TPosition::VECIN, 1> cleanPool;
@@ -100,15 +102,18 @@ public:
         lanes_ = available < 8U ? available : 8U;
         Allocate(outBuf_, lanes_ * uint32_t(data_.tokenStride));
         routeIds_ = idsBuf_.Get<int32_t>();
-        routeWeights_ = weightInBuf_.Get<float>();
-        sourceWeights_ = weightOutBuf_.Get<float>();
-        sourceMasks_ = maskBuf_.Get<uint32_t>();
-        directTasks_ = directBuf_.Get<uint32_t>();
+        if (count_ != 0U) routeWeights_ = weightInBuf_.Get<float>();
+        if (count_ != 0U) {
+            sourceWeights_ = weightOutBuf_.Get<float>();
+            sourceMasks_ = maskBuf_.Get<uint32_t>();
+            directTasks_ = directBuf_.Get<uint32_t>();
+        }
         serverState_ = serverBuf_.Get<uint32_t>();
         if (maxGroups != 0U) firstHopMasks_ = firstHopBuf_.Get<uint32_t>();
         DataCopyPad(routeIds_, ids_, {1U, bs_ * k_ * 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0});
-        DataCopyPad(routeWeights_, weights_[uint64_t(start_) * k_], {1U, count_ * k_ * 4U, 0U, 0U, 0U},
-                    {false, 0U, 0U, 0.0f});
+        if (count_ != 0U)
+            DataCopyPad(routeWeights_, weights_[uint64_t(start_) * k_], {1U, count_ * k_ * 4U, 0U, 0U, 0U},
+                        {false, 0U, 0U, 0.0f});
         Sync<HardEvent::MTE2_S>();
         // 每个 512B 块尾部的 32B 标记预置为 1；发送时 payload 和标记一起搬运。
         // 初始 MTE3_V 事件让 lane 首次可写，后续复用由上一包的发送完成事件控制。
@@ -121,6 +126,26 @@ public:
         }
         PipeBarrier<PIPE_V>();
 
+        if (enableDedup_)
+            SendWithDedup(input);
+        else
+            SendWithoutDedup(input);
+
+        // 6. 等待所有发送 lane 归还后，把本核 sourceMask 和 sourceWeights 写回 GM。
+        // 只有 sourceMask 标记的权重位置才有效，未选中位置不应被下游消费。
+        // 最后的 MTE3_S 依赖确保这两份源端输出完成后再返回。
+        for (uint32_t lane = 0; lane < lanes_; ++lane) WaitFlag<HardEvent::MTE3_V>(lane);
+        Sync<HardEvent::S_MTE3>();
+        if (enableDedup_) DataCopyPad(maskOut_[start_], sourceMasks_, {1U, count_ * 4U, 0U, 0U, 0U});
+        if (count_ != 0U)
+            DataCopyPad(weightOut_[uint64_t(start_) * k_], enableDedup_ ? sourceWeights_ : routeWeights_,
+                        {1U, count_ * k_ * 4U, 0U, 0U, 0U});
+        Sync<HardEvent::MTE3_S>();
+    }
+
+    // 摘要：去重发送主流程：先发同 server 合并的 FIRST_HOP，再按 server 顺序发缓存的 DIRECT。
+    __aicore__ inline void SendWithDedup(TQue<QuePosition::VECIN, 1>& input)
+    {
         // 4. 第一遍处理本核 token：同一远端 server 的多条路由合并为一份 FIRST_HOP。
         // 以组内最小 k 对应专家作为首跳目标，把其他成员的路由信息放入包尾，
         // 由目标接收端继续转发。所有首跳优先发出，尽早启动远端 relay。
@@ -135,7 +160,7 @@ public:
                 while ((mask & (uint32_t(1) << firstK)) == 0U) ++firstK;
                 const uint32_t index = (start_ + token) * k_ + firstK;
                 const uint32_t expert = uint32_t(routeIds_.GetValue(index));
-                SendPacket(input, token, firstK, expert, CalTokenSendExpertCnt(expert, index), mask);
+                SendPacket(input, start_ + token, firstK, expert, CalTokenSendExpertCnt(expert, index), mask);
                 sourceMasks_.SetValue(token, sourceMasks_.GetValue(token) | (uint32_t(1) << firstK));
                 // 源端仅标记实际发出的首跳路由；该位置输出权重 1，原路由权重另存包尾。
                 sourceWeights_.SetValue(token * k_ + firstK, 1.0f);
@@ -172,21 +197,26 @@ public:
                 const uint32_t token = directTasks_.GetValue(task * 4U);
                 const uint32_t k = directTasks_.GetValue(task * 4U + 1U);
                 const uint32_t q = directTasks_.GetValue(task * 4U + 3U);
-                SendPacket(input, token, k, expert, q, 0U);
+                SendPacket(input, start_ + token, k, expert, q, 0U);
                 sourceMasks_.SetValue(token, sourceMasks_.GetValue(token) | (uint32_t(1) << k));
                 sourceWeights_.SetValue(token * k_ + k, routeWeights_.GetValue(token * k_ + k));
             }
             if (++server == serverNum) server = 0U;
         }
-
-        // 6. 等待所有发送 lane 归还后，把本核 sourceMask 和 sourceWeights 写回 GM。
-        // 只有 sourceMask 标记的权重位置才有效，未选中位置不应被下游消费。
-        // 最后的 MTE3_S 依赖确保这两份源端输出完成后再返回。
-        for (uint32_t lane = 0; lane < lanes_; ++lane) WaitFlag<HardEvent::MTE3_V>(lane);
-        Sync<HardEvent::S_MTE3>();
-        DataCopyPad(maskOut_[start_], sourceMasks_, {1U, count_ * 4U, 0U, 0U, 0U});
-        DataCopyPad(weightOut_[uint64_t(start_) * k_], sourceWeights_, {1U, count_ * k_ * 4U, 0U, 0U, 0U});
-        Sync<HardEvent::MTE3_S>();
+    }
+    // 摘要：非去重发送流程：直接在原始展平路由上做连续核区间切分，每核只发自己的路由。
+    __aicore__ inline void SendWithoutDedup(TQue<QuePosition::VECIN, 1>& input)
+    {
+        // Route ownership is independent of the token partition used to copy weights.
+        const uint32_t total = bs_ * k_, core = GetBlockIdx();
+        const uint32_t base = total / kEpServerDedupSendCoreNum;
+        const uint32_t remainder = total % kEpServerDedupSendCoreNum;
+        const uint32_t begin = core * base + (core < remainder ? core : remainder);
+        const uint32_t count = base + (core < remainder ? 1U : 0U);
+        for (uint32_t i = begin; i < begin + count; ++i) {
+            const uint32_t expert = uint32_t(routeIds_.GetValue(i));
+            SendPacket(input, i / k_, i % k_, expert, CalTokenSendExpertCnt(expert, i), 0U);
+        }
     }
 
 private:
@@ -201,26 +231,14 @@ private:
     // 摘要：从计数阶段共享的 scratch 池分配 UB，并累计已占用字节数。
     __aicore__ inline void Allocate(TBuf<>& buffer, uint32_t bytes)
     {
+        // Auto keeps the dedup layout even for cores owning routes but no tokens.
+        if (bytes == 0U) return;
         scratch_->InitBuffer(buffer, bytes);
         usedBytes_ += bytes;
     }
     // 摘要：按目标 server 对当前 token 的路由分类：同 server 多条远端路由合并为 FIRST_HOP，其余为 DIRECT。
     __aicore__ inline void Classify(uint32_t token, uint32_t& directMask, uint32_t& groups)
     {
-        if (!kEpServerDedupEnable) {
-            // Reuse the 64B server state as this token's route masks. Keep the
-            // server scan even when every route is DIRECT; q and actual send
-            // order still come from the original routes and cyclic task loop.
-            const uint32_t serverNum = args_->rankSize / 8U;
-            for (uint32_t server = 0; server < serverNum; ++server) serverState_.SetValue(server, 0U);
-            for (uint32_t k = 0; k < k_; ++k) {
-                const uint32_t expert = uint32_t(routeIds_.GetValue((start_ + token) * k_ + k));
-                const uint32_t server = expert / localExperts_ / 8U;
-                serverState_.SetValue(server, serverState_.GetValue(server) | (uint32_t(1) << k));
-            }
-            for (uint32_t server = 0; server < serverNum; ++server) directMask |= serverState_.GetValue(server);
-            return;
-        }
         uint32_t seen = 0, grouped = 0;
         for (uint32_t k = 0; k < k_; ++k) {
             const uint32_t expert = uint32_t(routeIds_.GetValue((start_ + token) * k_ + k));
@@ -285,12 +303,19 @@ private:
     __aicore__ inline void FillTail(LocalTensor<uint8_t> payload, uint32_t token, uint32_t firstK, uint32_t mask)
     {
         auto header = payload[data_.headerPayloadOffset].template ReinterpretCast<uint32_t>();
-        auto index = payload[data_.readIndexPayloadOffset].template ReinterpretCast<uint32_t>();
-        auto weights = index.template ReinterpretCast<float>();
         header.SetValue(0U, uint32_t(args_->rank));
-        header.SetValue(1U, start_ + token);
+        header.SetValue(1U, token);
         header.SetValue(2U, firstK);
+        auto index = payload[data_.readIndexPayloadOffset].template ReinterpretCast<uint32_t>();
         header.SetValue(3U, uint32_t(mask == 0U ? EpServerDedupTokenType::Direct : EpServerDedupTokenType::FirstHop));
+        // Direct route ownership differs from the weight-copy token partition.
+        // Its reserved relay payload is unused; never index routeWeights_ here.
+        if (!enableDedup_) {
+            index.SetValue(0U, 0U);
+            return;
+        }
+        auto weights = index.template ReinterpretCast<float>();
+        token -= start_;
         weights.SetValue(1U, routeWeights_.GetValue(token * k_ + firstK));
         uint32_t entries = 0U;
         for (uint32_t k = firstK + 1U; mask != 0U && k < k_; ++k)
@@ -308,7 +333,7 @@ private:
     __aicore__ inline void SendPacket(TQue<QuePosition::VECIN, 1>& input, uint32_t token, uint32_t firstK,
                                       uint32_t expert, uint32_t q, uint32_t mask)
     {
-        const uint32_t tokenId = start_ + token, destination = expert / localExperts_;
+        const uint32_t tokenId = token, destination = expert / localExperts_;
         auto x = input.template AllocTensor<XType>();
         if constexpr (Prequantized) {
             // The full payload queue slot stages H bytes and 4P scale bytes.
@@ -362,6 +387,7 @@ private:
 
     const __gm__ DispatchDedup::CommArgs* args_ = nullptr;
     TPipe* pipe_ = nullptr;
+    bool enableDedup_ = false;
     TBufPool<TPosition::VECCALC, 16>* scratch_ = nullptr;
     uint32_t bs_ = 0, h_ = 0, k_ = 0, localExperts_ = 0, start_ = 0, count_ = 0;
     uint32_t usedBytes_ = 0, lanes_ = 0, packets_ = 0, directCount_ = 0;

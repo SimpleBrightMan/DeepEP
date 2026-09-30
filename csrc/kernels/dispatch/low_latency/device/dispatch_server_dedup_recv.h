@@ -21,10 +21,12 @@ public:
     // 摘要：绑定本 rank 接收输出，确定接收核编号和本轮双窗口偏移。
     __aicore__ inline void Init(const __gm__ DispatchDedup::CommArgs* args, GM_ADDR expandX, GM_ADDR dynamicScales,
                                 GM_ADDR tokenType, GM_ADDR destinationIndex, GM_ADDR relayReadIndex, uint32_t bs,
-                                uint32_t h, uint32_t k, uint32_t experts, TPipe* pipe, int64_t magic = 0)
+                                uint32_t h, uint32_t k, uint32_t experts, TPipe* pipe, int64_t magic = 0,
+                                bool enableDedup = true)
     {
         args_ = args;
         pipe_ = pipe;
+        enableDedup_ = enableDedup;
         bs_ = bs;
         k_ = k;
         experts_ = experts;
@@ -202,21 +204,29 @@ private:
         auto wire = lanesBuf_.Get<uint8_t>()[lane * laneStride_];
         auto type = wire[uint32_t(data_.tokenStride)].template ReinterpretCast<uint32_t>();
         auto destination = wire[uint32_t(data_.tokenStride) + 32U].template ReinterpretCast<uint32_t>();
-        ServerDedupPacketTail tail(wire, uint32_t(data_.headerWireOffset), uint32_t(data_.relayReadIndexWireOffset));
-        const uint32_t role = tail.Header().GetValue(3U);
         const uint32_t row = tasks_.Begin() + j;
-        const bool firstHop = role == uint32_t(EpServerDedupTokenType::FirstHop);
-        BuildServerDedupMetadata(type, destination, tail, tasks_.Position(j));
-        if (firstHop) PrepareServerDedupForward(tail);
+        bool firstHop = false;
+        if (enableDedup_) {
+            ServerDedupPacketTail tail(wire, uint32_t(data_.headerWireOffset),
+                                       uint32_t(data_.relayReadIndexWireOffset));
+            firstHop = tail.Header().GetValue(3U) == uint32_t(EpServerDedupTokenType::FirstHop);
+            BuildServerDedupMetadata(type, destination, tail, tasks_.Position(j));
+            if (firstHop) PrepareServerDedupForward(tail);
+        } else {
+            auto header = wire[data_.headerWireOffset].template ReinterpretCast<uint32_t>();
+            for (uint32_t i = 0; i < 3U; ++i) destination.SetValue(i, header.GetValue(i));
+        }
         ServerDedupReceiveSync<HardEvent::S_MTE3>();
         WaitFlag<HardEvent::MTE2_MTE3>(lane);
         WriteServerDedupPayloadRange(expandX_[uint64_t(row) * hiddenBytes_], wire, 0U, hiddenBytes_);
         if constexpr (WireFp8)
             WriteServerDedupPayloadRange(dynamicScales_[uint64_t(row) * data_.scaleBytes], wire,
                                          uint32_t(data_.quantCount), uint32_t(data_.scaleBytes));
-        DataCopyPad(tokenType_[row], type, {1U, 4U, 0U, 0U, 0U});
+        if (enableDedup_) DataCopyPad(tokenType_[row], type, {1U, 4U, 0U, 0U, 0U});
         DataCopyPad(destinationIndex_[uint64_t(row) * 3U], destination, {1U, 12U, 0U, 0U, 0U});
-        if (firstHop) {
+        if (enableDedup_ && firstHop) {
+            ServerDedupPacketTail tail(wire, uint32_t(data_.headerWireOffset),
+                                       uint32_t(data_.relayReadIndexWireOffset));
             DataCopyPad(relayReadIndex_[uint64_t(row) * k_ * 2U], tail.ReadIndex(), {1U, k_ * 8U, 0U, 0U, 0U});
             const uint32_t sourceRank = tail.Header().GetValue(0U);
             const uint32_t ranks = uint32_t(args_->rankSize);
@@ -253,6 +263,7 @@ private:
 
     const __gm__ DispatchDedup::CommArgs* args_ = nullptr;
     TPipe* pipe_ = nullptr;
+    bool enableDedup_ = false;
     uint64_t windowOffset_ = 0;
     static constexpr uint32_t recvCoreNum_ = kEpServerDedupRecvCoreNum;
     uint32_t bs_ = 0U, k_ = 0U, experts_ = 0U, localExperts_ = 0U, receiver_ = 0U;

@@ -11,8 +11,8 @@
 namespace CombineDedup {
 constexpr uint32_t kEpServerDedupCombineSendCoreNum = COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SEND_CORE_NUM;
 static_assert(kEpServerDedupCombineSendCoreNum >= 16U && kEpServerDedupCombineSendCoreNum <= 56U &&
-                  kEpServerDedupCombineSendCoreNum % 8U == 0U,
-              "COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SEND_CORE_NUM must be 16, 24, 32, 40, 48 or 56");
+                  kEpServerDedupCombineSendCoreNum % 4U == 0U,
+              "COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SEND_CORE_NUM must be 16..56 in steps of 4");
 constexpr uint32_t kEpServerDedupCombineRecvCoreNum = 64U - kEpServerDedupCombineSendCoreNum;
 constexpr uint32_t kEpServerDedupCombineMaxTokenNum = 10000U;
 // M1/M2 keep all resources distinct: three row arrays, compare mask, one

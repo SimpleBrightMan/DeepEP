@@ -26,7 +26,7 @@ def test_launch_identities():
     "world,argv",
     [
         (8, []),
-        (16, ["--num-max-tokens-per-rank", "256"]),
+        (16, ["--num-max-tokens-per-rank", "257"]),
         (16, ["--num-tokens", "32", "--num-max-tokens-per-rank", "16"]),
         (16, ["--num-sms", "64"]),
         (16, ["--num-qps", "2"]),
@@ -155,7 +155,7 @@ def test_cartesian_product_covers_all_axes_and_scalar_cases():
 def test_matrix_dedup_and_invalid_member():
     args = st.make_parser().parse_args(["--num-tokens", "8", "8", "16"])
     assert [case.num_tokens for case in st.matrix_cases(args)] == [8, 16]
-    args = st.make_parser().parse_args(["--num-tokens", "8", "256"])
+    args = st.make_parser().parse_args(["--num-tokens", "8", "257"])
     with pytest.raises(ValueError, match="Unsupported LL combination"):
         st.validate_args(args, 16)
 
@@ -169,7 +169,7 @@ def test_native_preflight_dispatch_and_combine():
     args = st.make_parser().parse_args(["--dtype", "fp8", "--hidden", "4096", "7168"])
     with pytest.raises(ValueError, match="dispatch layout rejected"):
         st.validate_native_cases(native, list(st.matrix_cases(args)), 16)
-    assert calls == [(16, 16, 4096, 8, 128, "bfloat16")]
+    assert calls == [(16, 16, 4096, 8, 128, "bfloat16", 16)]
     native.low_latency_layout = lambda *shape: {}
 
     def reject_combine(*shape):

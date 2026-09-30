@@ -63,7 +63,9 @@ def validate_native_cases(native, cases, world):
         try:
             if native.low_latency_layout(*shape, dtype) is None:
                 raise ValueError("dispatch layout rejected")
-            native.low_latency_combine_tiling(*shape, "float16" if case.dtype == "fp16" else "bfloat16")
+            native.low_latency_combine_tiling(
+                *shape, "float16" if case.dtype == "fp16" else "bfloat16", validate_args(case, world)
+            )
         except (ValueError, RuntimeError) as exc:
             raise ValueError(
                 f"Unsupported LL combination {case_config(case, validate_args(case, world))}: {exc}"
@@ -354,8 +356,8 @@ def validate_args(args, world):
     if world not in (16, 32, 64, 128):
         raise ValueError("LL ST requires EP16/32/64/128; EP8 would exercise HT, not LL")
     m = args.num_tokens if args.num_max_tokens_per_rank is None else args.num_max_tokens_per_rank
-    if not 0 < args.num_tokens <= m < 256:
-        raise ValueError("LL ST requires 0 < actual B <= M < 256")
+    if not 0 < args.num_tokens <= m <= 256:
+        raise ValueError("LL ST requires 0 < actual B <= M <= 256")
     if not 4 <= args.hidden <= 2147483647:
         raise ValueError("H must be >=4 for ST row identifiers and fit native int; native layout checks apply")
     if not 1 <= args.num_topk <= 16 or not world <= args.num_experts <= 1024 or args.num_experts % world:

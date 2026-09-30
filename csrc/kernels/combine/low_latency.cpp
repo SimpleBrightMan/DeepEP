@@ -23,9 +23,10 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void combine_serv
         magic = DispatchDedup::RotateDispatchServerDedupMagic(args, AscendC::GetBlockIdx(), &pipe);
     }
     const auto* td = reinterpret_cast<const volatile __gm__ CombineDedup::EpServerDedupCombineTilingData*>(tilingData);
+    const bool enableDedup = DispatchDedup::EpServerDedupEnabled(td->numMaxTokensPerRank);
     CombineDedup::CombineMemoryServerDedupKernel kernel;
     kernel.Init(commArgs, expertOut, destinationIndex, sendCounts, expertScales, tokenType, relayReadIndex, sourceMask,
-                yOut, td->bs, td->h, td->topK, td->moeExpertNum, td->dtype, 0, magic);
+                yOut, td->bs, td->h, td->topK, td->moeExpertNum, td->dtype, 0, magic, enableDedup);
     kernel.Process();
 }
 extern "C" DEEPEP_EXPORT void combine_server_dedup_kernel_do(void* stream,

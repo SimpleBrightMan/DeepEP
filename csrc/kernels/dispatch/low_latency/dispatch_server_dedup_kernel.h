@@ -15,7 +15,7 @@ public:
                                 GM_ADDR sendCountsOut, GM_ADDR tokenTypeOut, GM_ADDR destinationIndexOut,
                                 GM_ADDR relayReadIndexOut, GM_ADDR sourceMaskOut, GM_ADDR expertScalesOut, uint32_t bs,
                                 uint32_t h, uint32_t topK, uint32_t experts, uint32_t expertTokenNumsType, TPipe* pipe,
-                                GM_ADDR inputScales = nullptr)
+                                GM_ADDR inputScales = nullptr, bool enableDedup = true)
     {
         args_ = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs);
         core_ = GetBlockIdx();
@@ -25,10 +25,10 @@ public:
                      magic, pipe);
         if (core_ < kEpServerDedupSendCoreNum)
             sender_.Init(args_, x, expertIds, expertScales, sourceMaskOut, expertScalesOut, bs, h, topK, experts, pipe,
-                         magic, inputScales);
+                         magic, inputScales, enableDedup);
         else
             receiver_.Init(args_, expandXOut, dynamicScalesOut, tokenTypeOut, destinationIndexOut, relayReadIndexOut,
-                           bs, h, topK, experts, pipe, magic);
+                           bs, h, topK, experts, pipe, magic, enableDedup);
     }
 
     __aicore__ inline void Process()

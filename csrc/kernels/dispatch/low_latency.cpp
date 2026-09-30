@@ -22,6 +22,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_ser
     const auto* tiling = reinterpret_cast<const __gm__ DispatchDedup::EpServerDedupTilingData*>(tilingData);
     const uint32_t bs = tiling->bs;
     const uint32_t h = tiling->h;
+    const bool enableDedup = DispatchDedup::EpServerDedupEnabled(tiling->numMaxTokensPerRank);
     const uint32_t topK = tiling->topK;
     const uint32_t moeExpertNum = tiling->moeExpertNum;
     const uint32_t expertTokenNumsType = tiling->expertTokenNumsType;
@@ -34,7 +35,7 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void dispatch_ser
     DispatchDedup::DispatchMemoryServerDedupKernel<XType, WireFp8, E4M3, Prequantized> kernel;                         \
     kernel.Init(commArgs, x, expertIds, expertScales, expandXOut, dynamicScalesOut, expertTokenNumsOut, sendCountsOut, \
                 tokenTypeOut, destinationIndexOut, relayReadIndexOut, sourceMaskOut, expertScalesOut, bs, h, topK,     \
-                moeExpertNum, expertTokenNumsType, &pipe, inputScales);                                                \
+                moeExpertNum, expertTokenNumsType, &pipe, inputScales, enableDedup);                                   \
     kernel.Process()
     if (inputMode == DispatchDedup::EpServerDedupInputMode::PrequantizedFp8Packs && quantMode == 4 &&
         dtype == DispatchDedup::DISPATCH_DEDUP_DATA_TYPE_FP8E4M3 &&

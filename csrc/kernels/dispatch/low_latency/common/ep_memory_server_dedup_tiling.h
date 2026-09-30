@@ -10,7 +10,7 @@ namespace DispatchDedup {
 struct EpServerDedupTilingData {
     uint32_t bs;
     uint32_t h;
-    uint32_t reservedLaunchSlot;
+    uint32_t numMaxTokensPerRank;
     uint16_t moeExpertNum;
     uint8_t topK;
     uint8_t reservedSendCoreNum;
@@ -25,7 +25,7 @@ static_assert(sizeof(EpServerDedupTilingData) == 32U, "tiling occupies one 32B b
 // Keep the wire structure naturally aligned. Kernel reads use scalar GM
 // accesses, not an implicit vector/MTE load of the entire block.
 static_assert(alignof(EpServerDedupTilingData) == 4U, "tiling uses natural scalar alignment");
-static_assert(offsetof(EpServerDedupTilingData, reservedLaunchSlot) == 8U, "reserved slot offset");
+static_assert(offsetof(EpServerDedupTilingData, numMaxTokensPerRank) == 8U, "per-rank capacity offset");
 static_assert(offsetof(EpServerDedupTilingData, moeExpertNum) == 12U, "expert count offset");
 static_assert(offsetof(EpServerDedupTilingData, topK) == 14U, "topK offset");
 static_assert(offsetof(EpServerDedupTilingData, reservedSendCoreNum) == 15U, "reserved offset");
