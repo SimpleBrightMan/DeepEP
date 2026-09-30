@@ -108,9 +108,15 @@ def dispatch_layout(world, tokens, topk, experts, rows, fp8=False, weights=False
     return layout
 
 
+def _combine_resident_bytes(world, tokens, chunk_tokens=256):
+    chunks = (tokens + chunk_tokens - 1) // chunk_tokens + min(4, tokens, chunk_tokens) - 1
+    groups = world // min(world, 64)
+    return ((world * chunks * 8 + 31) // 32 + (groups * chunks * 4 + 31) // 32) * 32
+
+
 def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256):
-    if world not in (2, 4, 8, 16, 32, 64, 128):
-        raise ValueError("Combine supports EP2/4/8/16/32/64/128")
+    if world not in WORLD_SIZES:
+        raise ValueError("Combine supports EP2/4/8/16/32/64/128/256")
     integer("tokens", tokens, 1, 10240)
     integer("topk", topk, 1, 16)
     integer("rows", rows, 1, world * tokens * topk)
@@ -120,7 +126,7 @@ def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256):
         raise ValueError("Combine metadata indexing exceeds int32")
     chunks = (tokens + chunk_tokens - 1) // chunk_tokens + min(4, tokens, chunk_tokens) - 1
     groups = world // min(world, 64)
-    resident = ((world * chunks * 8 + 31) // 32 + (groups * chunks * 4 + 31) // 32) * 32
+    resident = _combine_resident_bytes(world, tokens, chunk_tokens)
     if resident > 44 * 1024:
         raise ValueError("Combine chunk ranges/masks exceed the resident 44 KiB UB capacity")
     slots = 3 * world + 96 + groups * chunks * 8 + 64 + world * chunks * 2 + 64
@@ -147,9 +153,11 @@ def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256):
 
 def elastic_size_hint(world, tokens, topk, experts, rows, gather_rows, fp8=False):
     dispatch = dispatch_layout(world, tokens, topk, experts, rows, fp8, weights=True)["workspace_bytes"]
-    # EP256 currently supports Dispatch only. Keep the two-half workspace
-    # contract, but do not call (or silently enable) the <=128 Combine layout.
-    combine = combine_layout(world, tokens, topk, rows, gather_rows)["workspace_bytes"] if world <= 128 else 0
+    # EP256 Dispatch accepts shapes beyond the default Combine UB limit.
+    # Preserve those size hints; Combine validates its own layout before launch.
+    combine = 0
+    if world != 256 or _combine_resident_bytes(world, tokens) <= 44 * 1024:
+        combine = combine_layout(world, tokens, topk, rows, gather_rows)["workspace_bytes"]
     # A fixed boundary prevents fresh/cached calls with different shapes or
     # BF16/FP8 dispatch from ever overlapping outstanding combine output copies.
     half = (max(dispatch, combine) + PAGE_BYTES - 1) // PAGE_BYTES * PAGE_BYTES

@@ -31,9 +31,9 @@ combine 根据 `handle.is_low_latency` 执行匹配路径，不改变 handle 的
 
 | 项目 | 约束 |
 | --- | --- |
-| EP | dispatch：2、4、8、16、32、64、128、256；combine：2、4、8、16、32、64、128。EP256 不支持完整 dispatch/combine 闭环 |
-| Shape | H=7168，1≤T≤10240，1≤K≤16，P≤E≤1024 |
-| 编码与容量 | `P*P*T*K < 2**31`，地址编码和实际接收/gather 行数还须通过布局检查 |
+| EP | dispatch / combine：2、4、8、16、32、64、128、256 |
+| Shape | H=7168，1≤T≤10240，1≤K≤16，P≤E≤1024；EP256 combine 在默认 chunk=256 下要求 T≤4608（44 KiB 常驻控制区），此 UB 限制不适用于纯 dispatch |
+| 编码与容量 | `P*P*T*K < 2**31`（EP256 要求 `T*K < 32768`），地址编码和实际接收/gather 行数还须通过布局检查 |
 | 输入 | BF16 `[T,7168]`，或 `(FP8 E4M3FN [T,7168], FP32 scales [T,56])` |
 | 路由 | int64 `topk_idx [T,K]`；可选 FP32 `topk_weights [T,K]` |
 | 调度 | BF16 dispatch：`num_compute_units=0/32`；FP8 dispatch 和 combine：`0/64`；`num_qps=0/2` |
@@ -59,6 +59,8 @@ fresh 调用执行 Notify 后搬运数据。cached 调用传入 `handle=handle` 
 **独立权重回传不会对 hidden 乘 gate；HT 模型侧仍须在专家计算或其后处理中应用一次路由权重。** 同一个 handle 可以重复 combine 或用于 cached dispatch。
 
 归约先在逻辑 server 内以 FP32 累加并写出 BF16 partial，再在源端以 FP32 累加 partial 并写 BF16。舍入结果可能与一次性全 FP32 求和不同。
+
+HT combine 默认使用三个 SO 窗口；T=4096、chunk=256 时按 8/4/4 个逻辑 chunk 划分，逻辑 chunk 不足三个时减少窗口数。
 
 ### 调用片段
 
@@ -152,8 +154,22 @@ combine 接受与 handle 行数一致的连续 BF16/FP16 专家输出，返回 `
 
 HT 的 `num_bytes` 包含 Notify/dispatch 和 combine 两个固定半区，按 2 MiB 对齐，最高 32 GiB。size hint 的接收/gather 行预算为 `min(P,4)*T*K`，不是最坏路由上界。严重热点需要更大的显式容量；超过实际容量时在 payload 启动前报错，不自动扩容。
 
+EP256 shape 超出默认 combine 的 UB 上限时，`get_buffer_size_hint()` 仅估算 dispatch；返回容量不代表该 shape 可用于 combine。实际 combine 调用仍检查 UB 和工作区容量。
+
 shape 合法不保证所有路由都满足容量限制。例如 EP64、T=1024、K=16、E=512、BF16 的所有槽位指向同一专家时，目标 rank 展开为 1,048,576 行，当前固定布局需要超过 32 GiB 的工作区，超过 Session 上限。
 
 LL 的 8 GiB 是对称工作区容量。两条路径都另行分配路由元数据和输出 Tensor，因此工作区容量不等于总显存用量。输出由框架管理，后续通信或 Buffer 销毁不会将其存储作为新的工作区覆盖。
 
 原生布局与路由编码是内部实现细节，不作为应用解析 handle 的协议。调试和测试入口见[测试说明](../tests/README.md)，性能统计见[性能说明](performance.md)。
+
+## 随机路由测试
+
+HT dispatch 和 combine 测试入口均支持 `--route random --seed 1`，`--route all` 也包含 random。
+随机路由使用确定性的 32 位伪随机序列，
+按 seed/source/token 生成专家槽位；允许重复专家，不做去重或强制均衡。所有 rank 必须使用相同的 seed，默认值为 1。
+重复调用保持路由不变以验证 cached handle，payload 随迭代变化；更换 seed 后重新启动作业。
+seed 记录在阶段日志、每 rank 结果和 profiler 元数据中，其余路由模式不受 seed 影响。
+random 仅指随机路由，hidden/权重仍使用确定性精度输入，不代表随机浮点数值测试。
+
+单独使用 random 时按实际路由计算容量；dispatch 的 `--route all` 还包含 hotspot，保留全局热点容量要求。
+其他路由和运行方式见[测试说明](../tests/README.md)。

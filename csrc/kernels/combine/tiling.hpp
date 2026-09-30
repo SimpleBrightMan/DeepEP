@@ -222,7 +222,7 @@ struct PutCombineTiling {
     uint32_t cross_tokens_per_turn;
     // All enabled by default by the host; disabling is for profiling only.
     uint32_t sync_local_reduce, sync_reduce_local, sync_reduce_cross;
-    uint32_t num_so;              // Return notification windows; host default 2, clamped to chunk count.
+    uint32_t num_so;              // Return notification windows; host default 3, clamped to chunk count.
     uint32_t first_chunk_splits;  // 1 disables startup splitting.
     uint32_t weight_topk, weight_rows, with_weights;
     uint64_t weight_recv_offset_bytes, weight_local_done_offset_bytes, weight_done_offset_bytes;
@@ -257,7 +257,7 @@ inline PutCombineTiling MakeCombineTiling(uint32_t rank, uint32_t world, uint32_
     t.shared_jetty = 1U;
     t.cross_tokens_per_turn = 8U;
     t.sync_local_reduce = t.sync_reduce_local = t.sync_reduce_cross = 1U;
-    t.num_so = 2U;
+    t.num_so = 3U;
     uint64_t cursor = uint64_t(t.control_slot_num) * combine_control::kSlotBytes;
     auto reserve = [&](uint64_t bytes) {
         const uint64_t offset = cursor;

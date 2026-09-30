@@ -8,6 +8,8 @@
 #include "aux_pipeline_layout.hpp"
 
 namespace ascend_deepep {
+constexpr uint32_t kMaxDispatchRanks = 256U;
+
 inline constexpr uint64_t DispatchPlanPhaseBytes(uint32_t world, uint32_t /*tokens*/)
 {
     return uint64_t(world) * 16U;

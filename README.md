@@ -19,7 +19,7 @@ Modified by Joyce_An 2026
 
 ### 新增特性
 
-- **高吞吐 Prefill：** 基于 URMA 的 dispatch/combine，集成 notify 与 Server 级 token 去重，支持 EP32/64/128，EP256 当前仅支持 dispatch；具体支持范围见 [Elastic 文档](docs/elastic.md)。
+- **高吞吐 Prefill：** 基于 URMA 的 dispatch/combine，集成 notify 与 Server 级 token 去重，支持 EP32/64/128/256；具体支持范围见 [Elastic 文档](docs/elastic.md)。
 - **低时延 Decode：** 通过同一 V2 接口提供小批量 dispatch/combine，覆盖 EP64/128。
 - **MegaMoE Prefill（实验性）：** W4A8 通信与专家计算融合，覆盖 EP32/64/128。
 - **MegaMoE Decode（实验性）：** 小批量 W4A8 融合推理，覆盖 EP64/128，与 Prefill 共用同一个 MegaMoE 前向入口。
@@ -85,8 +85,10 @@ DeepEP/
 | 64 | FP8 / BF16 | 🚧 待补充 | 🚧 待补充 |
 | 128 | BF16 / BF16 | 🚧 待补充 | 🚧 待补充 |
 | 128 | FP8 / BF16 | 🚧 待补充 | 🚧 待补充 |
-| 256 | BF16 / — | 🚧 待补充 | 不支持 |
-| 256 | FP8 / — | 🚧 待补充 | 不支持 |
+| 256 | BF16 / BF16 | 🚧 待补充 | 🚧 待补充 |
+| 256 | FP8 / BF16 | 🚧 待补充 | 🚧 待补充 |
+
+EP256 combine 要求 `T*K < 32768`（T 为每 rank token 数，K 为 top-k）；默认 `chunk=256` 时，44 KiB 常驻控制区要求 `T≤4608`。完整约束见 [Elastic 支持范围](docs/elastic.md#支持范围)。
 
 ![不同 EP 规模的 FP8 dispatch / BF16 combine 带宽](figures/performance_prefill.svg)
 

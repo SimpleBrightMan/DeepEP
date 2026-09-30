@@ -58,7 +58,7 @@ python tests/elastic/test_combine.py --ep-size 8 --nproc-per-node 8 \
 
 HT 脚本直接启动本机进程并使用 SHMEM，不创建 Gloo/HCCL 进程组；也支持外部 launcher 提供 rank 环境变量。Notify 验证包含在 fresh dispatch 中。
 
-combine 的专家输出固定 BF16、H=7168；其前置 dispatch 可用 `--dispatch-dtype bf16/fp8` 选择，默认 BF16，不使用 `--dtype` 或 `--hidden`。其 `--route all` 包括 normal、duplicates、invalid、empty、local_duplicates、local_experts；dispatch 另含 hotspot。`empty` 表示所有路由无效，所有 rank 仍参加通信。combine 不包含超过固定工作区上限的全局极端热点，容量约束见 [Elastic 接口](../docs/elastic.md)。
+combine 的专家输出固定 BF16、H=7168；其前置 dispatch 可用 `--dispatch-dtype bf16/fp8` 选择，默认 BF16，不使用 `--dtype` 或 `--hidden`。其 `--route all` 包括 normal、random、duplicates、invalid、empty、local_duplicates、local_experts；dispatch 另含 hotspot。`empty` 表示所有路由无效，所有 rank 仍参加通信。combine 不包含超过固定工作区上限的全局极端热点，容量约束见 [Elastic 接口](../docs/elastic.md)。
 
 combine 默认同时检查独立权重回传；`--without-weights` 关闭该通道，不改变 hidden 的归约语义。
 

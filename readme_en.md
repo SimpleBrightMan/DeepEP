@@ -19,7 +19,7 @@ Modified by Joyce_An 2026
 
 ### New features
 
-- **High-throughput prefill:** URMA dispatch and combine, integrated notify, and server-level token deduplication, supporting EP32/64/128. EP256 currently supports dispatch only; see the [Elastic guide](docs/elastic.md) for the detailed support matrix.
+- **High-throughput prefill:** URMA dispatch and combine, integrated notify, and server-level token deduplication, supporting EP32/64/128/256; see the [Elastic guide](docs/elastic.md) for the detailed support matrix.
 - **Low-latency decode:** small-batch dispatch and combine through the same V2 interface for EP64/128.
 - **MegaMoE prefill (experimental):** W4A8 fused communication and expert computation for EP32/64/128.
 - **MegaMoE decode (experimental):** small-batch W4A8 fused inference for EP64/128, using the same MegaMoE forward entry as prefill.
@@ -85,8 +85,10 @@ See the [architecture guide](docs/architecture.md) for module responsibilities.
 | 64 | FP8 / BF16 | 🚧 TBD | 🚧 TBD |
 | 128 | BF16 / BF16 | 🚧 TBD | 🚧 TBD |
 | 128 | FP8 / BF16 | 🚧 TBD | 🚧 TBD |
-| 256 | BF16 / — | 🚧 TBD | Unsupported |
-| 256 | FP8 / — | 🚧 TBD | Unsupported |
+| 256 | BF16 / BF16 | 🚧 TBD | 🚧 TBD |
+| 256 | FP8 / BF16 | 🚧 TBD | 🚧 TBD |
+
+EP256 combine requires `T*K < 32768`, where T is tokens per rank and K is top-k. With the default `chunk=256`, the 44 KiB resident control region requires `T≤4608`. See the [Elastic support matrix](docs/elastic.md#支持范围) for the full constraints.
 
 ![FP8 dispatch and BF16 combine bandwidth by EP size](figures/performance_prefill_en.svg)
 

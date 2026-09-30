@@ -1,8 +1,9 @@
-"""CPU-only standalone Combine fixtures. No Torch, Notify or Dispatch dependency.
+"""CPU-only Combine metadata reference for the elastic tests.
 
 The full deterministic routing is regenerated locally, NEVER communicated. This
 is a test planner, not a production distributed Notify implementation.
 """
+
 from array import array
 from dataclasses import dataclass
 
@@ -83,17 +84,23 @@ class CombineCase:
         return ((ranges + 31) // 32 + (masks + 31) // 32) * 32
 
     def validate(self):
-        if self.world not in (2, 4, 8, 16, 32, 64, 128):
+        if self.world not in (2, 4, 8, 16, 32, 64, 128, 256):
             raise ValueError("unsupported world")
-        if (isinstance(self.group_size, bool) or not isinstance(self.group_size, int)
-                or self.group_size not in (1, 2, 4, 8, 16, 32, 64, 128)):
+        if (
+            isinstance(self.group_size, bool)
+            or not isinstance(self.group_size, int)
+            or self.group_size not in (1, 2, 4, 8, 16, 32, 64, 128)
+        ):
             raise ValueError("group_size must be a power of two in [1,128]")
         if not 0 < self.tokens or not 1 <= self.topk <= 16:
             raise ValueError("require tokens>0 and 1<=topk<=16")
         if not isinstance(self.chunk_tokens, int) or not 0 < self.chunk_tokens <= INT32_MAX:
             raise ValueError("chunk_tokens must be a positive int32")
-        if (isinstance(self.first_chunk_splits, bool) or not isinstance(self.first_chunk_splits, int)
-                or not 1 <= self.first_chunk_splits <= INT32_MAX):
+        if (
+            isinstance(self.first_chunk_splits, bool)
+            or not isinstance(self.first_chunk_splits, int)
+            or not 1 <= self.first_chunk_splits <= INT32_MAX
+        ):
             raise ValueError("first_chunk_splits must be a positive int32")
         if self.experts <= 0 or self.experts % self.world:
             raise ValueError("experts must be divisible by world")
@@ -102,9 +109,11 @@ class CombineCase:
         if self.total_chunks > INT32_MAX:
             raise ValueError("chunk completion IDs exceed int32")
         if self.gateway_control_bytes > GATEWAY_CONTROL_UB_BYTES:
-            raise ValueError(f"chunk ranges/masks need {self.gateway_control_bytes} UB bytes, "
-                             f"exceeding {GATEWAY_CONTROL_UB_BYTES}; increase chunk_tokens "
-                             "(--num-tokens-per-chunk)")
+            raise ValueError(
+                f"chunk ranges/masks need {self.gateway_control_bytes} UB bytes, "
+                f"exceeding {GATEWAY_CONTROL_UB_BYTES}; increase chunk_tokens "
+                "(--num-tokens-per-chunk)"
+            )
         if self.route not in ("balanced", "random", "duplicates", "invalid", "skew", "empty"):
             raise ValueError("unknown route")
 
@@ -180,19 +189,19 @@ def route_experts(source, token, case):
 class CombinePlan:
     case: CombineCase
     rank: int
-    forward: array             # int32 [source, capacity, (token_end, token, primary, peer, row, gather)]
+    forward: array  # int32 [source, capacity, (token_end, token, primary, peer, row, gather)]
     forward_count: array
     forward_capacity: int
     backward: array
     backward_count: array
     backward_capacity: int
     server_mask: array
-    route_ids: array             # test-only: expert output row -> original route ID
+    route_ids: array  # test-only: expert output row -> original route ID
     rank_rows: tuple
     gather_rows: tuple
     primary_counts: tuple
-    chunk_ranges: array         # int32 [source_rank, raw-token chunk, (begin,end)]
-    chunk_masks: array          # int32 [gateway group, chunk], remote contributors only
+    chunk_ranges: array  # int32 [source_rank, raw-token chunk, (begin,end)]
+    chunk_masks: array  # int32 [gateway group, chunk], remote contributors only
 
     @property
     def lanes(self):
@@ -208,17 +217,17 @@ class CombinePlan:
 
     def forward_chunk_range(self, source, chunk):
         base = (source * self.chunks_per_group + chunk) * 2
-        return tuple(self.chunk_ranges[base:base + 2])
+        return tuple(self.chunk_ranges[base : base + 2])
 
     def forward_rows(self, source):
         base = source * self.forward_capacity * 6
         for i in range(self.forward_count[source]):
-            yield tuple(self.forward[base + i * 6:base + (i + 1) * 6])
+            yield tuple(self.forward[base + i * 6 : base + (i + 1) * 6])
 
     def backward_rows(self, lane):
         base = lane * self.backward_capacity * 3
         for i in range(self.backward_count[lane]):
-            yield tuple(self.backward[base + i * 3:base + (i + 1) * 3])
+            yield tuple(self.backward[base + i * 3 : base + (i + 1) * 3])
 
 
 def build_plan(case, rank):
@@ -289,7 +298,7 @@ def build_plan(case, rank):
     fcap = max(1, max(fc))
     f = array("i", [-1]) * (w * fcap * 6)
     for source, block in enumerate(forwards):
-        f[source * fcap * 6:source * fcap * 6 + len(block)] = block
+        f[source * fcap * 6 : source * fcap * 6 + len(block)] = block
     bc = array("i", (len(block) for block in backwards))
     bcap = max(1, max(bc))
     b = array("q", [-1]) * (len(backwards) * bcap * 3)
@@ -299,10 +308,13 @@ def build_plan(case, rank):
         for i, row in enumerate(block):
             source, expert_row, target, token = row
             chunk_id = steps[source] * case.chunks_per_group + case.token_chunk(token) + 1
-            next_chunk_id = (steps[block[i + 1][0]] * case.chunks_per_group +
-                             case.token_chunk(block[i + 1][3]) + 1) if i + 1 < len(block) else -1
+            next_chunk_id = (
+                (steps[block[i + 1][0]] * case.chunks_per_group + case.token_chunk(block[i + 1][3]) + 1)
+                if i + 1 < len(block)
+                else -1
+            )
             packed = target | ((chunk_id if next_chunk_id != chunk_id else 0) << 32)
-            b[(lane * bcap + i) * 3:(lane * bcap + i + 1) * 3] = array("q", (source, expert_row, packed))
+            b[(lane * bcap + i) * 3 : (lane * bcap + i + 1) * 3] = array("q", (source, expert_row, packed))
     chunk_ranges = array("i", [0]) * (w * case.chunks_per_group * 2)
     chunk_masks = array("i", [0]) * case.total_chunks
     steps = group_steps(rank, w, case.group_size)
@@ -317,9 +329,24 @@ def build_plan(case, rank):
                     chunk_masks[steps[source] * case.chunks_per_group + chunk] |= 1 << (peer % 8)
                 cursor += 1
             base = (source * case.chunks_per_group + chunk) * 2
-            chunk_ranges[base:base + 2] = array("i", (begin, cursor))
-    plan = CombinePlan(case, rank, f, fc, fcap, b, bc, bcap, masks, ids,
-                       tuple(rank_rows), tuple(gathers), tuple(primary_counts), chunk_ranges, chunk_masks)
+            chunk_ranges[base : base + 2] = array("i", (begin, cursor))
+    plan = CombinePlan(
+        case,
+        rank,
+        f,
+        fc,
+        fcap,
+        b,
+        bc,
+        bcap,
+        masks,
+        ids,
+        tuple(rank_rows),
+        tuple(gathers),
+        tuple(primary_counts),
+        chunk_ranges,
+        chunk_masks,
+    )
     validate_plan(plan)
     return plan
 
@@ -334,22 +361,28 @@ def validate_plan(p):
         raise ValueError("payload row counts exceed int32")
     if p.forward_capacity < 1 or len(p.forward) != c.world * p.forward_capacity * 6 or len(p.forward_count) != c.world:
         raise ValueError("bad forward shape")
-    if p.backward_capacity < 1 or len(p.backward) != p.lanes * p.backward_capacity * 3 or len(p.backward_count) != p.lanes:
+    if (
+        p.backward_capacity < 1
+        or len(p.backward) != p.lanes * p.backward_capacity * 3
+        or len(p.backward_count) != p.lanes
+    ):
         raise ValueError("bad backward shape")
     if len(p.route_ids) != p.rank_rows[rank] or len(p.server_mask) != c.tokens:
         raise ValueError("bad payload/mask shape")
-    if (p.forward.typecode != "i" or p.forward.itemsize != 4 or
-            p.backward.typecode != "q" or p.backward.itemsize != 8):
+    if p.forward.typecode != "i" or p.forward.itemsize != 4 or p.backward.typecode != "q" or p.backward.itemsize != 8:
         raise ValueError("forward must use int32 and backward must use int64")
-    if (p.chunk_ranges.typecode != "i" or p.chunk_ranges.itemsize != 4 or
-            len(p.chunk_ranges) != c.world * c.chunks_per_group * 2):
+    if (
+        p.chunk_ranges.typecode != "i"
+        or p.chunk_ranges.itemsize != 4
+        or len(p.chunk_ranges) != c.world * c.chunks_per_group * 2
+    ):
         raise ValueError("bad chunk ranges shape/type")
-    if (p.chunk_masks.typecode != "i" or p.chunk_masks.itemsize != 4 or
-            len(p.chunk_masks) != c.total_chunks):
+    if p.chunk_masks.typecode != "i" or p.chunk_masks.itemsize != 4 or len(p.chunk_masks) != c.total_chunks:
         raise ValueError("bad chunk masks shape/type")
     seen_local, seen_gather, seen_backward = set(), set(), set()
     expected_masks = [0] * c.total_chunks
     own_steps = group_steps(rank, c.world, c.group_size)
+
     def own_local(row, source, token=None):
         if not 0 <= row < p.rank_rows[rank] or row in seen_local:
             raise ValueError("local expert row missing/duplicated/out of bounds")
@@ -359,6 +392,7 @@ def validate_plan(p):
         if token is not None and identity // c.topk % c.tokens != token:
             raise ValueError("expert output token mismatch")
         seen_local.add(row)
+
     for source in range(c.world):
         if not 0 <= p.forward_count[source] <= p.forward_capacity:
             raise ValueError("forward count exceeds capacity")

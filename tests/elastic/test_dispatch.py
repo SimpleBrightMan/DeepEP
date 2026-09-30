@@ -23,6 +23,9 @@ import time
 import traceback
 
 
+_ROUTES = ("normal", "random", "duplicates", "invalid", "empty", "hotspot")
+
+
 def _progress_logger(operation, rank):
     started = previous = time.perf_counter()
 
@@ -209,12 +212,23 @@ def build_notify_golden(routes, experts, chunk_tokens):
     return {"plans": plans, "rank_rows": rank_rows, "gather_rows": plans[0]["gather_rows"], "address_stride": stride}
 
 
-def make_routes(world, tokens, topk, experts, generation, mode):
+def make_routes(world, tokens, topk, experts, generation, mode, *, seed=1):
+    """Generate deterministic routes, including duplicate expert slots.
+
+    Seed/source/token determine routing; generation only changes normal fixtures.
+    Keep random routes fixed across payload generations for cached dispatch.
+    """
     result = []
     for source in range(world):
         rows = []
         for token in range(tokens):
             row = [(source * 17 + token * 7 + slot * 131 + generation) % experts for slot in range(topk)]
+            if mode == "random":
+                state = (seed ^ (source * 0x9E3779B9) ^ (token * 0x85EBCA6B)) & 0xFFFFFFFF
+                row = []
+                for _ in range(topk):
+                    state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
+                    row.append((state >> 8) % experts)
             if mode == "duplicates" and topk > 1:
                 row[1] = row[0]
             if mode == "invalid":
@@ -235,6 +249,80 @@ def make_routes(world, tokens, topk, experts, generation, mode):
             rows.append(row)
         result.append(rows)
     return result
+
+
+def receive_capacity(routes, experts):
+    """Exact maximum expanded rows, without constructing all Notify metadata."""
+    world = len(routes)
+    if experts < world or experts % world:
+        raise ValueError("experts must be divisible by EP and at least EP")
+    local = experts // world
+    counts = [0] * world
+    for source in routes:
+        for token in source:
+            for expert in token:
+                if 0 <= expert < experts:
+                    counts[expert // local] += 1
+    return max(1, max(counts))
+
+
+def test_random_routes_match_reference_and_preserve_cached_routing():
+    import runpy
+
+    # Compare with the CPU reference's independent random route implementation.
+    reference = runpy.run_path(str(Path(__file__).with_name("combine_reference.py")))
+    for world in (2, 8, 256):
+        for seed in (0, 1, 2026, -1, 1 << 40):
+            case = reference["CombineCase"](world, 7, 6, world * 2, "random", seed)
+            actual = make_routes(world, 7, 6, world * 2, 0, "random", seed=seed)
+            expected = [
+                [reference["route_experts"](source, token, case) for token in range(7)] for source in range(world)
+            ]
+            assert actual == expected
+            assert actual == make_routes(world, 7, 6, world * 2, 1, "random", seed=seed)
+            assert all(0 <= expert < world * 2 for rows in actual for row in rows for expert in row)
+    routes = make_routes(8, 32, 6, 16, 0, "random", seed=1)
+    assert routes != make_routes(8, 32, 6, 16, 0, "random", seed=2026)
+    assert routes[0] != routes[1]
+    assert any(len(set(row)) < len(row) for rows in routes for row in rows)
+    counts = [len(expert_rows(routes, 16, rank)) for rank in range(8)]
+    assert len(set(counts)) > 1  # No balancing pass or per-token deduplication.
+    assert receive_capacity(routes, 16) == max(counts)
+    assert receive_capacity([[[-1, 2]], [[-1, 2]]], 2) == 1
+    assert make_routes(8, 7, 6, 16, 0, "normal", seed=1) == make_routes(8, 7, 6, 16, 0, "normal", seed=2026)
+
+
+def test_random_dispatch_cli(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "test_dispatch.py",
+            "--ep-size",
+            "256",
+            "--nproc-per-node",
+            "8",
+            "--node-rank",
+            "31",
+            "--tokens",
+            "4096",
+            "--topk",
+            "6",
+            "--experts",
+            "512",
+            "--route",
+            "random",
+            "--seed",
+            "2026",
+            "--output",
+            str(tmp_path),
+        ],
+    )
+    monkeypatch.setattr(sys.modules[__name__], "_launch", lambda args, worker: calls.append(args))
+    main()
+    (args,) = calls
+    assert (args.ep_size, args.node_rank, args.route, args.seed) == (256, 31, "random", 2026)
 
 
 def check_handle(handle, golden, rank, routes, experts):
@@ -347,7 +435,7 @@ def _launch(args, worker):
     ):
         raise ValueError("EP must be divisible by nproc-per-node; node-rank must be within the job")
     if args.ep_size not in (2, 4, 8, 16, 32, 64, 128, 256):
-        raise ValueError("Dispatch EP must be a power of two from 2 to 256")
+        raise ValueError("Dispatch/combine EP must be a power of two from 2 to 256")
     endpoint = args.shmem_ip_port or os.environ.get("DEEPEP_SHMEM_ENDPOINT")
     if not endpoint:
         master = os.environ.get("MASTER_ADDR", args.master_addr) if all(launched) else args.master_addr
@@ -369,6 +457,40 @@ def _worker_identity(local_rank, args):
     return rank, args.ep_size
 
 
+def test_ep256_launcher(monkeypatch):
+    from types import ModuleType
+
+    parser = argparse.ArgumentParser()
+    _add_launch_args(parser)
+    args = parser.parse_args(
+        [
+            "--ep-size",
+            "256",
+            "--nproc-per-node",
+            "8",
+            "--node-rank",
+            "31",
+            "--shmem-ip-port",
+            "tcp://192.0.2.1:19091",
+        ]
+    )
+    for name in ("RANK", "WORLD_SIZE", "LOCAL_RANK"):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+    torch = ModuleType("torch")
+    mp = ModuleType("torch.multiprocessing")
+    mp.spawn = lambda worker, args, nprocs, join: calls.append((args, nprocs, join))
+    torch.multiprocessing = mp
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch.multiprocessing", mp)
+    # Let monkeypatch restore the endpoint written by the launcher.
+    monkeypatch.setenv("DEEPEP_SHMEM_ENDPOINT", "tcp://192.0.2.2:1")
+    _launch(args, lambda *_: None)
+    assert calls == [((args,), 8, True)]
+    assert os.environ["DEEPEP_SHMEM_ENDPOINT"] == "tcp://192.0.2.1:19091"
+    assert [_worker_identity(local, args)[0] for local in range(8)] == list(range(248, 256))
+
+
 def expert_rows(routes, experts, rank):
     """Independent destination order: local expert, source rank, token, top-k slot."""
     local = experts // len(routes)
@@ -385,8 +507,8 @@ def expert_rows(routes, experts, rank):
 def test_forward_list_covers_unique_expert_rows():
     # Exercise both primary core maps, cross-server forwarding, same-rank
     # duplicates, singleton records, empty ranks and non-power-of-two strides.
-    for world in (2, 8, 16, 32, 64, 128):
-        for mode in ("normal", "duplicates", "invalid", "empty", "hotspot"):
+    for world in (2, 8, 16, 32, 64, 128, 256):
+        for mode in _ROUTES:
             tokens, topk, experts = 3, 6, world * 2
             routes = make_routes(world, tokens, topk, experts, 0, mode)
             golden = build_notify_golden(routes, experts, 256)
@@ -463,7 +585,7 @@ def test_dispatch_regions_and_encoding_bounds():
     import pytest
     from deep_ep.buffers._elastic_layout import dispatch_layout, workspace_layout
 
-    for world in (2, 8, 16, 64, 128):
+    for world in (2, 8, 16, 64, 128, 256):
         for fp8 in (False, True):
             for rows in (1, 3, world * 33 * 6):
                 layout = dispatch_layout(world, 33, 6, 1024, rows, fp8)
@@ -666,6 +788,7 @@ def profile_operator(args, rank, scenario, invoke, validate, build_info, log):
         rank=rank,
         world_size=args.ep_size,
         scenario=scenario,
+        seed=args.seed,
         tokens=args.tokens,
         topk=args.topk,
         experts=args.experts,
@@ -779,9 +902,8 @@ def main():
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--experts", type=int, default=1024)
     parser.add_argument("--dtype", choices=("bf16", "fp8", "both"), default="both")
-    parser.add_argument(
-        "--route", choices=("normal", "duplicates", "invalid", "empty", "hotspot", "all"), default="all"
-    )
+    parser.add_argument("--route", choices=(*_ROUTES, "all"), default="all")
+    parser.add_argument("--seed", type=int, default=1, help="Random routing seed; identical on every rank")
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--output", type=Path, required=True)
     add_profile_args(parser, ("notify", "dispatch"))
@@ -795,7 +917,7 @@ def main():
 def worker(local_rank, args):
     rank, world = _worker_identity(local_rank, args)
     log = _progress_logger("dispatch", rank)
-    log("worker.begin; import installed package")
+    log(f"worker.begin route={args.route} seed={args.seed}; import installed package")
     deep_ep = _import_installed_deep_ep()
     import torch
     import torch_npu  # noqa: F401
@@ -807,17 +929,25 @@ def worker(local_rank, args):
     if "elastic-notify-metadata-v6" not in info.get("capabilities", []):
         raise RuntimeError("Rebuild/install the wheel with Notify metadata v6")
     torch.npu.set_device(local_rank)
-    modes = ("normal", "duplicates", "invalid", "empty", "hotspot") if args.route == "all" else (args.route,)
+    modes = _ROUTES if args.route == "all" else (args.route,)
     dtypes = (False, True) if args.dtype == "both" else (args.dtype == "fp8",)
     if local_rank == 0:
         args.output.mkdir(parents=True, exist_ok=False)
     # Small correctness runs reserve the exact all-to-one bound. The public
     # hint budgets four times average rows and is intentionally smaller at EP>4.
     log("capacity.begin")
+    # Random routing is reproducible, so reserve its actual maximum rather than
+    # the all-to-one bound (which overflows address/workspace limits at EP256).
+    random_routes = (
+        make_routes(world, args.tokens, args.topk, args.experts, 0, "random", seed=args.seed)
+        if args.route == "random"
+        else None
+    )
+    rows = (
+        receive_capacity(random_routes, args.experts) if random_routes is not None else world * args.tokens * args.topk
+    )
     capacity = 2 * max(
-        dispatch_layout(
-            world, args.tokens, args.topk, args.experts, world * args.tokens * args.topk, fp8, weights=True
-        )["num_bytes"]
+        dispatch_layout(world, args.tokens, args.topk, args.experts, rows, fp8, weights=True)["num_bytes"]
         for fp8 in dtypes
     )
     log(f"buffer.init.begin bytes={capacity}")
@@ -835,7 +965,11 @@ def worker(local_rank, args):
     try:
         for mode in modes:
             log(f"route={mode} routes_and_notify_golden.begin (CPU)")
-            routes = make_routes(world, args.tokens, args.topk, args.experts, 0, mode)
+            routes = (
+                random_routes
+                if random_routes is not None
+                else make_routes(world, args.tokens, args.topk, args.experts, 0, mode, seed=args.seed)
+            )
             notify_golden = build_notify_golden(routes, args.experts, 256)
             entries = expert_rows(routes, args.experts, rank)
             log(f"route={mode} routes_and_notify_golden.done")
@@ -983,6 +1117,7 @@ def worker(local_rank, args):
                 experts=args.experts,
                 dtype=args.dtype,
                 route=args.route,
+                seed=args.seed,
             ),
             indent=2,
         )

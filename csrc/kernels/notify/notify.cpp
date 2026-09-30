@@ -715,7 +715,7 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyGatherCountTilesVf(__gm__ i
     const uint32_t worker = threadIdx.x * CoreCount + core;
     const uint32_t source = worker % world;
     const uint32_t source_worker = worker / world;
-    // 主机只接受 2/4/8/16/32/64/128 卡，均可整除总线程数。
+    // 主机只接受 2/4/8/16/32/64/128/256 卡，均可整除总线程数。
     const uint32_t source_workers = (CoreCount * kNotifySimtThreads) / world;
     auto* packet = packets + uint64_t(source) * packet_words;
     const uint32_t count = uint32_t(asc_ldcg(packet));

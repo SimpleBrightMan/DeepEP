@@ -15,7 +15,7 @@ namespace deepep {
 namespace {
 ascend_deepep::PutCombineTiling layout(int rank, int world, int tokens, int topk, int rows, int gathered, int chunk)
 {
-    if (world < 2 || world > 128 || (world & (world - 1)) || rank < 0 || rank >= world || tokens < 1 ||
+    if (world < 2 || world > 256 || (world & (world - 1)) || rank < 0 || rank >= world || tokens < 1 ||
         tokens > 10240 || topk < 1 || topk > 16 || chunk < 1 || chunk > 10240 || rows < 1 || gathered < 1 ||
         uint64_t(rows) > uint64_t(world) * tokens * topk || uint64_t(gathered) > uint64_t(world) * tokens * topk ||
         uint64_t(world) * world * tokens * topk >= (1ULL << 31)) {

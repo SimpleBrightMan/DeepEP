@@ -14,17 +14,17 @@ import runpy
 import sys
 
 _dispatch = runpy.run_path(str(Path(__file__).with_name("test_dispatch.py")))
-_ROUTES = ("normal", "duplicates", "invalid", "empty", "local_duplicates", "local_experts")
+_ROUTES = ("normal", "random", "duplicates", "invalid", "empty", "local_duplicates", "local_experts")
 
 
 def build_reference(routes, experts, rank, chunk_tokens=256):
-    source = Path(__file__).resolve().parents[2] / "third-party/ascend-deepep/put_combine_plan.py"
+    source = Path(__file__).with_name("combine_reference.py")
     spec = importlib.util.spec_from_file_location("_deepep_combine_reference", source)
     planner = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = planner
     spec.loader.exec_module(planner)
     # Replace only its synthetic route generator, not metadata construction.
-    # Upstream represents every invalid expert with -1.
+    # The reference represents every invalid expert with -1.
     planner.route_experts = lambda source, token, case: [
         expert if 0 <= expert < experts else -1 for expert in routes[source][token]
     ]
@@ -136,13 +136,13 @@ def worker(local_rank, args):
     torch.npu.set_device(local_rank)
     rank, world = _dispatch["_worker_identity"](local_rank, args)
     log = _dispatch["_progress_logger"]("combine", rank)
-    log("worker.begin")
+    log(f"worker.begin route={args.route} seed={args.seed}")
     modes = _ROUTES if args.route == "all" else (args.route,)
     capacity = 0
     references = {}
     for mode in modes:
         log(f"route={mode} capacity_golden.begin (CPU, before buffer initialization)")
-        routes = _dispatch["make_routes"](world, args.tokens, args.topk, args.experts, 0, mode)
+        routes = _dispatch["make_routes"](world, args.tokens, args.topk, args.experts, 0, mode, seed=args.seed)
         plan = build_reference(routes, args.experts, rank)
         references[mode] = plan
         capacity = max(
@@ -175,7 +175,7 @@ def worker(local_rank, args):
     try:
         for mode in modes:
             log(f"route={mode} routes_and_expert_rows.begin (CPU)")
-            routes = _dispatch["make_routes"](world, args.tokens, args.topk, args.experts, 0, mode)
+            routes = _dispatch["make_routes"](world, args.tokens, args.topk, args.experts, 0, mode, seed=args.seed)
             entries = _dispatch["expert_rows"](routes, args.experts, rank)
             log(f"route={mode} routes_and_expert_rows.done rows={len(entries)}")
             reference = references.pop(mode)
@@ -357,6 +357,7 @@ def worker(local_rank, args):
                 experts=args.experts,
                 route=args.route,
                 dispatch_dtype=args.dispatch_dtype,
+                seed=args.seed,
                 with_weights=not args.without_weights,
                 source_sha256=info["source_sha256"],
             ),
@@ -415,6 +416,126 @@ def test_sq_pressure_routes():
     assert reference["rank_rows"] == [64] + [0] * 127
 
 
+def test_ep256_shape_and_capacity_bounds():
+    import pytest
+    from deep_ep.buffers._elastic_layout import combine_layout, dispatch_layout, elastic_size_hint
+
+    world, tokens, topk, experts = 256, 4096, 6, 512
+    rows = 4 * tokens * topk  # Same conservative row budget as the public size hint.
+    for fp8 in (False, True):
+        dispatch = dispatch_layout(world, tokens, topk, experts, rows, fp8)
+        combine = combine_layout(world, tokens, topk, rows, rows)
+        size = elastic_size_hint(world, tokens, topk, experts, rows, rows, fp8)
+        assert size % (2 << 20) == 0 and size <= 32 << 30
+        assert max(dispatch["workspace_bytes"], combine["workspace_bytes"]) <= size // 2
+        assert world * dispatch["address_stride"] < 2**31
+    # EP256 is not a waiver of the int32 or 44 KiB resident-control limits.
+    combine_layout(world, 4608, topk, 1, 1)
+    with pytest.raises(ValueError, match="44 KiB"):
+        combine_layout(world, 4609, topk, 1, 1)
+    with pytest.raises(ValueError, match="encoding"):
+        dispatch_layout(world, tokens, 8, experts, 1)
+    with pytest.raises(ValueError, match="address encoding"):
+        dispatch_layout(world, tokens, topk, experts, world * tokens * topk)
+
+
+def test_ep256_dispatch_only_size_hint(monkeypatch):
+    import importlib
+    import pytest
+    from deep_ep.buffers._elastic_layout import combine_layout, dispatch_layout, elastic_size_hint
+
+    elastic = importlib.import_module("deep_ep.buffers.elastic")
+    monkeypatch.setattr(elastic, "require_native", lambda *_: None)
+    for tokens in (4609, 8192, 10240):
+        rows = 4 * tokens * 2
+        for fp8 in (False, True):
+            dispatch = dispatch_layout(256, tokens, 2, 1024, rows, fp8, weights=True)
+            expected = 2 * dispatch["num_bytes"]
+            assert elastic_size_hint(256, tokens, 2, 1024, rows, rows, fp8) == expected
+            assert (
+                elastic.ElasticBuffer.get_buffer_size_hint(None, tokens, 7168, 2, use_fp8_dispatch=fp8, world_size=256)
+                == expected
+            )
+            if tokens == 8192 and not fp8:
+                assert expected == 5_842_665_472
+        with pytest.raises(ValueError, match="44 KiB"):
+            combine_layout(256, tokens, 2, rows, rows)
+    # Dispatch's encoding restrictions still apply even without Combine sizing.
+    with pytest.raises(ValueError, match="encoding"):
+        elastic_size_hint(256, 8192, 4, 1024, 131072, 131072)
+
+
+def test_ep256_reference_high_ranks():
+    # Independent planners must agree across the half-world boundary and rank255.
+    for mode in ("normal", "random", "duplicates", "invalid", "empty", "local_experts"):
+        routes = _dispatch["make_routes"](256, 3, 6, 512, 0, mode)
+        golden = _dispatch["build_notify_golden"](routes, 512, 256)
+        for rank in (0, 127, 128, 255):
+            plan = build_reference(routes, 512, rank)
+            expected = golden["plans"][rank]
+            for name in (
+                "forward_list",
+                "backward_list",
+                "forward_counts",
+                "backward_counts",
+                "server_mask",
+                "rank_rows",
+                "gather_rows",
+                "chunk_masks",
+            ):
+                assert plan[name] == expected[name], (mode, rank, name)
+            assert plan["chunk_ranges"] == [
+                value for source in expected["chunk_ranges"] for pair in source for value in pair
+            ]
+            ids = plan["weight_return_meta"]
+            assert [(i // 18, i // 6 % 3, i % 6) for i in ids] == _dispatch["expert_rows"](routes, 512, rank)
+
+
+def test_ep256_combine_cli(monkeypatch, tmp_path):
+    import pytest
+
+    calls = []
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "test_combine.py",
+            "--ep-size",
+            "256",
+            "--nproc-per-node",
+            "8",
+            "--node-rank",
+            "31",
+            "--tokens",
+            "4096",
+            "--topk",
+            "6",
+            "--experts",
+            "512",
+            "--route",
+            "random",
+            "--seed",
+            "2026",
+            "--without-weights",
+            "--profile-op",
+            "combine",
+            "--output",
+            str(tmp_path / "ep256"),
+        ],
+    )
+    monkeypatch.setitem(_dispatch, "_launch", lambda args, worker: calls.append(args))
+    main()
+    (args,) = calls
+    assert (args.ep_size, args.node_rank, args.tokens, args.topk, args.experts) == (256, 31, 4096, 6, 512)
+    assert args.without_weights and args.profile_op == "combine"
+    assert args.route == "random" and args.seed == 2026
+    # Non-integer seeds fail before any device launch.
+    monkeypatch.setattr(sys, "argv", ["test_combine.py", "--seed", "bad", "--output", str(tmp_path)])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2 and len(calls) == 1
+
+
 def test_combine_reduction_predicates(tmp_path):
     """Execute the kernel's actual predicates on Host; does not test NPU synchronization."""
     import importlib.util
@@ -447,6 +568,21 @@ def test_combine_reduction_predicates(tmp_path):
         "template <bool EnableTrace>\n__aicore__ inline void ReduceGateway(",
     )
     helpers += section("constexpr uint32_t kWeightThreads =", "__aicore__ inline __gm__ uint64_t* WeightFlag(")
+    # Compile the production dispatch schedule too: Notify and Combine must
+    # agree with it for every high-rank source/destination and credit edge.
+    dispatch_code = (root / "csrc/kernels/dispatch/dispatch.cpp").read_text(encoding="utf-8")
+    helpers += "\nnamespace dispatch_contract {\n"
+    helpers += dispatch_code[
+        dispatch_code.index("constexpr uint32_t kMaxDispatchGroupWidth") : dispatch_code.index(
+            "// 128P uses the frozen"
+        )
+    ]
+    helpers += dispatch_code[
+        dispatch_code.index("__aicore__ inline uint32_t GetDispatchGroupWidth(") : dispatch_code.index(
+            "__aicore__ inline void DispatchSplitRange("
+        )
+    ]
+    helpers += "\n}\n"
     credit_test = (
         r"""
 namespace credit_test {
@@ -502,23 +638,25 @@ void expect_abort(Batch& b) {
     if (setjmp(failure) == 0) { b.FlushLane(0, 8, scratch); assert(false); }
     expect_failure = false; assert(copies == before);
 }
-void simulate(uint32_t tokens, bool empty = false) {
-    auto t = ascend_deepep::MakeCombineTiling(0, 128, tokens, 1, 8 * tokens, 1, 256);
+void simulate(uint32_t tokens, bool empty = false, uint32_t world = 128) {
+    auto t = ascend_deepep::MakeCombineTiling(0, world, tokens, 1, 8 * tokens, 1, 256);
     std::vector<uint32_t> peers;
-    for (uint32_t p = 8; p < 128; ++p) if (CrossPeerAssigned(t, p, 8)) peers.push_back(p);
-    assert((peers == std::vector<uint32_t>{8,20,48,52,80,84,112,116}));
+    for (uint32_t p = 8; p < world; ++p) if (CrossPeerAssigned(t, p, 8)) peers.push_back(p);
+    if (world == 128) assert((peers == std::vector<uint32_t>{8,20,48,52,80,84,112,116}));
+    else assert(peers.size() == 16);
     Batch b; b.so_reserve = 0;
     for (auto p:peers) for (uint32_t c = 0; c < t.chunks_per_group; ++c)
         if (CrossSoRequired(t, 0, p, c)) ++b.so_reserve;
-    assert(b.so_reserve == (tokens <= 256 ? 8U : 16U));
+    assert(b.so_reserve == peers.size() * std::min(3U, (tokens + 255U) / 256U));
     uint32_t payload[2]{};
     for (uint32_t c = 0; c < t.chunks_per_group; ++c) {
         auto begin = c ? std::min<uint64_t>(tokens, ChunkTokenEnd(t,c-1)) : 0;
         auto end = std::min<uint64_t>(tokens, ChunkTokenEnd(t,c));
-        for (uint32_t g = 0; g < 2; ++g) {
+        for (uint32_t g = 0; g < world / t.group_size; ++g) {
             std::vector<uint32_t> group;
-            for (auto p:peers) if (CombineGroup(0,128,p,t.group_size) == g) group.push_back(p);
+            for (auto p:peers) if (CombineGroup(0,world,p,t.group_size) == g) group.push_back(p);
             uint32_t left[2][8]{};
+            assert(group.size() <= 8);
             if (!empty) for (uint32_t i = 0; i < group.size(); ++i)
                 for (uint32_t n = 0; n < end - begin; ++n) ++left[n % 4 == 3 ? 1 : 0][i];
             bool remaining = true;
@@ -542,7 +680,7 @@ void simulate(uint32_t tokens, bool empty = false) {
         }
     }
     if (tokens == 6000 && !empty) assert(payload[0] == 36000 && payload[1] == 12000);
-    if (tokens <= 4096 || empty) assert(polls[0] == 0 && polls[1] == 0);
+    if ((world == 128 && tokens <= 4096) || empty) assert(polls[0] == 0 && polls[1] == 0);
     else assert(polls[0] > 0 && polls[1] == 0);
     // Final quiet must still drain both lanes before the next invocation.
     for (uint32_t lane = 0; lane < 2; ++lane) {
@@ -553,8 +691,9 @@ void simulate(uint32_t tokens, bool empty = false) {
 }
 void run() {
     // Bound each no-SO interval for every supported token count at chunk=256.
-    for (uint32_t tokens = 1; tokens <= 10240; ++tokens) {
-        auto t = ascend_deepep::MakeCombineTiling(0,128,tokens,1,1,1,256);
+    for (uint32_t world : {128U,256U})
+    for (uint32_t tokens = 1; tokens <= (world == 256 ? 4608U : 10240U); ++tokens) {
+        auto t = ascend_deepep::MakeCombineTiling(0,world,tokens,1,1,1,256);
         uint32_t previous = 0, lane0 = 0;
         for (uint32_t c = 0; c < t.chunks_per_group; ++c) {
             auto end = std::min<uint64_t>(tokens,ChunkTokenEnd(t,c));
@@ -562,13 +701,14 @@ void run() {
             lane0 += count - count / 4;
             if (CrossSoRequired(t,0,8,c)) {
                 assert(lane0 <= 3840);
-                assert(uint64_t(lane0) * 8 + 32 + 16 + 10 < 32768); lane0 = 0;
+                const uint32_t peers = world == 256 ? 16U : 8U;
+                assert(uint64_t(lane0) * peers + 32 + peers * 3 + 10 < 32768); lane0 = 0;
             }
         }
         assert(lane0 == 0);
     }
-    for (uint32_t world : {16U,32U,64U,128U}) for (uint32_t rank = 0; rank < world; ++rank) {
-        auto t = ascend_deepep::MakeCombineTiling(rank,world,10240,1,1,1,256);
+    for (uint32_t world : {16U,32U,64U,128U,256U}) for (uint32_t rank = 0; rank < world; ++rank) {
+        auto t = ascend_deepep::MakeCombineTiling(rank,world,world == 256 ? 4608 : 10240,1,1,1,256);
         for (uint32_t owner = 0; owner < 16; ++owner) {
             uint32_t peers = 0, so = 0;
             for (uint32_t p = 0; p < world; ++p) if (p/8 != rank/8 && CrossPeerAssigned(t,p,owner)) {
@@ -576,7 +716,8 @@ void run() {
                 for (uint32_t c = 0; c < t.chunks_per_group; ++c)
                     if (CrossChunkOwner(t,rank,p,c) == owner && CrossSoRequired(t,rank,p,c)) ++so;
             }
-            assert(peers <= 8 && so <= 16);
+            // Each owner reserves at most three window notifications per peer.
+            assert(peers <= (world == 256 ? 16U : 8U) && so <= (world == 256 ? 48U : 24U));
         }
     }
     reset(); Batch b;
@@ -594,9 +735,11 @@ void run() {
     std::memset(scratch, 0x5a, 32*kWqeBytes); b.FlushLane(0,8,scratch);
     assert(copies == 2 && polls[0] == 0);
     for (uint32_t i = 0; i < 32*kWqeBytes; ++i) assert(rings[0][(32760*kWqeBytes+i)%sizeof(rings[0])] == 0x5a);
-    reset(); simulate(256); simulate(4096); simulate(6000,true);
+    reset(); simulate(256); simulate(257); simulate(512); simulate(513); simulate(4096); simulate(6000,true);
     reset(); simulate(6000); simulate(6000); // Second invocation crosses the 16-bit CQE index range.
     reset(UINT32_MAX-100); simulate(10240); simulate(10240);
+    reset(); simulate(4096, false, 256); simulate(4096, false, 256);
+    reset(UINT32_MAX-100); simulate(4608, false, 256);
 }
 } // namespace credit_test
 """
@@ -619,6 +762,7 @@ void run() {
 #include "kernels/common.hpp"
 #include "kernels/combine/tiling.hpp"
 #include "kernels/notify/tiling.hpp"
+#include "kernels/dispatch/tiling.hpp"
 using CombineTiling = ascend_deepep::PutCombineTiling;
 namespace combine_control = ascend_deepep::combine_control;
 struct { uint32_t x; } threadIdx;
@@ -646,7 +790,30 @@ template<class T> struct GlobalTensor {
         + r"""
 int main() {
     credit_test::run();
-    for (uint32_t world : {2U, 16U, 64U, 128U}) {
+    static_assert(ascend_deepep::kMaxDispatchRanks >= 256);
+    for (uint32_t world : {2U,8U,16U,32U,64U,128U,256U}) {
+      const uint32_t width = first_hit_schedule::Width(world);
+      for (uint32_t rank = 0; rank < world; ++rank) {
+        std::vector<uint32_t> seen(world, 0);
+        const auto index = dispatch_contract::GetGroupRankIndex(rank, world);
+        assert(index == first_hit_schedule::Index(rank, world));
+        for (uint32_t group = 0; group < world / width; ++group)
+          for (uint32_t lane = 0; lane < width; ++lane) {
+            auto peer = dispatch_contract::GetGroupDstRank(rank, world, group, lane);
+            assert(peer >= 0 && uint32_t(peer) < world && ++seen[peer] == 1);
+            assert(uint32_t(peer) == first_hit_schedule::Peer(rank, world, group, lane));
+            assert(first_hit_schedule::Group(rank, world, peer) == group);
+            assert(dispatch_contract::GetGroupIncomingPeer(peer, world, group, index) == int32_t(rank));
+            if (group + 1 < world / width) {
+              auto next = dispatch_contract::GetNextGroupCreditPeer(rank, world, group, lane);
+              assert(next >= 0 && uint32_t(next) < world);
+              assert(dispatch_contract::GetGroupDstRank(next, world, group + 1, index) == int32_t(rank));
+            }
+          }
+        for (auto visits: seen) assert(visits == 1);
+      }
+    }
+    for (uint32_t world : {2U, 16U, 64U, 128U, 256U}) {
         constexpr uint32_t values = 7 * 6;
         simt::receive.assign(world, std::vector<float>(values, 0));
         simt::writes.assign(world, std::vector<uint32_t>(values, 0));
@@ -685,10 +852,12 @@ int main() {
     assert(AlignTaskToTokenBoundary(tasks, 0, 0, 0) == 0);
     assert(AlignTaskToTokenBoundary(tasks, 0, 0, 1) == 1);
     assert(AlignTaskToTokenBoundary(tasks, 0, 0, 2) == 3);
-    for (uint32_t world : {2U, 8U, 16U, 32U, 64U, 128U}) {
-      for (uint32_t tokens : {1U, 3U, 63U, 256U, 257U, 1025U, 10240U}) {
+    for (uint32_t world : {2U, 8U, 16U, 32U, 64U, 128U, 256U}) {
+      for (uint32_t tokens : {1U, 3U, 63U, 256U, 257U, 1025U, 4096U, 4608U, 10240U}) {
+        if (world == 256 && tokens > 4608) continue; // Resident controls exceed 44 KiB.
         auto t = ascend_deepep::MakeCombineTiling(0, world, tokens, 2, 1, 1);
         auto n = ascend_deepep::MakeNotifyTiling(0, world, tokens, 2, world * 4, 256, 7168);
+        auto d = ascend_deepep::MakeDispatchTiling(0, world, tokens, 2, world * 4, 1, false);
         std::cout << world << ' ' << tokens << ' ' << n.workspace_bytes << ' '
                   << n.backward_group_offsets << ' ' << n.source_chunk_masks << ' '
                   << n.expert_totals << ' ' << n.local_prefix_segments << ' '
@@ -697,7 +866,20 @@ int main() {
                   << t.returned_partial_offset_bytes << ' ' << t.output_offset_bytes << ' '
                   << t.weight_recv_offset_bytes << ' ' << t.weight_local_done_offset_bytes << ' '
                   << t.weight_done_offset_bytes << ' '
-                  << ascend_deepep::CombineWorkspaceBytes(t) << '\n';
+                  << ascend_deepep::CombineWorkspaceBytes(t) << ' '
+                  << d.sync << ' ' << d.book << ' ' << d.input << ' ' << d.output << ' '
+                  << d.weights << ' ' << d.scales << ' ' << d.inbox << ' '
+                  << d.inbox_stride << ' ' << d.address_stride << ' ' << d.workspace_bytes << '\n';
+        assert(t.num_so == 3U);
+        uint32_t windows = 0;
+        for (uint32_t c = 0; c < t.chunks_per_group; c = SoWindowEnd(t, c) + 1U) ++windows;
+        assert(windows == std::min(3U, (tokens + 255U) / 256U));
+        if (tokens == 4096) {
+          // Preserve the first half, then split the second half: 8 + 4 + 4 logical chunks.
+          assert(SoWindowEnd(t, 0) == 10U);
+          assert(SoWindowEnd(t, 11) == 14U);
+          assert(SoWindowEnd(t, 15) == 18U);
+        }
         assert(sizeof(t) == 168);
         assert(t.weight_topk == 2 && !t.with_weights && t.weight_rows == 0);
         assert(t.weight_recv_offset_bytes % 512 == 0);
@@ -788,7 +970,7 @@ int main() {
         stdout = output.read_text(encoding="utf-8")
     else:
         stdout = subprocess.run([str(executable)], check=True, capture_output=True, text=True, timeout=30).stdout
-    from deep_ep.buffers._elastic_layout import combine_layout, workspace_layout
+    from deep_ep.buffers._elastic_layout import combine_layout, dispatch_layout, workspace_layout
 
     for line in stdout.splitlines():
         world, tokens, *actual = map(int, line.split())
@@ -819,6 +1001,22 @@ int main() {
                 "workspace_bytes",
             )
         ]
+        dispatch = dispatch_layout(world, tokens, 2, world * 4, 1)
+        expected += [
+            dispatch[name]
+            for name in (
+                "sync",
+                "book",
+                "input",
+                "output",
+                "weights",
+                "scales",
+                "inbox",
+                "inbox_stride",
+                "address_stride",
+                "workspace_bytes",
+            )
+        ]
         assert actual == expected, (world, tokens)
 
 
@@ -837,12 +1035,13 @@ def main():
     )
     parser.add_argument("--without-weights", action="store_true", help="Disable weight return, including profiling")
     parser.add_argument("--route", choices=("all", *_ROUTES, "sq_pressure"), default="all")
+    parser.add_argument("--seed", type=int, default=1, help="Random routing seed; identical on every rank")
     parser.add_argument("--output", type=Path, required=True)
     _dispatch["add_profile_args"](parser, ("combine",))
     args = parser.parse_args()
     _dispatch["validate_profile_args"](parser, args)
-    if args.ep_size > 128 or not 1 <= args.tokens <= 10240 or not 1 <= args.topk <= 16 or args.repeat < 1:
-        parser.error("EP<=128, tokens1..10240, topk1..16, repeat>=1 required")
+    if args.ep_size > 256 or not 1 <= args.tokens <= 10240 or not 1 <= args.topk <= 16 or args.repeat < 1:
+        parser.error("EP<=256, tokens1..10240, topk1..16, repeat>=1 required")
     if args.experts < args.ep_size or args.experts > 1024 or args.experts % args.ep_size:
         parser.error("experts must be divisible by EP and <=1024")
     if args.route == "sq_pressure" and (

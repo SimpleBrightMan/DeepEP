@@ -220,7 +220,9 @@ class ElasticBuffer:
 
         Heavier skew requires explicit num_bytes; dispatch checks actual counts
         before payload launch. Size hints include weights and optional FP8 scales; combine
-        uses BF16 expert and gateway rows in the reserved second half.
+        uses BF16 expert and gateway rows in the reserved second half. EP256 shapes
+        beyond the default Combine UB limit receive a dispatch-only hint; the hint
+        does not guarantee that Combine supports the shape.
         """
         require_native("ElasticBuffer.get_buffer_size_hint")
         if type(hidden) is not int or hidden != 7168:

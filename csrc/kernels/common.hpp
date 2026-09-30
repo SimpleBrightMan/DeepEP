@@ -5,7 +5,7 @@
 #include <cstdint>
 
 // Scheduling helpers shared by Notify and Combine.
-// MoonEP's Legacy half-world mapping for EP8/32/64 and Staged 4x4
+// MoonEP's Legacy half-world mapping for EP<=64 and EP256, and Staged 4x4
 // two-frame mapping for EP128. Keep pure arithmetic host-testable.
 namespace first_hit_schedule {
 __aicore__ inline constexpr uint32_t Width(uint32_t world)

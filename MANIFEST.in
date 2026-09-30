@@ -13,7 +13,6 @@ recursive-include scripts *.py *.sh
 recursive-include tests *.py *.json *.cpp *.h *.md
 recursive-include benchmarks *.py *.json *.csv *.md
 include third-party/*.md third-party/*.LICENSE
-recursive-include third-party/ascend-deepep *.py
 prune third-party/shmem
 prune third-party/catlass
 recursive-include experiments/megamoe *.sh *.py *.cpp *.hpp *.cmake CMakeLists.txt *.json *.md *.txt *.LICENSE

@@ -654,7 +654,7 @@ __aicore__ inline void DispatchDeepepLocalPeer(DeepepPrimaryState& p, __ubuf__ u
 }
 
 // <=64P: 17 local writers use the unused upper group region.
-// 128P: 16 Clos owners need the full group region; nine local flags follow FM signals.
+// >=128P: 16 Clos owners need the full group region; nine local flags follow FM signals.
 __aicore__ inline __gm__ uint64_t* DeepepLocalPrimaryDone(DeepepSecondaryState& s, uint32_t worker)
 {
     return reinterpret_cast<__gm__ uint64_t*>(s.sync + uint64_t(s.world) * kRankSyncSlotBytes +
