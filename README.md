@@ -239,27 +239,102 @@ buffer = ElasticBuffer(
     num_max_tokens_per_rank=max_tokens_per_rank,
     hidden=7168,
     num_topk=6,
+    use_fp8_dispatch=False,  # FP8 输入时设为 True。
     explicitly_destroy=True,
 )
 ```
 
 LL 需显式设置 `num_bytes=8 << 30` 并使用不大于 256 的 token 上限，其他条件见 [Elastic 文档](docs/elastic.md)。使用结束后，各 rank 集体调用 `buffer.destroy()`。
 
-### 推理 Prefill 示例
+### Dispatch/Combine 示例
 
-`dispatch()` 完成路由准备与 token 分发；本地专家计算后，`combine()` 使用匹配的 `EPHandle` 归并结果。
+以下示例使用目标仓的 `ElasticBuffer` 接口组织 HT forward/backward。`dispatch()` 支持 BF16 Tensor，
+或 `(FP8 E4M3FN payload, FP32 per-128 scales)` 元组；`combine()` 使用匹配的 `EPHandle` 归并结果。
 
-> 🚧 **待补充｜Prefill 示例**
->
-> BF16 与 FP8 完整 Prefill 示例。
+```python
+from typing import Optional, Tuple, Union
 
-### 推理 Decode 示例
+import torch
 
-Decode 使用同一套 `ElasticBuffer` 接口及 `dispatch()` / `combine()` 方法，按实际执行路径配置 Buffer。
+from deep_ep import ElasticBuffer, EPHandle, EventOverlap
 
-> 🚧 **待补充｜Decode 示例**
->
-> EP64/EP128 完整 Decode 示例。
+
+def dispatch_forward(
+    x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+    num_max_tokens_per_rank: int,
+    expert_alignment: int = 1,
+) -> Tuple[
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    EPHandle,
+    EventOverlap,
+]:
+    """将 token 分发到各 rank 的本地专家布局。"""
+    return buffer.dispatch(
+        x,
+        topk_idx=topk_idx,
+        topk_weights=topk_weights,
+        num_experts=num_experts,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        expert_alignment=expert_alignment,
+        async_with_compute_stream=True,
+    )
+
+
+def dispatch_backward(
+    grad_recv_x: torch.Tensor,
+    grad_recv_topk_weights: Optional[torch.Tensor],
+    handle: EPHandle,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
+    """Dispatch 的 backward 使用 combine 回传输入及权重梯度。"""
+    return buffer.combine(
+        grad_recv_x,
+        handle=handle,
+        topk_weights=grad_recv_topk_weights,
+        async_with_compute_stream=True,
+    )
+
+
+def combine_forward(
+    x: torch.Tensor,
+    handle: EPHandle,
+) -> Tuple[torch.Tensor, EventOverlap]:
+    """使用 dispatch 返回的 handle 归并专家输出。"""
+    combined_x, _, event = buffer.combine(
+        x,
+        handle=handle,
+        async_with_compute_stream=True,
+    )
+    return combined_x, event
+
+
+def combine_backward(
+    grad_combined_x: torch.Tensor,
+    handle: EPHandle,
+) -> Tuple[torch.Tensor, EventOverlap]:
+    """Combine 的 backward 使用 cached dispatch 重新分发梯度。"""
+    grad_x, _, _, _, event = buffer.dispatch(
+        grad_combined_x,
+        handle=handle,
+        async_with_compute_stream=True,
+    )
+    return grad_x, event
+```
+
+使用 `EventOverlap` 管理通信流和计算流的依赖：
+
+```python
+recv_x, recv_topk_idx, recv_topk_weights, handle, event = dispatch_forward(...)
+
+# 此处可执行与本次 dispatch 输出无依赖的计算。
+
+event.current_stream_wait()
+# 等待完成后再使用 recv_x、recv_topk_idx 和 recv_topk_weights。
+```
 
 ### MegaMoE 示例
 
