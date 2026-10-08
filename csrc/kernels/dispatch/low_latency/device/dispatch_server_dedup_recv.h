@@ -7,6 +7,7 @@
 #include "kernel_operator.h"
 #include "adv_api/reduce/sum.h"
 #include "../common/ep_memory_server_dedup_protocol.h"
+#include "../../../common/ep_packet_receive_layout.h"
 #include "dispatch_server_dedup_receive_tasks.h"
 #include "dispatch_server_dedup_receive_packet.h"
 
@@ -111,14 +112,15 @@ public:
             // 从 pending 表分批循环探测；一批没有就绪项就继续扫描，直到至少一个包到齐。
             // Probe 对每个 packet 检查全部块标记，不是只看到首块就认为数据可读。
 
-            uint32_t count, ready;
+            uint32_t count;
+            ProbeResult probe;
             do {
                 if (scan >= tasks_.PendingCount()) scan = 0U;
                 const uint32_t remaining = tasks_.PendingCount() - scan;
                 count = remaining < kProbeBatch ? remaining : kProbeBatch;
-                ready = Probe(scan, count);
-                if (ready == 0U) scan += count;
-            } while (ready == 0U);
+                probe = Probe(scan, count);
+                if (probe.readyMask == 0U) scan += count;
+            } while (probe.readyMask == 0U);
 
             // Load and consume the immutable snapshot in the same descending
             // order. Higher-index removals cannot change lower pending entries.
@@ -127,17 +129,19 @@ public:
             uint32_t nextLoad = count;
             for (uint32_t i = count; i > 0U; --i) {
                 const uint32_t index = i - 1U;
-                if ((ready & (uint32_t(1) << index)) == 0U) continue;
+                if ((probe.readyMask & (uint32_t(1) << index)) == 0U) continue;
                 // 只预取 ready 位图命中的包；先填满可用 lane，再按相同倒序消费。
                 while (issued - consumed < depth && nextLoad != 0U) {
                     --nextLoad;
-                    if ((ready & (uint32_t(1) << nextLoad)) == 0U) continue;
-                    IssueLoad(snapshot.GetValue(nextLoad), issued % lanes_);
+                    if ((probe.readyMask & (uint32_t(1) << nextLoad)) == 0U) continue;
+                    IssueLoad(snapshot.GetValue(nextLoad), issued % lanes_,
+                              (probe.keepFlagsMask & (uint32_t(1) << nextLoad)) != 0U);
                     ++issued;
                 }
                 // 消费包括写出展开 token、量化 scale 和路由元数据；FIRST_HOP 还执行转发。
                 // 任务移出 pending 表只表示相关写操作已下发，lane 事件另行保护实际完成。
-                ConsumeLoaded(snapshot.GetValue(index), consumed % lanes_);
+                ConsumeLoaded(snapshot.GetValue(index), consumed % lanes_,
+                              (probe.keepFlagsMask & (uint32_t(1) << index)) != 0U);
                 tasks_.RemovePending(scan + index);
                 ++consumed;
             }
@@ -157,6 +161,10 @@ public:
 
 private:
     static constexpr uint32_t kProbeBatch = 16U;
+    struct ProbeResult {
+        uint32_t readyMask = 0U;
+        uint32_t keepFlagsMask = 0U;
+    };
     // 摘要：将稳定任务编号 j 映射为本轮通信窗口中的实际 packet 槽地址。
     __aicore__ inline __gm__ uint8_t* Slot(uint32_t j)
     {
@@ -164,7 +172,7 @@ private:
     }
 
     // 摘要：保存最多 16 项 pending 任务快照，检查每个包全部块的标记，返回就绪位图。
-    __aicore__ inline uint32_t Probe(uint32_t start, uint32_t count)
+    __aicore__ inline ProbeResult Probe(uint32_t start, uint32_t count)
     {
         auto indices = probeIdxBuf_.Get<uint32_t>();
         auto flags = flagsBuf_.Get<float>();
@@ -179,57 +187,87 @@ private:
         ServerDedupReceiveSync<HardEvent::MTE2_V>();
         Sum<float>(sums, flags, work, SumParams{count, blocks * 8U, blocks * 8U});
         ServerDedupReceiveSync<HardEvent::V_S>();
-        uint32_t ready = 0U;
-        for (uint32_t i = 0; i < count; ++i)
-            if (sums.GetValue(i) == float(blocks * 8U)) ready |= uint32_t(1) << i;
-        return ready;
+        ProbeResult result;
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto layout = PacketReceiveLayout::Decode(sums.GetValue(i), blocks);
+            if (layout != PacketReceiveLayout::State::Pending) result.readyMask |= uint32_t(1) << i;
+            if (layout == PacketReceiveLayout::State::KeepFlags) result.keepFlagsMask |= uint32_t(1) << i;
+        }
+        return result;
     }
 
     // 摘要：等待 lane 的旧输出完成后，将 packet 从 GM 预取到 UB，分别发布给 Scalar 和 MTE3 的依赖事件。
-    __aicore__ inline void IssueLoad(uint32_t j, uint32_t lane)
+    __aicore__ inline void IssueLoad(uint32_t j, uint32_t lane, bool keepFlags)
     {
         WaitFlag<HardEvent::MTE3_MTE2>(lane);
         auto wire = lanesBuf_.Get<uint8_t>()[lane * laneStride_];
         GlobalTensor<uint8_t> source;
         source.SetGlobalBuffer(Slot(j));
-        DataCopy(wire, source, uint32_t(data_.tokenStride));
+        if (keepFlags) {
+            DataCopy(wire, source, uint32_t(data_.tokenStride));
+        } else {
+            // Compact every 480B payload block, skipping the 32B GM Flag.
+            // GM source stride is bytes; UB destination stride is 32B blocks.
+            DataCopyPad(wire, source, {uint16_t(data_.blockCount), 480U, 32U, 0U, 0U},
+                        {false, 0U, 0U, 0});
+        }
         SetFlag<HardEvent::MTE2_MTE3>(lane);
         // Publish immediately after this load, before queuing later loads.
         SetFlag<HardEvent::MTE2_S>(lane);
     }
 
     // 摘要：消费已预取包，写出 token/scale 和路由元数据；FIRST_HOP 还向其余专家转发，再归还 lane。
-    __aicore__ inline void ConsumeLoaded(uint32_t j, uint32_t lane)
+    __aicore__ inline void ConsumeLoaded(uint32_t j, uint32_t lane, bool keepFlags)
     {
-        // One interval per consumed token; prefetch issue remains uninstrumented.
-
         WaitFlag<HardEvent::MTE2_S>(lane);
         auto wire = lanesBuf_.Get<uint8_t>()[lane * laneStride_];
+        const uint32_t row = tasks_.Begin() + j;
+        const uint32_t headerOffset = uint32_t(keepFlags ? data_.headerWireOffset : data_.headerPayloadOffset);
+        if (!enableDedup_ && !keepFlags) {
+            // Compact offsets are logical payload offsets. Retain this lane
+            // until all payload, scale and metadata output reads complete.
+            WaitFlag<HardEvent::MTE2_MTE3>(lane);
+            DataCopyPad(expandX_[uint64_t(row) * hiddenBytes_], wire,
+                        {1U, hiddenBytes_, 0U, 0U, 0U});
+            if constexpr (WireFp8)
+                DataCopyPad(dynamicScales_[uint64_t(row) * data_.scaleBytes], wire[uint32_t(data_.quantCount)],
+                            {1U, uint32_t(data_.scaleBytes), 0U, 0U, 0U});
+            auto header = wire[headerOffset].template ReinterpretCast<uint32_t>();
+            DataCopyPad(destinationIndex_[uint64_t(row) * 3U], header, {1U, 12U, 0U, 0U, 0U});
+            SetFlag<HardEvent::MTE3_MTE2>(lane);
+            return;
+        }
         auto type = wire[uint32_t(data_.tokenStride)].template ReinterpretCast<uint32_t>();
         auto destination = wire[uint32_t(data_.tokenStride) + 32U].template ReinterpretCast<uint32_t>();
-        const uint32_t row = tasks_.Begin() + j;
-        bool firstHop = false;
-        if (enableDedup_) {
-            ServerDedupPacketTail tail(wire, uint32_t(data_.headerWireOffset),
-                                       uint32_t(data_.relayReadIndexWireOffset));
-            firstHop = tail.Header().GetValue(3U) == uint32_t(EpServerDedupTokenType::FirstHop);
-            BuildServerDedupMetadata(type, destination, tail, tasks_.Position(j));
-            if (firstHop) PrepareServerDedupForward(tail);
-        } else {
-            auto header = wire[data_.headerWireOffset].template ReinterpretCast<uint32_t>();
-            for (uint32_t i = 0; i < 3U; ++i) destination.SetValue(i, header.GetValue(i));
+        ServerDedupPacketTail tail(wire, headerOffset,
+                                  uint32_t(keepFlags ? data_.relayReadIndexWireOffset : data_.readIndexPayloadOffset));
+        const bool firstHop = enableDedup_ &&
+                              tail.Header().GetValue(3U) == uint32_t(EpServerDedupTokenType::FirstHop);
+        if (enableDedup_) BuildServerDedupMetadata(type, destination, tail, tasks_.Position(j));
+        else for (uint32_t i = 0U; i < 3U; ++i) destination.SetValue(i, tail.Header().GetValue(i));
+        if (firstHop) {
+            PrepareServerDedupForward(tail);
+            // Forwarded packets only need compact payload. The hint remains
+            // independent of the application-level token type in the header.
+            wire.template ReinterpretCast<float>().SetValue(
+                PacketReceiveLayout::kMarkerOffset / 4U, PacketReceiveLayout::kCompact);
         }
         ServerDedupReceiveSync<HardEvent::S_MTE3>();
         WaitFlag<HardEvent::MTE2_MTE3>(lane);
-        WriteServerDedupPayloadRange(expandX_[uint64_t(row) * hiddenBytes_], wire, 0U, hiddenBytes_);
-        if constexpr (WireFp8)
-            WriteServerDedupPayloadRange(dynamicScales_[uint64_t(row) * data_.scaleBytes], wire,
-                                         uint32_t(data_.quantCount), uint32_t(data_.scaleBytes));
+        if (keepFlags) {
+            WriteServerDedupPayloadRange(expandX_[uint64_t(row) * hiddenBytes_], wire, 0U, hiddenBytes_);
+            if constexpr (WireFp8)
+                WriteServerDedupPayloadRange(dynamicScales_[uint64_t(row) * data_.scaleBytes], wire,
+                                             uint32_t(data_.quantCount), uint32_t(data_.scaleBytes));
+        } else {
+            DataCopyPad(expandX_[uint64_t(row) * hiddenBytes_], wire, {1U, hiddenBytes_, 0U, 0U, 0U});
+            if constexpr (WireFp8)
+                DataCopyPad(dynamicScales_[uint64_t(row) * data_.scaleBytes], wire[uint32_t(data_.quantCount)],
+                            {1U, uint32_t(data_.scaleBytes), 0U, 0U, 0U});
+        }
         if (enableDedup_) DataCopyPad(tokenType_[row], type, {1U, 4U, 0U, 0U, 0U});
         DataCopyPad(destinationIndex_[uint64_t(row) * 3U], destination, {1U, 12U, 0U, 0U, 0U});
-        if (enableDedup_ && firstHop) {
-            ServerDedupPacketTail tail(wire, uint32_t(data_.headerWireOffset),
-                                       uint32_t(data_.relayReadIndexWireOffset));
+        if (firstHop) {
             DataCopyPad(relayReadIndex_[uint64_t(row) * k_ * 2U], tail.ReadIndex(), {1U, k_ * 8U, 0U, 0U, 0U});
             const uint32_t sourceRank = tail.Header().GetValue(0U);
             const uint32_t ranks = uint32_t(args_->rankSize);
@@ -239,7 +277,6 @@ private:
                 const uint32_t expertId = index & 0xffffU;
                 const uint32_t q = index >> 16U;
                 const uint32_t destinationRank = expertId / localExperts_;
-                // DataCopy directly addresses the destination rank mapping.
                 GlobalTensor<uint8_t> output;
                 output.SetGlobalBuffer(args_->peerMems[destinationRank] +
                                        DispatchServerDedupDispatchOffset(data_, sourceRank, destinationRank,

@@ -9,6 +9,7 @@
 #include "../common/ep_memory_server_dedup_data_layout.h"
 #include "../common/ep_memory_server_dedup_protocol.h"
 #include "../../../common/ep_server_order.h"
+#include "../../../common/ep_packet_receive_layout.h"
 
 namespace DispatchDedup {
 using namespace AscendC;
@@ -219,9 +220,26 @@ public:
         const uint32_t remainder = total % kEpServerDedupSendCoreNum;
         const uint32_t begin = core * base + (core < remainder ? core : remainder);
         const uint32_t count = base + (core < remainder ? 1U : 0U);
-        for (uint32_t i = begin; i < begin + count; ++i) {
-            const uint32_t expert = uint32_t(routeIds_.GetValue(i));
-            SendPacket(input, i / k_, i % k_, expert, CalTokenSendExpertCnt(expert, i), 0U);
+        const uint32_t serverNum = args_->rankSize / 8U;
+        if (serverNum < 16U) {
+            for (uint32_t i = begin; i < begin + count; ++i) {
+                const uint32_t expert = uint32_t(routeIds_.GetValue(i));
+                SendPacket(input, i / k_, i % k_, expert, CalTokenSendExpertCnt(expert, i), 0U);
+            }
+            return;
+        }
+        // Keep the original route ownership and q slots. Only reorder this
+        // core's sends by the same 128P+ server order used by dedup DIRECT.
+        const uint32_t expertsPerServer = localExperts_ * 8U;
+        const uint32_t ownServer = args_->rank / 8U;
+        for (uint32_t step = 0; step < serverNum; ++step) {
+            const uint32_t server = EpServerOrder::ServerDedupDispatchDirectOrder(serverNum, ownServer, step);
+            const uint32_t firstExpert = server * expertsPerServer;
+            for (uint32_t i = begin; i < begin + count; ++i) {
+                const uint32_t expert = uint32_t(routeIds_.GetValue(i));
+                if (expert < firstExpert || expert >= firstExpert + expertsPerServer) continue;
+                SendPacket(input, i / k_, i % k_, expert, CalTokenSendExpertCnt(expert, i), 0U);
+            }
         }
     }
 
@@ -378,6 +396,12 @@ private:
         auto inWords = payload.template ReinterpretCast<int32_t>();
         Copy(outWords, inWords, uint64_t(64), uint8_t(data_.blockCount), {1, 1, 16, 15});
         Copy(outWords[64], inWords[64], uint64_t(56), uint8_t(data_.blockCount), {1, 1, 16, 15});
+        // Refresh this packet's layout marker on every reused lane, before
+        // the existing V_MTE3 publication dependency.
+        uint64_t markerMask[2] = {1U, 0U};
+        Duplicate<float>(out.template ReinterpretCast<float>()[PacketReceiveLayout::kMarkerOffset / 4U],
+                         mask != 0U ? PacketReceiveLayout::kKeepFlags : PacketReceiveLayout::kCompact,
+                         markerMask, 1U, 1U, 8U);
         if constexpr (!NeedQuantize) input.template FreeTensor<XType>(x);
         SetFlag<HardEvent::V_MTE3>(lane);
         WaitFlag<HardEvent::V_MTE3>(lane);
