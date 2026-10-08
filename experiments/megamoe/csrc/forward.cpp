@@ -446,7 +446,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     torch::Tensor y = out.has_value() ? *out : torch::empty(x.sizes(), x.options().dtype(torch::kBFloat16));
     CheckTensor(y, 2, "out");
     TORCH_CHECK(y.scalar_type() == torch::kBFloat16 && y.sizes() == x.sizes(), "out must be BF16 [BS, H]");
-    torch::Tensor expert_tokens = torch::empty({experts}, x.options().dtype(torch::kInt32));
+    torch::Tensor expert_tokens = compute_replay_ ? replay_counts_ :
+        torch::empty({experts}, x.options().dtype(torch::kInt32));
 
     const auto stream = c10_npu::getCurrentNPUStream();
     auto ptr = [](const torch::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
@@ -455,7 +456,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                        opt(x_scales), ptr(topk_ids), ptr(topk_weights), ptr(weight1), ptr(weight2), ptr(weight_scales1),
                        ptr(weight_scales2), opt(shared_weight1), opt(shared_weight2), opt(shared_weight_scales1),
                        opt(shared_weight_scales2), ptr(y), ptr(expert_tokens), ptr(workspace_), opt(timer),
-                       reinterpret_cast<const uint8_t*>(&tiling_), ffts_);
+                       reinterpret_cast<const uint8_t*>(&tiling_), ffts_, compute_replay_);
     // The direct kernel launch bypasses the PyTorch dispatcher; record that
     // every argument remains live until the current NPU stream reaches it.
     for (const auto* tensor : {&x, &topk_ids, &topk_weights, &weight1, &weight2, &weight_scales1, &weight_scales2,
@@ -474,7 +475,18 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     if (x_scales) {
         c10_npu::NPUCachingAllocator::recordStream(x_scales->storage().data_ptr(), stream);
     }
+    replay_counts_ = expert_tokens;
     return {y, expert_tokens};
+}
+
+void Plan::enable_compute_replay()
+{
+    TORCH_CHECK(tiling_.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 &&
+                    tiling_.sharedExpertNum == 0, "Compute replay requires W4A8 with no shared experts");
+    TORCH_CHECK(replay_counts_.defined(), "Compute replay requires a complete priming forward first");
+    // 完整 forward 留下 Dispatch 输入和专家计数；切换前保证设备已完成，不能重放半成品。
+    TORCH_CHECK(aclrtSynchronizeDevice() == ACL_SUCCESS, "Compute replay priming synchronization failed");
+    compute_replay_ = true;
 }
 
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden)

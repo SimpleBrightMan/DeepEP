@@ -135,6 +135,8 @@ def main():
     parser.add_argument("--relative-rmse", type=float, default=0.02, help="Timer on/off output tolerance only")
     args = parser.parse_args()
     config = load_config(args.config, args.bs_values)
+    if args.mode != "perf" or config["model"]["num_shared_experts"] != 0:
+        parser.error("Compute-replay benchmark requires --mode perf and num_shared_experts=0; output is not valid MoE output")
     if args.check_tokens < 0 or not 0 < args.relative_rmse < 1:
         parser.error("Invalid accuracy sample count or tolerance")
     import torch
@@ -211,6 +213,8 @@ def run(args, config, group):
         timer_ranks=timer_ranks,
         host_coordination="tcpstore",
         device_communication="shmem_mte",
+        measurement="compute_replay",
+        priming="one complete forward per BS outside timing; subsequent inputs/counts are frozen",
         api="fp8_fp4_mega_moe",
         numerical_contract="ascend_post_gmm2_route_weight_v1",
         created_utc=datetime.now(timezone.utc).isoformat(),
@@ -282,6 +286,14 @@ def run(args, config, group):
                 **shared_kwargs,
             )
 
+        # 真实路由只执行一次，计时中复用 Dispatch 的 GM 输入；不伪造专家负载或 ready flag。
+        call()
+        torch.npu.synchronize()  # 同时排空 torch_npu 的提交队列和设备工作。
+        buffer.enable_compute_replay()  # native 同步保证 priming 完成后才切换。
+        group.barrier(f"compute replay primed BS={bs}")
+        if rank == 0:
+            print(f"[COMPUTE-REPLAY] BS={bs} primed; timed kernels have no inter-rank communication; output invalid", flush=True)
+
         prefix = None
         if args.mode == "perf" or args.timer:
             error = None
@@ -337,11 +349,13 @@ def run(args, config, group):
             timings = [sample["duration_us"] for sample in samples]
             per_rank = group.all_gather(timings, f"profiling BS={bs}")
             report = summarize_rounds(per_rank, int(os.environ["LOCAL_WORLD_SIZE"]))
+            report["metric"] = "megamoe_compute_replay_duration_us"
+            report["measurement"] = "compute_replay"
             report["alignment"] = config["alignment"]
             (case / "profiling.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
             if rank == 0:
                 print(
-                    f"[PERF] BS={bs} MegaMoe E2E={report['mean_us']:.3f}us "
+                    f"[PERF] BS={bs} MegaMoe compute replay={report['mean_us']:.3f}us "
                     f"rank-max-mean={report['rank_max_mean_us']:.3f}us "
                     f"rounds={report['rounds']}/{report['recorded_rounds']} "
                     f"(last ceil(iters/2); kernel Duration; rank-min mean; timer off)",
@@ -379,7 +393,7 @@ def run(args, config, group):
                 timer_dir.mkdir(parents=True, exist_ok=True)
                 raw_timer = timer.cpu().numpy().astype("<i8", copy=False).reshape(-1)
                 raw_timer.tofile(timer_dir / f"rank_{rank}_npu_time.bin")
-                breakdown = rank_breakdown(compact_events(raw_timer, rank), rank)
+                breakdown = rank_breakdown(compact_events(raw_timer, rank), rank, compute_replay=True)
                 del raw_timer
                 print(f"[TIMER] rank={rank} BS={bs} raw saved; offline parse required", flush=True)
             records = group.all_gather(breakdown, f"timer breakdown BS={bs}")

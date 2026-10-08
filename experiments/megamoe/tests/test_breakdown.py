@@ -30,6 +30,25 @@ def fixture_events(offset=0):
     return [dict(e, start_cycle=e["start_cycle"] + offset, end_cycle=e["end_cycle"] + offset) for e in events]
 
 
+def test_compute_replay_requires_explicit_scope_and_has_no_fake_dispatch(tmp_path):
+    events = [event("AIV_RESET", 1, 4), event("AIC_GMM1_0", 5, 45), event("AIC_GMM2_0", 50, 80)]
+    assert rank_breakdown(events, 0)["status"] == "unavailable"
+    result = rank_breakdown(events, 0, compute_replay=True)
+    assert result["status"] == "ok"
+    assert result["measurement"] == "compute_replay"
+    assert result["head_us"] is result["launch_us"] is result["dispatch_at_us"] is None
+    assert result["setup_us"] == 4 and result["gmm_window_us"] == 75
+    assert result["gmm_uncovered_us"] == 5
+    write_breakdown([result], tmp_path, "compute replay BS4096")
+    assert "COMPUTE REPLAY" in (tmp_path / "timer_breakdown.txt").read_text()
+
+
+@pytest.mark.parametrize("name", ["AIV_DISPATCH_0", "AIV_COMBINE_0", "AIV_UNPERMUTE", "AIV_INPUT_CROSS_RANK_SYNC", "AIV_FINAL_CROSS_RANK_WAIT"])
+def test_compute_replay_rejects_communication_trace(name):
+    with pytest.raises(ValueError, match="communication event"):
+        rank_breakdown([event(name, 1, 2)], 0, compute_replay=True)
+
+
 def test_breakdown_keeps_5ms_sync_and_uses_one_critical_lane(tmp_path):
     result = rank_breakdown(fixture_events(), 0)
     assert result["status"] == "ok"

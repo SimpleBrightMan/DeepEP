@@ -5,6 +5,64 @@ Modified by Joyce_An 2026
 
 # MegaMoE Prefill Beta
 
+## 本分支：计算重放诊断（compute replay）
+
+基于 `codex/megamoe-local-ep8` 的 `a859c17`。本分支的 benchmark 默认只测计算重放，
+不是完整 MoE，不作为生产或精度基线；下文原有 API 默认仍运行完整 MoE，只有显式调用
+`buffer.enable_compute_replay()` 后才切换。
+
+在已激活的 Ascend 环境、仓库根目录运行（首次不要加 `--skip-build`，需要重编译 kernel 和扩展）：
+
+```bash
+python experiments/megamoe/scripts/batch_launch.py --ep-size 8 --bs-values 4096
+```
+
+默认 DeepSeek V4 Pro：H=7168、I=3072、E=384、TopK=6、S=0；保留 timer 采集和自动解析。
+正式性能轮次不传 timer，之后另跑 timer 批次。计时结果明确标为 `MegaMoe compute replay`，
+JSON metric 为 `megamoe_compute_replay_duration_us`，不能与完整 E2E 混用。
+
+每个 BS 先完整运行一次，设备同步后固定真实 Dispatch 输入、scale 和专家计数，再开始预热和测量：
+
+| 阶段 | 重放计时内 |
+| --- | --- |
+| 输入量化/打包、Route/count、Dispatch、跨卡输入握手 | 跳过，仅 priming 执行 |
+| 本地 flag reset、本卡同步 | 保留，保证连续调用安全 |
+| GMM1 权重 Prologue、MMAD、SwiGLU + MX 量化 | 原后端、原分块与依赖 |
+| GMM2 Prologue、MMAD、GM 写出 | 原后端与 Wave 顺序；保留原 FIX 完成边界和本地完成通知 |
+| Combine 远端写、输出跨卡握手、Unpermute/加权聚合 | 跳过 |
+
+EP8/BS4096 均衡路由下，每卡 48 个专家、每专家 512 token，共 24576 个路由 token；
+不是只计算 4096 行，也没有改变专家形状。GMM2 仍按原有大 BS 策略滞后一 Wave。
+`SendAndQuantBuffInit` 仅建立 UB 视图并初始化 scratch，不执行输入量化或网络传输。
+`ResetSyncStatus` 只清 flag，不覆盖 priming 留下的 Dispatch 数据/scale/计数。
+重放不再等待 Dispatch/count producer，但保留 GMM1→SwiGLU→GMM2 的 ready 协议。
+AIV1 的优先级循环只消费 SwiGLU，不执行 Dispatch 或 Combine。
+
+限制与读数：
+
+- 仅支持 W4A8、S=0、perf；benchmark 拒绝 accuracy 和共享专家配置。
+- SHMEM 初始化、priming、主机协调仍需要八卡；这些不在计算重放的 kernel Duration 中。
+- 重放不会更新最终 `y`，它仍是 priming 的旧值；专家计数也是 priming 的快照，不能用来验证重放正确性。
+- 同 BS 的输入/路由被固定。需要新输入时应重新创建 buffer；切换 BS 会建立新的计划并重新 priming。
+- 重放时间包含本地读写、Prologue、激活、计算依赖及同步，不是纯 Cube MMAD 时间。
+- “完整 E2E − 重放时间”不能直接称作通信耗时：通信与计算原本重叠，且通信去掉后资源竞争、缓存行为和 AIV1 调度均会变化。
+- 若重放仍约 4200us，应重点查计算后端/本地数据流；若明显降低，说明原计时中的计算区间受到通信竞争或等待影响。仍需结合流水细分，不能仅凭差值定因。
+
+timer 文件仍位于日志给出的运行目录下 `bs_4096/bs_4096/timer/`。
+流水应没有 Dispatch、Combine、跨卡同步或 Unpermute；保留 GMM/Prologue/SwiGLU。
+breakdown 的 `head/launch/dispatch` 为 N/A，新增 `setup_us` 表示首个可见事件到首次 GMM。
+离线重新解析时显式声明重放口径，若要查看 wait，加 `--include-wait`：
+
+```bash
+python -m deep_ep_experimental.megamoe.timer <timer目录> --ranks 0-7 --compute-replay --include-wait
+```
+
+这里没有跨卡同步锚点，不支持 `--time-origin sync`；各 rank 的相对时间不能解释为全球对齐时间。
+本地 CPU 测试不代表 CANN 编译或 NPU 正确性验证。上机需确认日志打印 `COMPUTE-REPLAY`，
+timer 具有预期 GMM 数量且无通信事件，并观察多轮运行无挂起/非法访问后再比较性能。
+
+---
+
 公开入口：`deep_ep_experimental.megamoe`。W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度。
 构建和多机测试入口位于本目录的 `scripts/`；机器地址及环境配置由使用者提供。
 

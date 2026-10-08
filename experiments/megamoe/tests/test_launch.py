@@ -178,6 +178,33 @@ def test_multinode_still_requires_hosts():
         launcher.make_plan(launcher.parse_args([]))
 
 
+def test_compute_replay_rejects_accuracy_and_shared_experts(tmp_path):
+    with pytest.raises(ValueError, match="Compute-replay"):
+        launcher.make_plan(launcher.parse_args(["--ep-size", "8", "--mode", "accuracy"]))
+    config = json.loads((ROOT / "experiments/megamoe/python/deep_ep_experimental/megamoe/configs/deepseek_v4_pro.json").read_text())
+    config["model"]["num_shared_experts"] = 1
+    path = tmp_path / "shared.json"
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="num_shared_experts=0"):
+        launcher.make_plan(launcher.parse_args(["--ep-size", "8", "--config", str(path)]))
+
+
+def test_compute_replay_summary_rejects_full_moe_results(tmp_path, capsys):
+    from deep_ep_experimental.megamoe.performance import summarize_rounds
+
+    report = summarize_rounds([[4000.0, 3900.0, 3800.0, 3700.0]] * 8, 8)
+    path = tmp_path / "bs_4096/rank_0/bs_4096/profiling.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="performance report"):
+        launcher.summarize(tmp_path, [4096], 8)
+    report["metric"] = "megamoe_compute_replay_duration_us"
+    path.write_text(json.dumps(report))
+    launcher.summarize(tmp_path, [4096], 8)
+    assert "MegaMoe compute replay=" in capsys.readouterr().out
+    assert "E2E" not in (tmp_path / "summary.txt").read_text()
+
+
 @pytest.mark.parametrize("exit_code", [0, 7])
 def test_local_stage_uses_bash_and_propagates_failure(tmp_path, monkeypatch, exit_code):
     plan = launcher.make_plan(launcher.parse_args(["--ep-size", "8", "--bs-values", "96"]))

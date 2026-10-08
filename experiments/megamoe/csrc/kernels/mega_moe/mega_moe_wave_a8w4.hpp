@@ -60,6 +60,7 @@ private:
     using MegaMoeBase::moeWeightTensorListAddrs_;
     using MegaMoeBase::params_;
     using MegaMoeBase::RunGmm2CombineForExpert;
+    using MegaMoeBase::computeReplay_;
     using MegaMoeBase::syncWorkspaceLayout_;
     using MegaMoeBase::timer_;
     using MegaMoeBase::tokenDispatchConfig_;
@@ -120,6 +121,10 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm1
         gmmExecutionConfig_, syncWorkspaceLayout_, params_.workspaceInfo, moeWeightTensorListAddrs_, epilogueOp_,
         gmmAddrInfo, state, tokenStartIndexInExpert, gmm1TilesPerMGroup);
     gmmAddrInfo.timer = timer_.Enabled() ? &timer_ : nullptr;
+    if (computeReplay_) {
+        // 输入已在 priming 中完成；本次没有 Dispatch producer，不能等待其被清零的 flag。
+        gmmAddrInfo.dispatchToGmm1Flag = nullptr;
+    }
     ProblemShape sliceProblemShape = state.problemShape;
     Get<M_VALUE>(sliceProblemShape) = sliceTokenCount;
     timer_.SetSlice(state.expertIdx, tokenStartIndexInExpert, sliceTokenCount);
@@ -322,10 +327,13 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
 {
     AivTaskCursor activation{}, combine{};
     bool hasActivation = NextAivSlice(activation, true);
-    bool hasCombine = NextAivSlice(combine, false);
+    bool hasCombine = !computeReplay_ && NextAivSlice(combine, false);
     SharedActivationCursor shared{};
     shared.done = sharedExpertNum_ == 0U;
     ExpertTokenPosition dispatch{};
+    if (computeReplay_) {
+        dispatch.expertIdx = commonConfig_.moeExpertPerRank;
+    }
     uint32_t dispatchGroups = 0U;
     uint64_t dispatchWave = 0U;
     while (hasActivation || hasCombine || !shared.done || dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
@@ -415,7 +423,9 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     uint64_t gmm1Count = 0U;
     uint64_t gmm2Count = 0U;
     DispatchBuffInit();
-    PrepareMoeExpertTokenCountTable<true>(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
+    if (!computeReplay_) {
+        PrepareMoeExpertTokenCountTable<true>(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
+    }
     if constexpr (g_coreType == AIV && CombineQuantMode == COMBINE_NO_QUANT) {
         if (GetSubBlockIdx() == 1U) {
             ProcessAiv1PriorityStages(gmm1TileReadySequence);

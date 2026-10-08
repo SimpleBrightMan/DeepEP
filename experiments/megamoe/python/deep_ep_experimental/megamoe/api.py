@@ -210,6 +210,20 @@ class SymmBuffer:
             collective_check(self.group, f"prepare BS={bs}", error)
         return self
 
+    def enable_compute_replay(self) -> None:
+        """Diagnostic only: freeze the last forward's dispatched inputs/counts.
+
+        Later calls run local GMM1/SwiGLU/GMM2 but do not produce a new MoE output.
+        Preparing a different BS creates a fresh, non-replay plan.
+        """
+        with self._lock:
+            self._runtime.ensure_alive()
+            if self._plan is None:
+                raise RuntimeError("Compute replay requires prepare and one priming forward")
+            if not hasattr(self._plan, "enable_compute_replay"):
+                raise RuntimeError("Installed wheel lacks compute replay; rebuild this branch (omit --skip-build)")
+            self._plan.enable_compute_replay()
+
     @property
     def workspace_bytes(self) -> int:
         """Prepared local scratch only; excludes symmetric heap, inputs and weights."""

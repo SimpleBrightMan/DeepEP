@@ -152,7 +152,9 @@ def main(argv=None):
 from importlib.resources import files
 from deep_ep._native import require_native
 require_native("cluster preflight")
-import deep_ep_experimental.megamoe._C
+from deep_ep_experimental.megamoe import _C
+if not hasattr(_C.Plan, "enable_compute_replay"):
+    raise RuntimeError("Installed wheel lacks compute replay; rebuild this branch (omit --skip-build)")
 info = json.loads(files("deep_ep").joinpath("_build_info.json").read_text())
 with open(sys.argv[1], "w") as f:
     json.dump(dict(build=info, torch=torch.__version__, torch_npu=torch_npu.__version__,
@@ -256,6 +258,7 @@ with open(sys.argv[1], "w") as f:
                     "-m",
                     "deep_ep_experimental.megamoe.timer",
                     str(run_dir / f"bs_{bs}/bs_{bs}/timer"),
+                    "--compute-replay",
                     "--ranks",
                     "0-7",
                 ]

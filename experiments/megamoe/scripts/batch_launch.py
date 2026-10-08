@@ -80,6 +80,8 @@ def make_plan(args):
     if not config_path.is_file():
         config_path = root / "experiments/megamoe/python/deep_ep_experimental/megamoe/configs" / (args.config + ".json")
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    if args.mode != "perf" or config["model"]["num_shared_experts"] != 0:
+        raise ValueError("Compute-replay branch requires --mode perf and num_shared_experts=0; output is not valid MoE output")
     if args.bs_values is not None:
         config["bs_values"] = [int(value) for value in args.bs_values.split(",")]
     batches = config["bs_values"]
@@ -132,6 +134,7 @@ def make_plan(args):
         input=args.input,
         routing=args.routing,
         mode=args.mode,
+        measurement="compute_replay",
         timer=not args.no_timer,
         parse_timer=not args.no_timer and args.parse_timer is not False,
         wheel=wheel,
@@ -272,7 +275,7 @@ def summarize(run_dir, batches, world):
         mean = report["mean_us"]
         if (
             report.get("aggregation") != "mean_of_per_round_min_rank"
-            or report.get("metric") != "megamoe_kernel_duration_us"
+            or report.get("metric") != "megamoe_compute_replay_duration_us"
             or not math.isfinite(mean)
             or mean <= 0
             or len(report["per_rank_rounds_us"]) != world
@@ -296,7 +299,7 @@ def summarize(run_dir, batches, world):
         ):
             raise ValueError(f"Incomplete/invalid performance rounds: {path}")
         lines.append(
-            f"[PERF] EP={world} BS={bs} MegaMoe E2E={mean:.3f}us "
+            f"[PERF] EP={world} BS={bs} MegaMoe compute replay={mean:.3f}us "
             f"rank-max-mean={report['rank_max_mean_us']:.3f}us "
             f"rounds={rounds}/{recorded_rounds} (last ceil(iters/2)) "
             f"kernel-Duration rank-min-mean timer=off"

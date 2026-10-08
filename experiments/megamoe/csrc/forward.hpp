@@ -37,12 +37,16 @@ public:
         return workspace_.numel();
     }
 
+    void enable_compute_replay();
+
 private:
     PlatformInfo platform_;
     MegaMoeTilingData tiling_;
     torch::Tensor workspace_;
     torch::Tensor context_;
     uint64_t ffts_;
+    bool compute_replay_ = false;
+    torch::Tensor replay_counts_;
 };
 
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden);
