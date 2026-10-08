@@ -143,7 +143,7 @@ HOST_DEVICE int64_t CalcRailTopkIdsRecvSize(const MegaMoeTilingData* tilingData)
 HOST_DEVICE bool UseDecodeRailRouting(const MegaMoeTilingData* t)
 {
     return t->topoType == TOPO_TYPE_MTE &&
-           UseDecodeInputReady(t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4, t->bs) &&
+           UsesCountEpochInputReady(t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4, t->bs) &&
            (t->epWorldSize <= MEGA_MOE_SERVER_SIZE || t->epWorldSize % MEGA_MOE_SERVER_SIZE == 0) &&
            t->blockAivNum > CalcServerNum(t->epWorldSize);
 }

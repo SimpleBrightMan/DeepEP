@@ -23,6 +23,108 @@ python experiments/megamoe/scripts/batch_launch.py --ep-size 8 --bs-values 32,96
 公开入口：`deep_ep_experimental.megamoe`。W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度。
 构建和多机测试入口位于本目录的 `scripts/`；机器地址及环境配置由使用者提供。
 
+## 0. 先读主流程，再读计算实现
+
+`codex/megamoe-readable` 基于 `main@8ffafeb` 整理调度层，目标是看清执行角色和依赖，
+不替换 GEMM/SwiGLU/通信算法，不改公开接口、tiling ABI、workspace 布局、flag 值或 timer 口径。
+未混入本机 EP8 启动脚本的独立改动。风格参考
+[DeepGEMM-Ascend 的 MegaMoE](https://github.com/deepseek-ai/DeepGEMM-Ascend/blob/main/deep_gemm/include/deep_gemm/mega_moe.hpp)：
+按角色组织流水、显式保留调度游标，在同步和复用边界说明约束；没有复制其实现或改变当前后端。
+
+### 阅读顺序
+
+以下路径均相对本目录；在 VSCode 搜索表内函数名可直接定位。
+
+| 顺序 | 文件 / 函数 | 先回答的问题 |
+| --- | --- | --- |
+| 1 | [api.py](python/deep_ep_experimental/megamoe/api.py)：`SymmBuffer._prepare`、`_run` | 哪些资源长期持有，哪些工作每次 forward 执行？ |
+| 2 | [forward.cpp](csrc/forward.cpp)：`MakeTiling`、`Plan::Plan`、`Plan::forward` | H/I/BS 如何变成 tiling、workspace 和 kernel 参数？ |
+| 3 | [mega_moe.cpp](csrc/kernels/mega_moe/mega_moe.cpp)：`mega_moe_kernel_do` | 实际实例化了哪些模板？现役 W4 路径是非量化 Combine。 |
+| 4 | [mega_moe_arch35.hpp](csrc/kernels/mega_moe/mega_moe_arch35.hpp)：`ProcessWave` | 输入、专家计算、输出的公共阶段怎样连接？ |
+| 5 | [mega_moe_shared_policy.hpp](csrc/kernels/mega_moe/common/mega_moe_shared_policy.hpp)：`SelectInputPreparationMode` | 为什么选这个输入协议？不要把策略当成 ready flag。 |
+| 6 | [mega_moe_wave_a8w4.hpp](csrc/kernels/mega_moe/mega_moe_wave_a8w4.hpp)：`ProcessMoeExpertStages`、`ProcessGmmWaves`、`ProcessAiv1PriorityStages` | AIC/AIV0 与 AIV1 分别怎样推进？ |
+| 7 | [mega_moe_wave_schedule.hpp](csrc/kernels/mega_moe/common/mega_moe_wave_schedule.hpp)：`AdvanceExpertTokenPositionInWave` | 一个专家怎样切成 slice，再装入 Wave？ |
+| 8 | [mega_moe_gmm1_activation.hpp](csrc/kernels/mega_moe/stage/mega_moe_gmm1_activation.hpp)：`WaitForGmm1InputReady`、`RunGmm1A8W4` | Dispatch、Prologue、MMAD、SwiGLU 的数据依赖是什么？ |
+| 9 | [block_prologue_a8w4.hpp](csrc/kernels/mega_moe/catlass_gmm/block_prologue_a8w4.hpp) 与 [mega_moe_gmm2_combine.hpp](csrc/kernels/mega_moe/stage/mega_moe_gmm2_combine.hpp) | 如何用分块生产/消费和完成计数保护数据？ |
+
+### 公共入口与输入模式
+
+`ProcessWave` 按以下顺序组织调用（不同角色可以并行，不能把它当成全卡串行时间线）：
+
+```text
+ProcessInputPreparationStage → WaitForLocalInput
+→ 可选 ProcessSharedExpertGmm1 → ProcessInputRouteHandshake
+→ 派生类 ProcessMoeExpertStages → 可选 ProcessSharedExpertTail
+→ ProcessOutputStage
+```
+
+`inputMode_` 在 Init 时确定；原来的 `decodeInputReady_` 和 `routeAiv1Only` 不再保存为独立布尔值。
+BS 指本卡实际输入行数，而非某专家接收行数或 buffer 容量。
+
+| 输入模式 | 条件 | 路由与同步 |
+| --- | --- | --- |
+| `CountEpoch` | W4A8、BS≤256，不要求有共享专家 | 双 AIV 量化/打包后本卡同步，再发送路由；count/epoch 检查替代输入跨卡握手 |
+| `Aiv1RouteOverlap` | W4A8、BS>256、有共享专家 | 双 AIV 准备输入；公共屏障后 AIV1 做路由/握手，与 AIC/AIV0 共享 GMM1 重叠 |
+| `AllAivRankBarrier` | 其余路径 | 双 AIV 在输入准备中做路由，随后做输入跨卡握手 |
+
+`SharedExpertPolicy` 只负责共享 GEMM 的分块。`useSmallBatchTiles` 表示共享专家使用 N192/N224；
+与输入模式共用小 BS 条件，但不再夹带通信职责。Host 的路由分核与设备端使用同一个输入模式选择函数。
+
+### Wave 与三种角色
+
+M-group 是同一专家最多 256 行；尾片也占一个组，不与下一专家拼接。
+Slice 不跨专家，Wave 可包含多个 slice。`ExpertWaveRange` 将起点、终点和最后非空专家放在一起，
+用于当前或滞后一轮的 GMM2；它不表示计算已完成。
+
+- AIC：`ProcessGmmWaves` 中执行 GMM1/GMM2。
+- AIV0：与 AIC 同序执行权重 Prologue，以 L1 ready/free 事件协作。
+- 非量化 Combine 的 AIV1：进入 `ProcessAiv1PriorityStages` 后返回，不执行下面的计算侧 Wave 循环。
+  优先级保持为路由 SwiGLU、Dispatch、共享 SwiGLU、Combine；未就绪任务只探测，不阻塞整个调度器。
+  一次搬运不能被中途抢占，每完成一个 tile/slice 才重新检查优先级。
+- 量化 Combine 兼容路径：保留首 Wave 预取及下一 Wave Dispatch / 当前 Wave Activation 的原顺序，
+  不应把这段代码误当成当前非量化 AIV1 路径。
+
+BS<4096 时计算顺序为 `G1(W0), G2(W0), G1(W1), G2(W1)...`；BS≥4096 时为
+`G1(W0), G1(W1), G2(W0), G1(W2), G2(W1)...`，末尾补齐最后一个 GMM2。
+GMM1/GMM2 各自保留跨专家分核游标，GMM2 物理分核方向反转。AIV1 的进度不由这些调用顺序代替。
+
+### 最重要的数据依赖
+
+| 生产者 → 消费者 | 数据 / 就绪条件 |
+| --- | --- |
+| 量化/打包 → 对端 Dispatch | 本地 token/scale 完成后才发布 count；接收方验证本轮 epoch |
+| Dispatch → GMM1 | `flagDispatchToGmm1Ptr`：本 M-group 已落地的实际行数 |
+| AIV0 Prologue → AIC | `AIV_SYNC_AIC_FLAG` 发布 L1 B ready；`AIC_SYNC_AIV_FLAG` 允许复用槽位 |
+| GMM1 → routed SwiGLU | 现役非 Prefetch 路径用 `flagGmmToEpiloguePtr` 的逐核完成序号 |
+| routed SwiGLU → GMM2 | `flagActivationToGmm2Ptr`：对应输入行块的激活完成计数 |
+| GMM2 → Combine | 对应 expert/slice 的完成计数，必须覆盖实际生产者 |
+| 共享 GMM1 → 共享激活 → 共享 GMM2 | 独立的 `flagSharedGmm1DonePtr` / `flagSharedActivationDonePtr`，不借用 routed 序号 |
+| Combine → Unpermute | 保留输出跨卡握手，确保源卡读取前远端结果已返回 |
+
+Prologue 转换的是权重，不是 Dispatch 输入；AIC 同时需要两者就绪。
+Prologue 按 K 块将 FP4 转为 FP8 并送入 L1，不必等整个专家的全部权重转换完才启动 MMAD。
+不要删除看似重复的 drain/barrier：Dispatch、SwiGLU、Combine 会顺序复用 UB，flag 发布必须晚于数据写完。
+
+### 重构验证边界
+
+CPU 测试直接编译生产代码中的策略和 Wave 辅助函数，比较旧版推进公式，覆盖空专家、255/256/257 尾片、
+跨专家/跨 Wave、大于 32 位的 GM 行号和 2000 组确定性随机分布。
+另一个测试提取当前 `ProcessWave` 及三个阶段函数的实际 C++ 函数体，使用记录型底层桩执行，
+核对 108 种角色/BS/共享专家组合的阶段及屏障调用顺序：
+
+```bash
+python -m pytest experiments/megamoe/tests/test_device_schedule.py -q
+```
+
+需要 C++17 编译器；可用 `CXX` 指定，没有编译器时测试会明确 skip。
+这不是 NPU 仿真，不能验证 DMA 可见性、死锁或性能。设备验收请在原版与重构版分别重新构建，
+保持同输入、路由、计时方式，至少检查：
+
+- W4A8、共享专家 0/1，BS=96/255/256/257/4095/4096；EP8 后再扩到 EP64。
+- balanced/random/skewed 的精度与专家计数，重复调用及 `256→257→256` 的 epoch/模式切换。
+- timer 关闭的性能、独立采集的阶段顺序和等待；不以 CPU 测试通过声称性能不变。
+- A8W8 公共阶段兼容性；公开 benchmark 固定 W4A8，A8W8 需独立设备用例。
+
 ## 1. 输入、输出与公开接口
 
 定义：`B` 为每卡 token 数，`H` 为隐藏维度，`I` 为 SwiGLU 后宽度，`K` 为 top-k，

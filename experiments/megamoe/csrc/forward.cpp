@@ -161,9 +161,10 @@ void SetSendMaskConfigs(MegaMoeTilingData& t, uint32_t ub)
     const uint32_t reset_bytes = AlignUp(reset_count, uint32_t{MegaMoeImpl::INT32_PER_256B}) * 4U;
     const uint32_t quant_out = AlignUp(t.h, 256U) + AlignUp(CeilDiv(t.h, 32U), 32U);
     const uint32_t quant_in = AlignUp(t.h, 128U) * 2U;
-    const auto sharedPolicy = MegaMoeImpl::SelectSharedExpertPolicy(
+    const auto inputMode = MegaMoeImpl::SelectInputPreparationMode(
         t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4, t.sharedExpertNum, t.bs);
-    const uint32_t route_cores = sharedPolicy.routeAiv1Only ? t.aicNum : t.blockAivNum;
+    const uint32_t route_cores = inputMode == MegaMoeImpl::InputPreparationMode::Aiv1RouteOverlap ?
+                                    t.aicNum : t.blockAivNum;
     const uint32_t max_experts = MegaMoeImpl::CalcSendMaskExpertCapacity(&t, route_cores);
     const uint32_t accumulator = AlignUp(max_experts * 4U, 32U);
     const uint32_t fixed = reset_bytes + 2048U + 2U * quant_out + 2U * quant_in + accumulator;

@@ -308,7 +308,7 @@ public:
     {
         Pipeline::UpdateProblem(config, addr, addr.gmm1OutGlobal);
         fused_ = ProblemConfig::FUSED_GATE_UP;
-        planarSingle_ = config.sharedPolicy.decode;
+        planarSingle_ = config.sharedPolicy.useSmallBatchTiles;
         halfN_ = config.outputN;
     }
     __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols)

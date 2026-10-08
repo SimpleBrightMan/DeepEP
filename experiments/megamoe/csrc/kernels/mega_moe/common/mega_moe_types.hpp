@@ -17,6 +17,7 @@
 #include "../mega_moe_tiling.hpp"
 #include "mega_moe_constants.hpp"
 #include "mega_moe_workspace.hpp"
+#include "mega_moe_wave_schedule.hpp"
 #if defined(ENABLE_MEGA_MOE_LAYERED_KERNEL)
 #include "adv_api/hcomm/hcomm.h"
 #endif
@@ -44,20 +45,6 @@ struct GmmRuntimeState {
     uint32_t& startBlockIdx;
     int32_t& vecSetSyncCom;
     uint16_t& pingpongIdx;
-};
-
-// 标识 MoE 专家序列中的二维 token 位置。
-struct ExpertTokenPosition {
-    uint32_t expertIdx = 0U;
-    uint32_t tokenIndexInExpert = 0U;
-    // 从全部本卡 MoE 专家起点累计的全局连续 row，避免末波 Combine 重新标量扫描 count 表。
-    uint64_t globalTokenIndex = 0U;
-};
-
-// 标识 MoE 专家紧凑 token 序列中的左闭右开区间 [begin, end)。
-struct ExpertTokenRange {
-    ExpertTokenPosition begin{};
-    ExpertTokenPosition end{};
 };
 
 using Mc2MoeContext = Mc2Aclnn::Mc2MoeContext;

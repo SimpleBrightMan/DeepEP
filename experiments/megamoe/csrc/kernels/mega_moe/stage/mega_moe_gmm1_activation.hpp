@@ -31,7 +31,8 @@ using namespace AscendC;
 constexpr uint32_t MAX_SINGLE_MN_ALIGN32_NUM_256 = 256U * 256U;
 constexpr uint32_t MAX_SINGLE_MN_ALIGN32_NUM_128 = 128U * 256U;
 
-// 等待当前 GMM1 tile 对应的 Dispatch 输入就绪。
+// AIC 等本 M-group 的实际行数全部落地；这不是外层调度 Wave 的全体屏障。
+// 同一 M-group 的各 N tile 共享输入 ready；尾块按实际行数等待。共享专家输入另有准备屏障。
 template <bool IsShared, typename Config>
 __aicore__ inline void WaitForGmm1InputReady(const GMMAddrInfo& gmmAddrInfo, const Config& config, uint32_t mLoc)
 {
@@ -42,9 +43,9 @@ __aicore__ inline void WaitForGmm1InputReady(const GMMAddrInfo& gmmAddrInfo, con
     if (gmmAddrInfo.dispatchToGmm1Flag == nullptr) {
         return;
     }
-    uint32_t waveIdx = mLoc / config.tileM;
+    uint32_t mGroupIdx = mLoc / config.tileM;
     uint32_t targetValue = (mLoc + config.tileM > config.m) ? (config.m - mLoc) : config.tileM;
-    uint64_t flagOffset = static_cast<uint64_t>(waveIdx) * INT_CACHELINE;
+    uint64_t flagOffset = static_cast<uint64_t>(mGroupIdx) * INT_CACHELINE;
     __gm__ int32_t* flagValueAddr = gmmAddrInfo.dispatchToGmm1Flag + flagOffset;
     AscendTimerWaitScope wait(gmmAddrInfo.timer, AscendTimer::AIC_GMM1_WAIT);
     WaitUntilGmFlagEquals(flagValueAddr, static_cast<int32_t>(targetValue));
@@ -565,6 +566,8 @@ __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQua
 }
 
 // AIV0 按同一投影顺序展开权重：routed 单次融合，shared 使用 planar 调度。
+// AIV0 按与 AIC 相同的 tile 顺序生产权重；Dequantize 内部逐 K 块转换 FP4→FP8 并写 L1。
+// L1 ready/free 跨核事件约束生产与复用，不要求整个专家的权重先全部转换完成。
 template <typename BlockPrologue, typename Scheduler, typename Config>
 __aicore__ inline void Gmm1Aiv0PrologueA8W4(BlockPrologue& blockPrologue, Scheduler& scheduler, const Config& config,
                                             uint32_t startLoopIdx, uint32_t tileNum)

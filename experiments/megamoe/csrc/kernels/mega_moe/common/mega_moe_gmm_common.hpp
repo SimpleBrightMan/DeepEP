@@ -166,7 +166,7 @@ struct Config {
         config.outputN = config.n / ACTIVATION_N_HALF;
         config.tileM = gmm1TileM;
         FinalizeProblemConfig(config, blockJob, gmm1TileM);
-        config.schedulerN = (IsGmm1Interleaved || config.sharedPolicy.decode) ? config.n : config.outputN;
+        config.schedulerN = (IsGmm1Interleaved || config.sharedPolicy.useSmallBatchTiles) ? config.n : config.outputN;
         // Fused routed tasks are logical N128 with physical N256 MMAD/prologue.
         config.tileN = FuseGateUp ? GMM1_FUSED_TILE_N : config.sharedPolicy.gmm1TileN;
         config.blockMmadTiling.tileN = FuseGateUp ? L1_TILE_N : config.tileN;
