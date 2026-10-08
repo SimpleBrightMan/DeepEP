@@ -104,11 +104,16 @@ int main(int argc, char** argv)
     setenv("DEEPEP_SHMEM_DENSE_QPS", "1", 1);
     const std::string mode = argv[1];
     auto create = []() { return deepep::Session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30); };
-    if (mode == "low-latency") {
-        expected_world = 16;
-        expected_bytes = 8ULL << 30;
-        deepep::Session session(0, 16, expected_bytes, "tcp://xxx.xxx.xxx.xxx:xxxxx", 30, true);
-        assert(session.capacity() == expected_bytes && session.workspace() == &storage && memsets == 1);
+    if (mode == "low-latency" || mode.rfind("ll-rank-bias-", 0) == 0) {
+        expected_world = mode == "low-latency" ? 16 : std::stoi(mode.substr(13));
+        const uint64_t logical_bytes = 8ULL << 30;
+        expected_bytes = logical_bytes + (2ULL << 20);
+        // Exercise the highest rank, full guard allocation, original-pointer
+        // ownership and logical capacity independently of the EP size.
+        deepep::Session session(expected_world - 1, expected_world, logical_bytes,
+                               "tcp://xxx.xxx.xxx.xxx:xxxxx", 30, true);
+        assert(session.capacity() == logical_bytes && session.workspace() == &storage && memsets == 1);
+        assert(uint64_t(expected_world - 1) * 1024U < expected_bytes - logical_bytes);
         session.close();
         assert(frees == 1 && finalized == 1 && !deepep::Session::busy());
     } else if (mode == "ep16-small-workspace") {

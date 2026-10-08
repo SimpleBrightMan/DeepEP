@@ -5,23 +5,11 @@
 #define COMBINE_DEDUP_EP_SERVER_DEDUP_SELECT_H
 
 #include "kernel_operator.h"
+#include "../../common/ep_server_order.h"
 
 namespace CombineDedup {
-// Preconditions: servers > 0, ownServer < servers, ordinal < servers.
-// Rotate within our half first, then the other half using its own length.
-// This mapping is independent of ownership and pipeline cursors.
-__aicore__ inline uint32_t ServerDedupHalfOrder(uint32_t servers, uint32_t ownServer, uint32_t ordinal)
-{
-    const uint32_t split = servers / 2U;
-    const bool lower = ownServer < split;
-    const uint32_t ownBase = lower ? 0U : split;
-    const uint32_t ownLength = lower ? split : servers - split;
-    const uint32_t relative = ownServer - ownBase;
-    if (ordinal < ownLength) return ownBase + (relative + ordinal + 1U) % ownLength;
-    const uint32_t otherBase = lower ? split : 0U;
-    const uint32_t otherLength = servers - ownLength;
-    return otherBase + (relative + ordinal - ownLength + 1U) % otherLength;
-}
+// Dispatch and Combine share the same large-world half ordering.
+using EpServerOrder::ServerDedupHalfOrder;
 
 // Table2 carries source ranks. Two comparisons select one eight-rank server
 // without scalar division or a per-candidate GetValue loop.

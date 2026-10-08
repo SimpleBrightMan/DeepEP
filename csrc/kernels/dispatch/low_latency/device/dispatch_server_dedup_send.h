@@ -8,6 +8,7 @@
 #include "dispatch_dedup_mxfp8_quant.h"
 #include "../common/ep_memory_server_dedup_data_layout.h"
 #include "../common/ep_memory_server_dedup_protocol.h"
+#include "../../../common/ep_server_order.h"
 
 namespace DispatchDedup {
 using namespace AscendC;
@@ -93,7 +94,9 @@ public:
         Allocate(weightOutBuf_, uint32_t(DispatchDedupAlign(uint64_t(count_) * k_ * 4U, 32U)));
         Allocate(maskBuf_, uint32_t(DispatchDedupAlign(uint64_t(count_) * 4U, 32U)));
         Allocate(directBuf_, uint32_t(DispatchDedupAlign(uint64_t(count_) * k_ * 16U, 32U)));
-        Allocate(serverBuf_, 64U);
+        // One uint32 state per server, including EP256's 32 servers.
+        const uint32_t serverBytes = uint32_t(DispatchDedupAlign(uint64_t(args_->rankSize / 8U) * 4U, 32U));
+        Allocate(serverBuf_, serverBytes < 64U ? 64U : serverBytes);
         const uint32_t remoteServers = args_->rankSize / 8U - 1U;
         const uint32_t maxGroups = remoteServers < k_ / 2U ? remoteServers : k_ / 2U;
         if (maxGroups != 0U) Allocate(firstHopBuf_, uint32_t(DispatchDedupAlign(maxGroups * 4U, 32U)));
@@ -183,7 +186,7 @@ public:
                 }
         }
 
-        // 5. 第二遍从本 server 起循环访问所有 server，稳定扫描缓存的 DIRECT 任务。
+        // 5. 第二遍按目标 server 稳定扫描 DIRECT：128P+ 半区交替，小规模保留全环顺序。
         // 首跳和 DIRECT 共用 packets_ 序号及 lane 环；阶段之间不额外等待全部包发完。
 
         // Stable per-server scans retain the original q and token/k order.
@@ -191,8 +194,9 @@ public:
         // across first hops and server boundaries without an added drain.
         const uint32_t serverNum = args_->rankSize / 8U;
         const uint32_t expertsPerServer = localExperts_ * 8U;
-        uint32_t server = args_->rank / 8U;
+        const uint32_t ownServer = args_->rank / 8U;
         for (uint32_t step = 0; step < serverNum; ++step) {
+            const uint32_t server = EpServerOrder::ServerDedupDispatchDirectOrder(serverNum, ownServer, step);
             const uint32_t firstExpert = server * expertsPerServer;
             for (uint32_t task = 0; task < directCount_; ++task) {
                 const uint32_t expert = directTasks_.GetValue(task * 4U + 2U);
@@ -204,7 +208,6 @@ public:
                 sourceMasks_.SetValue(token, sourceMasks_.GetValue(token) | (uint32_t(1) << k));
                 sourceWeights_.SetValue(token * k_ + k, routeWeights_.GetValue(token * k_ + k));
             }
-            if (++server == serverNum) server = 0U;
         }
     }
     // 摘要：非去重发送流程：直接在原始展平路由上做连续核区间切分，每核只发自己的路由。

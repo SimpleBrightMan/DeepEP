@@ -215,7 +215,7 @@ class Runtime:
                 )
             )
             _OWNER = self
-            if capacity == 8 << 30 and 16 <= size <= 128:
+            if capacity == 8 << 30 and 16 <= size <= 256:
                 # LL peers must finish initialization before any payload writes.
                 self.native.barrier()
 

@@ -72,7 +72,9 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     aclshmemx_uniqueid_t uid{};
     attr.my_pe = rank;
     attr.n_pes = size;
-    attr.local_mem_size = bytes;
+    const uint64_t allocation_bytes = bytes +
+        ((bytes == (8ULL << 30)) ? (2ULL << 20) : 0ULL);
+    attr.local_mem_size = allocation_bytes;
     if (!mpi) {
         std::memcpy(attr.ip_port, endpoint.c_str(), endpoint.size() + 1);
     }
@@ -119,11 +121,11 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     try {
         // Peer-table aggregate packets require physical 512B boundaries, not
         // merely 512B-relative offsets within a possibly 16B-aligned allocation.
-        workspace_ = udma ? aclshmem_align(512U, bytes) : aclshmem_malloc(bytes);
+        workspace_ = udma ? aclshmem_align(512U, allocation_bytes) : aclshmem_malloc(allocation_bytes);
         if (workspace_ == nullptr) {
             throw std::runtime_error("aclshmem_malloc failed");
         }
-        check(aclrtMemset(workspace_, bytes, 0, bytes), "aclrtMemset");
+        check(aclrtMemset(workspace_, allocation_bytes, 0, allocation_bytes), "aclrtMemset");
         bytes_ = bytes;
         rank_ = rank;
         world_ = size;

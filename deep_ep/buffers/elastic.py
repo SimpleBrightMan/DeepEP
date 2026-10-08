@@ -350,7 +350,7 @@ class ElasticBuffer:
         if (
             type(capacity) is not int
             or not b <= capacity <= 256
-            or runtime.world_size not in (16, 32, 64, 128)
+            or runtime.world_size not in (16, 32, 64, 128, 256)
             or topk_weights is None
         ):
             return None

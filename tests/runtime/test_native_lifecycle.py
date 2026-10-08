@@ -55,6 +55,11 @@ def lifecycle_binary(tmp_path_factory):
         "udma",
         "megamoe",
         "low-latency",
+        "ll-rank-bias-16",
+        "ll-rank-bias-32",
+        "ll-rank-bias-64",
+        "ll-rank-bias-128",
+        "ll-rank-bias-256",
         "ep16-small-workspace",
     ],
 )

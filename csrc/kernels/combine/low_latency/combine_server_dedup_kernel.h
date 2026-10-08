@@ -316,7 +316,7 @@ private:
         }
         PipeBarrier<PIPE_V>();
         for (uint32_t step = 1U; step <= servers; ++step) {
-            const uint32_t count = SelectDirectServer(ServerDedupHalfOrder(servers, ownServer, step - 1U));
+            const uint32_t count = SelectDirectServer(ServerDedupHalfOrder(servers, ownServer, step - 1U, enableDedup_));
             const uint32_t first = ServerDedupFirstOwned(core_, owner, kEpServerDedupCombineSendCoreNum);
             owner = (owner + count) % kEpServerDedupCombineSendCoreNum;
             for (uint32_t task = first; task < count; task += kEpServerDedupCombineSendCoreNum) {

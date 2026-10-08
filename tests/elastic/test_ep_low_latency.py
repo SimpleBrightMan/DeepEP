@@ -83,7 +83,7 @@ def make_parser():
     parser.add_argument("--config", help="JSON settings and Cartesian matrix")
     parser.add_argument("--plan", action="store_true", help="Print the case matrix without importing Torch")
     parser.add_argument("--output-dir", default="benchmark-runs", help="Parent for a unique run directory and traces")
-    parser.add_argument("--perf-tail", type=int, default=0, help="Statistics use last N samples; 0 uses all")
+    parser.add_argument("--perf-tail", type=int, default=30, help="Statistics use last N samples; default: min(30, num_iters); 0 uses all")
     parser.add_argument("--num-processes", type=int, default=8, help="Local spawned processes, as in DeepEP")
     parser.add_argument("--num-nodes", type=int, default=1)
     parser.add_argument("--node-rank", type=int, default=0)
@@ -134,10 +134,11 @@ def make_parser():
     parser.add_argument("--test-first-only", action="store_true")
     parser.add_argument("--delay-rows", type=int, default=118260)
     parser.add_argument("--delay-cols", type=int, default=30720)
-    parser.add_argument("--delay-exp-before", type=int, default=None, help="Default: max(num_iters // 2, 20)")
-    parser.add_argument("--delay-exp-after", type=int, default=None, help="Default: max(num_iters // 2, 20)")
+    parser.add_argument("--delay-exp-before", type=int, default=None, help="Pre-kernel exp padding; default: disabled (0)")
+    parser.add_argument("--delay-exp-after", type=int, default=None, help="Exp padding after the first kernel; default: 1000")
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--num-iters", type=int, default=20)
+    parser.add_argument("--num-iters", type=int, default=50)
+    parser.add_argument("--dispatch-only", action="store_true")
     parser.add_argument("--repeat-combine", type=int, default=2)
     parser.add_argument("--output", help="New rank-0 JSON result file (will not overwrite)")
     return parser
@@ -307,6 +308,9 @@ def parse_args(argv=None):
                     ]
                 )
     args = make_parser().parse_args(configured + argv)
+    tail_explicit = any(option == "--perf-tail" or option.startswith("--perf-tail=") for option in configured + argv)
+    if not tail_explicit:
+        args.perf_tail = min(args.perf_tail, args.num_iters)
     resolve_delay_counts(args)
     if args.shmem_port is not None:
         if not 0 < args.shmem_port < 65536:
@@ -337,8 +341,7 @@ def launch_config(args, environ):
 
 
 def resolve_delay_counts(args):
-    default = max(args.num_iters // 2, 20)
-    for name in ("delay_exp_before", "delay_exp_after"):
+    for name, default in (("delay_exp_before", 0), ("delay_exp_after", 1000)):
         if getattr(args, name) is None:
             setattr(args, name, default)
 
@@ -356,8 +359,8 @@ def validate_args(args, world):
         return max(capacities)
     if args.num_bytes != 8 << 30:
         raise ValueError("LL ST requires --num-bytes 8589934592 (exactly 8 GiB)")
-    if world not in (16, 32, 64, 128):
-        raise ValueError("LL ST requires EP16/32/64/128; EP8 would exercise HT, not LL")
+    if world not in (16, 32, 64, 128, 256):
+        raise ValueError("LL ST requires EP16/32/64/128/256; EP8 would exercise HT, not LL")
     m = args.num_tokens if args.num_max_tokens_per_rank is None else args.num_max_tokens_per_rank
     if not 0 < args.num_tokens <= m <= 256:
         raise ValueError("LL ST requires 0 < actual B <= M <= 256")
@@ -649,24 +652,28 @@ def measure(invoke, args, operation, profile_dir, progress=None):
         delay = torch.zeros(args.delay_rows, args.delay_cols, dtype=torch.float32, device="npu")
         for _ in range(args.delay_exp_before):
             torch.exp(delay, out=delay)
-        output = None
-        for iteration in range(args.num_iters):
+        # Capture the first call before exp padding, then align ranks once.
+        with torch.profiler.record_function(f"deepep_ll_{operation}"):
+            if operation == "combine" and args.group_backend == "gloo":
+                completion_boundary(args)
+            output = trace_call(args, f"{operation}.invoke", invoke)
+        for _ in range(args.delay_exp_after):
+            torch.exp(delay, out=delay)
+        trace_call(
+            args,
+            f"{operation}.alignment.after_exp",
+            dist.all_reduce,
+            alignment,
+            op=dist.ReduceOp.SUM,
+            async_op=False,
+        )
+        # Remaining captured calls have no per-iteration all_reduce.
+        for iteration in range(1, args.num_iters):
             with torch.profiler.record_function(f"deepep_ll_{operation}"):
                 if operation == "combine" and args.group_backend == "gloo":
                     # CPU collectives cannot order completion of prior NPU combine calls.
                     completion_boundary(args)
-                trace_call(
-                    args,
-                    f"{operation}.alignment.iteration.{iteration}",
-                    dist.all_reduce,
-                    alignment,
-                    op=dist.ReduceOp.SUM,
-                    async_op=False,
-                )
                 output = trace_call(args, f"{operation}.invoke", invoke)
-            if iteration == 0:
-                for _ in range(args.delay_exp_after):
-                    torch.exp(delay, out=delay)
         # Finish device work once before exporting; no per-iteration NPU sync/event wait.
         trace_call(args, "device.synchronize", torch.npu.synchronize)
         del output, delay, alignment
@@ -722,6 +729,19 @@ def run_case(buffer, args, rank, world, m, mode):
             num_qps=args.num_qps,
         )
 
+    import hashlib
+    mapped = {line.split()[-1] for line in Path("/proc/self/maps").read_text().splitlines() if len(line.split()) >= 6}
+    classes = [
+        [p for p in mapped if "/deep_ep/_C." in p and p.endswith(".so")],
+        [p for p in mapped if p.endswith("/libdeepep_kernels.so")],
+        [p for p in mapped if p.endswith("/libshmem.so")],
+        [p for p in mapped if p.endswith("/aclshmem_bootstrap_config_store.so")],
+    ]
+    if not all(len(paths) == 1 for paths in classes):
+        raise AssertionError(f"Cannot audit native/SDK mappings: {classes}")
+    libraries = {paths[0]: hashlib.sha256(Path(paths[0]).read_bytes()).hexdigest() for paths in classes}
+    live = {"pid": os.getpid(), "session": os.getsid(0), "rank": rank, "libraries": libraries}
+    (Path(args.run_directory) / f"loaded_rank_{rank:03d}.json").write_text(json.dumps(live))
     progress("dispatch.check")
     completion_boundary(args)
     recv, recv_idx, recv_weights, handle, event = trace_call(args, "dispatch.invoke", dispatch)
@@ -737,6 +757,19 @@ def run_case(buffer, args, rank, world, m, mode):
     agree_check(check_backend, args, rank)  # Never allow --skip-check to hide an HT fallback.
     if not args.skip_check:
         agree_check(lambda: verify_dispatch(recv, handle, entries, args, world, m), args, rank)
+    if args.dispatch_only:
+        result = {"case_id": args.case_id, "route": mode,
+                  "correctness": "skipped" if args.skip_check else "passed",
+                  "backend": "ll", "config": case_config(args, m),
+                  "tested_operations": ["dispatch"]}
+        if not args.skip_perf_test:
+            profile = Path(args.run_directory) / f"case_{args.case_id:05d}" / mode
+            result["dispatch"] = measure(dispatch, args, "dispatch", profile / "dispatch" / f"rank_{rank:03d}", progress)
+        if rank == 0:
+            print(json.dumps(result, ensure_ascii=False), flush=True)
+        completion_boundary(args)
+        progress("complete")
+        return result
     expert_output = prepare_experts(recv, counts, rank, args.num_experts, world, expert_dtype)
     expected = (
         expected_combine(

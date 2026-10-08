@@ -21,6 +21,17 @@ namespace py = pybind11;
 namespace deepep {
 namespace {
 using Shape = std::vector<int64_t>;
+constexpr uint64_t kRankBaseBiasBytes = 1024U;
+uint8_t* peer_buffer_base(Session& session, int peer)
+{
+    if (peer < 0 || peer >= session.world()) throw std::invalid_argument("Invalid LL peer");
+    auto* original = static_cast<uint8_t*>(aclshmem_ptr(session.workspace(), peer));
+    if (original == nullptr) throw std::invalid_argument("Invalid LL peer mapping");
+    if (session.capacity() != (8ULL << 30)) return original;
+    // Translate the original symmetric pointer before applying the destination-rank
+    // bias. The shared peer table keeps local receive and remote send views equal.
+    return original + uint64_t(peer) * kRankBaseBiasBytes;
+}
 uint8_t* tensor(py::handle value, const Shape& shape, const char* dtype)
 {
     auto torch = py::module_::import("torch");
@@ -78,7 +89,7 @@ void bind_low_latency(py::module_& module)
     });
     module.def("low_latency_comm_args", [](Session& session) {
         if (session.combine_only()) throw std::invalid_argument("LL requires a dense-channel Session");
-        if (session.capacity() != DispatchDedup::kEpServerDedupPeerBytes || session.world() > 128) {
+        if (session.capacity() != DispatchDedup::kEpServerDedupPeerBytes || session.world() > DispatchDedup::DISPATCH_DEDUP_MAX_RANK_SIZE) {
             throw std::invalid_argument("LL requires exactly 8 GiB of symmetric workspace");
         }
         DispatchDedup::CommArgs args{};
@@ -89,7 +100,7 @@ void bind_low_latency(py::module_& module)
         args.peerMemBytes = session.capacity();
         args.fftsVal = shmemx_get_ffts_config();
         for (int peer = 0; peer < session.world(); ++peer) {
-            args.peerMems[peer] = static_cast<uint8_t*>(aclshmem_ptr(session.workspace(), peer));
+            args.peerMems[peer] = peer_buffer_base(session, peer);
             if (args.peerMems[peer] == nullptr || reinterpret_cast<uintptr_t>(args.peerMems[peer]) % 32) {
                 throw std::invalid_argument("LL requires aligned MTE mappings for every peer");
             }

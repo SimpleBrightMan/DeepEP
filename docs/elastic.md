@@ -132,6 +132,13 @@ buffer = ElasticBuffer(
 
 需要精确接收行数 `[R,H]` 时，将上例的 `group=None` 和 `rank/world_size` 改为 `group=ep_group`，并在 dispatch 时使用 `do_cpu_sync=None/True`。`ep_group` 是已初始化的 Gloo/HCCL EP 进程组，由它确定 rank 顺序与规模；两种身份配置不能同时传入。该组负责计数协调，payload 仍由 SHMEM 和 LL kernel 传输。使用结束后，各 rank 集体调用 `buffer.destroy()`。
 
+### 去重 DIRECT 的发送顺序
+
+去重路径先按原 Token 分类顺序发送第一跳，再发送缓存的 DIRECT 包。小于 EP128 时，DIRECT 从本 server 起按全环轮转；EP128 及以上复用 Combine 的半区交替映射，各半区从本 server 的下一相对位置起轮转。EP128 的 server0 顺序为 `1,9,2,10,3,11,4,12,5,13,6,14,7,15,0,8`。
+
+空目标跳过，同一目标 server 内保持 Token/k 顺序和原始 q。第一跳、DIRECT 及 server 切换共用连续的 packet/lane 序号，不增加同步或 MTE 排空。非去重路径仍按原始展平路由分核，不采用这项重排。
+
+
 ### 返回与有效区域
 
 dispatch 返回 `(recv_x, None, None, handle, event)`，权重由 handle 保留，不作为第三项输出。接收行数取决于同步选项：

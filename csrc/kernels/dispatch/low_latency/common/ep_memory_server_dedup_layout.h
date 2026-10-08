@@ -189,11 +189,12 @@ inline bool DispatchDedupPacketUbFits(const EpMemoryServerDedupLayout& layout, i
                             align(b * k * 4, 256) + 2 * scratchBytes + qBytes + 2 * align(tokens * k * 4, 32) +
                             align(tokens * 4, 32) + align(tokens * k * 16, 32) + 64 + align(groups * 4, 32) +
                             layout.data.tokenStride;
+    const uint64_t serverStateExtra = std::max<uint64_t>(64U, align(world_size / 8U * 4U, 32U)) - 64U;
     const uint64_t receiver = align(num_experts * 4, 32) + 2 * align(((layout.capacityRows + 31) / 32) * 4, 32) +
                               16 * layout.data.blockCount * 32 + 256 +
                               16 * align((layout.data.blockCount + 7) / 8, 32) * 4 + 256 + 16 * 36 +
                               layout.data.tokenStride + 64;
-    return layout.data.blockCount > 0 && layout.data.blockCount <= UINT8_MAX && sender <= kEpServerDedupCountUbBytes &&
+    return layout.data.blockCount > 0 && layout.data.blockCount <= UINT8_MAX && sender + serverStateExtra <= kEpServerDedupCountUbBytes &&
            receiver <= kEpServerDedupCountUbBytes;
 }
 }  // namespace DispatchDedup
