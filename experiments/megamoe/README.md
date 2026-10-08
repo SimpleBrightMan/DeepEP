@@ -134,7 +134,39 @@ python -m pip show ascend-deepep
 wheel 位于 `dist/build-*/`；运行前按构建输出设置 SHMEM 的 `LD_LIBRARY_PATH`。
 基础包的 `pip wheel` 默认关闭 MegaMoE，详见[构建文档](../../docs/build.md)。
 
-## 3. 多机测试
+## 3. 单机与多机测试
+
+### 本机 EP8（一键性能与流水）
+
+在 Linux 八卡机器上激活匹配的 Torch/torch_npu 环境并加载 CANN，进入本仓库执行：
+
+```bash
+python experiments/megamoe/scripts/batch_launch.py --ep-size 8 --bs-values 96
+```
+
+默认使用 `deepseek_v4_pro`、FP8 输入/FP4 权重、balanced 路由、性能模式，
+自动构建安装、运行并保存/解析 rank0～7 的 timer；无需 hosts 文件、SSH 或
+`CONDA_BASE/CONDA_ENV/ASCEND_ENV`，直接继承当前 Python/CANN 环境。
+需要预加载 Conda libstdc++ 的机器可在命令前加
+`LD_PRELOAD="$CONDA_PREFIX/lib/libstdc++.so.6"`，该设置会传给执行阶段。
+入口自动配置仓内 SHMEM 库路径、通信端口，并从 `/tmp` 启动，避免源码遮蔽已安装包。
+需要八张可用 NPU；默认占用本机 29654/26733 端口，可分别用 `--master-port/--shmem-port` 更改。
+
+```bash
+# 只预览，不编译、不运行。
+python experiments/megamoe/scripts/batch_launch.py --ep-size 8 --bs-values 96 --plan
+# 已构建过：复用与已安装包身份匹配的唯一仓内 wheel，仍校验并安装。
+python experiments/megamoe/scripts/batch_launch.py --ep-size 8 --bs-values 96 --skip-build
+# 精度：自动先准备 CPU Golden。
+python experiments/megamoe/scripts/batch_launch.py --ep-size 8 --bs-values 96 --mode accuracy
+```
+
+不指定 `--bs-values` 时使用配置的 96、4096；EP8 的 384 个路由专家为每卡48个，
+建议先跑 BS96 确认内存容量。单机复用下面的结果格式：
+`benchmark-runs/ep8_*/bs_96/bs_96/timer/` 下保存原始 bin、流水 JSON 和耗时报告，
+性能采样关闭 timer，流水另行采集。默认流水隐藏 WAIT；需要查看时可按下方离线命令追加
+`--include-wait` 重新解析。`--no-timer`、`--no-parse-timer` 和共享专家配置也适用于 EP8。
+执行前保持已跟踪源码干净；更新算子或包内 Python 后不要用 `--skip-build` 复用旧包。
 
 ### 配置与启动
 
@@ -178,7 +210,7 @@ python experiments/megamoe/scripts/batch_launch.py --hosts-file "$HOSTS_FILE" --
 | `--routing balanced\|random\|skewed` | 默认 balanced；random/skewed 用于精度压力测试 |
 | `--no-timer` | 关闭打点和解析；默认自动保存、解析主节点 rank0～7 |
 | `--no-parse-timer` | 跳过自动流水解析，保留原始 timer 和耗时拆分 |
-| `--ep-size 32\|64\|128` | 默认64；分别为4/8/16台八卡机器 |
+| `--ep-size 8\|32\|64\|128` | 默认64；8为本机，其余分别为4/8/16台八卡机器 |
 | `--hosts-file 路径 / --master-ip IP` | 必填机器列表 JSON / 覆盖列表内的主节点 |
 | `--master-port / --shmem-port` | 默认29654 / 26733，必须不同且未占用 |
 | `--skip-build / --wheel 路径` | 复用已安装身份匹配的唯一 wheel / 指定共享 wheel；不再编译，但仍向各机安装 |

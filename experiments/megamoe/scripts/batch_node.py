@@ -161,8 +161,11 @@ with open(sys.argv[1], "w") as f:
         run([sys.executable, "-I", "-c", code, str(target)])
         return read_json(target)
 
-    interfaces = json.loads(run(["ip", "-j", "-4", "addr", "show", "up"], capture=True))
-    interface = interface_for(plan["hosts"][rank], interfaces)
+    if plan.get("local", False):
+        interface = "lo"
+    else:
+        interfaces = json.loads(run(["ip", "-j", "-4", "addr", "show", "up"], capture=True))
+        interface = interface_for(plan["hosts"][rank], interfaces)
     os.environ.update(
         OMP_NUM_THREADS="1",
         PYTHONUNBUFFERED="1",
