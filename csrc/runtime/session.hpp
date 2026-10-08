@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #pragma once
 #include <acl/acl.h>
@@ -20,7 +19,7 @@ namespace deepep {
 class Session {
 public:
     Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma = false,
-            bool megamoe = false);
+            bool megamoe = false, bool mpi = false, bool combine_only = false);
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
     ~Session() = default;  // Never start collectives from Python GC/interpreter exit.
@@ -57,6 +56,14 @@ public:
     int world() const
     {
         return world_;
+    }
+    bool combine_only() const
+    {
+        return combine_only_;
+    }
+    bool sparse_qp_enabled() const
+    {
+        return sparse_qp_enabled_;
     }
     bool peer_table() const
     {
@@ -100,6 +107,8 @@ private:
     int rank_ = 0;
     int world_ = 0;
     bool udma_ = false;
+    bool combine_only_ = false;
+    bool sparse_qp_enabled_ = false;
     bool peer_table_ = false;
     uint64_t generation_ = 0;
     bool dispatch_controls_valid_ = false;

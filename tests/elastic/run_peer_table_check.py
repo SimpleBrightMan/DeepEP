@@ -1,5 +1,4 @@
 # Copyright (c) 2026, Lu Lu
-# Modified by huangxiaolan 2026
 
 """Installed-wheel BF16/FP8 peer-table correctness and public API timing."""
 
@@ -446,7 +445,7 @@ def worker(local_rank, args):
                     "cached_public_api_wall_ms": timings,
                     "timing_boundary": "Python dispatch through NPU synchronize, includes API validation and host synchronization; not kernel-only",
                     "payload_copy_mode": "none; direct framework GM input/output",
-                    "copy_timing_note": "input_copy/output_copy are legacy empty event intervals, not payload copies",
+                    "barrier_timing_note": "Entry and exit barriers are timed separately from the payload kernel",
                     "routing_device_ms": routing_samples,
                     "routing_time_columns": {
                         "notify_device_ms": ["kernel", "post_barrier", "count_copy", "total"],
@@ -454,7 +453,7 @@ def worker(local_rank, args):
                     },
                     "clean_device_ms": clean_device_ms,
                     "kernel_profiles": kernel_profiles,
-                    "device_time_columns": ["input_copy", "kernel", "output_copy", "device_total"],
+                    "device_time_columns": buffer._dispatch_diagnostics["device_phase_names"],
                     "profile_ticks_per_us": 1000,
                 },
                 indent=2,

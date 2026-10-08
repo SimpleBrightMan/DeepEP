@@ -1,10 +1,10 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 // Link-time SDK doubles test ownership decisions, never ABI/device support.
 #include "runtime/session.hpp"
 #include "host/init/shmem_host_init.h"
 #include <cassert>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -100,6 +100,8 @@ void aclshmem_barrier_all()
 int main(int argc, char** argv)
 {
     assert(argc == 2);
+    // These SDK doubles intentionally exercise the explicit dense compatibility path.
+    setenv("DEEPEP_SHMEM_DENSE_QPS", "1", 1);
     const std::string mode = argv[1];
     auto create = []() { return deepep::Session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30); };
     if (mode == "low-latency") {

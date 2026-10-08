@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #pragma once
 #include "forward_plan.hpp"
@@ -9,7 +8,7 @@
 // scratch: int32 [world, ceil(tokens/32), 5] = primary prefix and four bucket prefixes.
 // Each peer/tile owns its scratch and final row ranges. Prefix steps have one
 // writer per peer, then one writer for the compact directory. No atomics.
-__simt_vf__ __launch_bounds__(128) inline void DispatchPeerPlanVf(__gm__ int32_t* destinations, uint32_t stride,
+__simt_vf__ __launch_bounds__(128) inline void DispatchPeerPlanVf(__gm__ int64_t* destinations, uint32_t stride,
                                                                   __gm__ int32_t* meta, __gm__ int32_t* rows,
                                                                   __gm__ int32_t* scratch, uint32_t rank,
                                                                   uint32_t world, uint32_t tokens, uint32_t topk,
@@ -62,8 +61,8 @@ __simt_vf__ __launch_bounds__(128) inline void DispatchPeerPlanVf(__gm__ int32_t
             if (peer / 8U != rank / 8U) {
                 for (uint32_t token = tile * 32U; token < end; ++token) {
                     for (uint32_t k = 0; k < topk; ++k) {
-                        const int32_t encoded = asc_ldcg(destinations + token * topk + k);
-                        if (encoded < 0 || uint32_t(encoded) / stride != peer) {
+                        const int64_t encoded = asc_ldcg(destinations + token * topk + k);
+                        if (encoded < 0 || uint64_t(encoded) / stride != peer) {
                             continue;
                         }
                         if (step == 0U) {
@@ -75,9 +74,8 @@ __simt_vf__ __launch_bounds__(128) inline void DispatchPeerPlanVf(__gm__ int32_t
                         ++ordinal;
                         bool relay = false;
                         for (uint32_t slot = 0; slot < topk; ++slot) {
-                            const int32_t other = asc_ldcg(destinations + token * topk + slot);
-                            if (other < 0 && other != (-2147483647 - 1) &&
-                                uint32_t(~other) / stride / 8U == peer / 8U) {
+                            const int64_t other = asc_ldcg(destinations + token * topk + slot);
+                            if (other < 0 && other != INT64_MIN && uint64_t(~other) / stride / 8U == peer / 8U) {
                                 relay = true;
                             }
                         }
@@ -85,7 +83,7 @@ __simt_vf__ __launch_bounds__(128) inline void DispatchPeerPlanVf(__gm__ int32_t
                         const uint32_t at = buckets[bucket]++;
                         if (step == 5U) {
                             asc_stcg(rows + at * 2U, int32_t(token));
-                            asc_stcg(rows + at * 2U + 1U, int32_t(uint32_t(encoded) % stride));
+                            asc_stcg(rows + at * 2U + 1U, int32_t(uint64_t(encoded) % stride));
                         }
                     }
                 }
@@ -108,13 +106,13 @@ __aicore__ inline void PreparePeerPlan(GM_ADDR workspace, GM_ADDR dst, GM_ADDR f
     using namespace ascend_deepep;
     TPipe pipe;
     TBuf<QuePosition::VECCALC> scratch;
-    pipe.InitBuffer(scratch, 4096);
+    pipe.InitBuffer(scratch, 8192);
     const uint32_t core = GetBlockIdx(), phase_words = t.plan_phase_bytes / 4U;
     auto* meta = reinterpret_cast<__gm__ int32_t*>(plan + 64U);
     auto* rows = reinterpret_cast<__gm__ int32_t*>(plan + t.plan_rows_offset);
     auto* prefix = reinterpret_cast<__gm__ int32_t*>(plan + t.plan_scratch_offset);
     for (uint32_t step = 0; step < 6U; ++step) {
-        asc_vf_call<DispatchPeerPlanVf>(dim3(128), reinterpret_cast<__gm__ int32_t*>(dst), t.address_stride, meta, rows,
+        asc_vf_call<DispatchPeerPlanVf>(dim3(128), reinterpret_cast<__gm__ int64_t*>(dst), t.address_stride, meta, rows,
                                         prefix, t.rank, t.world, t.tokens, t.topk, step, core);
         SetFlag<HardEvent::V_S>(EVENT_ID2);
         WaitFlag<HardEvent::V_S>(EVENT_ID2);
@@ -133,14 +131,13 @@ __aicore__ inline void PreparePeerPlan(GM_ADDR workspace, GM_ADDR dst, GM_ADDR f
                 counts[owner + 8U] += headers.GetValue(peer * 4U + 3U);
             }
         }
-        for (uint32_t q = 0; q < 16U; ++q)
-            error |= counts[q] + 2U + ACLSHMEM_UDMA_AGGREGATE_CREDIT_GUARD >= shm::UDMA_SQ_BASKBLK_CNT;
+        for (uint32_t q = 0; q < 16U; ++q) error |= counts[q] > uint64_t(t.tokens) * t.topk;
         // Separate versioned options from the compact phase/peer/QP directory.
         NativeLoad(headers, reinterpret_cast<__gm__ uint32_t*>(plan), 16U);
         headers.SetValue(4U, 3U);
         headers.SetValue(5U, phase_words);
         headers.SetValue(6U, t.plan_mailbox_offset / 4U);
-        headers.SetValue(7U, 7U);
+        headers.SetValue(7U, 8U);
         headers.SetValue(kClosPeerTableOptionsWord, DefaultClosPeerTableOptions(t.world));
         NativeStore(reinterpret_cast<__gm__ uint32_t*>(plan), headers, 16U);
         NativeLoad(headers, reinterpret_cast<__gm__ uint32_t*>(plan + t.forward_plan_offset) + 8U * (t.world + 1U), 1U);

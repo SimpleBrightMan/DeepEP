@@ -1,5 +1,4 @@
 # Copyright (c) 2026, Lu Lu
-# Modified by huangxiaolan 2026
 
 """Validate and summarize cached dispatch device timing and per-AIV diagnostics."""
 
@@ -16,7 +15,7 @@ def decode_profile(records, rank, fp8=True, weights=False, world=64, qp1_workers
         raise ValueError("Expected 64 AIV records")
     decoded = []
     for core, words in enumerate(records):
-        if len(words) != 32 or words[26:29] != [0x44504550, rank, core] or words[30] not in (1, 2, 3, 4, 5, 6, 7):
+        if len(words) != 32 or words[26:29] != [0x44504550, rank, core] or words[30] not in (1, 2, 3, 4, 5, 6, 7, 8):
             raise ValueError(f"Missing/stale profile rank={rank} core={core}")
 
         def interval(start, end):
@@ -53,6 +52,8 @@ def decode_profile(records, rank, fp8=True, weights=False, world=64, qp1_workers
         }
         if words[30] >= 7:
             phases["entry_setup_ms"] = phases.pop("entry_barrier_ms")
+        if words[30] >= 8:
+            phases["store_drain_ms"] = phases.pop("finish_wait_ms")
         if role.startswith("clos_"):
             phases.update(
                 clos_init_ms=interval(3, 8),
@@ -229,7 +230,14 @@ def summarize(data):
             if key in data[0]
         }
     )
-    for index, name in enumerate(("input_copy", "kernel", "output_copy", "device_total")):
+    legacy_columns = ("input_copy", "kernel", "output_copy", "device_total")
+    columns = tuple(data[0].get("device_time_columns", legacy_columns))
+    if columns not in (legacy_columns, ("entry_barrier", "kernel", "exit_barrier", "device_total")):
+        raise ValueError("Unknown device timing columns")
+    if any(tuple(r.get("device_time_columns", legacy_columns)) != columns for r in data):
+        raise ValueError("Mixed device timing columns")
+    result["device_time_columns"] = columns
+    for index, name in enumerate(columns):
         values = [max(r["clean_device_ms"][i][index] for r in data) for i in range(count)]
         if any(not math.isfinite(v) or v <= 0 for v in values):
             raise ValueError(f"Invalid Event time: {name}")

@@ -1,5 +1,4 @@
 # Copyright (c) 2026, Lu Lu
-# Modified by huangxiaolan 2026
 
 """Build wheel/sdist, install into a fresh venv, and test outside the checkout.
 
@@ -116,6 +115,7 @@ def inspect_wheel(path):
 
         kernel_capabilities = {
             "elastic-notify-metadata-v6",
+            "elastic-notify-metadata-v7",
             "elastic-dispatch-expanded-v1",
             "elastic-combine-expanded-v3",
         }

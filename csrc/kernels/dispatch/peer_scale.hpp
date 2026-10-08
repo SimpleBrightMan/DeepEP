@@ -1,46 +1,22 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #pragma once
 
 #include "peer_address.hpp"
 
-// Every sender drains hidden, forwarded hidden and scales before advertising
-// completion. Receivers wait for every sender before returning output storage.
+// Queue owners have already completed their URMA SO/quiet protocol. Drain this
+// AIV's remaining MTE stores, but do not join other AIVs/ranks here. The host
+// wrapper queues a separate all-rank barrier before exposing the output.
 template <bool Profile>
-__aicore__ inline void FinishPeerDispatch(GM_ADDR workspace, const DispatchTiling& t,
-                                          TBuf<QuePosition::VECCALC>& scratch, uint64_t* detail)
+__aicore__ inline void DrainDispatchStores(const DispatchTiling& t, uint64_t* detail)
 {
-    uint64_t stamp = DetailClock<Profile>(t.detail_mode);
+    const uint64_t stamp = DetailClock<Profile>(t.detail_mode);
     aclshmemx_mte_quiet();
     DetailAdd<Profile>(detail, 12U, DetailClock<Profile>(t.detail_mode) - stamp);
-    stamp = DetailClock<Profile>(t.detail_mode);
-    SyncAll<true>();
-    DetailAdd<Profile>(detail, 13U, DetailClock<Profile>(t.detail_mode) - stamp);
-    stamp = DetailClock<Profile>(t.detail_mode);
-    {
-        auto data = scratch.Get<uint64_t>();
-        data.SetValue(0, t.generation);
-        for (uint32_t peer = GetBlockIdx(); peer < t.world; peer += 64U) {
-            auto* remote =
-                reinterpret_cast<__gm__ uint64_t*>(aclshmem_ptr(workspace + t.done + uint64_t(t.rank) * 512U, peer));
-            NativeStore(remote, data, 1U);
-        }
-        aclshmemx_mte_quiet();
-        DetailAdd<Profile>(detail, 14U, DetailClock<Profile>(t.detail_mode) - stamp);
-        stamp = DetailClock<Profile>(t.detail_mode);
-        for (uint32_t peer = GetBlockIdx(); peer < t.world; peer += 64U)
-            aclshmem_uint64_wait_until(reinterpret_cast<__gm__ uint64_t*>(workspace + t.done + uint64_t(peer) * 512U),
-                                       ACLSHMEM_CMP_EQ, t.generation);
-    }
-    DetailAdd<Profile>(detail, 15U, DetailClock<Profile>(t.detail_mode) - stamp);
-    stamp = DetailClock<Profile>(t.detail_mode);
-    SyncAll<true>();
-    DetailAdd<Profile>(detail, 16U, DetailClock<Profile>(t.detail_mode) - stamp);
 }
 
 // Peer-double pipeline: SIMT decode, vector compaction,
-// asynchronous 224B scale plane + slot plane, per-peer ping-pong and SIMT scatter.
+// self-contained 512B data-with-flag packets, per-peer ping-pong and SIMT scatter.
 #include "scale_pipeline.hpp"
 #include "aux_pipeline.hpp"
 template <bool Profile>

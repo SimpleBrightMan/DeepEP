@@ -70,7 +70,7 @@ def test_random_cli_and_all(entry, route, seed_args, seed, monkeypatch, tmp_path
         [entry.__file__, "--ep-size", "256", "--route", route, "--output", str(tmp_path / "output"), *seed_args],
     )
     if entry is combine:
-        monkeypatch.setitem(combine._dispatch, "_launch", lambda args, worker: calls.append(args))
+        monkeypatch.setitem(combine._notify, "_launch", lambda args, worker: calls.append(args))
     else:
         monkeypatch.setattr(dispatch, "_launch", lambda args, worker: calls.append(args))
     entry.main()

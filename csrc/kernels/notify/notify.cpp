@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #include "kernel_operator.h"
 #include "simt_api/device_functions.h"
@@ -7,6 +6,7 @@
 #include "../common.hpp"
 #include "launch.hpp"
 #include "tiling.hpp"
+#include "profile.hpp"
 #include "../dispatch/tiling.hpp"
 #include "../dispatch/peer_order.hpp"
 
@@ -17,13 +17,13 @@ constexpr uint32_t kSimtThreads = 128U;
 constexpr uint32_t kSimtCores = 32U;
 constexpr uint32_t kTileTokens = ascend_deepep::kNotifyLocalTopkTileTokens;
 constexpr uint32_t kMetaFields = ascend_deepep::kNotifyLocalTopkRouteMetaFields;
-// Wire fields pack rank <= 255 and top-k positions <= 15.
+// Wire fields pack rank <= 511 and top-k positions <= 15.
 // Forward column 0 stores token_end; source rank is the partition index.
 // Weight return IDs encode (src_rank * tokens + token_id) * topk + topk_id.
-constexpr uint32_t kWireRankMask = 0xffU;
+constexpr uint32_t kWireRankMask = 0x1ffU;
 constexpr uint32_t kWireTopkMask = 0xfU;
-constexpr uint32_t kWirePrimaryTopkShift = 8U;
-constexpr uint32_t kWireSecondaryTopkShift = 12U;
+constexpr uint32_t kWirePrimaryTopkShift = 9U;
+constexpr uint32_t kWireSecondaryTopkShift = 13U;
 
 template <uint32_t CoreCount = kSimtCores>
 __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkTokensVf(
@@ -40,25 +40,25 @@ __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkTokensVf(
             continue;
         }
         int32_t expert_ids[16];
-        int32_t first_slot[32];
-        for (uint32_t server = 0; server < 32U; ++server) {
+        int32_t first_slot[64];
+        for (uint32_t server = 0; server < 64U; ++server) {
             first_slot[server] = -1;
         }
         const uint64_t base = uint64_t(token) * topk;
-        int64_t mask = 0;
+        uint64_t mask = 0;
         for (uint32_t k = 0; k < topk; ++k) {
             const int64_t value = asc_ldcg(topk_idx + base + k);
             const int32_t expert = value >= 0 && uint64_t(value) < experts ? int32_t(value) : -1;
             expert_ids[k] = expert;
             if (expert >= 0) {
                 const uint32_t server = uint32_t(expert) / local_experts / 8U;
-                mask |= int64_t(1) << server;
+                mask |= uint64_t(1) << server;
                 if (first_slot[server] < 0) {
                     first_slot[server] = int32_t(k);
                 }
             }
         }
-        asc_stcg(server_mask + token, mask);
+        asc_stcg(server_mask + token, int64_t(mask));
         for (uint32_t k = 0; k < topk; ++k) {
             const int32_t expert = expert_ids[k];
             int32_t primary = -1;
@@ -144,12 +144,12 @@ __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkVf(__gm__ ascend_de
         const uint32_t end = tokens - begin < kTileTokens ? tokens : begin + kTileTokens;
         for (uint32_t token = begin; token < end; ++token) {
             int32_t expert_ids[16];
-            int32_t first_slot_per_server[32];
-            for (uint32_t server = 0; server < 32U; ++server) {
+            int32_t first_slot_per_server[64];
+            for (uint32_t server = 0; server < 64U; ++server) {
                 first_slot_per_server[server] = -1;
             }
             const uint64_t base = uint64_t(token) * topk;
-            int64_t mask = 0;
+            uint64_t mask = 0;
             // 按原始 top-k 顺序选 gateway：每个 server 第一次出现的专家所在 rank。
             // 非法专家跳过；server_mask 的第 s 位表示该 token 是否需要发往 server s。
             for (uint32_t k = 0; k < topk; ++k) {
@@ -160,12 +160,12 @@ __simt_vf__ __launch_bounds__(128) inline void ParseLocalTopkVf(__gm__ ascend_de
                     continue;
                 }
                 const uint32_t server = uint32_t(expert) / local_experts / 8U;
-                mask |= int64_t(1) << server;
+                mask |= uint64_t(1) << server;
                 if (first_slot_per_server[server] < 0) {
                     first_slot_per_server[server] = int32_t(k);
                 }
             }
-            asc_stcg(server_mask + token, mask);
+            asc_stcg(server_mask + token, int64_t(mask));
             // 每条有效路由都有专家内序号，重复专家的不同 top-k 槽也分别计数。
             // 此时 ordinal 只在 tile 内有效，第三阶段再加上前面所有 tile 的数量。
             for (uint32_t k = 0; k < topk; ++k) {
@@ -429,7 +429,7 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyAddressStrideVf(__gm__ int3
 
 template <uint32_t CoreCount = kSimtCores>
 __simt_vf__ __launch_bounds__(128) inline void NotifyResolveDstVf(__gm__ int32_t* meta, __gm__ int32_t* bases,
-                                                                  __gm__ int32_t* address_stride, __gm__ int32_t* dst,
+                                                                  __gm__ int32_t* address_stride, __gm__ int64_t* dst,
                                                                   uint32_t world, uint32_t experts, uint64_t routes,
                                                                   uint32_t core)
 {
@@ -437,9 +437,10 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyResolveDstVf(__gm__ int32_t
     for (uint64_t route = threadIdx.x * CoreCount + core; route < routes; route += (CoreCount * kNotifySimtThreads)) {
         auto* row = meta + route * 6U;
         const int32_t expert = asc_ldcg(row);
-        int32_t encoded = (-2147483647 - 1);
+        int64_t encoded = INT64_MIN;
         if (expert >= 0) {
-            encoded = (expert / int32_t(experts / world)) * stride + asc_ldcg(bases + expert) + asc_ldcg(row + 4U);
+            encoded =
+                int64_t(expert / int32_t(experts / world)) * stride + asc_ldcg(bases + expert) + asc_ldcg(row + 4U);
             if ((asc_ldcg(row + 5U) & 2) == 0) {
                 encoded = ~encoded;
             }
@@ -453,18 +454,22 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyResolveDstVf(__gm__ int32_t
 // 与 NotifyTiling 的 scratch 大小保持一致；每个 tile 只写自己分配的区间。
 constexpr uint32_t kForwardTile = 32U;
 
-template <bool Write, bool Cached = false, bool SavePlan = false, uint32_t CoreCount = kSimtCores>
+template <bool Write, bool Cached = false, bool SavePlan = false, uint32_t CoreCount = kSimtCores,
+          bool CachedCounts = false>
 __simt_vf__ __launch_bounds__(128) inline void NotifyForwardTilesVf(
     __gm__ int32_t* meta, __gm__ int32_t* bases, __gm__ int32_t* offsets, __gm__ int32_t* packets, uint32_t rank,
     uint32_t world, uint32_t experts, uint32_t tokens, uint32_t topk, uint64_t packet_words, uint32_t core,
-    __ubuf__ int32_t* meta_ub, __ubuf__ int32_t* bases_ub, __ubuf__ int32_t* plan_ub = nullptr)
+    __ubuf__ int32_t* meta_ub, __ubuf__ int32_t* bases_ub, __ubuf__ int32_t* plan_ub = nullptr,
+    __ubuf__ int32_t* counts_ub = nullptr)
 {
     static_assert(!SavePlan || (Cached && !Write));
+    static_assert(!CachedCounts || SavePlan);
     const uint32_t tiles = (uint64_t(tokens) + kForwardTile - 1U) / kForwardTile;
+    const uint32_t local_tiles = core < tiles ? (tiles - core + CoreCount - 1U) / CoreCount : 0U;
     const uint32_t worker = threadIdx.x * CoreCount + core;
     for (uint32_t tile = worker; tile < tiles; tile += (CoreCount * kNotifySimtThreads)) {
         // Each tile owns its GM cursor; Write consumes the prefix in place.
-        if constexpr (!Write) {
+        if constexpr (!Write && !CachedCounts) {
             for (uint32_t gateway = 0; gateway < world; ++gateway) {
                 asc_stcg(offsets + uint64_t(gateway) * tiles + tile, int32_t(0));
             }
@@ -510,9 +515,16 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardTilesVf(
                 if (!direct && k == primary) {
                     continue;
                 }
-                auto* cursor = offsets + uint64_t(gateway) * tiles + tile;
-                const uint32_t index = uint32_t(asc_ldcg(cursor));
-                asc_stcg(cursor, int32_t(index + 1U));
+                uint32_t index;
+                if constexpr (CachedCounts) {
+                    auto* cursor = counts_ub + uint64_t(gateway) * local_tiles + tile / CoreCount;
+                    index = uint32_t(*cursor);
+                    *cursor = int32_t(index + 1U);
+                } else {
+                    auto* cursor = offsets + uint64_t(gateway) * tiles + tile;
+                    index = uint32_t(asc_ldcg(cursor));
+                    asc_stcg(cursor, int32_t(index + 1U));
+                }
                 if constexpr (SavePlan) {
                     // 沿 token/slot 原顺序确定行号，后续写线程的调度不改变排列。
                     plan_ub[plan_index] = int32_t(index);
@@ -549,6 +561,24 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyForwardTilesVf(
                 }
             }
         }
+    }
+    asc_threadfence();
+}
+
+template <uint32_t CoreCount = kSimtCores>
+__simt_vf__ __launch_bounds__(128) inline void NotifyExportForwardCountsVf(__gm__ int32_t* offsets, uint32_t tokens,
+                                                                           uint32_t world, uint32_t core,
+                                                                           __ubuf__ int32_t* counts_ub)
+{
+    const uint32_t tiles = (uint64_t(tokens) + kForwardTile - 1U) / kForwardTile;
+    const uint32_t local_tiles = core < tiles ? (tiles - core + CoreCount - 1U) / CoreCount : 0U;
+    // Different threads may read counts produced by another thread in the prior
+    // VF. The caller drains that VF and orders PIPE_V before reaching this one.
+    // Every (gateway, tile) has one writer, including zero-count and tail tiles.
+    for (uint32_t task = threadIdx.x; task < world * local_tiles; task += kNotifySimtThreads) {
+        const uint32_t gateway = task / local_tiles;
+        const uint32_t tile = core + task % local_tiles * CoreCount;
+        asc_stcg(offsets + uint64_t(gateway) * tiles + tile, counts_ub[task]);
     }
     asc_threadfence();
 }
@@ -831,13 +861,13 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyBuildForwardRowsVf(
 }
 
 template <uint32_t CoreCount = kSimtCores>
-__simt_vf__ __launch_bounds__(128) inline void NotifyChunkRangesVf(__gm__ int32_t* packets, __gm__ int32_t* forward,
-                                                                   uint32_t capacity, __gm__ int32_t* ranges,
-                                                                   __gm__ int32_t* masks, uint32_t rank, uint32_t world,
-                                                                   uint32_t chunks, uint32_t chunk_tokens,
-                                                                   uint32_t tokens, uint64_t packet_words,
-                                                                   uint32_t core)
+__simt_vf__ __launch_bounds__(128) inline void NotifyChunkRangesVf(
+    __gm__ int32_t* packets, __gm__ int32_t* forward, uint32_t capacity, __gm__ int32_t* ranges, __gm__ int32_t* masks,
+    __gm__ int32_t* backward_counts, uint32_t rank, uint32_t world, uint32_t chunks, uint32_t chunk_tokens,
+    uint32_t tokens, uint64_t packet_words, uint32_t core)
 {
+    const uint32_t lanes = world < 8U ? world : 8U;
+    const uint64_t lane_stride = uint64_t(world) * chunks;
     for (uint64_t task = threadIdx.x * CoreCount + core; task < uint64_t(world) * chunks;
          task += (CoreCount * kNotifySimtThreads)) {
         const uint32_t source = task / chunks;
@@ -866,6 +896,8 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyChunkRangesVf(__gm__ int32_
         int32_t mask = 0;
         uint32_t token_begin = begin;
         int32_t previous_token = -1;
+        // Static indices keep the eight counters in registers after unrolling.
+        uint32_t counts[8]{};
         while (end < count) {
             auto* row = packet + 16U + uint64_t(end) * 6U;
             const int32_t token = asc_ldcg(row + 1U);
@@ -882,6 +914,13 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyChunkRangesVf(__gm__ int32_
             const int32_t peer = asc_ldcg(row + 3U);
             if (peer >= 0 && peer != int32_t(rank)) {
                 mask |= 1 << (peer % 8);
+                // This is also NotifyGatherCountTilesVf's gather-row predicate.
+                // Read the immutable packet, not forward columns still being
+                // written by another core in NotifyBuildForwardRowsVf.
+#pragma unroll
+                for (uint32_t lane = 0; lane < 8U; ++lane) {
+                    counts[lane] += uint32_t(peer) == rank / 8U * 8U + lane;
+                }
             }
             ++end;
         }
@@ -893,39 +932,13 @@ __simt_vf__ __launch_bounds__(128) inline void NotifyChunkRangesVf(__gm__ int32_
         asc_stcg(ranges + task * 2U, int32_t(begin));
         asc_stcg(ranges + task * 2U + 1U, int32_t(end));
         asc_stcg(masks + task, mask);
-    }
-    asc_threadfence();
-}
-
-template <uint32_t CoreCount = kSimtCores>
-__simt_vf__ __launch_bounds__(128) inline void NotifyCountBackwardTasksVf(__gm__ int32_t* forward,
-                                                                          __gm__ int32_t* ranges,
-                                                                          __gm__ int32_t* offsets, uint32_t rank,
-                                                                          uint32_t world, uint32_t chunks,
-                                                                          uint32_t packet_capacity, uint32_t core)
-{
-    // 一个线程统计一个 (lane, source, chunk)，只扫描该 chunk 的 forward 区间。
-    // 所有任务都会写入计数，包括空任务，重复调用不依赖上轮 scratch 内容。
-    const uint32_t lanes = world < 8U ? world : 8U;
-    const uint32_t worker = threadIdx.x * CoreCount + core;
-    const uint64_t task_count = uint64_t(lanes) * world * chunks;
-    for (uint64_t task = worker; task < task_count; task += (CoreCount * kNotifySimtThreads)) {
-        const uint32_t lane = task / (uint64_t(world) * chunks);
-        const uint64_t remainder = task % (uint64_t(world) * chunks);
-        const uint32_t source = remainder / chunks;
-        const uint32_t chunk = remainder % chunks;
-        const uint64_t range_index = uint64_t(source) * chunks + chunk;
-        const uint32_t begin = uint32_t(asc_ldcg(ranges + range_index * 2U));
-        const uint32_t end = uint32_t(asc_ldcg(ranges + range_index * 2U + 1U));
-        const uint32_t peer = rank / 8U * 8U + lane;
-        uint32_t count = 0U;
-        for (uint32_t i = begin; i < end; ++i) {
-            auto* row = forward + (uint64_t(source) * packet_capacity + i) * 6U;
-            if (asc_ldcg(row + 3U) == int32_t(peer) && asc_ldcg(row + 5U) >= 0) {
-                ++count;
+#pragma unroll
+        for (uint32_t lane = 0; lane < 8U; ++lane) {
+            if (lane < lanes) {
+                // One (source, chunk) owner writes every lane, including zeros.
+                asc_stcg(backward_counts + uint64_t(lane) * lane_stride + task, int32_t(counts[lane]));
             }
         }
-        asc_stcg(offsets + task, int32_t(count));
     }
     asc_threadfence();
 }
@@ -1155,22 +1168,90 @@ __aicore__ inline void PrefixLocalTopkCached(__gm__ int32_t* matrix, __gm__ int3
     WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID3);
 }
 
-template <uint32_t CoreCount>
+namespace diagnostics = ascend_deepep::notify_diagnostics;
+// Profile-only UB: one 512B row owned by this AIV, exported once to disjoint GM.
+// Ordinary path: 8KiB communication + 96KiB metadata + 24KiB bases/routes UB.
+// Scalar stamps follow existing VF drains; entry alignment is diagnostic-only.
+template <bool Enabled>
+struct NotifyProfile {
+    TBuf<TPosition::VECOUT> buffer;
+    LocalTensor<uint64_t> words;
+    GlobalTensor<uint64_t> output;
+    __aicore__ inline void Init(TPipe& pipe, GM_ADDR address, uint64_t sample, const NotifyTiling& t, uint32_t core)
+    {
+        pipe.InitBuffer(buffer, diagnostics::kUbBytes);
+        words = buffer.template Get<uint64_t>();
+        output.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(address) + uint64_t(core) * diagnostics::kWords);
+        for (uint32_t i = 0; i < diagnostics::kWords; ++i) words.SetValue(i, 0);
+        words.SetValue(0, diagnostics::kMagic);
+        words.SetValue(1, diagnostics::kVersion);
+        words.SetValue(2, t.rank);
+        words.SetValue(3, core);
+        words.SetValue(4, t.world);
+        words.SetValue(5, t.tokens);
+        words.SetValue(6, t.topk);
+        words.SetValue(7, t.experts);
+        words.SetValue(8, t.chunk_tokens);
+        words.SetValue(9, sample);
+        words.SetValue(10, t.num_cores);
+        words.SetValue(11, diagnostics::End);
+        words.SetValue(12, (t.cache_parse_hist != 0U) | ((t.cache_parse_routes != 0U) << 1U) |
+                               ((t.cache_forward_inputs != 0U) << 2U) | ((t.cache_local_prefix != 0U) << 3U) |
+                               ((t.cache_local_prefix_totals != 0U) << 4U) |
+                               ((t.forward_count_offset_words != 0U) << 5U));
+    }
+    __aicore__ inline void Mark(uint32_t phase)
+    {
+        words.SetValue(diagnostics::kHeaderWords + phase, GetSystemCycle());
+    }
+    __aicore__ inline void AlignRanks()
+    {
+        // Diagnostic-only collective. It reduces launch skew but does not calibrate
+        // different devices' clocks. Record its wait outside measured work stages.
+        words.SetValue(13, GetSystemCycle());
+        aclshmemx_barrier_all_vec();
+        words.SetValue(14, GetSystemCycle());
+        words.SetValue(15, 1U);
+    }
+    __aicore__ inline void Save()
+    {
+        // Scalar producer -> MTE3 reader; wait before releasing the profile UB.
+        SetFlag<HardEvent::S_MTE3>(EVENT_ID4);
+        WaitFlag<HardEvent::S_MTE3>(EVENT_ID4);
+        DataCopy(output, words, diagnostics::kWords);
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID4);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID4);
+    }
+};
+template <>
+struct NotifyProfile<false> {
+    __aicore__ inline void Init(TPipe&, GM_ADDR, uint64_t, const NotifyTiling&, uint32_t) {}
+    __aicore__ inline void AlignRanks() {}
+    __aicore__ inline void Mark(uint32_t) {}
+    __aicore__ inline void Save() {}
+};
+
+template <uint32_t CoreCount, bool ProfileEnabled = false>
 __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta_address, GM_ADDR hist_address,
                                   GM_ADDR bases_address, GM_ADDR prefix_address, GM_ADDR counts_address,
                                   GM_ADDR gateways_address, GM_ADDR local_dst, GM_ADDR mask, GM_ADDR dst,
                                   GM_ADDR forward, GM_ADDR forward_counts, GM_ADDR backward, GM_ADDR backward_counts,
                                   GM_ADDR ranges, GM_ADDR masks, GM_ADDR rank_rows, GM_ADDR gather_rows,
-                                  GM_ADDR weight_return_meta, const NotifyTiling& t)
+                                  GM_ADDR weight_return_meta, const NotifyTiling& t, GM_ADDR profile_address = nullptr,
+                                  uint64_t sample = 0)
 {
     const uint32_t core = GetBlockIdx();
     TPipe pipe;
+    NotifyProfile<ProfileEnabled> profile;
+    profile.Init(pipe, profile_address, sample, t, core);
+    profile.AlignRanks();
+    profile.Mark(diagnostics::Setup);
     TBuf<TPosition::VECOUT> scratch_buffer;
     pipe.InitBuffer(scratch_buffer, ascend_deepep::kNotifyCommunicationUbBytes);
     auto scratch = scratch_buffer.Get<uint8_t>();
     TBuf<TPosition::VECIN> forward_meta_buffer;
     TBuf<TPosition::VECIN> forward_bases_buffer;
-    static_assert(ascend_deepep::kNotifyDynamicUbBytes <= 216U * 1024U);
+    static_assert(ascend_deepep::kNotifyDynamicUbBytes + (ProfileEnabled ? diagnostics::kUbBytes : 0U) <= 216U * 1024U);
     pipe.InitBuffer(forward_meta_buffer, ascend_deepep::kNotifyForwardMetaUbBytes);
     pipe.InitBuffer(forward_bases_buffer, ascend_deepep::kNotifyForwardBasesUbBytes);
     auto forward_meta_ub = forward_meta_buffer.Get<int32_t>();
@@ -1180,6 +1261,8 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
         reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()) + t.forward_plan_offset_words;
     auto* forward_token_prefix =
         reinterpret_cast<__ubuf__ uint16_t*>(forward_meta_ub.GetPhyAddr()) + t.forward_token_prefix_offset_words * 2U;
+    auto* forward_tile_counts =
+        reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()) + t.forward_count_offset_words;
     auto* meta = reinterpret_cast<__gm__ int32_t*>(meta_address);
     auto* hist = reinterpret_cast<__gm__ int32_t*>(hist_address);
     auto* counts = reinterpret_cast<__gm__ int32_t*>(counts_address);
@@ -1197,6 +1280,7 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
     auto* local_segments = reinterpret_cast<__gm__ int32_t*>(workspace + t.local_prefix_segments);
     static_assert(kPrefixSegmentTiles == ascend_deepep::kNotifyPrefixSegmentTiles);
     static_assert(kForwardTile == ascend_deepep::kNotifyForwardTileRows);
+    profile.Mark(diagnostics::ParseTopk);
     if (t.cache_parse_hist != 0U) {
         // 保持 tile/token/slot 顺序，UB 只替代计数的存储位置，不使用原子分配序号。
         const uint32_t hist_stride = (t.experts + t.world + 15U) / 16U * 16U;
@@ -1250,7 +1334,9 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
     }
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitParseTopk);
     SyncAll<true>();
+    profile.Mark(diagnostics::LocalPrefixSegments);
     const uint32_t prefix_tiles = (uint64_t(t.tokens) + kTileTokens - 1U) / kTileTokens;
     const uint32_t prefix_segments = (prefix_tiles + kPrefixSegmentTiles - 1U) / kPrefixSegmentTiles;
     if (t.cache_local_prefix != 0U) {
@@ -1262,7 +1348,9 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
     }
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitLocalPrefixSegments);
     SyncAll<true>();
+    profile.Mark(diagnostics::LocalPrefixTotals);
     if (t.cache_local_prefix_totals != 0U) {
         PrefixLocalTopkCached<true, CoreCount>(local_segments, local_segments, counts, gateways, prefix_segments,
                                                prefix_segments, t.world, t.experts, core, forward_meta_ub);
@@ -1272,40 +1360,54 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
     }
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitLocalPrefixTotals);
     SyncAll<true>();
+    profile.Mark(diagnostics::FinalizeTopk);
     asc_vf_call<FinalizeLocalTopkVf<true, CoreCount>>(dim3(128), meta, reinterpret_cast<__gm__ int32_t*>(local_dst),
                                                       hist, t.world, t.tokens, t.topk, t.experts, core, local_segments);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::PackCounts);
     asc_vf_call<NotifyPackCountsVf<CoreCount>>(
         dim3(128), counts, reinterpret_cast<__gm__ int32_t*>(workspace + t.count_send), t.experts, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitFinalizeTopk);
     SyncAll<true>();
+    profile.Mark(diagnostics::CountExchange);
     for (uint32_t peer = core; peer < t.world; peer += CoreCount) {
         NotifyTransfer(workspace + t.count_recv + uint64_t(t.rank) * t.count_stride, workspace + t.count_send,
                        uint64_t(t.experts) * 4U, peer, t, scratch);
     }
+    profile.Mark(diagnostics::GlobalWaitCountExchange);
     aclshmemx_barrier_all_vec();
+    profile.Mark(diagnostics::ExpertTotals);
     asc_vf_call<NotifyExpertTotalsVf<CoreCount>>(dim3(128), reinterpret_cast<__gm__ int32_t*>(workspace + t.count_recv),
                                                  bases, expert_totals, t.rank, t.world, t.experts, t.count_stride / 4U,
                                                  core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitExpertTotals);
     SyncAll<true>();
+    profile.Mark(diagnostics::RankBases);
     asc_vf_call<NotifyBasesVf<CoreCount>>(dim3(128), expert_totals, bases, rank_counts, t.world, t.experts, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitRankBases);
     SyncAll<true>();
+    profile.Mark(diagnostics::AddressStride);
     asc_vf_call<NotifyAddressStrideVf<CoreCount>>(dim3(128), rank_counts, address_stride, t.world, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitAddressStride);
     SyncAll<true>();
+    profile.Mark(diagnostics::ResolveDst);
     asc_vf_call<NotifyResolveDstVf<CoreCount>>(dim3(128), meta, bases, address_stride,
-                                               reinterpret_cast<__gm__ int32_t*>(dst), t.world, t.experts,
+                                               reinterpret_cast<__gm__ int64_t*>(dst), t.world, t.experts,
                                                uint64_t(t.tokens) * t.topk, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::ForwardCount);
     // meta 缓存和 prefix 搬运均使用此 tile 数，prefix 不依赖 cache_forward 分支。
     const uint32_t tiles = (uint64_t(t.tokens) + kForwardTile - 1U) / kForwardTile;
     if (cache_forward) {
@@ -1339,25 +1441,38 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
             asc_vf_call<NotifyForwardTokensVf<CoreCount>>(
                 dim3(128), t.tokens, t.topk, t.world, core,
                 reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()), forward_plan, forward_token_prefix);
+        } else if (t.forward_count_offset_words != 0U) {
+            // Parse routes are already drained before this phase. Count storage
+            // starts after the aligned bases, which ForwardWrite must preserve.
+            const uint32_t local_tiles = core < tiles ? (tiles - core + CoreCount - 1U) / CoreCount : 0U;
+            if (local_tiles != 0U) {
+                Duplicate(forward_bases_ub[t.forward_count_offset_words], int32_t(0), local_tiles * t.world);
+                PipeBarrier<PIPE_V>();
+            }
+            asc_vf_call<NotifyForwardTilesVf<false, true, true, CoreCount, true>>(
+                dim3(128), meta, bases, forward_offsets, reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send),
+                t.rank, t.world, t.experts, t.tokens, t.topk, t.forward_stride / 4U, core,
+                reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
+                reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan, forward_tile_counts);
         } else if (t.forward_plan_offset_words != 0U) {
             asc_vf_call<NotifyForwardTilesVf<false, true, true, CoreCount>>(
                 dim3(128), meta, bases, forward_offsets, reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send),
                 t.rank, t.world, t.experts, t.tokens, t.topk, t.forward_stride / 4U, core,
                 reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan);
+                reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan, forward_tile_counts);
         } else {
             asc_vf_call<NotifyForwardTilesVf<false, true, false, CoreCount>>(
                 dim3(128), meta, bases, forward_offsets, reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send),
                 t.rank, t.world, t.experts, t.tokens, t.topk, t.forward_stride / 4U, core,
                 reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan);
+                reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan, forward_tile_counts);
         }
     } else {
         asc_vf_call<NotifyForwardTilesVf<false, false, false, CoreCount>>(
             dim3(128), meta, bases, forward_offsets, reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send),
             t.rank, t.world, t.experts, t.tokens, t.topk, t.forward_stride / 4U, core,
             reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan);
+            reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan, forward_tile_counts);
     }
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
@@ -1368,8 +1483,16 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
                                                            forward_token_prefix);
         SetFlag<HardEvent::V_S>(EVENT_ID2);
         WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    } else if (t.forward_count_offset_words != 0U) {
+        PipeBarrier<PIPE_V>();
+        asc_vf_call<NotifyExportForwardCountsVf<CoreCount>>(dim3(128), forward_offsets, t.tokens, t.world, core,
+                                                            forward_tile_counts);
+        SetFlag<HardEvent::V_S>(EVENT_ID2);
+        WaitFlag<HardEvent::V_S>(EVENT_ID2);
     }
+    profile.Mark(diagnostics::LocalWaitResolveDst);
     SyncAll<true>();
+    profile.Mark(diagnostics::ForwardPrefix);
     // count 交换已排空，此处复用通信 scratch，不覆盖仍供 row writer 使用的 meta/plan。
     // 每核拥有 gateway=core,core+CoreCount,...，每个 UB 行起点按 32B 对齐。
     const uint32_t prefix_stride = t.forward_prefix_ub_stride;
@@ -1406,7 +1529,9 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
     }
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitForwardPrefix);
     SyncAll<true>();
+    profile.Mark(diagnostics::ForwardWrite);
     if (t.forward_plan_offset_words != 0U) {
         // count VF 写出的 UB 计划将由同核不同线程读取，显式保证 V 到 V 的依赖。
         PipeBarrier<PIPE_V>();
@@ -1428,40 +1553,50 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
             dim3(128), meta, bases, forward_offsets, reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send),
             t.rank, t.world, t.experts, t.tokens, t.topk, t.forward_stride / 4U, core,
             reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan);
+            reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan, forward_tile_counts);
     } else {
         asc_vf_call<NotifyForwardTilesVf<true, false, false, CoreCount>>(
             dim3(128), meta, bases, forward_offsets, reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_send),
             t.rank, t.world, t.experts, t.tokens, t.topk, t.forward_stride / 4U, core,
             reinterpret_cast<__ubuf__ int32_t*>(forward_meta_ub.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan);
+            reinterpret_cast<__ubuf__ int32_t*>(forward_bases_ub.GetPhyAddr()), forward_plan, forward_tile_counts);
     }
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitForwardWrite);
     SyncAll<true>();
+    profile.Mark(diagnostics::ForwardExchange);
     for (uint32_t peer = core; peer < t.world; peer += CoreCount) {
         auto* packet = workspace + t.forward_send + uint64_t(peer) * t.forward_stride;
         NotifyTransfer(workspace + t.forward_recv + uint64_t(t.rank) * t.forward_stride, packet,
                        64U + uint64_t(NotifyPacketCount(packet)) * 24U, peer, t, scratch);
     }
+    profile.Mark(diagnostics::GlobalWaitForwardExchange);
     aclshmemx_barrier_all_vec();
+    profile.Mark(diagnostics::GatherCount);
     asc_vf_call<NotifyGatherCountTilesVf<CoreCount>>(
         dim3(128), reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv), gather_offsets,
         reinterpret_cast<__gm__ int32_t*>(forward), t.rank, t.world, t.forward_capacity, t.forward_stride / 4U, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitGatherCount);
     SyncAll<true>();
+    profile.Mark(diagnostics::GatherSourcePrefix);
     asc_vf_call<NotifyGatherSourcePrefixVf<CoreCount>>(
         dim3(128), reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv), gather_offsets, prefix, t.world,
         t.forward_capacity, t.forward_stride / 4U, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitGatherSourcePrefix);
     SyncAll<true>();
+    profile.Mark(diagnostics::GatherPrefix);
     asc_vf_call<NotifyGatherPrefixVf<CoreCount>>(
         dim3(128), prefix, reinterpret_cast<__gm__ int32_t*>(workspace + t.gather_send), t.rank, t.world, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitGatherPrefix);
     SyncAll<true>();
+    profile.Mark(diagnostics::BuildForwardRows);
     asc_vf_call<NotifyBuildForwardRowsVf<CoreCount>>(
         dim3(128), reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv), gather_offsets, prefix,
         reinterpret_cast<__gm__ int32_t*>(forward), reinterpret_cast<__gm__ int32_t*>(forward_counts),
@@ -1469,34 +1604,36 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
         t.forward_stride / 4U, core, t.tokens, t.topk);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::ChunkRangesBackwardCount);
     // chunk 信息直接读取接收包，不依赖其他核写完 forward 表。
     asc_vf_call<NotifyChunkRangesVf<CoreCount>>(
         dim3(128), reinterpret_cast<__gm__ int32_t*>(workspace + t.forward_recv),
         reinterpret_cast<__gm__ int32_t*>(forward), t.forward_capacity, reinterpret_cast<__gm__ int32_t*>(ranges),
-        reinterpret_cast<__gm__ int32_t*>(workspace + t.source_chunk_masks), t.rank, t.world, t.chunks, t.chunk_tokens,
-        t.tokens, t.forward_stride / 4U, core);
+        reinterpret_cast<__gm__ int32_t*>(workspace + t.source_chunk_masks), backward_task_offsets, t.rank, t.world,
+        t.chunks, t.chunk_tokens, t.tokens, t.forward_stride / 4U, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    // Publish both forward rows and fused lane counts before prefix consumers.
+    profile.Mark(diagnostics::LocalWaitBuildForwardRows);
     SyncAll<true>();
-    asc_vf_call<NotifyCountBackwardTasksVf<CoreCount>>(dim3(128), reinterpret_cast<__gm__ int32_t*>(forward),
-                                                       reinterpret_cast<__gm__ int32_t*>(ranges), backward_task_offsets,
-                                                       t.rank, t.world, t.chunks, t.forward_capacity, core);
-    SetFlag<HardEvent::V_S>(EVENT_ID2);
-    WaitFlag<HardEvent::V_S>(EVENT_ID2);
-    SyncAll<true>();
+    profile.Mark(diagnostics::BackwardChunkPrefix);
     asc_vf_call<NotifyPrefixBackwardChunksVf<CoreCount>>(
         dim3(128), backward_task_offsets, backward_group_offsets,
         reinterpret_cast<__gm__ int32_t*>(workspace + t.source_chunk_masks), reinterpret_cast<__gm__ int32_t*>(masks),
         t.rank, t.world, t.chunks, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitBackwardChunkPrefix);
     SyncAll<true>();
+    profile.Mark(diagnostics::BackwardTaskPrefix);
     asc_vf_call<NotifyPrefixBackwardTasksVf<CoreCount>>(dim3(128), backward_group_offsets,
                                                         reinterpret_cast<__gm__ int64_t*>(workspace + t.backward_send),
                                                         t.world, t.chunks, t.backward_stride / 8U, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitBackwardTaskPrefix);
     SyncAll<true>();
+    profile.Mark(diagnostics::BackwardWrite);
     asc_vf_call<NotifyWriteBackwardTasksVf<CoreCount>>(
         dim3(128), reinterpret_cast<__gm__ int32_t*>(forward), reinterpret_cast<__gm__ int32_t*>(ranges),
         backward_task_offsets, backward_group_offsets, reinterpret_cast<__gm__ int64_t*>(workspace + t.backward_send),
@@ -1504,7 +1641,9 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
         t.forward_capacity, t.backward_stride / 8U, t.forward_stride / 4U, core);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::LocalWaitBackwardWrite);
     SyncAll<true>();
+    profile.Mark(diagnostics::BackwardGatherExchange);
     for (uint32_t peer = core; peer < t.world; peer += CoreCount) {
         if (peer / 8U == t.rank / 8U) {
             auto* packet = workspace + t.backward_send + uint64_t(peer % 8U) * t.backward_stride;
@@ -1515,7 +1654,9 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
                        workspace + t.gather_send + uint64_t(t.rank) * sizeof(int32_t), sizeof(int32_t), peer, t,
                        scratch);
     }
+    profile.Mark(diagnostics::GlobalWaitBackwardGatherExchange);
     aclshmemx_barrier_all_vec();
+    profile.Mark(diagnostics::CollectBackward);
     asc_vf_call<NotifyCollectBackwardVf<CoreCount>>(
         dim3(128), reinterpret_cast<__gm__ int64_t*>(workspace + t.backward_recv),
         reinterpret_cast<__gm__ int64_t*>(backward), reinterpret_cast<__gm__ int32_t*>(backward_counts),
@@ -1524,6 +1665,8 @@ __aicore__ inline void FullNotify(GM_ADDR input, GM_ADDR workspace, GM_ADDR meta
         t.backward_stride / 8U, core, t.tokens);
     SetFlag<HardEvent::V_S>(EVENT_ID2);
     WaitFlag<HardEvent::V_S>(EVENT_ID2);
+    profile.Mark(diagnostics::End);
+    profile.Save();
 }
 #endif
 }  // namespace
@@ -1573,6 +1716,44 @@ extern "C" ASCEND_DEEPEP_EXPORT void notify_full_kernel_do(
                                    gather_rows, weight_return_meta, config);
 }
 
+extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void notify_profile_kernel(
+    GM_ADDR input, GM_ADDR workspace, GM_ADDR meta, GM_ADDR hist, GM_ADDR bases, GM_ADDR prefix, GM_ADDR counts,
+    GM_ADDR gateways, GM_ADDR local_dst, GM_ADDR mask, GM_ADDR dst, GM_ADDR forward, GM_ADDR forward_counts,
+    GM_ADDR backward, GM_ADDR backward_counts, GM_ADDR ranges, GM_ADDR masks, GM_ADDR rank_rows, GM_ADDR gather_rows,
+    GM_ADDR weight_return_meta, GM_ADDR profile, uint64_t sample, ascend_deepep::NotifyTiling t)
+{
+#if !defined(CATLASS_ARCH) || CATLASS_ARCH == 3510
+    util_set_ffts_config(0U);
+    // 核数在入口选择编译期特化，SIMT 热循环中的除法仍可优化成常量移位。
+    if (t.num_cores == 64U) {
+        FullNotify<64U, true>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask, dst,
+                              forward, forward_counts, backward, backward_counts, ranges, masks, rank_rows, gather_rows,
+                              weight_return_meta, t, profile, sample);
+    } else {
+        FullNotify<32U, true>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask, dst,
+                              forward, forward_counts, backward, backward_counts, ranges, masks, rank_rows, gather_rows,
+                              weight_return_meta, t, profile, sample);
+    }
+#endif
+}
+
+extern "C" ASCEND_DEEPEP_EXPORT void notify_profile_kernel_do(
+    void* stream, uint8_t* input, uint8_t* workspace, uint8_t* meta, uint8_t* hist, uint8_t* bases, uint8_t* prefix,
+    uint8_t* counts, uint8_t* gateways, uint8_t* local_dst, uint8_t* mask, uint8_t* dst, uint8_t* forward,
+    uint8_t* forward_counts, uint8_t* backward, uint8_t* backward_counts, uint8_t* ranges, uint8_t* masks,
+    uint8_t* rank_rows, uint8_t* gather_rows, uint8_t* weight_return_meta, uint8_t* profile, uint64_t sample,
+    uint8_t* tiling)
+{
+    // SIMD 主核调用的 SIMT VF 也访问这些 TPipe buffer，必须在启动时声明动态 UB 范围。
+    const auto& config = *reinterpret_cast<ascend_deepep::NotifyTiling*>(tiling);
+    notify_profile_kernel<<<config.num_cores,
+                            ASCEND_DEEPEP_KERNEL_LAUNCH_UB(ascend_deepep::kNotifyDynamicUbBytes +
+                                                           ascend_deepep::notify_diagnostics::kUbBytes),
+                            stream>>>(input, workspace, meta, hist, bases, prefix, counts, gateways, local_dst, mask,
+                                      dst, forward, forward_counts, backward, backward_counts, ranges, masks, rank_rows,
+                                      gather_rows, weight_return_meta, profile, sample, config);
+}
+
 extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_barrier_kernel_do(void* stream, uint32_t num_cores)
 {
     notify_dispatch_barrier_kernel<<<num_cores, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(0), stream>>>();
@@ -1604,6 +1785,6 @@ extern "C" ASCEND_DEEPEP_EXPORT void notify_dispatch_peer_plan_kernel_do(void* s
                                                                          uint64_t stride_offset)
 {
     const auto t = *reinterpret_cast<ascend_deepep::DispatchTiling*>(tiling);
-    notify_dispatch_peer_plan_kernel<<<32, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(4096), stream>>>(
+    notify_dispatch_peer_plan_kernel<<<32, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(8192), stream>>>(
         workspace, dst, forward, counts, plan, t, stride_offset);
 }

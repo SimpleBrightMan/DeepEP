@@ -1,10 +1,9 @@
 # Copyright (c) 2026, Lu Lu
-# Modified by huangxiaolan 2026
 
 """Host workspace layouts for Elastic Notify, dispatch and combine."""
 
-WORLD_SIZES = (2, 4, 8, 16, 32, 64, 128, 256)
-MAX_BYTES = 32 << 30
+WORLD_SIZES = (2, 4, 8, 16, 32, 64, 128, 256, 512)
+MAX_BYTES = (1 << 63) - 1
 PAGE_BYTES = 2 << 20
 
 
@@ -13,24 +12,26 @@ def integer(name, value, lower, upper):
         raise ValueError(f"{name} must be an integer in [{lower}, {upper}]")
 
 
-def workspace_layout(world, tokens, topk, experts=1024):
+def workspace_layout(world, tokens, topk, experts=1024, chunk_tokens=256):
     """Mirror MakeNotifyTiling; launch also compares this with the native result."""
     if type(world) is not int or world not in WORLD_SIZES:
-        raise ValueError("Notify supports EP2/4/8/16/32/64/128/256")
-    integer("tokens", tokens, 1, 10240)
+        raise ValueError("Notify supports EP2/4/8/16/32/64/128/256/512")
+    integer("tokens", tokens, 1, 16384)
     integer("topk", topk, 1, 16)
     integer("experts", experts, world, 1024)
     if experts % world:
         raise ValueError("num_experts must be divisible by EP")
-    if world * world * tokens * topk >= 2**31:
-        raise ValueError("Notify int32 destination encoding requires EP*EP*T*K < 2**31")
+    if world * tokens * topk >= 2**31:
+        raise ValueError("Notify int32 row indexing requires EP*T*K < 2**31")
 
     def align(n):
         return (n + 511) // 512 * 512
 
+    if type(chunk_tokens) is not int or chunk_tokens not in (256, 512, 1024):
+        raise ValueError("Notify chunk_tokens must be 256, 512 or 1024")
     fcap = tokens * topk
     bcap = world * fcap
-    chunks = (tokens + 255) // 256 + min(4, tokens) - 1
+    chunks = (tokens + chunk_tokens - 1) // chunk_tokens + min(4, tokens, chunk_tokens) - 1
     lanes = min(world, 8)
     cstride, fstride, bstride = align(experts * 4), align(64 + fcap * 24), align(64 + bcap * 24)
     regions = (
@@ -58,18 +59,18 @@ def workspace_layout(world, tokens, topk, experts=1024):
     layout["workspace_bytes"] = cursor
     layout["num_bytes"] = max(PAGE_BYTES, (cursor + PAGE_BYTES - 1) // PAGE_BYTES * PAGE_BYTES)
     if layout["num_bytes"] > MAX_BYTES:
-        raise ValueError("Notify workspace exceeds the 32 GiB runtime limit")
+        raise ValueError("Notify workspace exceeds the int64 byte-size limit")
     return layout
 
 
 def dispatch_layout(world, tokens, topk, experts, rows, fp8=False, weights=False):
     if world not in WORLD_SIZES:
-        raise ValueError("Payload dispatch supports EP2/4/8/16/32/64/128/256")
+        raise ValueError("Payload dispatch supports EP2/4/8/16/32/64/128/256/512")
     notify = workspace_layout(world, tokens, topk, experts)
     integer("receive capacity", rows, 1, world * tokens * topk)
     stride = 1 << (rows - 1).bit_length()
-    if world * stride >= 2**31:
-        raise ValueError("Dispatch power-of-two address encoding exceeds int32")
+    if world * stride >= 2**63:
+        raise ValueError("Dispatch power-of-two address encoding exceeds int64")
     if type(fp8) is not bool:
         raise TypeError("fp8 must be bool")
     if type(weights) is not bool:
@@ -100,11 +101,11 @@ def dispatch_layout(world, tokens, topk, experts, rows, fp8=False, weights=False
     layout.update(
         aggregate_protocol=1,
         aggregate_packet_bytes=512,
-        scale_batch_rows=(64 if world <= 64 else 56 if world <= 128 else 24) if fp8 else 0,
+        scale_batch_rows=(64 if world <= 64 else 56 if world <= 128 else 24 if world <= 256 else 8) if fp8 else 0,
     )
     layout["num_bytes"] = max(PAGE_BYTES, (cursor + PAGE_BYTES - 1) // PAGE_BYTES * PAGE_BYTES)
     if layout["num_bytes"] > MAX_BYTES:
-        raise ValueError("Dispatch workspace exceeds the 32 GiB runtime limit")
+        raise ValueError("Dispatch workspace exceeds the int64 byte-size limit")
     return layout
 
 
@@ -116,19 +117,16 @@ def _combine_resident_bytes(world, tokens, chunk_tokens=256):
 
 def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256):
     if world not in WORLD_SIZES:
-        raise ValueError("Combine supports EP2/4/8/16/32/64/128/256")
-    integer("tokens", tokens, 1, 10240)
+        raise ValueError("Combine supports EP2/4/8/16/32/64/128/256/512")
+    integer("tokens", tokens, 1, 16384)
     integer("topk", topk, 1, 16)
     integer("rows", rows, 1, world * tokens * topk)
     integer("gather_rows", gather_rows, 1, world * tokens * topk)
-    integer("chunk_tokens", chunk_tokens, 1, 10240)
-    if world * world * tokens * topk >= 2**31:
+    integer("chunk_tokens", chunk_tokens, 1, 16384)
+    if world * tokens * topk >= 2**31:
         raise ValueError("Combine metadata indexing exceeds int32")
     chunks = (tokens + chunk_tokens - 1) // chunk_tokens + min(4, tokens, chunk_tokens) - 1
     groups = world // min(world, 64)
-    resident = _combine_resident_bytes(world, tokens, chunk_tokens)
-    if resident > 44 * 1024:
-        raise ValueError("Combine chunk ranges/masks exceed the resident 44 KiB UB capacity")
     slots = 3 * world + 96 + groups * chunks * 8 + 64 + world * chunks * 2 + 64
     cursor, result = slots * 512, {"control_slot_num": slots}
     for name, count in (
@@ -153,15 +151,11 @@ def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256):
 
 def elastic_size_hint(world, tokens, topk, experts, rows, gather_rows, fp8=False):
     dispatch = dispatch_layout(world, tokens, topk, experts, rows, fp8, weights=True)["workspace_bytes"]
-    # EP256 Dispatch accepts shapes beyond the default Combine UB limit.
-    # Preserve those size hints; Combine validates its own layout before launch.
-    combine = 0
-    if world != 256 or _combine_resident_bytes(world, tokens) <= 44 * 1024:
-        combine = combine_layout(world, tokens, topk, rows, gather_rows)["workspace_bytes"]
+    combine = combine_layout(world, tokens, topk, rows, gather_rows)["workspace_bytes"]
     # A fixed boundary prevents fresh/cached calls with different shapes or
     # BF16/FP8 dispatch from ever overlapping outstanding combine output copies.
     half = (max(dispatch, combine) + PAGE_BYTES - 1) // PAGE_BYTES * PAGE_BYTES
     total = 2 * half
     if total > MAX_BYTES:
-        raise ValueError("Elastic workspace exceeds the 32 GiB runtime limit")
+        raise ValueError("Elastic workspace exceeds the int64 byte-size limit")
     return total

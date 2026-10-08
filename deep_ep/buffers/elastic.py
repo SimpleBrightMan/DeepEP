@@ -1,5 +1,4 @@
 # Copyright (c) 2026, Lu Lu
-# Modified by Joyce_An 2026
 
 # API signatures adapted from DeepSeek DeepEP; see third-party/deepseek-deepep.LICENSE.
 """V2 expanded dispatch/combine and their Notify metadata orchestration."""
@@ -126,7 +125,7 @@ class EPHandle:
         self.trace = None
         self.hidden = None
         self.metadata_only = True
-        self.metadata_version = 6
+        self.metadata_version = 7
         self._buffer_token = None
         self._routing_versions = {}
 
@@ -155,10 +154,16 @@ class ElasticBuffer:
         *,
         rank: Optional[int] = None,
         world_size: Optional[int] = None,
+        bootstrap: str = "default",
+        combine_only: bool = False,
     ):
         """Initialize MTE+URMA using a group or explicit rank/world_size.
 
         Explicit identities bootstrap SHMEM directly and only validate locally.
+        bootstrap="mpi" uses MPI_COMM_WORLD under MPICH instead of Config Store.
+        combine_only=True omits Dispatch metadata and its QP admission pairs;
+        Dispatch and LL require combine_only=False. SDKs with peer-mask support
+        use sparse channels; DEEPEP_SHMEM_DENSE_QPS=1 forces dense admission.
         All ranks must agree on configuration and collective call order.
         num_bytes is the entire symmetric workspace, cleared at construction.
         Dispatch validates exactly 8 GiB when selecting LL; no extra allocation.
@@ -180,7 +185,7 @@ class ElasticBuffer:
             raise TypeError("use_fp8_dispatch must be bool")
         if explicitly_destroy is not True:
             raise NotImplementedError("Runtime currently requires explicitly_destroy=True")
-        integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 0, 10240)
+        integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 0, 16384)
         integer("num_topk", num_topk, 0, 16)
         if type(hidden) is not int or hidden not in (0, 7168):
             raise ValueError("Dispatch supports hidden=7168")
@@ -194,7 +199,16 @@ class ElasticBuffer:
         self.hidden = hidden
         self.num_topk = num_topk
         self._handle_token = object()
-        self._runtime = Runtime(group, num_bytes, num_cpu_timeout_secs, udma=True, rank=rank, world_size=world_size)
+        self._runtime = Runtime(
+            group,
+            num_bytes,
+            num_cpu_timeout_secs,
+            udma=True,
+            rank=rank,
+            world_size=world_size,
+            bootstrap=bootstrap,
+            combine_only=combine_only,
+        )
 
     def __del__(self):
         warn_unclosed(self)
@@ -220,9 +234,8 @@ class ElasticBuffer:
 
         Heavier skew requires explicit num_bytes; dispatch checks actual counts
         before payload launch. Size hints include weights and optional FP8 scales; combine
-        uses BF16 expert and gateway rows in the reserved second half. EP256 shapes
-        beyond the default Combine UB limit receive a dispatch-only hint; the hint
-        does not guarantee that Combine supports the shape.
+        uses BF16 expert and gateway rows in the reserved second half. Both operators
+        are included at every supported shape; actual allocation depends on the runtime.
         """
         require_native("ElasticBuffer.get_buffer_size_hint")
         if type(hidden) is not int or hidden != 7168:
@@ -620,6 +633,8 @@ class ElasticBuffer:
         runtime = runtime_of(self)
         runtime.ensure_alive()
         native, npu = require_native("ElasticBuffer.dispatch"), npu_api()
+        if getattr(runtime, "combine_only", False):
+            raise ValueError("Dispatch requires combine_only=False when constructing ElasticBuffer")
         if isinstance(handle, EPHandle) and handle.is_low_latency:
             raise NotImplementedError("Cached dispatch is not supported for LL handles")
         if handle is None:
@@ -729,7 +744,7 @@ class ElasticBuffer:
                         not isinstance(handle, EPHandle)
                         or handle._buffer_token is not self._handle_token
                         or handle.metadata_only
-                        or handle.metadata_version != 6
+                        or handle.metadata_version != 7
                     ):
                         raise ValueError("Cached handle must come from this buffer's successful payload dispatch")
                     if topk_idx is not None:
@@ -752,7 +767,7 @@ class ElasticBuffer:
                 num_max_tokens_per_rank = (
                     (bound or tokens) if num_max_tokens_per_rank is None else num_max_tokens_per_rank
                 )
-                integer("num_max_tokens_per_rank", num_max_tokens_per_rank, tokens, 10240)
+                integer("num_max_tokens_per_rank", num_max_tokens_per_rank, tokens, 16384)
                 if bound and num_max_tokens_per_rank > bound:
                     raise ValueError("Input/capacity exceeds the buffer token bound")
                 if self.num_topk and self.num_topk != topk:
@@ -823,10 +838,10 @@ class ElasticBuffer:
                     if getattr(handle, "dispatch_dst", None) is None:
                         # Preserve Notify's original stride/sentinel ABI for Combine.
                         raw = handle.dst.to(torch.int64)
-                        flat = torch.where(raw < 0, ~raw, raw)
+                        flat = torch.where(raw == -(1 << 63), 0, torch.where(raw < 0, ~raw, raw))
                         encoded = flat // rows * layout["address_stride"] + flat % rows
                         encoded = torch.where(raw < 0, ~encoded, encoded)
-                        handle.dispatch_dst = torch.where(raw == -(1 << 31), raw, encoded).to(torch.int32)
+                        handle.dispatch_dst = torch.where(raw == -(1 << 63), raw, encoded)
                     out = torch.empty((local_rows, width), dtype=hidden.dtype, device=hidden.device)
                     out_weights = (
                         torch.empty((local_rows,), dtype=torch.float32, device=hidden.device)
@@ -890,6 +905,7 @@ class ElasticBuffer:
                     )
                     if diagnostics is not None:
                         diagnostics["device_ms"] = device_times
+                        diagnostics["device_phase_names"] = ("entry_barrier", "kernel", "exit_barrier", "device_total")
                     handle.metadata_only = False
                     handle.num_compute_units = 64 if fp8 else 32
                     handle._routing_versions = {
@@ -951,7 +967,7 @@ class ElasticBuffer:
         runtime.ensure_alive()
         native, npu = require_native("ElasticBuffer.combine"), npu_api()
         with runtime.notify_lock:
-            error, signature, retained = None, [0] * 7, ()
+            error, signature, retained = None, [0] * 9, ()
             try:
                 if runtime.notify_failed:
                     raise RuntimeError("A previous communication launch failed; restart the distributed job")
@@ -973,7 +989,7 @@ class ElasticBuffer:
                     not isinstance(handle, EPHandle)
                     or handle._buffer_token is not self._handle_token
                     or handle.metadata_only
-                    or handle.metadata_version != 6
+                    or handle.metadata_version != 7
                 ):
                     raise ValueError("Combine needs this buffer's successful expanded payload dispatch handle")
                 if not handle.do_expand or handle.expert_alignment != 1:
@@ -998,6 +1014,48 @@ class ElasticBuffer:
                         "x must be contiguous BF16 [num_expanded_tokens,7168] on the buffer NPU without grad"
                     )
                 tokens, topk, chunk = handle.num_tokens, handle.num_topk, handle.chunk_tokens
+                diagnostics = getattr(self, "_combine_diagnostics", None)
+                profile, profile_sample, chunk_profile, peer_profile = None, 0, None, None
+                if diagnostics is not None:
+                    profile, profile_sample = diagnostics["profile"], diagnostics["sample"]
+                    chunk_profile = diagnostics["chunks"]
+                    peer_profile = diagnostics["peers"]
+                    if getattr(native, "combine_peer_profile_version", lambda: 0)() != 1:
+                        raise RuntimeError("Rebuild/install all ranks for Combine peer profile v1")
+                    if getattr(native, "combine_chunk_profile_version", lambda: 0)() != 2:
+                        raise RuntimeError("Rebuild/install all ranks for Combine chunk profile v2")
+                    chunks = (tokens + chunk - 1) // chunk + min(4, tokens, chunk) - 1
+                    groups = runtime.world_size // min(runtime.world_size, 64)
+                    if (
+                        not isinstance(peer_profile, torch.Tensor)
+                        or peer_profile.dtype != torch.int64
+                        or peer_profile.device != x.device
+                        or tuple(peer_profile.shape) != (2, runtime.world_size, chunks, 2, 16)
+                        or not peer_profile.is_contiguous()
+                        or peer_profile.requires_grad
+                    ):
+                        raise ValueError("Invalid Combine peer profile tensor shape/dtype/device")
+                    if (
+                        not isinstance(chunk_profile, torch.Tensor)
+                        or chunk_profile.dtype != torch.int64
+                        or chunk_profile.device != x.device
+                        or tuple(chunk_profile.shape) != (64, (groups + 2) * chunks, 36)
+                        or not chunk_profile.is_contiguous()
+                        or chunk_profile.requires_grad
+                    ):
+                        raise ValueError("Invalid Combine chunk profile tensor shape/dtype/device")
+                    integer("Combine profile sample", profile_sample, 1, (1 << 63) - 1)
+                    if getattr(native, "combine_profile_version", lambda: 0)() != 4:
+                        raise RuntimeError("Rebuild/install all ranks for Combine profile v4")
+                    if (
+                        not isinstance(profile, torch.Tensor)
+                        or profile.dtype != torch.int64
+                        or profile.device != x.device
+                        or tuple(profile.shape) != (64, 72)
+                        or not profile.is_contiguous()
+                        or profile.requires_grad
+                    ):
+                        raise ValueError("Combine profile must be contiguous int64 [64,72] on the buffer NPU")
                 if topk_weights is not None and (
                     not isinstance(topk_weights, torch.Tensor)
                     or topk_weights.dtype != torch.float32
@@ -1047,12 +1105,21 @@ class ElasticBuffer:
                             weight_return_meta=handle.weight_return_meta,
                         )
                     retained = (x, output, handle.topk_idx, *(getattr(handle, name) for name in _PERSISTENT))
+                    if profile is not None:
+                        tensors.update(
+                            profile=profile,
+                            profile_sample=profile_sample,
+                            chunk_profile=chunk_profile,
+                            peer_profile=peer_profile,
+                        )
+                        retained += (profile, chunk_profile, peer_profile)
                     if output_weights is not None:
                         retained += (topk_weights, output_weights)
                     for tensor in retained:
                         tensor.record_stream(runtime.stream)
                     runtime.stream.synchronize()
                 signature = [tokens, topk, chunk, rows, gathered, runtime.capacity, int(topk_weights is not None)]
+                signature += [int(profile is not None), profile_sample]
             except Exception as exc:
                 error = exc
             _collective_check(runtime, error, signature)
@@ -1100,6 +1167,7 @@ class ElasticBuffer:
         expand,
         zero_padding,
         aligned_sf,
+        chunk_tokens=256,
     ):
         import torch
         from ..utils.event import EventHandle, EventOverlap
@@ -1109,7 +1177,7 @@ class ElasticBuffer:
         native = require_native("ElasticBuffer.dispatch")
         npu = npu_api()
         with runtime.notify_lock:
-            signature = [0] * 5
+            signature = [0] * 6
             error = None
             try:
                 if runtime.notify_failed:
@@ -1164,7 +1232,7 @@ class ElasticBuffer:
                 ):
                     raise ValueError("topk_idx must be contiguous int64 [T,K] on the buffer NPU")
                 topk = topk_idx.shape[1]
-                layout = workspace_layout(runtime.world_size, tokens, topk, num_experts)
+                layout = workspace_layout(runtime.world_size, tokens, topk, num_experts, chunk_tokens)
                 if topk_weights is not None and (
                     not isinstance(topk_weights, torch.Tensor)
                     or topk_weights.dtype != torch.float32
@@ -1176,7 +1244,7 @@ class ElasticBuffer:
                     raise ValueError("topk_weights must be contiguous FP32 [T,K] without grad")
                 bound = self.num_max_tokens_per_rank
                 capacity = (bound or tokens) if capacity is None else capacity
-                integer("num_max_tokens_per_rank", capacity, tokens, 10240)
+                integer("num_max_tokens_per_rank", capacity, tokens, 16384)
                 if bound and (tokens > bound or capacity > bound):
                     raise ValueError("Input/capacity exceeds the buffer token bound")
                 if self.num_topk and self.num_topk != topk:
@@ -1185,11 +1253,19 @@ class ElasticBuffer:
                     raise ValueError(
                         f"Notify requires at least {2 * layout['num_bytes']} SHMEM bytes per rank (reserved halves)"
                     )
-                specification = native.notify_layout(runtime.rank, runtime.world_size, tokens, topk, num_experts)
+                specification = native.notify_layout(
+                    runtime.rank,
+                    runtime.world_size,
+                    tokens,
+                    topk,
+                    num_experts,
+                    chunk_tokens,
+                    combine_only=runtime.combine_only,
+                )
                 if specification["workspace_bytes"] != layout["workspace_bytes"]:
                     raise RuntimeError("Python/native notify layouts differ; rebuild the installed package")
                 native.notify_check_mapping(runtime.native)
-                signature = [tokens, topk, num_experts, hidden, capacity]
+                signature = [tokens, topk, num_experts, hidden, capacity, chunk_tokens]
             except Exception as exc:
                 error = exc
             _collective_check(runtime, error, signature)
@@ -1225,12 +1301,19 @@ class ElasticBuffer:
                     if routing_diagnostics is not None:
                         tensors["kernel_timing"] = True
                     notify_ms, prepare_ms = native.notify(
-                        runtime.native, indices, tensors, tokens, topk, num_experts, runtime.stream.npu_stream
+                        runtime.native,
+                        indices,
+                        tensors,
+                        tokens,
+                        topk,
+                        num_experts,
+                        runtime.stream.npu_stream,
+                        chunk_tokens,
                     )
                     if routing_diagnostics is not None:
                         routing_diagnostics["notify_device_ms"] = notify_ms
                         routing_diagnostics["prepare_device_ms"] = prepare_ms
-                        routing_diagnostics["plan_in_notify"] = True
+                        routing_diagnostics["plan_in_notify"] = not runtime.combine_only
                     tensors.pop("kernel_timing", None)
                     runtime.stream.synchronize()
                     local_experts = num_experts // runtime.world_size
@@ -1268,7 +1351,7 @@ class ElasticBuffer:
                     result.address_stride = max(1, max(rows))
                     result.rank, result.world_size = runtime.rank, runtime.world_size
                     result.num_tokens, result.num_topk = tokens, topk
-                    result.chunk_tokens = 256
+                    result.chunk_tokens = chunk_tokens
                     result._buffer_token = self._handle_token
                     result.trace = None
                     retained = (

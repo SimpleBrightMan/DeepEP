@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #include "ops/device_phase_timing.hpp"
 
@@ -10,6 +9,7 @@
 #include <array>
 #include "kernels/dispatch/tiling.hpp"
 #include "kernels/dispatch/launch.hpp"
+#include "kernels/notify/launch.hpp"
 #include "runtime/session.hpp"
 
 namespace py = pybind11;
@@ -18,13 +18,13 @@ namespace {
 ascend_deepep::DispatchTiling layout(int rank, int world, int tokens, int topk, int experts, int rows, bool fp8,
                                      bool weights = false)
 {
-    if (world < 2 || world > 256 || (world & (world - 1)) || rank < 0 || rank >= world || tokens < 1 ||
-        tokens > 10240 || topk < 1 || topk > 16 || experts < world || experts > 1024 || experts % world || rows < 1 ||
-        uint64_t(rows) > uint64_t(world) * tokens * topk || uint64_t(world) * world * tokens * topk >= (1ULL << 31)) {
-        throw std::invalid_argument("Invalid dispatch shape (EP2..256, H7168, T1..10240, K1..16, E<=1024)");
+    if (world < 2 || world > 512 || (world & (world - 1)) || rank < 0 || rank >= world || tokens < 1 ||
+        tokens > 16384 || topk < 1 || topk > 16 || experts < world || experts > 1024 || experts % world || rows < 1 ||
+        uint64_t(rows) > uint64_t(world) * tokens * topk || uint64_t(world) * tokens * topk >= (1ULL << 31)) {
+        throw std::invalid_argument("Invalid dispatch shape (EP2..512, H7168, T1..16384, K1..16, E<=1024)");
     }
     auto t = ascend_deepep::MakeDispatchTiling(rank, world, tokens, topk, experts, rows, fp8, weights);
-    if (uint64_t(world) * t.address_stride >= (1ULL << 31) || t.workspace_bytes > (32ULL << 30)) {
+    if (uint64_t(world) * t.address_stride >= (1ULL << 63) || t.workspace_bytes > (1ULL << 63)) {
         throw std::invalid_argument("Dispatch address encoding or workspace capacity overflow");
     }
     return t;
@@ -79,6 +79,7 @@ void bind_dispatch(py::module_& module)
     module.def("dispatch_plan_bytes", &ascend_deepep::DispatchPlanBytes);
     module.def("dispatch", [](Session& session, py::dict tensors, int tokens, int topk, int experts, int rows,
                               int local_rows, bool fp8, uintptr_t stream_address) {
+        if (session.combine_only()) throw std::invalid_argument("Dispatch requires combine_only=False");
         const auto t =
             layout(session.rank(), session.world(), tokens, topk, experts, rows, fp8, !tensors["weights"].is_none());
         auto* workspace = static_cast<uint8_t*>(session.workspace());
@@ -94,7 +95,7 @@ void bind_dispatch(py::module_& module)
         const char* dtype = fp8 ? "float8_e4m3fn" : "bfloat16";
         auto* input = pointer(tensors["input"], {tokens, 7168}, dtype, device);
         auto* output = pointer(tensors["output"], {local_rows, 7168}, dtype, device);
-        auto* destinations = pointer(tensors["dst"], {tokens, topk}, "int32", device);
+        auto* destinations = pointer(tensors["dst"], {tokens, topk}, "int64", device);
         auto* forward = pointer(tensors["forward_list"], {session.world(), int64_t(tokens) * topk, 6}, "int32", device);
         auto* counts = pointer(tensors["forward_counts"], {session.world()}, "int32", device);
         uint8_t *weights = nullptr, *out_weights = nullptr, *scales = nullptr, *out_scales = nullptr;
@@ -186,14 +187,14 @@ void bind_dispatch(py::module_& module)
             session.remember_dispatch_controls(controls);
         }
         timing.mark(0, stream);
-        // Keep the four timing columns stable; the input/output copy intervals
-        // are now empty. All framework payload buffers are accessed directly.
+        // All 64 AIVs participate; timing includes these separate barrier tasks.
+        notify_dispatch_barrier_kernel_do(stream, 64U);
         timing.mark(1, stream);
         dispatch_kernel_do(stream, workspace, destinations, forward, counts, weights, scales,
                            reinterpret_cast<uint8_t*>(&config));
         timing.mark(2, stream);
-        // FinishPeerDispatch joins inbound writes before the framework records
-        // its completion event. Independent output storage survives reuse/destroy.
+        // Join inbound writes before recording the public completion event.
+        notify_dispatch_barrier_kernel_do(stream, 64U);
         timing.mark(3, stream);
         return timing.finish(stream);
     });

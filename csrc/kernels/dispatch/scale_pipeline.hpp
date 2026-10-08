@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #pragma once
 struct PeerScalePlan {
@@ -20,21 +19,21 @@ __aicore__ inline void NativeFill(LocalTensor<int32_t> tensor, int32_t value, ui
 #include "aggregate_transport.hpp"
 #include "aggregate_packet.hpp"
 namespace DeepepScaleAggregate {
-__simt_vf__ __launch_bounds__(128) inline void Decode(__ubuf__ int32_t* ranks, __ubuf__ int32_t* slots,
-                                                      __ubuf__ int32_t* indices, uint32_t n, uint32_t begin,
-                                                      uint32_t stride)
+__simt_vf__ __launch_bounds__(128) inline void Decode(__gm__ int64_t* destinations, __ubuf__ int32_t* ranks,
+                                                      __ubuf__ int32_t* slots, __ubuf__ int32_t* indices, uint32_t n,
+                                                      uint32_t begin, uint32_t stride, uint32_t shift)
 {
     for (uint32_t i = threadIdx.x; i < n; i += 128U) {
-        const uint32_t bits = uint32_t(ranks[i]);
+        const uint64_t bits = uint64_t(asc_ldcg(destinations + begin + i));
         indices[i] = int32_t(begin + i);
-        if (bits == 0x80000000U) {
+        if (bits == 0x8000000000000000ULL) {
             ranks[i] = -1;
             slots[i] = -1;
             continue;
         }
-        const uint32_t flat = bits ^ (0U - (bits >> 31U));
-        ranks[i] = int32_t(flat / stride);
-        slots[i] = int32_t(flat % stride);
+        const uint64_t flat = bits ^ (0ULL - (bits >> 63U));
+        ranks[i] = int32_t(flat >> shift);
+        slots[i] = int32_t(flat & (stride - 1U));
     }
     asc_threadfence();
 }
@@ -197,6 +196,8 @@ __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const Pee
     }
     const uint32_t owner = AscendC::GetBlockIdx() - 32U;
     const uint32_t routes = t.tokens * t.topk;
+    uint32_t address_shift = 0;
+    for (uint32_t value = plan.address_stride; value > 1U; value >>= 1U) ++address_shift;
     const uint32_t peers = owner < t.world ? (t.world - 1U - owner) / 32U + 1U : 0U;
     auto ranks = layout.aux_routes ? local_scratch.GetWithOffset<int32_t>(layout.tile, 0U)
                                    : scratch.GetWithOffset<int32_t>(layout.tile, 0U);
@@ -239,13 +240,13 @@ __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const Pee
             const uint32_t n = routes - begin < layout.tile ? routes - begin : layout.tile;
             const uint32_t padded = (n + 63U) & ~63U;
             uint64_t start = Clock<Profile>();
-            NativeLoad(ranks, reinterpret_cast<__gm__ int32_t*>(plan.destinations) + begin, n);
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            asc_vf_call<DeepepScaleAggregate::Decode>(
-                dim3(128), reinterpret_cast<__ubuf__ int32_t*>(ranks.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ int32_t*>(slots.GetPhyAddr()),
-                reinterpret_cast<__ubuf__ int32_t*>(indices.GetPhyAddr()), n, begin, plan.address_stride);
+            AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
+            asc_vf_call<DeepepScaleAggregate::Decode>(dim3(128), reinterpret_cast<__gm__ int64_t*>(plan.destinations),
+                                                      reinterpret_cast<__ubuf__ int32_t*>(ranks.GetPhyAddr()),
+                                                      reinterpret_cast<__ubuf__ int32_t*>(slots.GetPhyAddr()),
+                                                      reinterpret_cast<__ubuf__ int32_t*>(indices.GetPhyAddr()), n,
+                                                      begin, plan.address_stride, address_shift);
             DeepepWeightAggregate::WaitVector();
             for (uint32_t i = n; i < padded; ++i) {
                 ranks.SetValue(i, -1);

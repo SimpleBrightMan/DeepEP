@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #pragma once
 
@@ -21,8 +20,24 @@ __aicore__ inline void ForwardPeer(DeepepSecondaryState& s, const DispatchTiling
     auto prefix = metadata.GetWithOffset<uint32_t>(1024U, 4096U);
     NativeLoad(prefix, reinterpret_cast<__gm__ uint32_t*>(plan) + lane * (s.world + 1U), s.world + 1U);
     auto records = metadata.Get<uint32_t>();
-    auto indices = metadata.GetWithOffset<uint32_t>(kFmSimtMaxWqes, kFmSimtIndicesOffset);
-    uint32_t seen[8]{};
+    uint32_t seen[16]{};
+    auto local_begin = metadata.GetWithOffset<uint32_t>(s.world, 8192U);
+    auto local_end = metadata.GetWithOffset<uint32_t>(s.world, 10240U);
+    for (uint32_t source = 0U; source < s.world; ++source) {
+        const uint32_t begin = prefix.GetValue(source), end = prefix.GetValue(source + 1U);
+        if (begin == end) seen[source / 32U] |= 1U << (source % 32U);
+        if constexpr (Local) {
+            const uint32_t workers = ascend_deepep::scale_clos::LocalWorkers(s.world);
+            const uint32_t worker = s.core - ascend_deepep::scale_clos::LocalFirst(s.world);
+            // Distribute each source's remainder using its global CSR position.
+            // Across adjacent sources every worker gets floor/ceil(total/workers).
+            const uint32_t count = end - begin, whole = count / workers, remainder = count % workers;
+            const uint32_t rotated = (worker + workers - begin % workers) % workers;
+            const uint32_t first = begin + rotated * whole + (rotated < remainder ? rotated : remainder);
+            local_begin.SetValue(source, first);
+            local_end.SetValue(source, first + whole + (rotated < remainder ? 1U : 0U));
+        }
+    }
     if constexpr (Local) {
         SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
         SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
@@ -33,13 +48,16 @@ __aicore__ inline void ForwardPeer(DeepepSecondaryState& s, const DispatchTiling
         bool pending = false;
         uint32_t selected = s.world, first = 0U, last = 0U;
         for (uint32_t source = 0; source < s.world; ++source) {
+            if (seen[source / 32U] == UINT32_MAX) {
+                source = (source / 32U + 1U) * 32U - 1U;
+                continue;
+            }
             const uint32_t bit = 1U << (source % 32U);
             if (seen[source / 32U] & bit) continue;
             uint32_t begin = prefix.GetValue(source), end = prefix.GetValue(source + 1U);
             if constexpr (Local) {
-                const uint32_t count = end - begin, worker = s.core - ascend_deepep::scale_clos::LocalFirst(s.world);
-                end = begin + uint64_t(count) * (worker + 1U) / ascend_deepep::scale_clos::LocalWorkers(s.world);
-                begin += uint64_t(count) * worker / ascend_deepep::scale_clos::LocalWorkers(s.world);
+                begin = local_begin.GetValue(source);
+                end = local_end.GetValue(source);
             }
             if (begin == end) {
                 seen[source / 32U] |= bit;
@@ -58,14 +76,14 @@ __aicore__ inline void ForwardPeer(DeepepSecondaryState& s, const DispatchTiling
             const uint32_t count = last - at < 128U ? last - at : 128U;
             NativeLoad(records, pairs + uint64_t(at) * 2U, count * 2U);
             if constexpr (!Local) {
-                // Same configurable power-of-two DB granularity as Clos (1..64),
-                // not a quiet per batch. WQE loop has no data-dependent branch.
+                // Construct up to 32 descriptors per VF, then publish four per
+                // DB. The source-ready gate covers the entire source row range.
                 for (uint32_t row = 0; row < count;) {
-                    const uint32_t n = count - row < s.rotation_wqes ? count - row : s.rotation_wqes;
-                    IssueFmRows(s, peer, wqe, records, indices, row, n);
+                    const uint32_t n = count - row < kFmBuildRows ? count - row : kFmBuildRows;
+                    IssueFmRows(s, peer, wqe, records, row, n);
                     row += n;
                     issued += n;
-                    ++batches;
+                    batches += (n + 3U) / 4U;
                 }
             } else {
                 for (uint32_t row = 0; row < count; row += 4U) {

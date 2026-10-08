@@ -1,5 +1,4 @@
 # Copyright (c) 2026, Lu Lu
-# Modified by SimpleBright_Man 2026
 
 """Shared V1/V2 resource owner; no EP algorithms are enabled by this module."""
 
@@ -50,9 +49,9 @@ def rank_and_world(group, rank=None, world_size=None):
     if group is None:
         from .buffers._elastic_layout import WORLD_SIZES
 
-        integer("world_size", world_size, 2, 256)
+        integer("world_size", world_size, 2, 512)
         if world_size not in WORLD_SIZES:
-            raise ValueError("Runtime supports EP2/4/8/16/32/64/128/256")
+            raise ValueError("Runtime supports EP2/4/8/16/32/64/128/256/512")
         integer("rank", rank, 0, world_size - 1)
         return rank, world_size
     if rank is not None or world_size is not None:
@@ -69,14 +68,45 @@ class Runtime:
 
     _megamoe = False
 
-    def __init__(self, group, capacity, timeout=120, *, udma=False, rank=None, world_size=None):
+    def __init__(
+        self,
+        group,
+        capacity,
+        timeout=120,
+        *,
+        udma=False,
+        rank=None,
+        world_size=None,
+        bootstrap="default",
+        combine_only=False,
+    ):
         global _OWNER
         native = require_native("Runtime.__init__")
-        integer("capacity", capacity, 2 << 20, (1 if self._megamoe else 32) << 30)
+        integer("capacity", capacity, 2 << 20, (1 << 30) if self._megamoe else (1 << 63) - 1)
         if capacity % (2 << 20):
             raise ValueError("capacity must be aligned to 2 MiB")
-        integer("timeout", timeout, 1, 300)
-        address = endpoint()
+        integer("timeout", timeout, 1, 3600)
+        if bootstrap not in ("default", "mpi"):
+            raise ValueError("bootstrap must be default or mpi")
+        if bootstrap == "mpi":
+            if group is not None or not udma or self._megamoe:
+                raise ValueError("MPI bootstrap requires explicit rank/world_size and the Elastic UDMA runtime")
+            if not callable(getattr(native, "create_mpi_runtime", None)):
+                raise RuntimeError("Rebuild/install DeepEP with MPI bootstrap support")
+            try:
+                mpi_rank, mpi_size = (int(os.environ[name]) for name in ("PMI_RANK", "PMI_SIZE"))
+            except (KeyError, ValueError) as exc:
+                raise ValueError("MPI bootstrap requires an MPICH launcher with PMI_RANK/PMI_SIZE") from exc
+            if (rank, world_size) != (mpi_rank, mpi_size):
+                raise ValueError("Explicit rank/world_size disagree with MPI_COMM_WORLD")
+        address = "" if bootstrap == "mpi" else endpoint()
+        if type(combine_only) is not bool or (combine_only and not udma):
+            raise ValueError("combine_only requires a UDMA runtime and a bool value")
+        self.combine_only = combine_only
+        dense_qps = os.environ.get("DEEPEP_SHMEM_DENSE_QPS", "0")
+        if dense_qps not in ("0", "1"):
+            raise ValueError("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1")
+        self.bootstrap = bootstrap
         store_group = self._megamoe and isinstance(group, StoreGroup)
         if self._megamoe and (group is None or udma):
             raise ValueError("MegaMoE requires a ProcessGroup or StoreGroup and the MTE runtime")
@@ -96,7 +126,7 @@ class Runtime:
             from .buffers._elastic_layout import WORLD_SIZES
 
             if size not in WORLD_SIZES:
-                raise ValueError("Runtime supports EP2/4/8/16/32/64/128/256")
+                raise ValueError("Runtime supports EP2/4/8/16/32/64/128/256/512")
         if group is not None and not store_group:
             import torch
             import torch.distributed as dist
@@ -130,7 +160,7 @@ class Runtime:
                             self.device,
                         ]
                     )
-                local_values.append(int(udma))
+                local_values.append(int(udma) + 2 * int(combine_only) + 4 * int(dense_qps))
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")
                 else:
@@ -145,7 +175,7 @@ class Runtime:
                 if any(value[:3] != values[0][:3] for value in values):
                     raise ValueError("Ranks disagree on workspace capacity, timeout or bootstrap endpoint")
                 if any(value[-1] != values[0][-1] for value in values):
-                    raise ValueError("Ranks disagree on MTE/URMA runtime engines")
+                    raise ValueError("Ranks disagree on MTE/URMA runtime engines or QP configuration")
                 if self._megamoe:
                     invalid_hosts = [i for i, value in enumerate(values) if value[4] == 0]
                     if invalid_hosts:
@@ -174,9 +204,15 @@ class Runtime:
             self.notify_inflight = None
             self.stream = npu.Stream(device=self.device)
             self.native = (
-                native.Runtime(rank, size, capacity, address, timeout, udma)
-                if udma
-                else factory(rank, size, capacity, address, timeout)
+                native.create_combine_runtime(rank, size, capacity, address, timeout, bootstrap == "mpi")
+                if combine_only
+                else native.create_mpi_runtime(rank, size, capacity, timeout)
+                if bootstrap == "mpi"
+                else (
+                    native.Runtime(rank, size, capacity, address, timeout, udma)
+                    if udma
+                    else factory(rank, size, capacity, address, timeout)
+                )
             )
             _OWNER = self
             if capacity == 8 << 30 and 16 <= size <= 128:

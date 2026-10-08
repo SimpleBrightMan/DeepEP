@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #pragma once
 #include <cstdint>
@@ -12,7 +11,7 @@
 
 namespace ascend_deepep::scale_pipeline {
 constexpr uint32_t kScratchBytes = 132096U;
-constexpr uint32_t kWorkers = 32U, kMaxPeers = 8U, kMaxBuffers = 16U;
+constexpr uint32_t kWorkers = 32U, kMaxPeers = 16U, kMaxBuffers = 32U;
 // Keep manual completion tickets on IDs 0..3; IDs 6/7 may be used by AscendC.
 // Larger worlds retain all UB buffers and share tickets after a local wait.
 constexpr uint32_t kCompletionEvents = 4U;
@@ -33,7 +32,7 @@ struct Layout {
 SCALE_PIPE_INLINE constexpr Layout Make(uint32_t world, uint32_t stride)
 {
     Layout p{};
-    if (!world || world > 256U || stride != 224U) {
+    if (!world || world > 512U || stride != 224U) {
         return p;
     }
     p.peers = (world + kWorkers - 1U) / kWorkers;
@@ -60,6 +59,7 @@ SCALE_PIPE_INLINE constexpr Layout Make(uint32_t world, uint32_t stride)
     }
     return Layout{};
 }
+static_assert(Make(512U, 224U).batch == 8U && Make(512U, 224U).bytes <= kScratchBytes);
 static_assert(Make(32U, 224U).batch == 64U);
 static_assert(Make(64U, 224U).batch == 64U && Make(64U, 224U).tile == 3840U);
 static_assert(Make(128U, 224U).batch == 56U && Make(128U, 224U).bytes <= kScratchBytes);

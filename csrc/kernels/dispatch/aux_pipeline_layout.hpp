@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #pragma once
 #include "scale_pipeline_layout.hpp"
@@ -18,7 +17,7 @@ __aicore__
     Make(uint32_t world, uint32_t stride)
 {
     Layout p{};
-    if ((world < 2U || world > 256U || (world & (world - 1U))) || stride != 0U) {
+    if ((world < 2U || world > 512U || (world & (world - 1U))) || stride != 0U) {
         return p;
     }
     p.peers = (world + 31U) / 32U;
@@ -46,6 +45,7 @@ __aicore__
     }
     return Layout{};
 }
+static_assert(Make(512U, 0U).peers == 16U && Make(512U, 0U).batch > 0U && Make(512U, 0U).bytes <= 132096U);
 static_assert(Make(128U, 0U).batch == 960U && Make(128U, 0U).bytes <= 132096U);
 static_assert(Make(256U, 0U).batch > 0U && Make(256U, 0U).bytes <= 132096U);
 }  // namespace ascend_deepep::aux_pipeline

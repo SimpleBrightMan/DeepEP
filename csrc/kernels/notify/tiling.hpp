@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by lishaoxun 2026
 
 #pragma once
 #include <cstdint>
@@ -10,8 +9,11 @@ inline constexpr uint32_t kNotifyLocalTopkRouteMetaFields = 6U;
 inline constexpr uint32_t kNotifyLocalTopkTileTokens = 16U;
 inline constexpr uint32_t kNotifyCores = 32U;
 inline constexpr uint32_t kNotifyForwardTileRows = 32U;
-inline constexpr uint32_t kNotifyForwardMetaUbBytes = 32U * 1024U;
-inline constexpr uint32_t kNotifyForwardBasesUbBytes = 8U * 1024U;
+// EP128/256, T=16384, K=6, E=512: histogram/prefix <=96KiB,
+// forward metadata + stable row plan =96KiB, cached parse routes =24KiB.
+// The same buffers are reused across phases; no symmetric-memory layout change.
+inline constexpr uint32_t kNotifyForwardMetaUbBytes = 96U * 1024U;
+inline constexpr uint32_t kNotifyForwardBasesUbBytes = 24U * 1024U;
 inline constexpr uint32_t kNotifyCommunicationUbBytes = 8U * 1024U;
 inline constexpr uint32_t kNotifyPrefixSegmentTiles = 16U;
 inline constexpr uint32_t kNotifyPrefixBlockColumns = 16U;
@@ -77,6 +79,21 @@ inline constexpr uint32_t NotifyForwardTokenPrefixOffsetWords(uint32_t tokens, u
     const uint64_t matrix_bytes = local_tiles * world * kNotifyForwardTileRows * sizeof(uint16_t);
     return plan != 0U && matrix_start * 4U + matrix_bytes <= kNotifyForwardMetaUbBytes ? uint32_t(matrix_start) : 0U;
 }
+// Count-only cursors reuse the space after the aligned expert bases. Each tile
+// has one writer; the completed [gateway, local_tile] matrix is exported once.
+// Saved plans consume tile-local ordinals, never an atomically assigned order.
+inline constexpr uint32_t NotifyForwardCountOffsetWords(uint32_t tokens, uint32_t topk, uint32_t experts,
+                                                        uint32_t world, uint32_t num_cores = kNotifyCores)
+{
+    if (NotifyForwardPlanOffsetWords(tokens, topk, experts, num_cores) == 0U ||
+        NotifyForwardTokenPrefixOffsetWords(tokens, topk, experts, world, num_cores) != 0U) {
+        return 0U;
+    }
+    const uint64_t tiles = (uint64_t(tokens) + kNotifyForwardTileRows - 1U) / kNotifyForwardTileRows;
+    const uint64_t local_tiles = (tiles + num_cores - 1U) / num_cores;
+    const uint64_t offset = (uint64_t(experts) + 7U) / 8U * 8U;
+    return (offset + local_tiles * world) * sizeof(int32_t) <= kNotifyForwardBasesUbBytes ? uint32_t(offset) : 0U;
+}
 // parse 暂借 forward meta 的 UB，每个 tile 独占一行，行步长按 64B 对齐。
 inline constexpr bool NotifyParseHistFitsUb(uint32_t tokens, uint32_t world, uint32_t experts,
                                             uint32_t num_cores = kNotifyCores)
@@ -116,6 +133,7 @@ struct NotifyTiling {
     uint32_t cache_local_prefix_totals;
     uint32_t forward_plan_offset_words;
     uint32_t forward_token_prefix_offset_words;
+    uint32_t forward_count_offset_words;
     uint32_t forward_prefix_ub_stride;
     uint64_t count_stride;
     uint64_t forward_stride;
@@ -162,6 +180,7 @@ inline NotifyTiling MakeNotifyTiling(uint32_t rank, uint32_t world, uint32_t tok
     t.cache_parse_routes = NotifyParseRoutesFitUb(tokens, topk, world, experts, num_cores) ? 1U : 0U;
     t.forward_plan_offset_words = NotifyForwardPlanOffsetWords(tokens, topk, experts, num_cores);
     t.forward_token_prefix_offset_words = NotifyForwardTokenPrefixOffsetWords(tokens, topk, experts, world, num_cores);
+    t.forward_count_offset_words = NotifyForwardCountOffsetWords(tokens, topk, experts, world, num_cores);
     t.forward_prefix_ub_stride = NotifyForwardPrefixUbStride(tokens, world, num_cores);
     const auto align512 = [](uint64_t n) { return (n + 511U) / 512U * 512U; };
     const uint32_t lanes = world < 8U ? world : 8U;

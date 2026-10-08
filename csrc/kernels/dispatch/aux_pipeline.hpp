@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #pragma once
 struct PeerAuxPlan {
@@ -140,6 +139,8 @@ __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const Pee
     const uint32_t owner = AscendC::GetBlockIdx() - 32U;
     const uint32_t peers = owner < t.world ? (t.world - 1U - owner) / 32U + 1U : 0U;
     const uint32_t routes = t.tokens * t.topk;
+    uint32_t address_shift = 0;
+    for (uint32_t value = plan.address_stride; value > 1U; value >>= 1U) ++address_shift;
     const uint32_t capacity = t.weight_capacity;
     const uint64_t inbox = t.weight_inbox;
     const uint64_t region_stride = t.weight_inbox_stride;
@@ -181,14 +182,14 @@ __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const Pee
         const uint32_t n = routes - begin < layout.tile ? routes - begin : layout.tile;
         const uint32_t padded = (n + 63U) & ~63U;
         uint64_t start = Clock<Profile>();
-        NativeLoad(ranks, reinterpret_cast<__gm__ int32_t*>(plan.destinations) + begin, n);
         NativeLoad(weights, reinterpret_cast<__gm__ int32_t*>(plan.weights) + begin, n);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-        asc_vf_call<DeepepScaleAggregate::Decode>(dim3(128), reinterpret_cast<__ubuf__ int32_t*>(ranks.GetPhyAddr()),
+        asc_vf_call<DeepepScaleAggregate::Decode>(dim3(128), reinterpret_cast<__gm__ int64_t*>(plan.destinations),
+                                                  reinterpret_cast<__ubuf__ int32_t*>(ranks.GetPhyAddr()),
                                                   reinterpret_cast<__ubuf__ int32_t*>(slots.GetPhyAddr()),
                                                   reinterpret_cast<__ubuf__ int32_t*>(indices.GetPhyAddr()), n, begin,
-                                                  plan.address_stride);
+                                                  plan.address_stride, address_shift);
         DeepepWeightAggregate::WaitVector();
         for (uint32_t i = n; i < padded; ++i) {
             ranks.SetValue(i, -1);

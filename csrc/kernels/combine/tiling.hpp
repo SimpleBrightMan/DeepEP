@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by lishaoxun 2026
 
 #pragma once
 #include <cstdint>
@@ -13,6 +12,18 @@ constexpr uint32_t kGatewayScratchBytes = 4U * 1024U;
 constexpr uint32_t kGatewayUbBytes = 48U * 1024U;
 constexpr uint32_t kGatewayControlUbBytes = kGatewayUbBytes - kGatewayScratchBytes;
 }  // namespace combine_config
+#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+__aicore__
+#endif
+    inline constexpr uint32_t
+    GatewayControlChunks(uint32_t world, uint32_t chunks)
+{
+    const uint32_t groups = world < 64U ? 1U : world / 64U;
+    const uint64_t bytes =
+        ((uint64_t(world) * chunks * 8U + 31U) / 32U + (uint64_t(groups) * chunks * 4U + 31U) / 32U) * 32U;
+    return bytes <= combine_config::kGatewayControlUbBytes ? chunks : (chunks < 8U ? chunks : 8U);
+}
+static_assert(512U * 8U * 8U + 8U * 8U * 4U <= combine_config::kGatewayControlUbBytes);
 namespace combine_control {
 constexpr uint32_t kSlotBytes = 512;
 // Per-chunk gather flags followed by per-reducer monotonic completion epochs.
@@ -227,6 +238,19 @@ struct PutCombineTiling {
     uint32_t weight_topk, weight_rows, with_weights;
     uint64_t weight_recv_offset_bytes, weight_local_done_offset_bytes, weight_done_offset_bytes;
 };
+
+// For a fixed owner each peer emits one SO per lane at every logical window
+// tail, including empty windows. EP64 alternating owners use the general path.
+#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+__aicore__
+#endif
+    inline constexpr uint32_t
+    CombineFixedOwnerSoReserve(const PutCombineTiling& t, uint32_t peers)
+{
+    const uint32_t logical_chunks = t.chunks_per_group - t.first_chunk_splits + 1U;
+    const uint32_t windows = t.num_so < logical_chunks ? t.num_so : logical_chunks;
+    return (t.shared_jetty ? peers : uint32_t(peers != 0U)) * windows;
+}
 
 // Caller validates public bounds before narrowing. All region arithmetic is uint64.
 inline PutCombineTiling MakeCombineTiling(uint32_t rank, uint32_t world, uint32_t tokens, uint32_t topk, uint32_t rows,

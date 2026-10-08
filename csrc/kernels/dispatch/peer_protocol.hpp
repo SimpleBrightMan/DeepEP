@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #pragma once
 
@@ -7,9 +6,9 @@
 
 namespace ascend_deepep {
 // Notify-derived peer table (uint32 words, NOT mailbox uint64 words below):
-// peer0 words 4/5/6/7 are mode/direct-offset/mailbox-offset/ABI(7).
-// Mode3 (direct-only): direct-offset=0; suffix is owner-only profile storage.
-// There is no helper publication/ACK or ready fanout in this mode.
+// peer0 words 4/5/6/7 are mode/direct-offset/mailbox-offset/ABI(8).
+// Mode3: two data phases, with helper publication/ACK after relay SO.
+// The suffix contains the relay mailbox and owner-only profile storage.
 // Options live in peer1's reserved word4 (absolute word12); never overwrite
 // peer0 word7, which EVERY AIV validates before the entry barrier.
 constexpr uint32_t kClosPeerTableOptionsWord = 12U;
@@ -60,8 +59,8 @@ static_assert(kClosPeerTableOptionsWord < kClosPeerTableOptionsLoadWords);
 // SHMEM transport/control storage. Each cache line has exactly one writer.
 constexpr uint32_t kClosRelayAssistOwners = 8U;
 constexpr uint32_t kClosRelayAssistLineWords = 64U;  // 512B, conservative isolation
-constexpr uint32_t kClosRelayAssistQueues = 64U;     // EP256, two QPs / actual EID
-constexpr uint32_t kClosRelayAssistPeers = 32U;
+constexpr uint32_t kClosRelayAssistQueues = 128U;    // EP512, two QPs / actual EID
+constexpr uint32_t kClosRelayAssistPeers = 64U;
 constexpr uint32_t kClosRelayAssistQueueWord = 2U * kClosRelayAssistLineWords;
 constexpr uint32_t kClosRelayAssistPeerWord = kClosRelayAssistQueueWord + kClosRelayAssistQueues * 4U;
 constexpr uint32_t kClosRelayAssistOwnerWords = kClosRelayAssistPeerWord + kClosRelayAssistPeers * 4U;

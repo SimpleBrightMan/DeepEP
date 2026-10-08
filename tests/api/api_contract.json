@@ -369,7 +369,9 @@
             {"name": "num_device_timeout_secs", "kind": "POSITIONAL_OR_KEYWORD", "default": 100},
             {"name": "explicitly_destroy", "kind": "POSITIONAL_OR_KEYWORD", "default": false},
             {"name": "rank", "kind": "KEYWORD_ONLY", "default": null},
-            {"name": "world_size", "kind": "KEYWORD_ONLY", "default": null}
+            {"name": "world_size", "kind": "KEYWORD_ONLY", "default": null},
+            {"name": "bootstrap", "kind": "KEYWORD_ONLY", "default": "default"},
+            {"name": "combine_only", "kind": "KEYWORD_ONLY", "default": false}
           ]
         },
         "destroy": {

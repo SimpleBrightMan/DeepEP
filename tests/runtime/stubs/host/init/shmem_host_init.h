@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by zhu-mingzhe71 2026
 
 #pragma once
 #include <cstddef>
@@ -10,6 +9,7 @@ constexpr int ACLSHMEM_DATA_OP_MTE = 1;
 constexpr int ACLSHMEM_DATA_OP_UDMA = 8;
 using data_op_engine_type_t = int;
 constexpr int ACLSHMEMX_INIT_WITH_DEFAULT = 1;
+constexpr int ACLSHMEMX_INIT_WITH_MPI = 2;
 struct aclshmemx_uniqueid_t {
     char bytes[128]{};
 };

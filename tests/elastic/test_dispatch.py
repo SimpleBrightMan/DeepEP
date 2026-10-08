@@ -1,5 +1,4 @@
 # Copyright (c) 2026, Lu Lu
-# Modified by huangxiaolan 2026
 
 """Forward-list contract checks and installed-wheel, bitwise NPU dispatch validation.
 
@@ -112,7 +111,7 @@ def build_notify_golden(routes, experts, chunk_tokens):
         starts[expert] = rank_rows[peer]
         rank_rows[peer] += count
     stride = max(1, max(rank_rows, default=0))
-    invalid = -(1 << 31)
+    invalid = -(1 << 63)
     plans = []
     for source in range(world):
         plans.append(
@@ -329,7 +328,7 @@ def check_handle(handle, golden, rank, routes, experts):
     import torch
 
     plan = golden["plans"][rank]
-    if handle.metadata_only or handle.metadata_version != 6:
+    if handle.metadata_only or handle.metadata_version != 7:
         raise AssertionError("Expected expanded dispatch handle metadata v6")
     for name in (
         "server_mask",
@@ -569,7 +568,7 @@ def test_dispatch_destination_initialization():
     torch = SimpleNamespace(
         int32="int32", int64="int64", where=lambda condition, yes, no: ScalarTensor(yes if condition else no)
     )
-    for raw, expected in ((0, 0), (2, 2), (3, 4), (5, 6), (-1, -1), (-4, -5), (-6, -7), (-(1 << 31), -(1 << 31))):
+    for raw, expected in ((0, 0), (2, 2), (3, 4), (5, 6), (-1, -1), (-4, -5), (-6, -7), (-(1 << 63), -(1 << 63))):
         handle = SimpleNamespace(dispatch_dst=None, dst=ScalarTensor(raw))
         scope = dict(handle=handle, rows=3, layout={"address_stride": 4}, torch=torch)
         exec(code, scope)
@@ -603,7 +602,7 @@ def test_dispatch_regions_and_encoding_bounds():
                 assert layout["workspace_bytes"] == layout["done"] + world * 512
                 assert layout["num_bytes"] >= layout["workspace_bytes"]
                 assert layout["num_bytes"] % (2 << 20) == 0
-    for arguments in ((512, 1, 1, 1024, 1), (2, 1, 1, 1024, 3), (2, 1, 1, 1024, 0)):
+    for arguments in ((1024, 1, 1, 1024, 1), (2, 1, 1, 1024, 3), (2, 1, 1, 1024, 0)):
         with pytest.raises(ValueError):
             dispatch_layout(*arguments)
 
@@ -1232,6 +1231,60 @@ else:
             timeout=30,
         )
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_dispatch_barrier_timing_and_profile_versions():
+    import runpy
+
+    import pytest
+
+    metrics = runpy.run_path(str(Path(__file__).with_name("dispatch_metrics.py")))
+    records = []
+    for core in range(64):
+        words = [0] * 32
+        words[:8] = range(100, 108)
+        words[26:31] = [0x44504550, 0, core, 1, 8]
+        if core == 0:
+            words[8:14] = [104, 105, 105, 1, 1, 1]
+        records.append(words)
+    current = metrics["decode_profile"](records, 0, fp8=False, world=2)
+    assert all("store_drain_ms" in r["phases_ms"] and "finish_wait_ms" not in r["phases_ms"] for r in current)
+    for words in records:
+        words[30] = 7
+    legacy = metrics["decode_profile"](records, 0, fp8=False, world=2)
+    assert current[0]["phases_ms"]["store_drain_ms"] == legacy[0]["phases_ms"]["finish_wait_ms"]
+
+    ranks = [
+        dict(
+            rank=rank,
+            world=2,
+            passed=True,
+            tokens=4096,
+            topk=6,
+            experts=384,
+            dtype="bf16",
+            weights=False,
+            backend="udma",
+            source_sha256="test",
+            clean_device_ms=[[0.1, 1.0, 0.2, 1.3]],
+            kernel_profiles=[],
+            event_only=True,
+        )
+        for rank in range(2)
+    ]
+    old_report = metrics["summarize"](ranks)
+    assert old_report["input_copy"]["mean_ms"] == 0.1
+    columns = ["entry_barrier", "kernel", "exit_barrier", "device_total"]
+    for rank in ranks:
+        rank["device_time_columns"] = columns
+    report = metrics["summarize"](ranks)
+    assert "input_copy" not in report and "output_copy" not in report
+    assert report["entry_barrier"]["mean_ms"] == 0.1
+    assert report["exit_barrier"]["mean_ms"] == 0.2
+    assert report["algorithm_bandwidth"] == old_report["algorithm_bandwidth"]
+    ranks[1].pop("device_time_columns")
+    with pytest.raises(ValueError, match="Mixed device timing columns"):
+        metrics["summarize"](ranks)
 
 
 if __name__ == "__main__":

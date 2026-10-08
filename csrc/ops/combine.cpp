@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by lishaoxun 2026
 
 #include "ops/combine.hpp"
 #include <pybind11/stl.h>
@@ -8,6 +7,9 @@
 #include <vector>
 #include "kernels/combine/tiling.hpp"
 #include "kernels/combine/launch.hpp"
+#include "kernels/combine/profile.hpp"
+#include "kernels/combine/chunk_profile.hpp"
+#include "kernels/combine/peer_profile.hpp"
 #include "runtime/session.hpp"
 
 namespace py = pybind11;
@@ -15,22 +17,13 @@ namespace deepep {
 namespace {
 ascend_deepep::PutCombineTiling layout(int rank, int world, int tokens, int topk, int rows, int gathered, int chunk)
 {
-    if (world < 2 || world > 256 || (world & (world - 1)) || rank < 0 || rank >= world || tokens < 1 ||
-        tokens > 10240 || topk < 1 || topk > 16 || chunk < 1 || chunk > 10240 || rows < 1 || gathered < 1 ||
+    if (world < 2 || world > 512 || (world & (world - 1)) || rank < 0 || rank >= world || tokens < 1 ||
+        tokens > 16384 || topk < 1 || topk > 16 || chunk < 1 || chunk > 16384 || rows < 1 || gathered < 1 ||
         uint64_t(rows) > uint64_t(world) * tokens * topk || uint64_t(gathered) > uint64_t(world) * tokens * topk ||
-        uint64_t(world) * world * tokens * topk >= (1ULL << 31)) {
+        uint64_t(world) * tokens * topk >= (1ULL << 31)) {
         throw std::invalid_argument("Invalid expanded Combine shape");
     }
     const auto t = ascend_deepep::MakeCombineTiling(rank, world, tokens, topk, rows, gathered, chunk);
-    const uint64_t range_bytes = uint64_t(world) * t.chunks_per_group * 8U;
-    const uint64_t mask_bytes = uint64_t(t.total_chunk_num) * 4U;
-    if ((range_bytes + 31U) / 32U * 32U + (mask_bytes + 31U) / 32U * 32U >
-        ascend_deepep::combine_config::kGatewayControlUbBytes) {
-        throw std::invalid_argument("Combine chunk ranges/masks exceed the resident 44 KiB UB capacity");
-    }
-    if (ascend_deepep::CombineWorkspaceBytes(t) > (16ULL << 30)) {
-        throw std::invalid_argument("Combine exceeds its half of the 32 GiB session limit");
-    }
     return t;
 }
 using Shape = std::vector<int64_t>;
@@ -58,6 +51,9 @@ void copy(void* dst, const void* src, uint64_t bytes, aclrtStream stream)
 }  // namespace
 void bind_combine(py::module_& module)
 {
+    module.def("combine_profile_version", [] { return ascend_deepep::combine_diagnostics::kVersion; });
+    module.def("combine_chunk_profile_version", [] { return ascend_deepep::combine_chunks::kVersion; });
+    module.def("combine_peer_profile_version", [] { return ascend_deepep::combine_peers::kVersion; });
     module.def("combine_layout", [](int rank, int world, int tokens, int topk, int rows, int gathered, int chunk) {
         const auto t = layout(rank, world, tokens, topk, rows, gathered, chunk);
         py::dict result;
@@ -106,6 +102,22 @@ void bind_combine(py::module_& module)
             weight_meta = pointer(tensors["weight_return_meta"], {local_rows}, "int32", device);
             weight_output = pointer(tensors["weight_output"], {tokens, topk}, "float32", device);
         }
+        uint8_t *profile = nullptr, *chunk_profile = nullptr, *peer_profile = nullptr;
+        uint64_t sample = 0;
+        if (tensors.contains("profile") && !tensors["profile"].is_none()) {
+            profile = pointer(tensors["profile"], {64, ascend_deepep::combine_diagnostics::kWords}, "int64", device);
+            chunk_profile = pointer(
+                tensors["chunk_profile"],
+                {64,
+                 int64_t(ascend_deepep::combine_chunks::RecordsPerCore(t.rank_num / t.group_size, t.chunks_per_group)),
+                 ascend_deepep::combine_chunks::kWords},
+                "int64", device);
+            peer_profile = pointer(tensors["peer_profile"],
+                                   {2, session.world(), t.chunks_per_group, 2, ascend_deepep::combine_peers::kWords},
+                                   "int64", device);
+            sample = tensors["profile_sample"].cast<uint64_t>();
+            if (!sample || sample >= (1ULL << 63)) throw std::invalid_argument("Invalid Combine profile sample");
+        }
         auto stream = reinterpret_cast<aclrtStream>(stream_address);
         py::gil_scoped_release release;
         // Before overwriting even input storage, all peers have finished the
@@ -113,8 +125,14 @@ void bind_combine(py::module_& module)
         notify_dispatch_barrier_kernel_do(stream, 64U);
         copy(workspace + t.expert_input_offset_bytes, input, uint64_t(local_rows) * 14336U, stream);
         combine_prepare_kernel_do(stream, workspace, reinterpret_cast<uint8_t*>(&t));
-        combine_kernel_do(stream, workspace, forward, counts, backward, backward_counts, mask, ranges, masks, weights,
-                          weight_meta, reinterpret_cast<uint8_t*>(&t));
+        if (profile) {
+            combine_profile_kernel_do(stream, workspace, forward, counts, backward, backward_counts, mask, ranges,
+                                      masks, weights, weight_meta, profile, sample, chunk_profile, peer_profile,
+                                      reinterpret_cast<uint8_t*>(&t));
+        } else {
+            combine_kernel_do(stream, workspace, forward, counts, backward, backward_counts, mask, ranges, masks,
+                              weights, weight_meta, reinterpret_cast<uint8_t*>(&t));
+        }
         notify_dispatch_barrier_kernel_do(stream, 64U);
         copy(output, workspace + t.output_offset_bytes, uint64_t(tokens) * 14336U, stream);
         if (t.with_weights) {

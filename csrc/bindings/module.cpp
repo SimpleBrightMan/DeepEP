@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #include <pybind11/pybind11.h>
 #include <memory>
@@ -27,6 +26,18 @@ PYBIND11_MODULE(_C, module)
         return std::string(info.dli_fname);
     });
     module.def("runtime_busy", &deepep::Session::busy, py::call_guard<py::gil_scoped_release>());
+    module.def(
+        "create_mpi_runtime",
+        [](int rank, int size, uint64_t bytes, unsigned timeout) {
+            return std::make_unique<deepep::Session>(rank, size, bytes, "", timeout, true, false, true);
+        },
+        py::call_guard<py::gil_scoped_release>());
+    module.def(
+        "create_combine_runtime",
+        [](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool mpi) {
+            return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, true, false, mpi, true);
+        },
+        py::call_guard<py::gil_scoped_release>());
     py::class_<deepep::Session>(module, "Runtime")
         .def(py::init<int, int, uint64_t, const std::string&, unsigned, bool>(), py::arg("rank"), py::arg("size"),
              py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"), py::arg("udma") = false,
@@ -35,6 +46,7 @@ PYBIND11_MODULE(_C, module)
         .def("close", &deepep::Session::close, py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("closed", &deepep::Session::closed)
         .def_property_readonly("capacity", &deepep::Session::capacity)
+        .def_property_readonly("sparse_qp_enabled", &deepep::Session::sparse_qp_enabled)
         .def_property_readonly("peer_table", &deepep::Session::peer_table);
 #ifdef DEEPEP_BUILD_MEGAMOE
     module.def(

@@ -84,7 +84,7 @@ class CombineCase:
         return ((ranges + 31) // 32 + (masks + 31) // 32) * 32
 
     def validate(self):
-        if self.world not in (2, 4, 8, 16, 32, 64, 128, 256):
+        if self.world not in (2, 4, 8, 16, 32, 64, 128, 256, 512):
             raise ValueError("unsupported world")
         if (
             isinstance(self.group_size, bool)
@@ -108,12 +108,6 @@ class CombineCase:
             raise ValueError("route IDs exceed int32")
         if self.total_chunks > INT32_MAX:
             raise ValueError("chunk completion IDs exceed int32")
-        if self.gateway_control_bytes > GATEWAY_CONTROL_UB_BYTES:
-            raise ValueError(
-                f"chunk ranges/masks need {self.gateway_control_bytes} UB bytes, "
-                f"exceeding {GATEWAY_CONTROL_UB_BYTES}; increase chunk_tokens "
-                "(--num-tokens-per-chunk)"
-            )
         if self.route not in ("balanced", "random", "duplicates", "invalid", "skew", "empty"):
             raise ValueError("unknown route")
 
@@ -279,7 +273,7 @@ def build_plan(case, rank):
                 gateway, primary = records[0]
                 primary_counts[gateway] += 1
                 if source == rank:
-                    masks[token] |= 1 << server
+                    masks[token] |= (1 << server) if server < 63 else -(1 << 63)
                 if gateway == rank:
                     # One placeholder or len(records)-1 secondary rows; no boundary scan needed.
                     token_task_end = len(forwards[source]) // 6 + max(1, len(records) - 1)
@@ -480,5 +474,5 @@ def validate_plan(p):
         for expert in route_experts(rank, token, c):
             if expert >= 0:
                 expected |= 1 << (expert // (c.experts // c.world) // 8)
-        if actual != expected:
+        if actual & ((1 << 64) - 1) != expected:
             raise ValueError("source server mask mismatch")

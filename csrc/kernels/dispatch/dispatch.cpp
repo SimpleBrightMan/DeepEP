@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #include "kernel_operator.h"
 #include "shmem.h"
@@ -70,7 +69,7 @@ namespace {
 // Payload lives in framework GM; only controls and aggregate inboxes use SHMEM.
 // Keep peer ownership, dual-QP SO completion and local row expansion unchanged.
 #if (defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)) && CATLASS_ARCH == 3510
-// Preserve cross-server group/credit and dual-QP 3:1. Secondary is in dispatch.cpp.
+// Preserve the server-deduplicated route table and dual-QP 3:1 partition.
 // Adaptation: stable Notify rows and per-call live output virtual addresses, no expert migration.
 namespace DispatchDeepep {
 __aicore__ inline __gm__ uint8_t* PeerHiddenAddress(__gm__ uint64_t* book, int32_t peer,
@@ -84,20 +83,16 @@ __aicore__ inline __gm__ uint8_t* PeerHiddenAddress(__gm__ uint64_t* book, int32
     return reinterpret_cast<__gm__ uint8_t*>(addresses.GetValue(uint64_t(peer) * book_words));
 }
 
-constexpr uint32_t kUdmaWqeBatchSize = 128;
+constexpr uint32_t kUdmaScratchRows = 128;
 constexpr uint32_t kUdmaWqeBytes = 64;
 // Payload uses QP0/1; control values occupy separate 512B workspace slots.
 constexpr uint32_t kMaxCreatedUdmaQpCount = 6;
 constexpr uint32_t kMaxActiveUdmaQpCount = 2;
 constexpr uint32_t kActiveUdmaQpIndices[kMaxActiveUdmaQpCount] = {0, 1};
 constexpr uint32_t kPeerCompletionValueSlot = 3;
-constexpr uint32_t kPeerCreditFlagSlot = 5;
 static_assert(kPeerCompletionValueSlot != kActiveUdmaQpIndices[0] &&
               kPeerCompletionValueSlot != kActiveUdmaQpIndices[1]);
-static_assert(kPeerCompletionValueSlot != kPeerCreditFlagSlot);
 static_assert(kActiveUdmaQpIndices[kMaxActiveUdmaQpCount - 1] < kMaxCreatedUdmaQpCount);
-static_assert(kPeerCreditFlagSlot < kMaxCreatedUdmaQpCount);
-static_assert(kPeerCreditFlagSlot > kActiveUdmaQpIndices[kMaxActiveUdmaQpCount - 1]);
 
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 inline constexpr aclshmemx_udma_op_config_t kUdmaDataRoNoCqeConfig{0U, 0U, 0U, ACLSHMEMX_UDMA_ODR_RO};
@@ -105,7 +100,7 @@ inline constexpr aclshmemx_udma_op_config_t kUdmaDataRoCqeConfig{1U, 0U, 0U, ACL
 inline constexpr aclshmemx_udma_op_config_t kUdmaSyncSoCqeConfig{1U, 0U, 0U, ACLSHMEMX_UDMA_ODR_SO};
 #endif
 
-constexpr uint32_t kUdmaWqeScratchBytes = kUdmaWqeBatchSize * kUdmaWqeBytes;
+constexpr uint32_t kUdmaWqeScratchBytes = kUdmaScratchRows * kUdmaWqeBytes;
 constexpr uint32_t kWeightGmConflictGroupBytes = 512;
 constexpr uint32_t kWeightsPerGmConflictGroup = kWeightGmConflictGroupBytes / sizeof(float);
 constexpr uint32_t kWeightSimtThreadCount = kWeightsPerGmConflictGroup;
@@ -138,20 +133,9 @@ constexpr uint32_t kTwoFrameDispatchWorldSize = kDispatchFrameCount * kDispatchR
 constexpr int64_t kPeerSyncFlagBytes = 512;
 constexpr int64_t kPeerSyncSlotBytes = kMaxCreatedUdmaQpCount * kPeerSyncFlagBytes;
 constexpr int64_t kRankSyncSlotBytes = kMaxDispatchGroupWidth * kPeerSyncSlotBytes;
-constexpr uint32_t kMaxDispatchAivCount = 32;
-constexpr int64_t kGroupSyncFlagBytes = 512;
-constexpr uint32_t kGroupSyncRoundCount = 4;
-constexpr uint32_t kGroupSyncPhasesPerGroup = 2;
-constexpr uint32_t kGroupSyncCompletionPhase = 0;
-constexpr uint32_t kGroupSyncDonePhase = 1;
-constexpr int32_t kStrictGroupSyncMaxWorldSize = 64;
 static_assert(kPeerSyncFlagBytes >= sizeof(uint64_t));
 static_assert(kPeerSyncFlagBytes % sizeof(uint64_t) == 0);
-static_assert(kGroupSyncFlagBytes >= sizeof(uint64_t));
-static_assert(kGroupSyncFlagBytes % sizeof(uint64_t) == 0);
 static_assert(kMaxDispatchGroupWidth % 2 == 0);
-static_assert(kMaxDispatchAivCount > kMaxDispatchGroupWidth);
-static_assert((1U << kGroupSyncRoundCount) >= kMaxDispatchGroupWidth);
 static_assert(kDispatchGroupRows * kDispatchGroupColumns == kMaxDispatchGroupWidth);
 static_assert(kDispatchRowsPerFrame * kDispatchRanksPerDirectRow == kDispatchRanksPerFrame);
 static_assert(kDispatchGroupsPerFrame * kMaxDispatchGroupWidth == kDispatchRanksPerFrame);
@@ -182,52 +166,6 @@ __aicore__ inline __gm__ uint64_t* GetPeerCompletionFlag(int32_t src_rank, uint3
                                               qp_idx * kPeerSyncFlagBytes);
 }
 
-__aicore__ inline __gm__ uint64_t* GetPeerCreditFlag(int32_t src_rank, uint32_t peer_rank_index,
-                                                     __gm__ uint8_t* sync_buffer)
-{
-    return reinterpret_cast<__gm__ uint64_t*>(sync_buffer + static_cast<int64_t>(src_rank) * kRankSyncSlotBytes +
-                                              static_cast<int64_t>(peer_rank_index) * kPeerSyncSlotBytes +
-                                              kPeerCreditFlagSlot * kPeerSyncFlagBytes);
-}
-
-__aicore__ inline uint64_t GetPeerCreditToken(uint64_t magic, uint32_t group, uint32_t group_count)
-{
-    return magic * (static_cast<uint64_t>(group_count) + 1U) + group + 1U;
-}
-
-__aicore__ inline __gm__ uint64_t* GetGroupSyncFlag(uint32_t aiv_index, uint32_t round,
-                                                    __gm__ uint8_t* group_sync_buffer)
-{
-    const int64_t flag_index = static_cast<int64_t>(aiv_index) * kGroupSyncRoundCount + round;
-    return reinterpret_cast<__gm__ uint64_t*>(group_sync_buffer + flag_index * kGroupSyncFlagBytes);
-}
-
-__aicore__ inline uint64_t GetGroupSyncInitToken(uint64_t magic, uint32_t group_count)
-{
-    const uint64_t token_count = static_cast<uint64_t>(group_count) * kGroupSyncPhasesPerGroup + 1U;
-    return magic * token_count + 1U;
-}
-
-__aicore__ inline uint64_t GetGroupSyncPhaseToken(uint64_t magic, uint32_t group, uint32_t group_count, uint32_t phase)
-{
-    const uint64_t token_count = static_cast<uint64_t>(group_count) * kGroupSyncPhasesPerGroup + 1U;
-    const uint64_t group_token_offset = static_cast<uint64_t>(group) * kGroupSyncPhasesPerGroup + phase + 2U;
-    return magic * token_count + group_token_offset;
-}
-
-// Local dissemination is used ONLY by AIV8..15; FM/local-copy never join it.
-__aicore__ inline void SyncActiveAivs(uint32_t aiv_index, uint32_t active_aiv_count, uint64_t sync_token,
-                                      __gm__ uint8_t* group_sync_buffer)
-{
-    for (uint32_t distance = 1U, round = 0U; distance < active_aiv_count; distance <<= 1U, ++round) {
-        const uint32_t next_aiv = (aiv_index + distance) % active_aiv_count;
-        auto* next = GetGroupSyncFlag(next_aiv, round, group_sync_buffer);
-        *next = sync_token;
-        dcci_cacheline(reinterpret_cast<__gm__ uint8_t*>(next));
-        aclshmem_uint64_wait_until(GetGroupSyncFlag(aiv_index, round, group_sync_buffer), ACLSHMEM_CMP_GE, sync_token);
-    }
-}
-
 __aicore__ inline uint32_t GetDispatchGroupWidth(int32_t world_size)
 {
     return world_size < static_cast<int32_t>(kMaxDispatchGroupWidth) ? static_cast<uint32_t>(world_size)
@@ -237,27 +175,6 @@ __aicore__ inline uint32_t GetDispatchGroupWidth(int32_t world_size)
 __aicore__ inline bool UseTwoFrameDispatchSchedule(int32_t world_size)
 {
     return world_size == static_cast<int32_t>(kTwoFrameDispatchWorldSize);
-}
-
-// Four rounds per frame, with the original per-edge completion/credit dependency.
-__aicore__ inline uint32_t GetDispatchFrameToggle(uint32_t group)
-{
-    return group / kDispatchGroupsPerFrame;
-}
-
-__aicore__ inline uint32_t GetDispatchFrameSubround(uint32_t group)
-{
-    return group % kDispatchGroupsPerFrame;
-}
-
-__aicore__ inline int32_t BuildTwoFrameDispatchRank(uint32_t frame, uint32_t group_row, uint32_t group_side,
-                                                    uint32_t group_rank_index)
-{
-    const uint32_t lane_row = group_rank_index / kDispatchGroupColumns;
-    const uint32_t lane_column = group_rank_index % kDispatchGroupColumns;
-    const uint32_t row = group_row * kDispatchGroupRows + lane_row;
-    const uint32_t column = group_side * kDispatchGroupColumns + lane_column;
-    return static_cast<int32_t>(frame * kDispatchRanksPerFrame + row * kDispatchRanksPerDirectRow + column);
 }
 
 __aicore__ inline uint32_t GetGroupRankIndex(int32_t rank, int32_t world_size)
@@ -273,88 +190,6 @@ __aicore__ inline uint32_t GetGroupRankIndex(int32_t rank, int32_t world_size)
     const uint32_t half_group_width = GetDispatchGroupWidth(world_size) / 2;
     return static_cast<uint32_t>(rank / half_world_size) * half_group_width +
            static_cast<uint32_t>(rank % static_cast<int32_t>(half_group_width));
-}
-
-// 128P staged policy: left/right groups start in opposite frames, then switch
-// frames after four rounds. Preserve independent two-sequence credit progress.
-// For every round the transform is bijective, so every destination red-box
-// group receives from exactly one source red-box group.
-__aicore__ inline int32_t GetGroupDstRank(int32_t rank, int32_t world_size, uint32_t group, uint32_t group_rank_index)
-{
-    if (UseTwoFrameDispatchSchedule(world_size)) {
-        const uint32_t source_frame = static_cast<uint32_t>(rank) / kDispatchRanksPerFrame;
-        const uint32_t local_rank = static_cast<uint32_t>(rank) % kDispatchRanksPerFrame;
-        const uint32_t source_row = local_rank / kDispatchRanksPerDirectRow;
-        const uint32_t source_column = local_rank % kDispatchRanksPerDirectRow;
-        const uint32_t source_group_row = source_row / kDispatchGroupRows;
-        const uint32_t source_group_side = source_column / kDispatchGroupColumns;
-
-        const uint32_t frame_toggle = GetDispatchFrameToggle(group);
-        const uint32_t subround = GetDispatchFrameSubround(group);
-
-        //
-        const uint32_t group_row_delta = subround / 2U;
-        const uint32_t group_side_delta = subround % 2U;
-
-        //
-        //
-        const uint32_t destination_frame = source_frame ^ source_group_side ^ frame_toggle;
-        const uint32_t destination_group_row = (source_group_row + group_row_delta) % kDispatchGroupRowBlocks;
-        const uint32_t destination_group_side = source_group_side ^ group_side_delta;
-
-        return BuildTwoFrameDispatchRank(destination_frame, destination_group_row, destination_group_side,
-                                         group_rank_index);
-    }
-
-    const int32_t half_world_size = world_size / 2;
-    const uint32_t group_width = GetDispatchGroupWidth(world_size);
-    const uint32_t half_group_width = group_width / 2;
-    const uint32_t group_count = static_cast<uint32_t>(world_size) / group_width;
-    const uint32_t rank_group = static_cast<uint32_t>(rank % half_world_size) / half_group_width;
-    const uint32_t peer_group = (rank_group + group) % group_count;
-    return static_cast<int32_t>(group_rank_index / half_group_width) * half_world_size +
-           static_cast<int32_t>(peer_group * half_group_width + group_rank_index % half_group_width);
-}
-
-__aicore__ inline int32_t GetGroupIncomingPeer(int32_t rank, int32_t world_size, uint32_t group,
-                                               uint32_t group_rank_index)
-{
-    if (UseTwoFrameDispatchSchedule(world_size)) {
-        const uint32_t destination_frame = static_cast<uint32_t>(rank) / kDispatchRanksPerFrame;
-        const uint32_t local_rank = static_cast<uint32_t>(rank) % kDispatchRanksPerFrame;
-        const uint32_t destination_row = local_rank / kDispatchRanksPerDirectRow;
-        const uint32_t destination_column = local_rank % kDispatchRanksPerDirectRow;
-        const uint32_t destination_group_row = destination_row / kDispatchGroupRows;
-        const uint32_t destination_group_side = destination_column / kDispatchGroupColumns;
-
-        const uint32_t frame_toggle = GetDispatchFrameToggle(group);
-        const uint32_t subround = GetDispatchFrameSubround(group);
-        const uint32_t group_row_delta = subround / 2U;
-        const uint32_t group_side_delta = subround % 2U;
-        const uint32_t source_group_side = destination_group_side ^ group_side_delta;
-        const uint32_t source_group_row =
-            (destination_group_row + kDispatchGroupRowBlocks - group_row_delta) % kDispatchGroupRowBlocks;
-        const uint32_t source_frame = destination_frame ^ source_group_side ^ frame_toggle;
-
-        return BuildTwoFrameDispatchRank(source_frame, source_group_row, source_group_side, group_rank_index);
-    }
-
-    const int32_t half_world_size = world_size / 2;
-    const uint32_t group_width = GetDispatchGroupWidth(world_size);
-    const uint32_t half_group_width = group_width / 2;
-    const uint32_t group_count = static_cast<uint32_t>(world_size) / group_width;
-
-    const uint32_t rank_group = static_cast<uint32_t>(rank % half_world_size) / half_group_width;
-    const uint32_t incoming_group = (rank_group + group_count - group % group_count) % group_count;
-
-    return static_cast<int32_t>(group_rank_index / half_group_width) * half_world_size +
-           static_cast<int32_t>(incoming_group * half_group_width + group_rank_index % half_group_width);
-}
-
-__aicore__ inline int32_t GetNextGroupCreditPeer(int32_t rank, int32_t world_size, uint32_t group,
-                                                 uint32_t group_rank_index)
-{
-    return GetGroupIncomingPeer(rank, world_size, group + 1U, group_rank_index);
 }
 
 __aicore__ inline void DispatchSplitRange(int64_t total, int64_t part_count, int64_t part_index, int64_t& range_begin,
@@ -443,40 +278,15 @@ __aicore__ inline void PublishPeerCompletionSignal(int32_t dst_rank, int32_t cur
     }
 }
 
-__aicore__ inline void PublishNextPeerCredit(uint32_t group, int32_t current_rank, int32_t world_size,
-                                             uint32_t group_rank_index, uint64_t magic, uint32_t group_count,
-                                             __gm__ uint8_t* sync_buffer,
-                                             AscendC::TBuf<AscendC::QuePosition::VECCALC>& local_copy_buffer)
-{
-    const int32_t next_peer = GetNextGroupCreditPeer(current_rank, world_size, group, group_rank_index);
-    if (next_peer == current_rank) {
-        return;
-    }
-
-    constexpr uint32_t credit_word_count = kPeerSyncFlagBytes / sizeof(uint64_t);
-    const uint64_t next_credit_token = GetPeerCreditToken(magic, group + 1U, group_count);
-    AscendC::LocalTensor<uint64_t> credit_local = local_copy_buffer.Get<uint64_t>();
-    for (uint32_t i = 0; i < credit_word_count; ++i) {
-        credit_local.SetValue(i, i == 0U ? next_credit_token : 0U);
-    }
-    AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
-    AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
-
-    __gm__ uint64_t* local_credit = GetPeerCreditFlag(current_rank, group_rank_index, sync_buffer);
-    __gm__ uint64_t* remote_credit = reinterpret_cast<__gm__ uint64_t*>(aclshmem_ptr(local_credit, next_peer));
-    AscendC::GlobalTensor<uint64_t> remote_credit_tensor;
-    remote_credit_tensor.SetGlobalBuffer(remote_credit, credit_word_count);
-    AscendC::DataCopy(remote_credit_tensor, credit_local, credit_word_count);
-    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
-}
-
-// One permanent owner per physical peer, including BOTH primary QPs.
-// An FM owner never joins a Clos group. Self-copy has no QP.
+// Each FM owner uses its private QP0. Clos assigns QP0 and QP1 to
+// independent cores; self-copy has no QP.
 struct DeepepSecondaryState {
     uint64_t profile = 0;
     uint64_t* detail = nullptr;
     uint32_t detail_mode = 0, rotation_wqes = 4, detail_phase = 0;
+    uint32_t wqe_cache_valid = 0;
+    uint64_t fm_context = 0, fm_queue = 0;
+    uint32_t fm_slot = 0;
     // GM_ADDR is a pointer macro, so each member needs its own declaration.
     GM_ADDR hidden;
     GM_ADDR workspace;
@@ -486,7 +296,7 @@ struct DeepepSecondaryState {
     uint64_t magic;
     bool peer = false, clos_shared_jetty = true, clos_split_qp = true, address_peer_ready = true;
     uint32_t book_words = 64U, clos_table_owner = 0U, scale_bytes = 0U;
-    uint64_t clos_relay_mailbox = 0U, scale_send_offset = 0U, address_seen[4]{};
+    uint64_t clos_relay_mailbox = 0U, scale_send_offset = 0U, address_seen[8]{};
 };
 
 __aicore__ inline void CopyDeepepRows(GM_ADDR source, GM_ADDR destination, uint32_t row_bytes,
@@ -532,7 +342,27 @@ struct DeepepPrimaryState {
     DeepepSecondaryState* secondary;
     uint32_t tokens, topk, address_stride;
     uint64_t clos_peer_table = 0, clos_peer_rows = 0, bytes = 0;
+    uint64_t fm_context = 0, fm_queue = 0;
+    uint32_t fm_slot = 0;
 };
+
+#include "fm_primary.hpp"
+
+// Each thread owns its decoded route. No int64 vector instruction or extra UB plane.
+__simt_vf__ __launch_bounds__(128) inline void DecodePrimaryDestinations(__gm__ int64_t* input, __ubuf__ int32_t* rows,
+                                                                         __ubuf__ int32_t* ranks,
+                                                                         __ubuf__ int32_t* indices, uint32_t begin,
+                                                                         uint32_t count, uint32_t stride,
+                                                                         uint32_t shift)
+{
+    for (uint32_t i = threadIdx.x; i < count; i += 128U) {
+        const int64_t encoded = asc_ldcg(input + begin + i);
+        ranks[i] = encoded < 0 ? -1 : int32_t(uint64_t(encoded) >> shift);
+        rows[i] = encoded < 0 ? -1 : int32_t(uint64_t(encoded) & (stride - 1U));
+        indices[i] = int32_t(begin + i);
+    }
+    asc_threadfence();
+}
 
 // One complete selection tile per visit. All deferred WQEs are submitted before
 // switching peers. QP selection remains based on the ORIGINAL route-tile index.
@@ -542,7 +372,7 @@ __aicore__ inline void IssueDeepepPrimaryTile(DeepepPrimaryState& p, int32_t dst
 {
     auto& s = *p.secondary;
     auto* hidden = p.input;
-    auto* encoded_destinations = reinterpret_cast<__gm__ int32_t*>(p.destinations);
+    auto* encoded_destinations = reinterpret_cast<__gm__ int64_t*>(p.destinations);
     auto* book = s.book;
     const uint32_t current_rank = s.rank, active_qp_count = 2U;
     const int64_t num_topk = p.topk, route_count = int64_t(p.tokens) * p.topk;
@@ -560,13 +390,8 @@ __aicore__ inline void IssueDeepepPrimaryTile(DeepepPrimaryState& p, int32_t dst
     AscendC::LocalTensor<uint8_t> compare_mask =
         slot_select_buffer.GetWithOffset<uint8_t>(compare_mask_bytes, tensor_bytes * 4);
 
-    AscendC::GlobalTensor<int32_t> dst_global;
-    dst_global.SetGlobalBuffer(encoded_destinations, route_count);
-    uint32_t slot_shift = 0;
-    // Address encoding follows receive capacity, NOT the source route count.
-    for (int64_t value = address_stride; value > 1; value >>= 1) {
-        ++slot_shift;
-    }
+    uint32_t address_shift = 0;
+    for (uint32_t value = p.address_stride; value > 1U; value >>= 1U) ++address_shift;
     const uint32_t route_tile = dst_rank / 8 == current_rank / 8 ? slotChunkCount : 1024U;
     const int64_t chunk_index = chunk_start / route_tile;
     const uint32_t qp_slot = GetChunkQpSlot(chunk_index, dst_rank / 8 == current_rank / 8 ? 1U : active_qp_count);
@@ -578,18 +403,16 @@ __aicore__ inline void IssueDeepepPrimaryTile(DeepepPrimaryState& p, int32_t dst
     const uint32_t padded_count =
         ((chunk_count + kVectorSlotSelectCountAlign - 1) / kVectorSlotSelectCountAlign) * kVectorSlotSelectCountAlign;
 
-    AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID1);
-    AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID1);
-    AscendC::DataCopyExtParams dst_copy_parameters{1, static_cast<uint32_t>(chunk_count * sizeof(int32_t)), 0, 0, 0};
-    AscendC::DataCopyPadExtParams<int32_t> dst_pad_parameters{false, 0, 0, 0};
-    AscendC::DataCopyPad(dst_local, dst_global[chunk_start], dst_copy_parameters, dst_pad_parameters);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
-
-    AscendC::ShiftRight(dst_rank_tensor, dst_local, static_cast<int32_t>(slot_shift), padded_count);
-    AscendC::CreateVecIndex(route_indices, static_cast<int32_t>(chunk_start), padded_count);
-    AscendC::PipeBarrier<PIPE_V>();
-
+    AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID1);
+    AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID1);
+    asc_vf_call<DecodePrimaryDestinations>(dim3(128), encoded_destinations,
+                                           reinterpret_cast<__ubuf__ int32_t*>(dst_local.GetPhyAddr()),
+                                           reinterpret_cast<__ubuf__ int32_t*>(dst_rank_tensor.GetPhyAddr()),
+                                           reinterpret_cast<__ubuf__ int32_t*>(route_indices.GetPhyAddr()),
+                                           uint32_t(chunk_start), chunk_count, uint32_t(address_stride), address_shift);
+    AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID1);
+    AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID1);
+    for (uint32_t i = chunk_count; i < padded_count; ++i) dst_rank_tensor.SetValue(i, -1);
     AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID1);
     AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID1);
 
@@ -603,9 +426,15 @@ __aicore__ inline void IssueDeepepPrimaryTile(DeepepPrimaryState& p, int32_t dst
 
     const uint64_t local_selected_count = selected_route_count;
 
+    // EP32 retains its faster scalar primary path. Larger worlds also keep
+    // the measured server-dedup schedule; their secondary uses the batch builder.
+    if (s.world <= 16U || s.world == 64U) {
+        IssueFmPrimaryRows(p, dst_rank, udma_wqe_buffer, selected_route_indices, dst_local,
+                           static_cast<uint32_t>(chunk_start), local_selected_count);
+        return;
+    }
     aclshmemx_submit_state_t udma_submit_state{};
-
-    constexpr uint32_t batch_rows = kUdmaWqeBatchSize;
+    constexpr uint32_t batch_rows = 4U;
     auto* target = PeerHiddenAddress(book, dst_rank, s.book_words);
 
     for (uint64_t batch_start = 0; batch_start < local_selected_count; batch_start += batch_rows) {
@@ -670,20 +499,21 @@ __aicore__ inline void DispatchDeepepLocalCopy(DeepepPrimaryState& p, __ubuf__ u
     int64_t begin = 0, end = 0;
     DispatchSplitRange(int64_t(p.tokens) * p.topk, ascend_deepep::scale_clos::LocalWorkers(s.world), worker, begin,
                        end);
-    auto routes = copy.Get<int32_t>();
-    auto rows = routes[kUdmaWqeBatchSize];
+    auto routes = copy.Get<int64_t>();
+    auto rows = copy.Get<int32_t>()[2U * kUdmaScratchRows];
+    static_assert(4U * kUdmaScratchRows * sizeof(int32_t) <= kLocalCopyTileBytes);
 
-    for (int64_t first = begin; first < end; first += kUdmaWqeBatchSize) {
-        const uint32_t n = end - first < kUdmaWqeBatchSize ? end - first : kUdmaWqeBatchSize;
-        NativeLoad(routes, reinterpret_cast<__gm__ int32_t*>(p.destinations) + first, n);
+    for (int64_t first = begin; first < end; first += kUdmaScratchRows) {
+        const uint32_t n = end - first < kUdmaScratchRows ? end - first : kUdmaScratchRows;
+        NativeLoad(routes, reinterpret_cast<__gm__ int64_t*>(p.destinations) + first, n);
         uint32_t count = 0;
         for (uint32_t i = 0; i < n; ++i) {
-            const int32_t encoded = routes.GetValue(i);
-            if (encoded < 0 || uint32_t(encoded) / p.address_stride != s.rank) {
+            const int64_t encoded = routes.GetValue(i);
+            if (encoded < 0 || uint64_t(encoded) / p.address_stride != s.rank) {
                 continue;
             }
             rows.SetValue(count * 2U, (first + i) / p.topk);
-            rows.SetValue(count * 2U + 1U, uint32_t(encoded) % p.address_stride);
+            rows.SetValue(count * 2U + 1U, uint64_t(encoded) % p.address_stride);
             ++count;
         }
         if (!count) {
@@ -829,10 +659,10 @@ __aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR
         }
         DispatchProfileMark<Profile>(profile, 5U);
     }
-    // Fixed participation: all 64 AIVs join, including empty work owners.
-    // Join ALL inbound writes before returning framework-owned live outputs.
+    // Each AIV drains its stores. The same-stream exit barrier in the host
+    // wrapper joins all ranks before the caller can consume the outputs.
     DispatchProfileMark<Profile>(profile, 6U);
-    FinishPeerDispatch<Profile>(workspace, t, copy, detail.data());
+    DrainDispatchStores<Profile>(t, detail.data());
     DispatchProfileMark<Profile>(profile, 7U);
     if constexpr (Profile) {
         if (t.detail_profile) {
@@ -855,7 +685,7 @@ __aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR
         record[27] = t.rank;
         record[28] = core;
         record[29] = t.generation;
-        record[30] = 7U;
+        record[30] = 8U;
         dcci_cachelines(reinterpret_cast<__gm__ uint8_t*>(record), 256U);
         AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
     }

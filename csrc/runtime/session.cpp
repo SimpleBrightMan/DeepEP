@@ -1,11 +1,13 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #include "runtime/session.hpp"
 #include <cstring>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <vector>
 #include "kernels/udma_layout.hpp"
+#include "kernels/common.hpp"
+#include "runtime/udma_peer_masks.hpp"
 #include <mutex>
 #include <stdexcept>
 #include "host/init/shmem_host_init.h"
@@ -34,19 +36,25 @@ bool Session::busy()
 }
 
 Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
-                 bool megamoe)
+                 bool megamoe, bool mpi, bool combine_only)
 {
+    if (combine_only && (!udma || megamoe)) throw std::invalid_argument("Combine-only requires UDMA");
+    const char* dense_env = std::getenv("DEEPEP_SHMEM_DENSE_QPS");
+    const std::string dense = dense_env == nullptr ? "0" : dense_env;
+    if (dense != "0" && dense != "1") throw std::invalid_argument("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1");
+    combine_only_ = combine_only;
     constexpr uint64_t alignment = 2ULL * 1024 * 1024;
-    if (size < 2 || size > (megamoe ? 128 : 256) || (!megamoe && (size & (size - 1))) || rank < 0 || rank >= size ||
-        bytes < alignment || bytes > (megamoe ? 1ULL : 32ULL) * 1024 * 1024 * 1024 || bytes % alignment != 0 ||
-        timeout < 1 || timeout > 300 || (megamoe && udma) || endpoint.empty() ||
-        endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN || endpoint.find('\0') != std::string::npos) {
+    if (size < 2 || size > (megamoe ? 128 : 512) || (!megamoe && (size & (size - 1))) || rank < 0 || rank >= size ||
+        bytes < alignment || bytes > (megamoe ? (1ULL << 30) : ((1ULL << 63) - 1U)) || bytes % alignment != 0 ||
+        timeout < 1 || timeout > 3600 || (megamoe && (udma || mpi)) ||
+        (!mpi && (endpoint.empty() || endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN ||
+                  endpoint.find('\0') != std::string::npos))) {
         throw std::invalid_argument("Invalid rank, capacity, timeout or bootstrap endpoint");
     }
     // BF16 and FP8 use the same peer-table transport at every supported EP size.
     peer_table_ = udma;
-    if (peer_table_ && (size < 2 || size > 256 || (size & (size - 1)))) {
-        throw std::invalid_argument("peer-table requires EP2/4/8/16/32/64/128/256");
+    if (peer_table_ && (size < 2 || size > 512 || (size & (size - 1)))) {
+        throw std::invalid_argument("peer-table requires EP2/4/8/16/32/64/128/256/512");
     }
     std::lock_guard<std::mutex> guard(runtime_mutex);
     if (occupied || aclshmemx_init_status() != ACLSHMEM_STATUS_NOT_INITIALIZED) {
@@ -65,13 +73,25 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     attr.my_pe = rank;
     attr.n_pes = size;
     attr.local_mem_size = bytes;
-    std::memcpy(attr.ip_port, endpoint.c_str(), endpoint.size() + 1);
-    attr.comm_args = &uid;
+    if (!mpi) {
+        std::memcpy(attr.ip_port, endpoint.c_str(), endpoint.size() + 1);
+    }
+    // A null communicator selects MPI_COMM_WORLD. The SHMEM MPI plugin owns
+    // MPI_Init/Finalize when the application has not initialized MPI itself.
+    attr.comm_args = mpi ? nullptr : &uid;
     attr.option_attr.data_op_engine_type =
         udma ? static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA) : ACLSHMEM_DATA_OP_MTE;
     attr.option_attr.shm_init_timeout = timeout;
     attr.option_attr.shm_create_timeout = timeout;
     attr.option_attr.control_operation_timeout = timeout;
+    using SetPeerQpMasks = int (*)(const uint64_t*, uint32_t);
+    auto set_masks =
+        udma ? reinterpret_cast<SetPeerQpMasks>(dlsym(RTLD_DEFAULT, "aclshmemx_set_udma_peer_qp_masks")) : nullptr;
+    if (udma && dense != "1" && !set_masks) {
+        throw std::runtime_error(
+            "SHMEM lacks aclshmemx_set_udma_peer_qp_masks; use the SDK pinned in dependencies.lock.json, "
+            "or explicitly select dense channels with DEEPEP_SHMEM_DENSE_QPS=1");
+    }
     // A failed initialization can leave SDK state behind. Keep the process
     // reserved until a new process is launched; do not finalize foreign state.
     occupied = true;
@@ -82,8 +102,20 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
         check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, ascend_deepep::udma_layout::kQpCount),
               "aclshmemx_set_qp_num");
         check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, true), "aclshmemx_set_shared_jetty");
+        std::vector<uint64_t> masks;
+        if (dense != "1") {
+            masks.resize(size);
+            for (int peer = 0; peer < size; ++peer)
+                masks[peer] = combine_only ? first_hit_schedule::CombineQpMask(rank, peer, size)
+                                           : udma_admission::PeerMask(rank, peer, size);
+        }
+        if (set_masks) {
+            check(set_masks(masks.empty() ? nullptr : masks.data(), masks.size()), "aclshmemx_set_udma_peer_qp_masks");
+            sparse_qp_enabled_ = !masks.empty();
+        }
     }
-    check(aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attr), "aclshmemx_init_attr");
+    check(aclshmemx_init_attr(mpi ? ACLSHMEMX_INIT_WITH_MPI : ACLSHMEMX_INIT_WITH_DEFAULT, &attr),
+          "aclshmemx_init_attr");
     try {
         // Peer-table aggregate packets require physical 512B boundaries, not
         // merely 512B-relative offsets within a possibly 16B-aligned allocation.

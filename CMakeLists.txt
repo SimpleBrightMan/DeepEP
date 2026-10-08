@@ -1,5 +1,4 @@
 # Copyright (c) 2026, Lu Lu
-# Modified by huangxiaolan 2026
 
 cmake_minimum_required(VERSION 3.20)
 project(deepep_runtime LANGUAGES CXX)
@@ -49,7 +48,7 @@ endif()
 # Packaging consumes this file instead of maintaining another operator list.
 file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/capabilities.json" CONTENT [=[
 {
-  "capabilities": ["runtime-mte", "runtime-urma", "event", "elastic-notify-metadata-v6", "elastic-dispatch-expanded-v1", "elastic-combine-expanded-v3"],
+  "capabilities": ["runtime-mte", "runtime-urma", "runtime-mpi-bootstrap", "event", "elastic-notify-metadata-v7", "elastic-notify-profile-v1", "elastic-dispatch-expanded-v1", "elastic-combine-expanded-v3", "elastic-combine-chunk-tuning-v1", "elastic-combine-profile-v4", "elastic-combine-peers-v1", "elastic-combine-chunks-v2", "runtime-combine-sparse-qp-v1"],
   "communication_operations": ["ElasticBuffer.dispatch", "ElasticBuffer.combine"]
 }
 ]=])

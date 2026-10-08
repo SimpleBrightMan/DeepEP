@@ -1,5 +1,4 @@
 // Copyright (c) 2026, Lu Lu
-// Modified by huangxiaolan 2026
 
 #pragma once
 #include <cstdint>
@@ -8,7 +7,7 @@
 #include "aux_pipeline_layout.hpp"
 
 namespace ascend_deepep {
-constexpr uint32_t kMaxDispatchRanks = 256U;
+constexpr uint32_t kMaxDispatchRanks = 512U;
 
 inline constexpr uint64_t DispatchPlanPhaseBytes(uint32_t world, uint32_t /*tokens*/)
 {
