@@ -57,7 +57,7 @@ __simt_vf__ __launch_bounds__(128) inline void Expand(__ubuf__ uint32_t* packed,
             }
             continue;
         }
-        output[uint64_t(slot) * words + column] = packed[(row / 2U) * 128U + (row % 2U) * 56U + column];
+        output[uint64_t(slot) * words + column] = packed[(row / 2U) * 128U + (row % 2U) * packed_words + column];
     }
     errors[threadIdx.x] = bad;
     asc_threadfence();
@@ -84,7 +84,7 @@ __aicore__ inline void LocalExpand(AscendC::LocalTensor<uint8_t> packed, AscendC
     AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID2);
     asc_vf_call<Expand>(dim3(128), reinterpret_cast<__ubuf__ uint32_t*>(packed.GetPhyAddr()),
                         reinterpret_cast<__ubuf__ int32_t*>(slots.GetPhyAddr()),
-                        reinterpret_cast<__gm__ uint32_t*>(plan.output), n, 224U / 4U, 224U / 4U, t.output_rows,
+                        reinterpret_cast<__gm__ uint32_t*>(plan.output), n, t.hidden / 128U, 224U / 4U, t.output_rows,
                         reinterpret_cast<__ubuf__ uint32_t*>(errors.GetPhyAddr()));
     DeepepWeightAggregate::WaitVector();
     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
@@ -280,7 +280,8 @@ __aicore__ inline void Run(GM_ADDR workspace, const DispatchTiling& t, const Pee
                     start = Clock<Profile>();
                     const uint32_t route = uint32_t(selected.GetValue(i));
                     DispatchDeepep::IssueGmBytesToUb(packed[DispatchAggregatePacket::ScaleData(peer.buffered)],
-                                                     plan.input + uint64_t(route / t.topk) * 224U, 224U);
+                                                     plan.input + uint64_t(route / t.topk) * (t.hidden / 128U) * 4U,
+                                                     (t.hidden / 128U) * 4U);
                     // Read the slot from the shared decoded tile; no fifth tile array.
                     packed_slots.SetValue(DispatchAggregatePacket::ScaleSlot(peer.buffered),
                                           slots.GetValue(route - begin));

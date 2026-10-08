@@ -251,7 +251,8 @@ def summarize(data):
         }
     t, k = data[0]["tokens"], data[0]["topk"]
     fp8 = data[0]["dtype"] == "fp8"
-    hidden, scales = t * k * 7168 * (1 if fp8 else 2), t * k * 224 if fp8 else 0
+    width = data[0].get("hidden", 7168)
+    hidden, scales = t * k * width * (1 if fp8 else 2), t * k * (width // 128) * 4 if fp8 else 0
     ms = result["kernel"]["mean_ms"]
     result["algorithm_bandwidth"] = {
         "logical_hidden_bytes_per_rank": hidden,

@@ -16,14 +16,16 @@ namespace py = pybind11;
 namespace deepep {
 namespace {
 ascend_deepep::DispatchTiling layout(int rank, int world, int tokens, int topk, int experts, int rows, bool fp8,
-                                     bool weights = false)
+                                     bool weights = false, int hidden = 7168)
 {
     if (world < 2 || world > 512 || (world & (world - 1)) || rank < 0 || rank >= world || tokens < 1 ||
         tokens > 16384 || topk < 1 || topk > 16 || experts < world || experts > 1024 || experts % world || rows < 1 ||
-        uint64_t(rows) > uint64_t(world) * tokens * topk || uint64_t(world) * tokens * topk >= (1ULL << 31)) {
-        throw std::invalid_argument("Invalid dispatch shape (EP2..512, H7168, T1..16384, K1..16, E<=1024)");
+        uint64_t(rows) > uint64_t(world) * tokens * topk || uint64_t(world) * tokens * topk >= (1ULL << 31) ||
+        hidden <= 0 || hidden > 7168 || hidden % (fp8 ? 128 : 16)) {
+        throw std::invalid_argument(
+            "Invalid dispatch shape (EP2..512, H<=7168 aligned to BF16:16/FP8:128, T1..16384, K1..16, E<=1024)");
     }
-    auto t = ascend_deepep::MakeDispatchTiling(rank, world, tokens, topk, experts, rows, fp8, weights);
+    auto t = ascend_deepep::MakeDispatchTiling(rank, world, tokens, topk, experts, rows, fp8, weights, hidden);
     if (uint64_t(world) * t.address_stride >= (1ULL << 63) || t.workspace_bytes > (1ULL << 63)) {
         throw std::invalid_argument("Dispatch address encoding or workspace capacity overflow");
     }
@@ -51,8 +53,8 @@ void bind_dispatch(py::module_& module)
 {
     module.def(
         "dispatch_layout",
-        [](int rank, int world, int tokens, int topk, int experts, int rows, bool fp8, bool weights) {
-            const auto t = layout(rank, world, tokens, topk, experts, rows, fp8, weights);
+        [](int rank, int world, int tokens, int topk, int experts, int rows, bool fp8, bool weights, int hidden) {
+            const auto t = layout(rank, world, tokens, topk, experts, rows, fp8, weights, hidden);
             py::dict result;
             result["workspace_bytes"] = t.workspace_bytes;
             result["address_stride"] = t.address_stride;
@@ -75,13 +77,14 @@ void bind_dispatch(py::module_& module)
             return result;
         },
         py::arg("rank"), py::arg("world"), py::arg("tokens"), py::arg("topk"), py::arg("experts"), py::arg("rows"),
-        py::arg("fp8"), py::arg("weights") = false);
+        py::arg("fp8"), py::arg("weights") = false, py::arg("hidden") = 7168);
     module.def("dispatch_plan_bytes", &ascend_deepep::DispatchPlanBytes);
     module.def("dispatch", [](Session& session, py::dict tensors, int tokens, int topk, int experts, int rows,
                               int local_rows, bool fp8, uintptr_t stream_address) {
         if (session.combine_only()) throw std::invalid_argument("Dispatch requires combine_only=False");
-        const auto t =
-            layout(session.rank(), session.world(), tokens, topk, experts, rows, fp8, !tensors["weights"].is_none());
+        const int hidden = tensors["input"].attr("size")(1).cast<int>();
+        const auto t = layout(session.rank(), session.world(), tokens, topk, experts, rows, fp8,
+                              !tensors["weights"].is_none(), hidden);
         auto* workspace = static_cast<uint8_t*>(session.workspace());
         if (!session.udma() || t.workspace_bytes > session.capacity() / 2U || stream_address == 0 || local_rows < 0 ||
             local_rows > rows) {
@@ -93,8 +96,8 @@ void bind_dispatch(py::module_& module)
             throw std::runtime_error("Cannot obtain current ACL device");
         }
         const char* dtype = fp8 ? "float8_e4m3fn" : "bfloat16";
-        auto* input = pointer(tensors["input"], {tokens, 7168}, dtype, device);
-        auto* output = pointer(tensors["output"], {local_rows, 7168}, dtype, device);
+        auto* input = pointer(tensors["input"], {tokens, hidden}, dtype, device);
+        auto* output = pointer(tensors["output"], {local_rows, hidden}, dtype, device);
         auto* destinations = pointer(tensors["dst"], {tokens, topk}, "int64", device);
         auto* forward = pointer(tensors["forward_list"], {session.world(), int64_t(tokens) * topk, 6}, "int32", device);
         auto* counts = pointer(tensors["forward_counts"], {session.world()}, "int32", device);
@@ -104,8 +107,8 @@ void bind_dispatch(py::module_& module)
             out_weights = pointer(tensors["output_weights"], {local_rows}, "float32", device);
         }
         if (fp8) {
-            scales = pointer(tensors["scales"], {tokens, 56}, "float32", device);
-            out_scales = pointer(tensors["output_scales"], {local_rows, 56}, "float32", device);
+            scales = pointer(tensors["scales"], {tokens, hidden / 128}, "float32", device);
+            out_scales = pointer(tensors["output_scales"], {local_rows, hidden / 128}, "float32", device);
         }
         auto stream = reinterpret_cast<aclrtStream>(stream_address);
         auto config = t;

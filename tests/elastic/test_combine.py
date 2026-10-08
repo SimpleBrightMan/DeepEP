@@ -68,6 +68,7 @@ def profile_combine(args, rank, scenario, buffer, expert, invoke, validate, info
             tokens=args.tokens,
             topk=args.topk,
             weights=not args.without_weights,
+            hidden=getattr(args, "hidden", 7168),
             sample=sample,
             chunk_tokens=chunk_tokens,
         )
@@ -106,7 +107,7 @@ def profile_combine(args, rank, scenario, buffer, expert, invoke, validate, info
             world_size=args.ep_size,
             tokens=args.tokens,
             topk=args.topk,
-            hidden=7168,
+            hidden=getattr(args, "hidden", 7168),
             sample=sample,
             chunk_tokens=chunk_tokens,
             with_weights=not args.without_weights,
@@ -138,7 +139,7 @@ def profile_combine(args, rank, scenario, buffer, expert, invoke, validate, info
             tokens=args.tokens,
             topk=args.topk,
             experts=args.experts,
-            hidden=7168,
+            hidden=getattr(args, "hidden", 7168),
             scenario=scenario,
             seed=args.seed,
             with_weights=not args.without_weights,
@@ -230,18 +231,18 @@ def check_handle(handle, reference, rank):
     )
 
 
-def payload(source, tokens, generation):
+def payload(source, tokens, generation, hidden=7168):
     import torch
 
-    return ((torch.arange(tokens)[:, None] + torch.arange(7168)[None, :] + source + generation) % 7 - 3).to(
+    return ((torch.arange(tokens)[:, None] + torch.arange(hidden)[None, :] + source + generation) % 7 - 3).to(
         torch.bfloat16
     )
 
 
-def expected_output(routes, experts, rank, generation):
+def expected_output(routes, experts, rank, generation, hidden=7168):
     import torch
 
-    base = payload(rank, len(routes[rank]), generation).float()
+    base = payload(rank, len(routes[rank]), generation, hidden).float()
     selected = torch.tensor(routes[rank], dtype=torch.int64)
     valid = (selected >= 0) & (selected < experts)
     slots = torch.arange(selected.shape[1])[None, :]
@@ -283,6 +284,7 @@ def check_dispatch_inputs(
     weight_ids,
     log,
     context,
+    hidden=7168,
 ):
     """Optional payload Dispatch oracle; Notify is checked independently."""
     if not enabled:
@@ -291,7 +293,7 @@ def check_dispatch_inputs(
 
     log(f"{context} dispatch_golden.begin (CPU)")
     sources = torch.tensor([s + t for s, t, _ in entries], dtype=torch.int32)[:, None]
-    expected_recv = ((sources + torch.arange(7168)[None, :] + generation) % 7 - 3).to(torch.bfloat16)
+    expected_recv = ((sources + torch.arange(hidden)[None, :] + generation) % 7 - 3).to(torch.bfloat16)
     log(f"{context} dispatch_golden.done")
     if fp8:
         _notify["assert_bytes"](
@@ -302,7 +304,7 @@ def check_dispatch_inputs(
         )
         _notify["assert_bytes"](
             recv[1],
-            torch.full((len(entries), 56), scale_value, dtype=torch.float32),
+            torch.full((len(entries), hidden // 128), scale_value, dtype=torch.float32),
             f"{context} FP8 scales",
             progress=log,
         )
@@ -370,14 +372,14 @@ def prepare_routing(buffer, args, x, indices, input_weights, handle):
     return None, None, handle, event
 
 
-def direct_expert_input(entries, generation, device):
+def direct_expert_input(entries, generation, device, hidden=7168):
     """Expanded expert input in expert/source/token/slot order, without transport."""
     import torch
 
     sources = torch.tensor(
         [source + token + generation for source, token, _ in entries], dtype=torch.int32, device=device
     )
-    columns = torch.arange(7168, dtype=torch.int32, device=device)
+    columns = torch.arange(hidden, dtype=torch.int32, device=device)
     return ((sources[:, None] + columns[None, :]) % 7 - 3).float()
 
 
@@ -435,6 +437,7 @@ def worker(local_rank, args):
                     max(1, max(plan["rank_rows"])),
                     max(1, max(plan["gather_rows"])),
                     fp8=args.dispatch_dtype == "fp8",
+                    hidden=args.hidden,
                 ),
             )
             if case is cases[0]:
@@ -449,7 +452,7 @@ def worker(local_rank, args):
         world_size=world,
         num_bytes=capacity,
         num_max_tokens_per_rank=max_tokens,
-        hidden=7168,
+        hidden=args.hidden,
         num_topk=args.topk,
         use_fp8_dispatch=args.dispatch_dtype == "fp8",
         explicitly_destroy=True,
@@ -537,16 +540,16 @@ def run_case(buffer, args, rank, world, info, log, references):
             log(f"{context} inputs.begin")
             indices = torch.tensor(routes[rank], dtype=torch.int64, device="npu") if handle is None else None
             x = (
-                payload(rank, args.tokens, generation).npu()
+                payload(rank, args.tokens, generation, args.hidden).npu()
                 if args.check_dispatch
-                else torch.empty((args.tokens, 7168), dtype=torch.bfloat16, device="npu")
+                else torch.empty((args.tokens, args.hidden), dtype=torch.bfloat16, device="npu")
             )
             fp8 = args.dispatch_dtype == "fp8"
             scale_value = 0.5 if generation % 2 else 1.0
             dispatch_input = (
                 (
                     (x.float() / scale_value).to(torch.float8_e4m3fn),
-                    torch.full((args.tokens, 56), scale_value, dtype=torch.float32, device="npu"),
+                    torch.full((args.tokens, args.hidden // 128), scale_value, dtype=torch.float32, device="npu"),
                 )
                 if fp8
                 else x
@@ -585,6 +588,7 @@ def run_case(buffer, args, rank, world, info, log, references):
                 weight_ids,
                 log,
                 context,
+                args.hidden,
             )
             # Producer stream is deliberately distinct; Combine must honor its event.
             log(f"{context} expert_compute.enqueue.begin")
@@ -594,7 +598,7 @@ def run_case(buffer, args, rank, world, info, log, references):
                 if args.check_dispatch:
                     expert_input = recv[0].float() * recv[1].repeat_interleave(128, dim=1) if fp8 else recv.float()
                 else:
-                    expert_input = direct_expert_input(entries, generation, "npu")
+                    expert_input = direct_expert_input(entries, generation, "npu", args.hidden)
                 bias = torch.tensor(
                     [routes[s][t][k] % 3 - 1 + k % 3 - 1 for s, t, k in entries], dtype=torch.float32, device="npu"
                 )[:, None]
@@ -614,7 +618,7 @@ def run_case(buffer, args, rank, world, info, log, references):
                 weight_golden = expected_weights(routes, args.experts, rank, generation)
                 _notify["assert_bytes"](values, weight_golden, f"{context} weights", progress=log)
             log(f"{context} combine_golden.begin (CPU)")
-            golden = expected_output(routes, args.experts, rank, generation)
+            golden = expected_output(routes, args.experts, rank, generation, args.hidden)
             log(f"{context} combine_golden.done")
             _notify["assert_bytes"](output, golden, f"{context} combine", progress=log)
             if args.profile_op and generation == 0:
@@ -695,6 +699,7 @@ def run_case(buffer, args, rank, world, info, log, references):
                 bootstrap=args.bootstrap,
                 tokens=args.tokens,
                 case_id=args.case_id,
+                hidden=args.hidden,
                 session_bytes=buffer._runtime.capacity,
                 chunk_tokens=args.chunk_tokens,
                 topk=args.topk,
@@ -815,6 +820,83 @@ def test_large_shape_and_capacity_bounds(monkeypatch):
             combine_layout(world, tokens, 6, 1, 1)
 
 
+def test_hidden_layouts_match_native(tmp_path):
+    import shutil
+    import subprocess
+    from deep_ep.buffers._elastic_layout import combine_layout, dispatch_layout, elastic_size_hint, validate_hidden
+
+    for width in (0, 15, 17, 7169, 7296, True):
+        with pytest.raises(ValueError, match="hidden"):
+            validate_hidden(width)
+    with pytest.raises(ValueError, match="128"):
+        validate_hidden(144, True)
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if not compiler:
+        pytest.skip("Requires a host C++ compiler")
+    source = tmp_path / "hidden_layout.cpp"
+    source.write_text(
+        """
+#include <iostream>
+#include "kernels/dispatch/tiling.hpp"
+#include "kernels/combine/tiling.hpp"
+int main() {
+    for (unsigned world : {2U, 8U, 128U, 256U, 512U})
+      for (unsigned h : {16U, 48U, 128U, 144U, 1024U, 4096U, 6144U, 7040U, 7152U, 7168U})
+        for (bool fp8 : {false, true}) {
+            if (fp8 && h % 128) continue;
+            auto d = ascend_deepep::MakeDispatchTiling(0, world, 33, 6, 1024, 128, fp8, true, h);
+            auto c = ascend_deepep::MakeCombineTiling(0, world, 33, 6, 128, 256, 256, h);
+            std::cout << world << ' ' << h << ' ' << fp8 << ' '
+              << d.input << ' ' << d.output << ' ' << d.weights << ' ' << d.scales << ' '
+              << d.inbox << ' ' << d.inbox_stride << ' ' << d.workspace_bytes << ' '
+              << c.expert_input_offset_bytes << ' ' << c.gather_input_offset_bytes << ' '
+              << c.server_partial_offset_bytes << ' ' << c.returned_partial_offset_bytes << ' '
+              << c.output_offset_bytes << ' ' << c.weight_recv_offset_bytes << ' '
+              << ascend_deepep::CombineWorkspaceBytes(c) << '\\n';
+        }
+}
+""",
+        encoding="utf-8",
+    )
+    binary = tmp_path / ("hidden_layout.exe" if sys.platform == "win32" else "hidden_layout")
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-O2",
+            "-I" + str(Path(__file__).resolve().parents[2] / "csrc"),
+            str(source),
+            "-o",
+            str(binary),
+        ],
+        check=True,
+        timeout=60,
+    )
+    result = subprocess.run([str(binary)], check=True, capture_output=True, text=True, timeout=30)
+    for line in result.stdout.splitlines():
+        world, width, fp8, *actual = map(int, line.split())
+        d = dispatch_layout(world, 33, 6, 1024, 128, bool(fp8), True, width)
+        c = combine_layout(world, 33, 6, 128, 256, 256, width)
+        expected = [d[k] for k in ("input", "output", "weights", "scales", "inbox", "inbox_stride", "workspace_bytes")]
+        expected += [
+            c[k]
+            for k in (
+                "expert_input",
+                "gather_input",
+                "server_partial",
+                "returned_partial",
+                "output",
+                "weight_recv",
+                "workspace_bytes",
+            )
+        ]
+        assert actual == expected, (world, width, fp8)
+        assert d["output"] - d["input"] == (33 * width * (1 if fp8 else 2) + 511) // 512 * 512
+        assert c["gather_input"] - c["expert_input"] == 128 * width * 2
+        size = elastic_size_hint(world, 33, 6, 1024, 128, 256, bool(fp8), width)
+        assert max(d["workspace_bytes"], c["workspace_bytes"]) <= size // 2
+
+
 def test_ep512_reference_high_ranks():
     # Independent planners must agree across the half-world boundary and rank511.
     for mode in ("normal", "random", "duplicates", "invalid", "empty", "local_experts"):
@@ -916,6 +998,7 @@ def test_notify_checked_without_payload_dispatch(monkeypatch, tmp_path):
         output=tmp_path,
         route="random",
         tokens=1,
+        hidden=7168,
         topk=1,
         experts=2,
         seed=1,
@@ -1777,6 +1860,7 @@ def main():
     parser.add_argument("--bootstrap", choices=("default", "mpi"), default="default")
     _combine_cases["add_arguments"](parser, 257)
     parser.add_argument("--cases-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--experts", type=int, default=1024)
     parser.add_argument("--repeat", type=int, default=3)
@@ -1808,6 +1892,8 @@ def main():
     _notify["add_profile_args"](parser, ("combine",))
     args = parser.parse_args()
     _notify["validate_profile_args"](parser, args)
+    if not 0 < args.hidden <= 7168 or args.hidden % (128 if args.dispatch_dtype == "fp8" else 16):
+        parser.error("hidden must be <=7168 and divisible by 16 (BF16) or 128 (FP8)")
     try:
         cases = _combine_cases["from_args"](args)
     except ValueError as exc:
@@ -2212,6 +2298,7 @@ def test_session_one_buffer_for_grow_shrink_and_fail_fast(tmp_path, monkeypatch,
     args = SimpleNamespace(
         tokens=4096,
         tokens_list=[4096, 16384, 4096],
+        hidden=4096,
         chunk_tokens=256,
         chunk_tokens_list=[256, 512],
         topk=6,

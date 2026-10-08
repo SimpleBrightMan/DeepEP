@@ -31,7 +31,7 @@ NOTE = (
     "Payload WQEs exclude SO/credit WQEs; completion SOs exclude credit checkpoints. "
     "Source wait splits flag polling, existing SyncAll and diagnostic record export. "
     "SQ pressure counters describe software credit reclamation, not physical SQ occupancy. "
-    "Lane payload bytes equal submitted BF16 rows times 14336, excluding SO and credit WQEs. "
+    "Lane payload bytes equal submitted BF16 rows times H*2, excluding SO and credit WQEs. "
     "Lane quiet durations are sequential local waits (lane 0 then lane 1), not comparable wire-service times. "
     "Phases overlap across cores; their maxima must not be added. "
     "Clocks are never aligned across devices. Kernel records exclude prepare, entry/exit barriers, "
@@ -39,7 +39,7 @@ NOTE = (
 )
 
 
-def decode_profile(records, *, rank, world, tokens, topk, weights, sample, chunk_tokens=256):
+def decode_profile(records, *, rank, world, tokens, topk, weights, sample, chunk_tokens=256, hidden=7168):
     if len(records) != 64:
         raise ValueError("Expected 64 Combine AIV records")
     cores = []
@@ -165,7 +165,7 @@ def decode_profile(records, *, rank, world, tokens, topk, weights, sample, chunk
                 prefix = f"Lane{lane}"
                 rows = v[prefix + "PayloadRows"]
                 counters[prefix + "PayloadRows"] = rows
-                counters[prefix + "PayloadBytes"] = rows * 7168 * 2
+                counters[prefix + "PayloadBytes"] = rows * hidden * 2
                 counters[prefix + "SqPressureCount"] = v[prefix + "SqPressureCount"]
                 phases[f"lane{lane}_credit_wait"] = ticks(prefix + "CreditWaitTicks", phases["producer"])
                 phases[f"lane{lane}_quiet"] = ticks(prefix + "QuietTicks", phases["outgoing_quiet"])
@@ -238,6 +238,7 @@ def summarize(reports):
             weights=d["with_weights"],
             sample=d["sample"],
             chunk_tokens=d.get("chunk_tokens", 256),
+            hidden=d["hidden"],
         )
         for c in cores:
             for name, value in c["phases_us"].items():

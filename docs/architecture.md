@@ -50,7 +50,7 @@ fresh dispatch 先运行 Notify，计算接收计数、转发与归并元数据�
 
 ## 低时延路径
 
-LL 通过同一组 dispatch/combine 方法进入独立 kernel。fresh dispatch 在实际 shape、选项与容量符合要求时选择 LL；combine 按 handle 的路径执行。LL 使用固定 8 GiB 对称工作区，保存源端权重供 combine 加权。
+LL 通过同一组 dispatch/combine 方法进入独立 kernel。fresh dispatch 在实际 shape、选项与容量符合要求时选择 LL；combine 按 handle 的路径执行。LL 使用固定 8 GiB 对称工作区，保留路由元数据供 combine 复用。
 
 使用显式 rank/world_size 时返回容量缓冲区。可选地传入已有 Gloo/HCCL EP group 并允许 CPU 同步，可通过该组汇总计数、返回精确接收行数；payload 仍由 SHMEM 和 LL kernel 传输。内部计数、路由表和有效区域由 LL 实现管理，不能按 HT 的字段与布局解释。
 

@@ -15,15 +15,16 @@
 namespace py = pybind11;
 namespace deepep {
 namespace {
-ascend_deepep::PutCombineTiling layout(int rank, int world, int tokens, int topk, int rows, int gathered, int chunk)
+ascend_deepep::PutCombineTiling layout(int rank, int world, int tokens, int topk, int rows, int gathered, int chunk,
+                                       int hidden)
 {
     if (world < 2 || world > 512 || (world & (world - 1)) || rank < 0 || rank >= world || tokens < 1 ||
         tokens > 16384 || topk < 1 || topk > 16 || chunk < 1 || chunk > 16384 || rows < 1 || gathered < 1 ||
         uint64_t(rows) > uint64_t(world) * tokens * topk || uint64_t(gathered) > uint64_t(world) * tokens * topk ||
-        uint64_t(world) * tokens * topk >= (1ULL << 31)) {
+        uint64_t(world) * tokens * topk >= (1ULL << 31) || hidden <= 0 || hidden > 7168 || hidden % 16) {
         throw std::invalid_argument("Invalid expanded Combine shape");
     }
-    const auto t = ascend_deepep::MakeCombineTiling(rank, world, tokens, topk, rows, gathered, chunk);
+    const auto t = ascend_deepep::MakeCombineTiling(rank, world, tokens, topk, rows, gathered, chunk, hidden);
     return t;
 }
 using Shape = std::vector<int64_t>;
@@ -54,24 +55,29 @@ void bind_combine(py::module_& module)
     module.def("combine_profile_version", [] { return ascend_deepep::combine_diagnostics::kVersion; });
     module.def("combine_chunk_profile_version", [] { return ascend_deepep::combine_chunks::kVersion; });
     module.def("combine_peer_profile_version", [] { return ascend_deepep::combine_peers::kVersion; });
-    module.def("combine_layout", [](int rank, int world, int tokens, int topk, int rows, int gathered, int chunk) {
-        const auto t = layout(rank, world, tokens, topk, rows, gathered, chunk);
-        py::dict result;
-        result["control_slot_num"] = t.control_slot_num;
-        result["expert_input"] = t.expert_input_offset_bytes;
-        result["gather_input"] = t.gather_input_offset_bytes;
-        result["server_partial"] = t.server_partial_offset_bytes;
-        result["returned_partial"] = t.returned_partial_offset_bytes;
-        result["output"] = t.output_offset_bytes;
-        result["weight_recv"] = t.weight_recv_offset_bytes;
-        result["weight_local_done"] = t.weight_local_done_offset_bytes;
-        result["weight_done"] = t.weight_done_offset_bytes;
-        result["workspace_bytes"] = ascend_deepep::CombineWorkspaceBytes(t);
-        return result;
-    });
+    module.def(
+        "combine_layout",
+        [](int rank, int world, int tokens, int topk, int rows, int gathered, int chunk, int hidden) {
+            const auto t = layout(rank, world, tokens, topk, rows, gathered, chunk, hidden);
+            py::dict result;
+            result["control_slot_num"] = t.control_slot_num;
+            result["expert_input"] = t.expert_input_offset_bytes;
+            result["gather_input"] = t.gather_input_offset_bytes;
+            result["server_partial"] = t.server_partial_offset_bytes;
+            result["returned_partial"] = t.returned_partial_offset_bytes;
+            result["output"] = t.output_offset_bytes;
+            result["weight_recv"] = t.weight_recv_offset_bytes;
+            result["weight_local_done"] = t.weight_local_done_offset_bytes;
+            result["weight_done"] = t.weight_done_offset_bytes;
+            result["workspace_bytes"] = ascend_deepep::CombineWorkspaceBytes(t);
+            return result;
+        },
+        py::arg("rank"), py::arg("world"), py::arg("tokens"), py::arg("topk"), py::arg("rows"), py::arg("gathered"),
+        py::arg("chunk"), py::arg("hidden") = 7168);
     module.def("combine", [](Session& session, py::dict tensors, int tokens, int topk, int rows, int gathered,
                              int local_rows, int chunk, uintptr_t stream_address) {
-        auto t = layout(session.rank(), session.world(), tokens, topk, rows, gathered, chunk);
+        const int hidden = tensors["input"].attr("size")(1).cast<int>();
+        auto t = layout(session.rank(), session.world(), tokens, topk, rows, gathered, chunk, hidden);
         const uint64_t half = session.capacity() / 2U;
         auto* workspace = static_cast<uint8_t*>(session.workspace()) + half;
         if (!session.udma() || ascend_deepep::CombineWorkspaceBytes(t) > half || !stream_address || local_rows < 0 ||
@@ -82,8 +88,8 @@ void bind_combine(py::module_& module)
         if (aclrtGetDevice(&device) != 0) {
             throw std::runtime_error("Cannot obtain current ACL device");
         }
-        auto* input = pointer(tensors["input"], {local_rows, 7168}, "bfloat16", device);
-        auto* output = pointer(tensors["output"], {tokens, 7168}, "bfloat16", device);
+        auto* input = pointer(tensors["input"], {local_rows, hidden}, "bfloat16", device);
+        auto* output = pointer(tensors["output"], {tokens, hidden}, "bfloat16", device);
         auto* forward = pointer(tensors["forward_list"], {session.world(), int64_t(tokens) * topk, 6}, "int32", device);
         auto* counts = pointer(tensors["forward_counts"], {session.world()}, "int32", device);
         auto* backward =
@@ -123,7 +129,7 @@ void bind_combine(py::module_& module)
         // Before overwriting even input storage, all peers have finished the
         // previous operator and its output copy on this ordered stream.
         notify_dispatch_barrier_kernel_do(stream, 64U);
-        copy(workspace + t.expert_input_offset_bytes, input, uint64_t(local_rows) * 14336U, stream);
+        copy(workspace + t.expert_input_offset_bytes, input, uint64_t(local_rows) * hidden * 2U, stream);
         combine_prepare_kernel_do(stream, workspace, reinterpret_cast<uint8_t*>(&t));
         if (profile) {
             combine_profile_kernel_do(stream, workspace, forward, counts, backward, backward_counts, mask, ranges,
@@ -134,7 +140,7 @@ void bind_combine(py::module_& module)
                               weights, weight_meta, reinterpret_cast<uint8_t*>(&t));
         }
         notify_dispatch_barrier_kernel_do(stream, 64U);
-        copy(output, workspace + t.output_offset_bytes, uint64_t(tokens) * 14336U, stream);
+        copy(output, workspace + t.output_offset_bytes, uint64_t(tokens) * hidden * 2U, stream);
         if (t.with_weights) {
             copy(weight_output, workspace + t.weight_recv_offset_bytes, uint64_t(tokens) * topk * sizeof(float),
                  stream);

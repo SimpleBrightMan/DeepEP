@@ -111,6 +111,7 @@ constexpr uint32_t kSlotTensorBytes = slotChunkCount * sizeof(int32_t);
 constexpr uint32_t kSlotCompareMaskBytes = ((slotChunkCount / 8 + 31) / 32) * 32;
 constexpr uint32_t kSlotSelectUbBytes = 4 * kSlotTensorBytes + kSlotCompareMaskBytes;
 constexpr uint32_t kDuplicateHiddenStageBytes = 65504;
+static_assert(4U * 7168U * sizeof(bfloat16_t) <= kDuplicateHiddenStageBytes);
 constexpr uint32_t kDuplicateMaxPrimaryRows = 4;
 constexpr uint32_t kDuplicateHiddenStagingBytes = 2 * kDuplicateHiddenStageBytes;
 constexpr uint32_t kAivUbCapacityBytes = 192 * 1024;
@@ -616,7 +617,7 @@ __aicore__ inline void Dispatch(GM_ADDR workspace, GM_ADDR destinations, GM_ADDR
         s.world = t.world;
         s.core = core;
         s.lanes = t.world < 8U ? t.world : 8U;
-        s.row_bytes = t.fp8 ? 7168U : 14336U;
+        s.row_bytes = t.hidden * (t.fp8 ? 1U : 2U);
         s.magic = t.generation;
         s.peer = true;
         if (s.peer) {

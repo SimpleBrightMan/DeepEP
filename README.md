@@ -88,7 +88,7 @@ DeepEP/
 | 256 | BF16 / BF16 | 🚧 待补充 | 🚧 待补充 |
 | 256 | FP8 / BF16 | 🚧 待补充 | 🚧 待补充 |
 
-EP256 combine 要求 `T*K < 32768`（T 为每 rank token 数，K 为 top-k）；默认 `chunk=256` 时，44 KiB 常驻控制区要求 `T≤4608`。完整约束见 [Elastic 支持范围](docs/elastic.md#支持范围)。
+HT 接口接受每 rank 最多 16384 token，实际路由还须满足工作区容量和地址编码检查。完整约束见 [Elastic 支持范围](docs/elastic.md#支持范围)。
 
 ![不同 EP 规模的 FP8 dispatch / BF16 combine 带宽](figures/performance_prefill.svg)
 
@@ -228,113 +228,94 @@ bash experiments/megamoe/scripts/build.sh
 
 ### Buffer 初始化
 
-以下为 HT 初始化片段，假定已设置 NPU 设备和 SHMEM endpoint，且 `max_tokens_per_rank > 256`：
+Prefill 与 Decode 共用 `ElasticBuffer.dispatch()` / `combine()`。在支持的配置下，`num_max_tokens_per_rank ≤ 256` 适用低时延，其余配置使用高吞吐。该参数是每 rank 的 token 容量上限，不是本次实际 token 数。
+
+以下 BF16 示例假定已设置 NPU、SHMEM endpoint 和 EP 进程组 `ep_group`。模型提供当前 NPU 上的 `x [T,H]`（BF16）、`topk_idx [T,K]`（INT64）和 `topk_weights [T,K]`（FP32）。各 rank 的 T/H/K 相同，且 `T ≤ max_tokens_per_rank`、专家数可被 EP size 整除。高吞吐支持 `0 < H ≤ 7168`，BF16 的 H 为 16 的倍数，FP8 的 H 为 128 的倍数，1≤K≤16。
+
+低时延使用 8 GiB 工作区，高吞吐由 Buffer 自动估算容量。
 
 ```python
 from deep_ep import ElasticBuffer
 
+max_tokens_per_rank = 256
+num_experts = 384
+hidden = x.shape[1]
+num_topk = topk_idx.shape[1]
+
 buffer = ElasticBuffer(
-    rank=rank,
-    world_size=ep_size,
+    group=ep_group,
+    num_bytes=(8 << 30) if max_tokens_per_rank <= 256 else None,
     num_max_tokens_per_rank=max_tokens_per_rank,
-    hidden=7168,
-    num_topk=6,
-    use_fp8_dispatch=False,  # FP8 输入时设为 True。
+    hidden=hidden,
+    num_topk=num_topk,
     explicitly_destroy=True,
 )
 ```
 
-LL 需显式设置 `num_bytes=8 << 30` 并使用不大于 256 的 token 上限，其他条件见 [Elastic 文档](docs/elastic.md)。使用结束后，各 rank 集体调用 `buffer.destroy()`。
+各 rank 使用相同配置，并在迭代间复用 Buffer。推理只执行前向，反向示例用于高吞吐训练；完整支持范围见 [Elastic 文档](docs/elastic.md)。
 
 ### Dispatch/Combine 示例
 
-以下示例使用目标仓的 `ElasticBuffer` 接口组织 HT forward/backward。`dispatch()` 支持 BF16 Tensor，
-或 `(FP8 E4M3FN payload, FP32 per-128 scales)` 元组；`combine()` 使用匹配的 `EPHandle` 归并结果。
+前向为 Dispatch → 专家计算并乘权 → Combine；反向为 Dispatch → 专家反向 → Combine。Combine 和反向调用均传入对应前向 Dispatch 返回的 handle。
+
+下面四个示例函数封装通信调用和结果等待，专家计算及梯度计算由模型负责。通信输入需连续且不带梯度。
 
 ```python
-from typing import Optional, Tuple, Union
-
-import torch
-
-from deep_ep import ElasticBuffer, EPHandle, EventOverlap
-
-
-def dispatch_forward(
-    x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-    topk_idx: torch.Tensor,
-    topk_weights: torch.Tensor,
-    num_experts: int,
-    num_max_tokens_per_rank: int,
-    expert_alignment: int = 1,
-) -> Tuple[
-    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
-    EPHandle,
-    EventOverlap,
-]:
-    """将 token 分发到各 rank 的本地专家布局。"""
-    return buffer.dispatch(
-        x,
-        topk_idx=topk_idx,
-        topk_weights=topk_weights,
+def dispatch_forward(x, topk_idx, topk_weights):
+    recv_x, _, recv_weights, handle, event = buffer.dispatch(
+        x.detach().contiguous(),
+        topk_idx=topk_idx.contiguous(),
+        topk_weights=topk_weights.detach().contiguous(),
         num_experts=num_experts,
-        num_max_tokens_per_rank=num_max_tokens_per_rank,
-        expert_alignment=expert_alignment,
-        async_with_compute_stream=True,
+        do_expand=True,
     )
+    event.current_stream_wait()
+    return recv_x, recv_weights, handle
 
 
-def dispatch_backward(
-    grad_recv_x: torch.Tensor,
-    grad_recv_topk_weights: Optional[torch.Tensor],
-    handle: EPHandle,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
-    """Dispatch 的 backward 使用 combine 回传输入及权重梯度。"""
-    return buffer.combine(
-        grad_recv_x,
-        handle=handle,
-        topk_weights=grad_recv_topk_weights,
-        async_with_compute_stream=True,
+def dispatch_backward(grad_recv_x, grad_recv_weights, handle):
+    grad_x, grad_weights, event = buffer.combine(
+        grad_recv_x.detach().contiguous(),
+        handle,
+        topk_weights=grad_recv_weights.detach().contiguous(),
     )
+    event.current_stream_wait()
+    return grad_x, grad_weights
 
 
-def combine_forward(
-    x: torch.Tensor,
-    handle: EPHandle,
-) -> Tuple[torch.Tensor, EventOverlap]:
-    """使用 dispatch 返回的 handle 归并专家输出。"""
-    combined_x, _, event = buffer.combine(
-        x,
-        handle=handle,
-        async_with_compute_stream=True,
-    )
-    return combined_x, event
+def combine_forward(expert_out, handle):
+    out, _, event = buffer.combine(expert_out.detach().contiguous(), handle)
+    event.current_stream_wait()
+    return out
 
 
-def combine_backward(
-    grad_combined_x: torch.Tensor,
-    handle: EPHandle,
-) -> Tuple[torch.Tensor, EventOverlap]:
-    """Combine 的 backward 使用 cached dispatch 重新分发梯度。"""
-    grad_x, _, _, _, event = buffer.dispatch(
-        grad_combined_x,
-        handle=handle,
-        async_with_compute_stream=True,
-    )
-    return grad_x, event
+def combine_backward(grad_out, handle):
+    grad_expert_out, _, _, _, event = buffer.dispatch(grad_out.detach().contiguous(), handle=handle)
+    event.current_stream_wait()
+    return grad_expert_out
 ```
 
-使用 `EventOverlap` 管理通信流和计算流的依赖：
+`local_experts_forward/backward` 由模型提供，不是 DeepEP 接口。前向完成专家 FFN 并应用一次 `recv_weights`，返回保持接收行顺序的 BF16 输出及反向所需的 `expert_ctx`。反向负责专家参数梯度，并返回与 `recv_x`、`recv_weights` 同 shape 的 BF16 输入梯度和 FP32 权重梯度。
 
 ```python
-recv_x, recv_topk_idx, recv_topk_weights, handle, event = dispatch_forward(...)
-
-# 此处可执行与本次 dispatch 输出无依赖的计算。
-
-event.current_stream_wait()
-# 等待完成后再使用 recv_x、recv_topk_idx 和 recv_topk_weights。
+# 前向：训练和推理共用调用方式。
+recv_x, recv_weights, handle = dispatch_forward(x, topk_idx, topk_weights)
+expert_out, expert_ctx = local_experts_forward(recv_x, recv_weights, handle)
+out = combine_forward(expert_out, handle)
 ```
+
+训练时，在模型反向传播中调用：
+
+```python
+# grad_out 由模型反向传播传入，与 out 同 shape，使用 BF16。
+grad_expert_out = combine_backward(grad_out, handle)
+grad_recv_x, grad_recv_weights = local_experts_backward(grad_expert_out, expert_ctx)
+grad_x, grad_topk_weights = dispatch_backward(grad_recv_x, grad_recv_weights, handle)
+```
+
+模型将 `grad_x`、`grad_topk_weights` 分别接回输入网络和 router；推理只执行前向部分。
+
+所有 rank 按相同顺序参与通信，包括没有接收行的 rank；训练时保留 handle 到反向结束。所有迭代完成后，各 rank 同序调用 `buffer.destroy()`，再释放 EP 进程组。FP8、异步和 handle 复用见 [Elastic 文档](docs/elastic.md)与 [API 文档](docs/api.md)。
 
 ### MegaMoE 示例
 

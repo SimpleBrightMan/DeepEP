@@ -542,6 +542,324 @@ def test_forward_list_covers_unique_expert_rows():
                 assert output[rank] == [(source, token) for source, token, _ in expert_rows(routes, experts, rank)]
 
 
+def _host_elastic_buffer(monkeypatch):
+    """Exercise Python orchestration with real CPU tensors and a fake native backend."""
+    from collections import Counter
+    from contextlib import nullcontext
+    from threading import RLock
+    from types import SimpleNamespace
+    import pytest
+    from deep_ep.buffers import elastic
+    from deep_ep.utils import event
+
+    torch = pytest.importorskip("torch")
+    calls = Counter()
+    device = SimpleNamespace(type="npu", index=0)
+    empty = torch.empty
+
+    class Tensor(torch.Tensor):
+        @property
+        def device(self):
+            return device
+
+        def record_stream(self, stream):
+            calls["record_stream"] += 1
+
+        def cpu(self):
+            calls["cpu"] += 1
+            return super().cpu()
+
+    def allocate(*args, **kwargs):
+        if kwargs.get("device") is device:
+            kwargs["device"] = "cpu"
+            return torch.Tensor._make_subclass(Tensor, empty(*args, **kwargs), False)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", allocate)
+    stream = SimpleNamespace(npu_stream=1, synchronize=lambda: calls.update(["sync"]))
+    npu = SimpleNamespace(
+        stream=lambda _: nullcontext(),
+        current_device=lambda: 0,
+        current_stream=lambda _: stream,
+        Event=lambda: SimpleNamespace(record=lambda _: None, wait=lambda _: calls.update(["event_wait"])),
+    )
+
+    def notify_layout(rank, world, tokens, topk, experts, chunk, **kwargs):
+        shapes = {name: ((16,), "int32") for name in elastic._PERSISTENT}
+        shapes.update(
+            dst=((tokens, topk), "int64"),
+            rank_rows=((world,), "int32"),
+            gather_rows=((world,), "int32"),
+            expert_totals=((experts,), "int32"),
+            weight_return_meta=((world * tokens * topk,), "int32"),
+            _peer_plan=((16,), "uint8"),
+        )
+        return {
+            "workspace_bytes": elastic.workspace_layout(world, tokens, topk, experts, chunk)["workspace_bytes"],
+            "tensors": shapes,
+        }
+
+    def notify(session, indices, outputs, *args):
+        calls["notify"] += 1
+        for tensor in outputs.values():
+            assert not torch.is_inference(tensor)
+            tensor.zero_()
+        outputs["rank_rows"].fill_(2)
+        outputs["expert_totals"].fill_(2)
+        outputs["gather_rows"].fill_(1)
+        return None, None
+
+    def layout(kind, args):
+        calls[kind + "_layout"] += 1
+        return getattr(elastic, kind + "_layout")(*args[1:])
+
+    native = SimpleNamespace(
+        notify_check_mapping=lambda _: None,
+        notify_layout=notify_layout,
+        notify=notify,
+        dispatch_layout=lambda *args: layout("dispatch", args),
+        combine_layout=lambda *args: layout("combine", args),
+        dispatch=lambda *args: calls.update(["dispatch"]),
+        combine=lambda *args: calls.update(["combine"]),
+    )
+    for module in (elastic, event):
+        monkeypatch.setattr(module, "require_native", lambda _: native)
+        monkeypatch.setattr(module, "npu_api", lambda: npu)
+    buffer = elastic.ElasticBuffer.__new__(elastic.ElasticBuffer)
+    buffer.hidden = 0
+    buffer.num_max_tokens_per_rank, buffer.num_topk = 16, 1
+    buffer._handle_token = object()
+    buffer._runtime = SimpleNamespace(
+        ensure_alive=lambda: None,
+        notify_failed=False,
+        notify_lock=RLock(),
+        group=None,
+        device=0,
+        rank=0,
+        world_size=2,
+        stream=stream,
+        native=SimpleNamespace(peer_table=True),
+        capacity=1 << 32,
+        combine_only=False,
+        closed=True,
+    )
+    return buffer, lambda shape, dtype: torch.empty(shape, dtype=dtype, device=device), calls
+
+
+def test_inference_dispatch_combine_and_cached_host_work(monkeypatch):
+    import pytest
+    from deep_ep.buffers.elastic import _PERSISTENT
+
+    torch = pytest.importorskip("torch")
+    buffer, tensor, calls = _host_elastic_buffer(monkeypatch)
+    with torch.inference_mode():
+        x, indices = tensor((2, 7168), torch.bfloat16), tensor((2, 1), torch.int64)
+        recv, _, _, handle, _ = buffer.dispatch(x, topk_idx=indices, num_experts=2)
+        assert torch.is_inference(x) and torch.is_inference(indices)
+        assert handle.topk_idx.data_ptr() != indices.data_ptr()
+        for name in ("topk_idx", "dispatch_dst", *_PERSISTENT, "_peer_plan"):
+            value = getattr(handle, name)
+            assert not torch.is_inference(value)
+            assert handle._routing_versions[name] == (value.data_ptr(), value._version)
+        assert calls["cpu"] == 1
+        assert handle.address_stride == 2 and handle._gather_stride == 1
+        calls.clear()
+        for _ in range(2):
+            buffer.combine(recv, handle, async_with_compute_stream=True)
+            buffer.dispatch(x, handle=handle, async_with_compute_stream=True)
+        assert calls["combine"] == calls["dispatch"] == 2
+        assert calls["cpu"] == calls["sync"] == calls["notify"] == 0
+        assert calls["combine_layout"] == 1 and calls["dispatch_layout"] == 0
+        assert calls["event_wait"] and calls["record_stream"]
+        handle.forward_counts.add_(1)
+        with pytest.raises(ValueError, match="Cached routing was modified"):
+            buffer.combine(recv, handle)
+        with pytest.raises(ValueError, match="Cached routing was modified"):
+            buffer.dispatch(x, handle=handle)
+        assert calls["combine"] == calls["dispatch"] == 2
+
+
+def test_inference_routing_copy_policy(monkeypatch):
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    buffer, tensor, calls = _host_elastic_buffer(monkeypatch)
+    ordinary_indices = tensor((2, 1), torch.int64)
+    with torch.inference_mode():
+        x, indices = tensor((2, 7168), torch.bfloat16), tensor((2, 1), torch.int64)
+        with pytest.raises(ValueError, match="do_handle_copy=True"):
+            buffer.dispatch(x, topk_idx=indices, num_experts=2, do_handle_copy=False)
+        assert calls["notify"] == calls["dispatch"] == 0
+        assert not buffer._runtime.notify_failed
+        recv, _, _, handle, _ = buffer.dispatch(x, topk_idx=ordinary_indices, num_experts=2, do_handle_copy=False)
+        assert handle.topk_idx is ordinary_indices
+    buffer.combine(recv, handle)
+    with torch.inference_mode():
+        handle.forward_list = tensor(handle.forward_list.shape, handle.forward_list.dtype)
+        with pytest.raises(ValueError, match="Cached routing was modified"):
+            buffer.combine(recv, handle)
+    assert calls["combine"] == 1
+
+
+def test_cached_layout_variants_and_capacity_checks(monkeypatch):
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    buffer, tensor, calls = _host_elastic_buffer(monkeypatch)
+    x, indices = tensor((2, 7168), torch.bfloat16), tensor((2, 1), torch.int64)
+    recv, _, _, handle, _ = buffer.dispatch(x, topk_idx=indices, num_experts=2)
+    weights = tensor((2, 1), torch.float32)
+    buffer.dispatch(x, handle=handle, topk_weights=weights)
+    buffer.dispatch(x, handle=handle, topk_weights=weights)
+    fp8 = (tensor((2, 7168), torch.float8_e4m3fn), tensor((2, 56), torch.float32))
+    buffer.dispatch(fp8, handle=handle, topk_weights=weights)
+    buffer.dispatch(x, handle=handle)
+    assert calls["dispatch_layout"] == 3
+    buffer.combine(recv, handle)
+    buffer._runtime.capacity = 0
+    with pytest.raises(ValueError, match="SHMEM"):
+        buffer.combine(recv, handle)
+    with pytest.raises(ValueError, match="SHMEM"):
+        buffer.dispatch(x, handle=handle)
+    assert calls["combine"] == 1 and calls["dispatch"] == 5
+    assert not buffer._runtime.notify_failed
+
+
+def test_hidden_shapes_and_cached_contract(monkeypatch):
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    buffer, tensor, calls = _host_elastic_buffer(monkeypatch)
+    indices = tensor((2, 1), torch.int64)
+    for width in (16, 48, 128, 144, 1024, 4096, 6144, 7040, 7152, 7168):
+        x = tensor((2, width), torch.bfloat16)
+        recv, _, _, handle, _ = buffer.dispatch(x, topk_idx=indices, num_experts=2)
+        assert recv.shape == (2, width) and handle.hidden == width
+        out, _, _ = buffer.combine(recv, handle)
+        assert out.shape == (2, width)
+        buffer.dispatch(x, handle=handle)
+        if width % 128 == 0:
+            fp8 = (tensor((2, width), torch.float8_e4m3fn), tensor((2, width // 128), torch.float32))
+            recv_fp8, _, _, _, _ = buffer.dispatch(fp8, handle=handle)
+            assert recv_fp8[0].shape == (2, width) and recv_fp8[1].shape == (2, width // 128)
+        with pytest.raises(ValueError, match="original hidden"):
+            buffer.dispatch(tensor((2, 32 if width == 16 else 16), torch.bfloat16), handle=handle)
+        with pytest.raises(ValueError, match="matching the handle"):
+            buffer.combine(tensor((2, width + 16), torch.bfloat16), handle)
+    launched = calls["dispatch"]
+    for width in (0, 15, 17, 7169, 7296):
+        with pytest.raises(ValueError, match="hidden"):
+            buffer.dispatch(tensor((2, width), torch.bfloat16), topk_idx=indices, num_experts=2)
+    with pytest.raises(ValueError, match="scales"):
+        buffer.dispatch(
+            (tensor((2, 128), torch.float8_e4m3fn), tensor((2, 56), torch.float32)), topk_idx=indices, num_experts=2
+        )
+    buffer.hidden = 4096
+    with pytest.raises(ValueError, match="buffer configuration"):
+        buffer.dispatch(tensor((2, 7168), torch.bfloat16), topk_idx=indices, num_experts=2)
+    assert calls["dispatch"] == launched
+
+
+def test_scale_packet_scatter_hidden_sizes(tmp_path):
+    import shutil
+    import subprocess
+    import pytest
+
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if not compiler:
+        pytest.skip("Requires a host C++ compiler")
+    header = (Path(__file__).resolve().parents[2] / "csrc/kernels/dispatch/scale_pipeline.hpp").read_text(
+        encoding="utf-8"
+    )
+    expand = header[
+        header.index("__simt_vf__ __launch_bounds__(128) inline void Expand") : header.index(
+            "__aicore__ inline void WaitPack"
+        )
+    ]
+    source = tmp_path / "scale.cpp"
+    source.write_text(
+        """
+#include <cstdint>
+#include <cassert>
+#include <vector>
+#define __simt_vf__
+#define __launch_bounds__(n)
+#define __ubuf__
+#define __gm__
+struct { unsigned x; } threadIdx;
+void asc_threadfence() {}
+"""
+        + expand
+        + """
+int main() {
+    for (unsigned words = 1; words <= 56; ++words) {
+        std::vector<uint32_t> packed(3 * 128, 0xdeadbeef), errors(128, 0);
+        auto* slots = reinterpret_cast<int32_t*>(packed.data());
+        const int32_t targets[] = {2, 0, 1, -1, 3, -1};
+        for (unsigned row = 0; row < 6; ++row) {
+            slots[row / 2 * 128 + 112 + row % 2] = targets[row];
+            for (unsigned col = 0; col < words; ++col)
+                packed[row / 2 * 128 + row % 2 * 56 + col] = (row + 1) * 1000 + col;
+        }
+        std::vector<uint32_t> output(4 * words + 16, 0xabcddcba), expected = output;
+        for (unsigned row = 0; row < 6; ++row) if (targets[row] >= 0)
+            for (unsigned col = 0; col < words; ++col)
+                expected[8 + targets[row] * words + col] = (row + 1) * 1000 + col;
+        for (threadIdx.x = 0; threadIdx.x < 128; ++threadIdx.x)
+            Expand(packed.data(), slots, output.data() + 8, 6, words, 56, 4, errors.data());
+        assert(output == expected);
+        output[8] ^= 1;
+        assert(output != expected);
+        for (auto error : errors) assert(error == 0);
+        slots[112] = 4;
+        for (threadIdx.x = 0; threadIdx.x < 128; ++threadIdx.x)
+            Expand(packed.data(), slots, output.data() + 8, 6, words, 56, 4, errors.data());
+        unsigned bad = 0;
+        for (auto error : errors) bad += error;
+        assert(bad == 1);
+    }
+}
+""",
+        encoding="utf-8",
+    )
+    binary = tmp_path / ("scale.exe" if sys.platform == "win32" else "scale")
+    subprocess.run([compiler, "-std=c++17", "-O2", str(source), "-o", str(binary)], check=True, timeout=60)
+    subprocess.run([str(binary)], check=True, timeout=30)
+
+
+def test_collective_check_copies_one_summary(monkeypatch):
+    from types import SimpleNamespace
+    import pytest
+    from deep_ep.buffers.elastic import _collective_check
+
+    torch = pytest.importorskip("torch")
+    import torch.distributed as dist
+
+    seen = []
+    fail_rank = None
+
+    def gather(peers, local, group):
+        assert not torch.is_inference(local)
+        assert len({peer.untyped_storage().data_ptr() for peer in peers}) == 1
+        # Backend workers may write after leaving the caller's inference context.
+        with torch.inference_mode(False):
+            for rank, peer in enumerate(peers):
+                peer.copy_(local)
+                if rank == fail_rank:
+                    peer[0] = 1
+        seen.append(len(peers))
+
+    monkeypatch.setattr(dist, "get_backend", lambda _: "gloo")
+    monkeypatch.setattr(dist, "all_gather", gather)
+    runtime = SimpleNamespace(group=object(), world_size=4)
+    with torch.inference_mode():
+        _collective_check(runtime, None, [2, 1, 2])
+        fail_rank = 2
+        with pytest.raises(ValueError, match=r"ranks \[2\]"):
+            _collective_check(runtime, None, [2, 1, 2])
+    assert seen == [4, 4]
+
+
 def test_dispatch_destination_initialization():
     import ast
     from types import SimpleNamespace
@@ -630,16 +948,16 @@ def assert_bytes(actual, expected, name, progress=None):
         progress(f"{name}: precision.passed")
 
 
-def payload(source, tokens, generation, fp8):
+def payload(source, tokens, generation, fp8, width=7168):
     import torch
 
     # Bounded independently of EP, token count and hidden size. Neither BF16
     # nor FP8 construction can overflow; no arithmetic runs in dispatch.
     rows = torch.arange(tokens, dtype=torch.int32)[:, None]
-    columns = torch.arange(7168, dtype=torch.int32)[None, :]
+    columns = torch.arange(width, dtype=torch.int32)[None, :]
     hidden = ((source * 13 + rows * 7 + columns * 3 + generation * 11) % 127 - 63).float() / 16
     hidden = hidden.to(torch.float8_e4m3fn if fp8 else torch.bfloat16)
-    scales = ((source + rows + torch.arange(56)[None, :] + generation) % 7 + 1).float() / 8
+    scales = ((source + rows + torch.arange(width // 128)[None, :] + generation) % 7 + 1).float() / 8
     return hidden, scales
 
 
@@ -649,23 +967,23 @@ def weights_for(source, tokens, topk, generation):
     return ((torch.arange(tokens * topk).reshape(tokens, topk) + source * 3 + generation) % 31 + 1).float() / 32
 
 
-def expected_payload(routes, experts, rank, generation, fp8, *, entries=None):
+def expected_payload(routes, experts, rank, generation, fp8, *, entries=None, width=7168):
     import torch
 
     if entries is None:
         entries = expert_rows(routes, experts, rank)
     topk = len(routes[0][0])
     dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
-    hidden = torch.empty((len(entries), 7168), dtype=dtype)
-    scales = torch.empty((len(entries), 56), dtype=torch.float32)
+    hidden = torch.empty((len(entries), width), dtype=dtype)
+    scales = torch.empty((len(entries), width // 128), dtype=torch.float32)
     weights = torch.empty((len(entries),), dtype=torch.float32)
     if not entries:
         return hidden, scales, weights
-    columns = torch.arange(7168, dtype=torch.int32)[None, :]
+    columns = torch.arange(width, dtype=torch.int32)[None, :]
     # Quantize the 127 distinct rows once; gather bytes to preserve FP8 rounding.
     phases = torch.arange(127, dtype=torch.int32)[:, None]
     lookup = (((phases + columns * 3) % 127 - 63).float() / 16).to(dtype).view(torch.uint8)
-    scale_columns = torch.arange(56, dtype=torch.int32)[None, :]
+    scale_columns = torch.arange(width // 128, dtype=torch.int32)[None, :]
     for begin in range(0, len(entries), 256):
         end = min(begin + 256, len(entries))
         coordinates = torch.tensor(entries[begin:end], dtype=torch.int32)
@@ -791,7 +1109,7 @@ def profile_operator(args, rank, scenario, invoke, validate, build_info, log):
         tokens=args.tokens,
         topk=args.topk,
         experts=args.experts,
-        hidden=7168,
+        hidden=getattr(args, "hidden", 7168),
         warmup=args.profile_warmup,
         iterations=args.profile_iters,
         torch_version=str(torch.__version__),
@@ -898,6 +1216,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     _add_launch_args(parser)
     parser.add_argument("--tokens", type=int, default=33)
+    parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--experts", type=int, default=1024)
     parser.add_argument("--dtype", choices=("bf16", "fp8", "both"), default="both")
@@ -908,6 +1227,8 @@ def main():
     add_profile_args(parser, ("notify", "dispatch"))
     args = parser.parse_args()
     validate_profile_args(parser, args)
+    if not 0 < args.hidden <= 7168 or args.hidden % (16 if args.dtype == "bf16" else 128):
+        parser.error("hidden must be <=7168 and divisible by 16 (BF16) or 128 (FP8)")
     if not __debug__ or os.environ.get("PYTHONOPTIMIZE") or args.repeat < 2:
         parser.error("Enable assertions and use --repeat >=2")
     _launch(args, worker)
@@ -946,7 +1267,9 @@ def worker(local_rank, args):
         receive_capacity(random_routes, args.experts) if random_routes is not None else world * args.tokens * args.topk
     )
     capacity = 2 * max(
-        dispatch_layout(world, args.tokens, args.topk, args.experts, rows, fp8, weights=True)["num_bytes"]
+        dispatch_layout(world, args.tokens, args.topk, args.experts, rows, fp8, weights=True, hidden=args.hidden)[
+            "num_bytes"
+        ]
         for fp8 in dtypes
     )
     log(f"buffer.init.begin bytes={capacity}")
@@ -955,7 +1278,7 @@ def worker(local_rank, args):
         world_size=world,
         num_bytes=capacity,
         num_max_tokens_per_rank=args.tokens,
-        hidden=7168,
+        hidden=args.hidden,
         num_topk=args.topk,
         explicitly_destroy=True,
     )
@@ -983,7 +1306,7 @@ def worker(local_rank, args):
                             f"iter={generation + 1}/{args.repeat}"
                         )
                         log(f"{iteration} inputs.begin")
-                        local, scales = payload(rank, args.tokens, generation, fp8)
+                        local, scales = payload(rank, args.tokens, generation, fp8, args.hidden)
                         local_weights = weights_for(rank, args.tokens, args.topk, generation)
                         producer = torch.npu.Stream()
                         with torch.npu.stream(producer):
@@ -1017,7 +1340,7 @@ def worker(local_rank, args):
                             raise AssertionError("Cached dispatch replaced its routing handle")
                         log(f"{iteration} payload_golden.begin (CPU)")
                         expected, expected_scales, expected_weights = expected_payload(
-                            routes, args.experts, rank, generation, fp8, entries=entries
+                            routes, args.experts, rank, generation, fp8, entries=entries, width=args.hidden
                         )
                         log(f"{iteration} payload_golden.done")
                         data = output[0] if fp8 else output
@@ -1114,6 +1437,7 @@ def worker(local_rank, args):
                 tokens=args.tokens,
                 topk=args.topk,
                 experts=args.experts,
+                hidden=args.hidden,
                 dtype=args.dtype,
                 route=args.route,
                 seed=args.seed,

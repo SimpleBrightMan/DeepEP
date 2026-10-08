@@ -66,7 +66,7 @@ def test_signature_matches_project_contract(name, method, spec):
     assert isinstance(inspect.getattr_static(cls, method), staticmethod) == (spec["kind"] == "staticmethod")
 
 
-def test_snapshot_pins_sources_and_does_not_claim_implementation():
+def test_snapshot_pins_sources_and_partial_implementation():
     assert BASELINE["schema_version"] == 3
     assert "not an exact upstream signature snapshot" in BASELINE["contract"]
     assert set(BASELINE["platform_naming"]) == {
@@ -81,7 +81,7 @@ def test_snapshot_pins_sources_and_does_not_claim_implementation():
     }
     assert BASELINE["upstream"]["revision"] == "a56d6156febcd9976e55adc85b5155bfac9f28f8"
     assert all(len(digest) == 64 for digest in BASELINE["upstream"]["sources"].values())
-    assert BASELINE["implementation_status"] == "declarations_only"
+    assert BASELINE["implementation_status"] == "partial_native"
     assert set(BASELINE["exports"]) == set(BASELINE["objects"])
 
 

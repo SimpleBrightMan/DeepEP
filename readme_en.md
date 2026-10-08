@@ -227,38 +227,94 @@ The script prepares dependencies and builds and installs a wheel with MegaMoE an
 
 ### Buffer initialization
 
-The following HT initialization assumes the NPU device and SHMEM endpoint are set, with `max_tokens_per_rank > 256`:
+Prefill and decode share `ElasticBuffer.dispatch()` / `combine()`. For supported configurations, `num_max_tokens_per_rank ≤ 256` uses low latency; other configurations use high throughput. This parameter is the per-rank token capacity, not the current token count.
+
+The BF16 example below assumes that the NPU device, SHMEM endpoint and EP process group `ep_group` are configured. The model supplies `x [T,H]` (BF16), `topk_idx [T,K]` (INT64) and `topk_weights [T,K]` (FP32) on the current NPU. All ranks use the same T/H/K, with `T ≤ max_tokens_per_rank` and an expert count divisible by the EP size. High throughput supports `0 < H ≤ 7168`: H must be divisible by 16 for BF16 or 128 for FP8, with 1≤K≤16.
+
+Low latency uses an 8 GiB workspace; for high throughput, the buffer estimates the capacity automatically.
 
 ```python
 from deep_ep import ElasticBuffer
 
+max_tokens_per_rank = 256
+num_experts = 384
+hidden = x.shape[1]
+num_topk = topk_idx.shape[1]
+
 buffer = ElasticBuffer(
-    rank=rank,
-    world_size=ep_size,
+    group=ep_group,
+    num_bytes=(8 << 30) if max_tokens_per_rank <= 256 else None,
     num_max_tokens_per_rank=max_tokens_per_rank,
-    hidden=7168,
-    num_topk=6,
+    hidden=hidden,
+    num_topk=num_topk,
     explicitly_destroy=True,
 )
 ```
 
-For LL, explicitly set `num_bytes=8 << 30` and use a token bound no greater than 256; other requirements are listed in the [Elastic guide](docs/elastic.md). Call `buffer.destroy()` collectively when finished.
+Use the same configuration on all ranks and reuse the buffer across iterations. Inference uses only the forward steps; the backward example is for high-throughput training. See the [Elastic guide](docs/elastic.md) for supported configurations.
 
-### Example use in inference prefilling
+### Dispatch/Combine example
 
-`dispatch()` prepares routing metadata and distributes tokens. After local expert computation, `combine()` aggregates results using the matching `EPHandle`.
+Forward runs Dispatch → expert computation and weighting → Combine. Backward runs Dispatch → expert backward → Combine. Pass the handle returned by the corresponding forward Dispatch to Combine and both backward calls.
 
-> 🚧 **TBD | Prefill example**
->
-> complete BF16 and FP8 prefill examples.
+The four example functions below wrap communication calls and waits. The model provides expert computation and gradient computation. Communication inputs must be contiguous and detached.
 
-### Example use in inference decoding
+```python
+def dispatch_forward(x, topk_idx, topk_weights):
+    recv_x, _, recv_weights, handle, event = buffer.dispatch(
+        x.detach().contiguous(),
+        topk_idx=topk_idx.contiguous(),
+        topk_weights=topk_weights.detach().contiguous(),
+        num_experts=num_experts,
+        do_expand=True,
+    )
+    event.current_stream_wait()
+    return recv_x, recv_weights, handle
 
-Decode uses the same `ElasticBuffer` API and `dispatch()` / `combine()` methods, with a buffer configured for the selected path.
 
-> 🚧 **TBD | Decode example**
->
-> complete EP64/EP128 decode example.
+def dispatch_backward(grad_recv_x, grad_recv_weights, handle):
+    grad_x, grad_weights, event = buffer.combine(
+        grad_recv_x.detach().contiguous(),
+        handle,
+        topk_weights=grad_recv_weights.detach().contiguous(),
+    )
+    event.current_stream_wait()
+    return grad_x, grad_weights
+
+
+def combine_forward(expert_out, handle):
+    out, _, event = buffer.combine(expert_out.detach().contiguous(), handle)
+    event.current_stream_wait()
+    return out
+
+
+def combine_backward(grad_out, handle):
+    grad_expert_out, _, _, _, event = buffer.dispatch(grad_out.detach().contiguous(), handle=handle)
+    event.current_stream_wait()
+    return grad_expert_out
+```
+
+`local_experts_forward/backward` are supplied by the model, not DeepEP APIs. Forward computes the expert FFN and applies `recv_weights` once, returning BF16 outputs in the received row order and an `expert_ctx` for backward. Backward computes expert parameter gradients and returns BF16 input gradients and FP32 weight gradients with the same shapes as `recv_x` and `recv_weights`, respectively.
+
+```python
+# Forward: training and inference use the same calls.
+recv_x, recv_weights, handle = dispatch_forward(x, topk_idx, topk_weights)
+expert_out, expert_ctx = local_experts_forward(recv_x, recv_weights, handle)
+out = combine_forward(expert_out, handle)
+```
+
+During training, call these steps in the model's backward pass:
+
+```python
+# The model supplies grad_out during backward, in BF16 with the same shape as out.
+grad_expert_out = combine_backward(grad_out, handle)
+grad_recv_x, grad_recv_weights = local_experts_backward(grad_expert_out, expert_ctx)
+grad_x, grad_topk_weights = dispatch_backward(grad_recv_x, grad_recv_weights, handle)
+```
+
+The model feeds `grad_x` and `grad_topk_weights` back into the input network and router, respectively. Inference uses only the forward steps.
+
+Every rank must participate in communication in the same order, including ranks with no received rows. For training, keep each handle until its backward pass finishes. After all iterations, call `buffer.destroy()` in the same order on all ranks, before releasing the EP group. See the [Elastic guide](docs/elastic.md) and [API guide](docs/api.md) for FP8, asynchronous calls and handle reuse.
 
 ### MegaMoE example
 

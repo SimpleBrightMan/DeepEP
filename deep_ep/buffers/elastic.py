@@ -9,7 +9,14 @@ from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 from .._native import _unavailable, npu_api, require_native
 from .._runtime import Runtime, rank_and_world, runtime_of, warn_unclosed
-from ._elastic_layout import combine_layout, dispatch_layout, elastic_size_hint, integer, workspace_layout
+from ._elastic_layout import (
+    combine_layout,
+    dispatch_layout,
+    elastic_size_hint,
+    integer,
+    validate_hidden,
+    workspace_layout,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -44,10 +51,11 @@ def _collective_check(runtime, error, signature):
 
     values = [int(error is not None), *signature]
     device = f"npu:{runtime.device}" if str(dist.get_backend(runtime.group)) == "hccl" else "cpu"
-    local = torch.tensor(values, dtype=torch.int64, device=device)
-    peers = [torch.empty_like(local) for _ in range(runtime.world_size)]
-    dist.all_gather(peers, local, group=runtime.group)
-    gathered = [peer.cpu().tolist() for peer in peers]
+    with torch.inference_mode(False), torch.no_grad():
+        local = torch.tensor(values, dtype=torch.int64, device=device)
+        peers = torch.empty((runtime.world_size, len(values)), dtype=local.dtype, device=local.device)
+    dist.all_gather(list(peers.unbind(0)), local, group=runtime.group)
+    gathered = peers.cpu().tolist()
     failed = [rank for rank, row in enumerate(gathered) if row[0]]
     if failed:
         raise ValueError(f"Notify preflight failed on ranks {failed}: {error or 'see the failing rank log'}")
@@ -128,6 +136,9 @@ class EPHandle:
         self.metadata_version = 7
         self._buffer_token = None
         self._routing_versions = {}
+        self._gather_stride = None
+        self._combine_layout_cache = None
+        self._dispatch_layout_cache = {}
 
 
 class ElasticBuffer:
@@ -187,11 +198,12 @@ class ElasticBuffer:
             raise NotImplementedError("Runtime currently requires explicitly_destroy=True")
         integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 0, 16384)
         integer("num_topk", num_topk, 0, 16)
-        if type(hidden) is not int or hidden not in (0, 7168):
-            raise ValueError("Dispatch supports hidden=7168")
+        integer("hidden", hidden, 0, 7168)
+        if hidden:
+            validate_hidden(hidden, use_fp8_dispatch)
         if num_bytes is None:
-            if not num_max_tokens_per_rank or not num_topk or hidden != 7168:
-                raise NotImplementedError("Pass num_bytes or provide token/topk bounds and hidden=7168")
+            if not num_max_tokens_per_rank or not num_topk or not hidden:
+                raise NotImplementedError("Pass num_bytes or provide token/topk bounds and hidden")
             num_bytes = self.get_buffer_size_hint(
                 group, num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch, world_size=world_size
             )
@@ -238,8 +250,7 @@ class ElasticBuffer:
         are included at every supported shape; actual allocation depends on the runtime.
         """
         require_native("ElasticBuffer.get_buffer_size_hint")
-        if type(hidden) is not int or hidden != 7168:
-            raise ValueError("Dispatch sizing requires hidden=7168")
+        validate_hidden(hidden, use_fp8_dispatch)
         if allow_hybrid_mode is not True or allow_multiple_reduction is not True:
             raise NotImplementedError("Dispatch sizing supports only default algorithm options")
         _, world = rank_and_world(group, 0 if group is None else None, world_size)
@@ -251,6 +262,7 @@ class ElasticBuffer:
             min(world, 4) * num_max_tokens_per_rank * num_topk,
             min(world, 4) * num_max_tokens_per_rank * num_topk,
             use_fp8_dispatch,
+            hidden,
         )
 
     def barrier(
@@ -615,7 +627,8 @@ class ElasticBuffer:
     ]:
         """Return (expanded_x, None, expanded_weights, handle, event).
 
-        Supports BF16 or (FP8 E4M3FN, FP32 [T,H/128] scales), H=7168,
+        Supports H <= 7168: BF16 (H divisible by 16) or FP8 E4M3FN (H divisible by 128,
+        with FP32 [T,H/128] scales),
         Fresh calls with resolved num_max_tokens_per_rank <= 256 prefer LL;
         unsupported LL options use HT only before payload launch. HT supports
         fresh/cached expanded routing with expert_alignment=1, num_qps=0/2,
@@ -731,10 +744,11 @@ class ElasticBuffer:
                         "x must be contiguous BF16, or (FP8 E4M3FN, FP32 scales), on the buffer NPU without grad"
                     )
                 tokens, width = hidden.shape
-                if width != 7168:
-                    raise ValueError("Dispatch supports hidden=7168")
-                if fp8 and not check_tensor(scales, torch.float32, (tokens, 56)):
-                    raise ValueError("FP8 scales must be contiguous FP32 [T,56] on the buffer NPU without grad")
+                validate_hidden(width, fp8)
+                if self.hidden and width != self.hidden:
+                    raise ValueError("hidden differs from buffer configuration")
+                if fp8 and not check_tensor(scales, torch.float32, (tokens, width // 128)):
+                    raise ValueError("FP8 scales must be contiguous FP32 [T,H/128] on the buffer NPU without grad")
                 if type(num_compute_units) is not int or num_compute_units not in (0, 64 if fp8 else 32):
                     raise ValueError("num_compute_units must be 0/32 for BF16 or 0/64 for FP8")
                 if type(num_qps) is not int or num_qps not in (0, 2):
@@ -753,11 +767,13 @@ class ElasticBuffer:
                         raise ValueError("num_experts differs from cached routing")
                     for name, version in handle._routing_versions.items():
                         tensor = getattr(handle, name)
-                        if (tensor.data_ptr(), tensor._version) != version:
+                        if torch.is_inference(tensor) or (tensor.data_ptr(), tensor._version) != version:
                             raise ValueError(f"Cached routing was modified: {name}")
                     num_experts, topk = handle.num_experts, handle.num_topk
                     if tokens != handle.num_tokens:
                         raise ValueError("Cached dispatch requires the original token count")
+                    if width != handle.hidden:
+                        raise ValueError("Cached dispatch requires the original hidden size")
                 else:
                     if not check_tensor(topk_idx, torch.int64) or topk_idx.ndim != 2 or topk_idx.shape[0] != tokens:
                         raise ValueError("topk_idx must be contiguous int64 [T,K] on the buffer NPU")
@@ -815,33 +831,34 @@ class ElasticBuffer:
             payload_signature = signature + [0, int(runtime.native.peer_table), int(hasattr(handle, "_peer_plan"))]
             try:
                 rows, local_rows = handle.address_stride, handle.num_expanded_tokens
-                layout = dispatch_layout(
-                    runtime.world_size, tokens, topk, num_experts, rows, fp8, weights=topk_weights is not None
-                )
+                layout_key = (runtime.world_size, tokens, topk, num_experts, rows, fp8, topk_weights is not None, width)
+                layout = handle._dispatch_layout_cache.get(layout_key)
+                if layout is None:
+                    layout = dispatch_layout(*layout_key)
+                    native_layout = native.dispatch_layout(runtime.rank, *layout_key)
+                    if native_layout.get("aggregate_protocol") != layout["aggregate_protocol"] or any(
+                        layout[key] != value for key, value in native_layout.items()
+                    ):
+                        raise RuntimeError("Python/native dispatch layouts differ; rebuild the installed package")
+                    handle._dispatch_layout_cache[layout_key] = layout
                 if layout["workspace_bytes"] > runtime.capacity // 2:
                     raise ValueError(
                         f"Dispatch needs at least {2 * layout['num_bytes']} SHMEM bytes per rank for the actual receive counts"
                     )
-                native_layout = native.dispatch_layout(
-                    runtime.rank, runtime.world_size, tokens, topk, num_experts, rows, fp8, topk_weights is not None
-                )
-                if native_layout.get("aggregate_protocol") != layout["aggregate_protocol"] or any(
-                    layout[key] != value for key, value in native_layout.items()
-                ):
-                    raise RuntimeError("Python/native dispatch layouts differ; rebuild the installed package")
                 payload_signature[-3] = rows
                 if previous_event is not None:
                     previous_event.current_stream_wait()
                 producer = EventHandle()
                 with npu.stream(runtime.stream):
                     producer.current_stream_wait()
-                    if getattr(handle, "dispatch_dst", None) is None:
-                        # Preserve Notify's original stride/sentinel ABI for Combine.
-                        raw = handle.dst.to(torch.int64)
-                        flat = torch.where(raw == -(1 << 63), 0, torch.where(raw < 0, ~raw, raw))
-                        encoded = flat // rows * layout["address_stride"] + flat % rows
-                        encoded = torch.where(raw < 0, ~encoded, encoded)
-                        handle.dispatch_dst = torch.where(raw == -(1 << 63), raw, encoded)
+                    with torch.inference_mode(False), torch.no_grad():
+                        if getattr(handle, "dispatch_dst", None) is None:
+                            # Preserve Notify's original stride/sentinel ABI for Combine.
+                            raw = handle.dst.to(torch.int64)
+                            flat = torch.where(raw == -(1 << 63), 0, torch.where(raw < 0, ~raw, raw))
+                            encoded = flat // rows * layout["address_stride"] + flat % rows
+                            encoded = torch.where(raw < 0, ~encoded, encoded)
+                            handle.dispatch_dst = torch.where(raw == -(1 << 63), raw, encoded)
                     out = torch.empty((local_rows, width), dtype=hidden.dtype, device=hidden.device)
                     out_weights = (
                         torch.empty((local_rows,), dtype=torch.float32, device=hidden.device)
@@ -849,7 +866,9 @@ class ElasticBuffer:
                         else None
                     )
                     out_scales = (
-                        torch.empty((local_rows, 56), dtype=torch.float32, device=hidden.device) if fp8 else None
+                        torch.empty((local_rows, width // 128), dtype=torch.float32, device=hidden.device)
+                        if fp8
+                        else None
                     )
                     peer_plan = getattr(handle, "_peer_plan", None)
                     if runtime.native.peer_table and peer_plan is None:
@@ -881,9 +900,18 @@ class ElasticBuffer:
                     )
                     for tensor in retained:
                         tensor.record_stream(runtime.stream)
-                    # Catch allocations/input copies and drain the previous call on
-                    # every rank before scratch addresses can change or be reused.
-                    runtime.stream.synchronize()
+                    routing_versions = {
+                        name: (getattr(handle, name).data_ptr(), getattr(handle, name)._version)
+                        for name in (
+                            "topk_idx",
+                            "dispatch_dst",
+                            *_PERSISTENT,
+                            *(("_peer_plan",) if peer_plan is not None else ()),
+                        )
+                    }
+                    # Validate fresh metadata before collective preflight; native dispatch drains cached calls.
+                    if not handle._routing_versions:
+                        runtime.stream.synchronize()
             except Exception as exc:
                 error = exc
             _collective_check(runtime, error, payload_signature)
@@ -908,15 +936,7 @@ class ElasticBuffer:
                         diagnostics["device_phase_names"] = ("entry_barrier", "kernel", "exit_barrier", "device_total")
                     handle.metadata_only = False
                     handle.num_compute_units = 64 if fp8 else 32
-                    handle._routing_versions = {
-                        name: (getattr(handle, name).data_ptr(), getattr(handle, name)._version)
-                        for name in (
-                            "topk_idx",
-                            "dispatch_dst",
-                            *_PERSISTENT,
-                            *(("_peer_plan",) if peer_plan is not None else ()),
-                        )
-                    }
+                    handle._routing_versions = routing_versions
                     event = EventOverlap(EventHandle(), retained)
                 if not async_with_compute_stream:
                     event.current_stream_wait()
@@ -998,7 +1018,7 @@ class ElasticBuffer:
                     raise ValueError("Handle topology differs from the buffer")
                 for name, version in handle._routing_versions.items():
                     tensor = getattr(handle, name)
-                    if (tensor.data_ptr(), tensor._version) != version:
+                    if torch.is_inference(tensor) or (tensor.data_ptr(), tensor._version) != version:
                         raise ValueError(f"Cached routing was modified: {name}")
                 local_rows = handle.num_expanded_tokens
                 if (
@@ -1008,10 +1028,10 @@ class ElasticBuffer:
                     or x.device.index != runtime.device
                     or not x.is_contiguous()
                     or x.requires_grad
-                    or tuple(x.shape) != (local_rows, 7168)
+                    or tuple(x.shape) != (local_rows, handle.hidden)
                 ):
                     raise ValueError(
-                        "x must be contiguous BF16 [num_expanded_tokens,7168] on the buffer NPU without grad"
+                        "x must be contiguous BF16 [num_expanded_tokens,H] matching the handle on the buffer NPU without grad"
                     )
                 tokens, topk, chunk = handle.num_tokens, handle.num_topk, handle.chunk_tokens
                 diagnostics = getattr(self, "_combine_diagnostics", None)
@@ -1067,22 +1087,25 @@ class ElasticBuffer:
                     raise ValueError(
                         "topk_weights must be contiguous FP32 [num_expanded_tokens] on the buffer NPU without grad"
                     )
+                rows, gathered = handle.address_stride, handle._gather_stride
+                layout_key = (runtime.world_size, tokens, topk, rows, gathered, chunk, handle.hidden)
+                cached = handle._combine_layout_cache
+                if cached is None or cached[0] != layout_key:
+                    layout = combine_layout(*layout_key)
+                    expected = native.combine_layout(runtime.rank, *layout_key)
+                    if dict(expected) != layout:
+                        raise RuntimeError("Python/native combine layouts differ; rebuild the installed package")
+                    handle._combine_layout_cache = (layout_key, layout)
+                else:
+                    layout = cached[1]
+                if layout["workspace_bytes"] > runtime.capacity // 2:
+                    raise ValueError("Combine exceeds its reserved SHMEM half; increase num_bytes on every rank")
                 if previous_event is not None:
                     previous_event.current_stream_wait()
                 producer = EventHandle()
                 with npu.stream(runtime.stream):
                     producer.current_stream_wait()
-                    rows = max(1, max(handle.rank_rows.cpu().tolist()))
-                    gathered = max(1, max(handle.gather_rows.cpu().tolist()))
-                    layout = combine_layout(runtime.world_size, tokens, topk, rows, gathered, chunk)
-                    if layout["workspace_bytes"] > runtime.capacity // 2:
-                        raise ValueError("Combine exceeds its reserved SHMEM half; increase num_bytes on every rank")
-                    expected = native.combine_layout(
-                        runtime.rank, runtime.world_size, tokens, topk, rows, gathered, chunk
-                    )
-                    if dict(expected) != layout:
-                        raise RuntimeError("Python/native combine layouts differ; rebuild the installed package")
-                    output = torch.empty((tokens, 7168), dtype=torch.bfloat16, device=x.device)
+                    output = torch.empty((tokens, handle.hidden), dtype=torch.bfloat16, device=x.device)
                     tensors = {
                         name: getattr(handle, name)
                         for name in (
@@ -1117,8 +1140,16 @@ class ElasticBuffer:
                         retained += (topk_weights, output_weights)
                     for tensor in retained:
                         tensor.record_stream(runtime.stream)
-                    runtime.stream.synchronize()
-                signature = [tokens, topk, chunk, rows, gathered, runtime.capacity, int(topk_weights is not None)]
+                signature = [
+                    tokens,
+                    topk,
+                    chunk,
+                    rows,
+                    gathered,
+                    runtime.capacity,
+                    int(topk_weights is not None),
+                    handle.hidden,
+                ]
                 signature += [int(profile is not None), profile_sample]
             except Exception as exc:
                 error = exc
@@ -1218,10 +1249,11 @@ class ElasticBuffer:
                     or not x.is_contiguous()
                     or x.requires_grad
                 ):
-                    raise ValueError("x must be a contiguous BF16/FP8 [T,7168] NPU tensor without grad")
+                    raise ValueError("x must be a contiguous BF16/FP8 [T,H] NPU tensor without grad")
                 tokens, hidden = x.shape
-                if hidden != 7168:
-                    raise ValueError("Notify requires hidden=7168")
+                validate_hidden(hidden, x.dtype == torch.float8_e4m3fn)
+                if self.hidden and hidden != self.hidden:
+                    raise ValueError("hidden differs from buffer configuration")
                 if (
                     not isinstance(topk_idx, torch.Tensor)
                     or topk_idx.ndim != 2
@@ -1231,6 +1263,8 @@ class ElasticBuffer:
                     or not topk_idx.is_contiguous()
                 ):
                     raise ValueError("topk_idx must be contiguous int64 [T,K] on the buffer NPU")
+                if not copy_handle and torch.is_inference(topk_idx):
+                    raise ValueError("Inference routing tensors require do_handle_copy=True")
                 topk = topk_idx.shape[1]
                 layout = workspace_layout(runtime.world_size, tokens, topk, num_experts, chunk_tokens)
                 if topk_weights is not None and (
@@ -1280,13 +1314,15 @@ class ElasticBuffer:
                 producer = EventHandle()
                 with npu.stream(runtime.stream):
                     producer.current_stream_wait()
-                    indices = topk_idx.clone() if copy_handle else topk_idx
+                    # Persistent routing keeps version counters even inside inference_mode.
+                    with torch.inference_mode(False), torch.no_grad():
+                        indices = topk_idx.clone() if copy_handle else topk_idx
+                        tensors = {
+                            name: torch.empty(shape, dtype=getattr(torch, dtype), device=x.device)
+                            for name, (shape, dtype) in specification["tensors"].items()
+                        }
                     topk_idx.record_stream(runtime.stream)
                     indices.record_stream(runtime.stream)
-                    tensors = {
-                        name: torch.empty(shape, dtype=getattr(torch, dtype), device=x.device)
-                        for name, (shape, dtype) in specification["tensors"].items()
-                    }
                     for tensor in tensors.values():
                         tensor.record_stream(runtime.stream)
                     # Catch allocation/input copy errors before device collectives.
@@ -1315,16 +1351,19 @@ class ElasticBuffer:
                         routing_diagnostics["prepare_device_ms"] = prepare_ms
                         routing_diagnostics["plan_in_notify"] = not runtime.combine_only
                     tensors.pop("kernel_timing", None)
-                    runtime.stream.synchronize()
                     local_experts = num_experts // runtime.world_size
                     begin = runtime.rank * local_experts
-                    counts = tensors["expert_totals"][begin : begin + local_experts].clone()
-                    prefix = counts.cumsum(0, dtype=torch.int32)
-                    count_list = counts.cpu().tolist()
-                    rows = tensors["rank_rows"].cpu().tolist()
+                    with torch.inference_mode(False), torch.no_grad():
+                        counts = tensors["expert_totals"][begin : begin + local_experts].clone()
+                        prefix = counts.cumsum(0, dtype=torch.int32)
+                        summary = torch.cat((counts, tensors["rank_rows"], tensors["gather_rows"])).cpu().tolist()
+                    count_list = summary[:local_experts]
+                    rows = summary[local_experts : local_experts + runtime.world_size]
+                    gathered = summary[local_experts + runtime.world_size :]
                     # Keep the allocation alive through this contiguous view.
                     # Padding is unwritten; only actual expanded rows are valid.
-                    tensors["weight_return_meta"] = tensors["weight_return_meta"][: rows[runtime.rank]]
+                    with torch.inference_mode(False), torch.no_grad():
+                        tensors["weight_return_meta"] = tensors["weight_return_meta"][: rows[runtime.rank]]
                     # num_recv_tokens (deduplicated layout) is unavailable; expanded count is exact.
                     result = EPHandle(
                         True,
@@ -1349,8 +1388,10 @@ class ElasticBuffer:
                     if "_peer_plan" in tensors:
                         result._peer_plan = tensors["_peer_plan"]
                     result.address_stride = max(1, max(rows))
+                    result._gather_stride = max(1, max(gathered))
                     result.rank, result.world_size = runtime.rank, runtime.world_size
                     result.num_tokens, result.num_topk = tokens, topk
+                    result.hidden = hidden
                     result.chunk_tokens = chunk_tokens
                     result._buffer_token = self._handle_token
                     result.trace = None

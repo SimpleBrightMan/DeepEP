@@ -254,13 +254,13 @@ __aicore__
 
 // Caller validates public bounds before narrowing. All region arithmetic is uint64.
 inline PutCombineTiling MakeCombineTiling(uint32_t rank, uint32_t world, uint32_t tokens, uint32_t topk, uint32_t rows,
-                                          uint32_t gather_rows, uint32_t chunk_tokens = 256U)
+                                          uint32_t gather_rows, uint32_t chunk_tokens = 256U, uint32_t hidden = 7168U)
 {
     PutCombineTiling t{};
     t.rank_id = rank;
     t.rank_num = world;
     t.token_num = tokens;
-    t.hidden_size = 7168U;
+    t.hidden_size = hidden;
     t.expert_row_capacity = rows;
     t.gather_row_capacity = gather_rows;
     t.forward_row_capacity = tokens * topk;
@@ -288,11 +288,11 @@ inline PutCombineTiling MakeCombineTiling(uint32_t rank, uint32_t world, uint32_
         cursor += (bytes + 511U) / 512U * 512U;
         return offset;
     };
-    t.expert_input_offset_bytes = reserve(uint64_t(rows) * 7168U * 2U);
-    t.gather_input_offset_bytes = reserve(uint64_t(gather_rows) * 7168U * 2U);
-    t.server_partial_offset_bytes = reserve(uint64_t(rows) * 7168U * 2U);
-    t.returned_partial_offset_bytes = reserve(uint64_t(tokens) * ((world + 7U) / 8U) * 7168U * 2U);
-    t.output_offset_bytes = reserve(uint64_t(tokens) * 7168U * 2U);
+    t.expert_input_offset_bytes = reserve(uint64_t(rows) * hidden * 2U);
+    t.gather_input_offset_bytes = reserve(uint64_t(gather_rows) * hidden * 2U);
+    t.server_partial_offset_bytes = reserve(uint64_t(rows) * hidden * 2U);
+    t.returned_partial_offset_bytes = reserve(uint64_t(tokens) * ((world + 7U) / 8U) * hidden * 2U);
+    t.output_offset_bytes = reserve(uint64_t(tokens) * hidden * 2U);
     t.weight_topk = topk;
     t.weight_recv_offset_bytes = reserve(uint64_t(tokens) * topk * sizeof(float));
     t.weight_local_done_offset_bytes = reserve(uint64_t(combine_config::kAivCores) * combine_control::kSlotBytes);

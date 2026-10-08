@@ -5,7 +5,7 @@
     "scaleup": "Intra-domain transport; no particular interconnect implementation is implied.",
     "scaleout": "Inter-domain transport; no particular interconnect implementation is implied.",
     "memory_transport": "Memory-semantic transport only, not all scale-up backends; flags do not establish capability.",
-    "qps": "Reserved for a QP-capable backend, not a shared DMA queue/channel count; no QP policy is implemented.",
+    "qps": "Backend-specific queue-pair hints; HT uses fixed shared-jetty scheduling, not an arbitrary DMA channel count.",
     "compute_units": "Backend-defined compute scheduling units; values are not hardware tuning recommendations.",
     "device": "NPU execution, timeout and reference-capture terminology.",
     "aligned_col_major_sf": "Reserved scale-factor layout option; no implementation or alignment capability is implied.",
@@ -22,7 +22,7 @@
       "csrc/legacy/config.hpp": "1788b4ac3a0300245935d5e92b9261f45f0dd6277618faf7b4f53f1f1198d1f0"
     }
   },
-  "implementation_status": "declarations_only",
+  "implementation_status": "partial_native",
   "exports": [
     "Buffer",
     "ElasticBuffer",
@@ -37,12 +37,12 @@
       "parameter": "do_expand",
       "upstream_default": false,
       "project_default": null,
-      "reason": "None will select False on first dispatch and inherit the handle layout on cached dispatch; explicit conflicts must fail. No dispatch is implemented yet."
+      "reason": "Fresh dispatch defaults to expanded layout; cached dispatch inherits the handle layout. Unexpanded dispatch is unsupported."
     }
   ],
   "deferred_exports": {
     "topk_idx_t": "Requires the native build's index-width choice; no dtype alias is fabricated.",
-    "module_level_topology_queries": "Only ElasticBuffer method declarations are included."
+    "module_level_topology_queries": "Only ElasticBuffer topology methods are exposed."
   },
   "excluded_scope": [
     "Engram",
@@ -52,7 +52,7 @@
     "native extension internals"
   ],
   "target_contracts": {
-    "status": "specified_not_implemented",
+    "status": "partial_native",
     "Buffer.get_dispatch_layout": {
       "returns": [
         "num_tokens_per_rank",
@@ -88,6 +88,7 @@
         "event"
       ],
       "unexpanded": {
+        "supported": false,
         "x": "[N,H]",
         "topk_idx": "[N,K]",
         "weights": "[N,K] or None"
@@ -106,7 +107,7 @@
       ],
       "x": "[T,H]",
       "weights": "[T,K] or None",
-      "weight_semantics": "Independent FP32 route values; not an implicit multiplication of x."
+      "weight_semantics": "HT returns independent FP32 route values without multiplying x; LL applies the saved source weights and returns no weights."
     },
     "EPHandle": {
       "caller_fields": [
@@ -116,7 +117,7 @@
         "num_recv_tokens_per_expert_list"
       ],
       "ownership": "Routing plan belongs to one buffer and survives until the matching backward/recompute finishes.",
-      "metadata_version": 6,
+      "metadata_version": 7,
       "forward_list": {
         "shape": "[world_size,T*K,6]",
         "dtype": "int32",

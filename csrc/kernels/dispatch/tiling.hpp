@@ -53,14 +53,15 @@ struct DispatchTiling {
     uint64_t peer_table = 0, generation = 0, peer_book = 0, done = 0, plan_phase_bytes = 0;
     uint64_t forward_plan_offset = 0, forward_header_bytes = 0;
     uint64_t plan_rows_offset = 0, plan_scratch_offset = 0, plan_mailbox_offset = 0;
-    uint32_t rank, world, tokens, topk, rows, address_stride, fp8;
+    uint32_t rank, world, tokens, topk, rows, address_stride, fp8, hidden;
     uint64_t sync, book, input, output, weights, scales, inbox, inbox_stride, workspace_bytes;
 };
 
 // Caller validates bounds before narrowing to this device ABI. All byte
 // calculations stay uint64_t, including receive capacity and scale inboxes.
 inline DispatchTiling MakeDispatchTiling(uint32_t rank, uint32_t world, uint32_t tokens, uint32_t topk,
-                                         uint32_t experts, uint32_t rows, bool fp8, bool weights = false)
+                                         uint32_t experts, uint32_t rows, bool fp8, bool weights = false,
+                                         uint32_t hidden = 7168U)
 {
     DispatchTiling t{};
     t.plan_rows_offset = DispatchPlanRowsOffset(world);
@@ -75,17 +76,18 @@ inline DispatchTiling MakeDispatchTiling(uint32_t rank, uint32_t world, uint32_t
     t.topk = topk;
     t.rows = rows;
     t.fp8 = fp8;
+    t.hidden = hidden;
     t.address_stride = 1;
     while (t.address_stride < rows) {
         t.address_stride <<= 1;
     }
-    uint64_t cursor = MakeNotifyTiling(rank, world, tokens, topk, experts, 256, 7168, 32).workspace_bytes;
+    uint64_t cursor = MakeNotifyTiling(rank, world, tokens, topk, experts, 256, hidden, 32).workspace_bytes;
     auto reserve = [&cursor](uint64_t bytes) {
         const auto offset = cursor;
         cursor += (bytes + 511) / 512 * 512;
         return offset;
     };
-    const uint64_t row_bytes = fp8 ? 7168 : 14336;
+    const uint64_t row_bytes = uint64_t(hidden) * (fp8 ? 1U : 2U);
     t.sync = reserve(uint64_t(world) * 49152 + 65536);
     // Retain unused legacy payload slices so Python layout/Combine partitioning
     // stay compatible. Dispatch accesses only the per-call framework GM virtual addresses.
@@ -93,7 +95,8 @@ inline DispatchTiling MakeDispatchTiling(uint32_t rank, uint32_t world, uint32_t
     t.input = reserve(uint64_t(tokens) * row_bytes);
     t.output = reserve(uint64_t(rows) * row_bytes);
     t.weights = reserve(uint64_t(rows) * 4);
-    t.scales = reserve(fp8 ? uint64_t(rows) * 224 : 0);
+    const uint32_t scale_words = hidden / 128U;
+    t.scales = reserve(fp8 ? uint64_t(rows) * scale_words * 4U : 0);
     t.inbox_stride = fp8 ? 512U + ((uint64_t(tokens) * topk + 1U) / 2U) * 512U : 0U;
     t.inbox = reserve(uint64_t(world) * t.inbox_stride);
     t.peer_book = reserve(uint64_t(world) * 512U);

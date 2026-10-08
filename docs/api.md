@@ -24,13 +24,13 @@ Modified by Joyce_An 2026
 
 ### 显式 rank/world_size
 
-当前 HT `test_dispatch.py`、`test_combine.py` 和首页示例使用此方式：`group=None, rank=rank, world_size=ep_size`。Buffer 直接以显式身份初始化 SHMEM，无需创建 Gloo/HCCL 进程组。
+当前 HT `test_dispatch.py`、`test_combine.py` 使用此方式：`group=None, rank=rank, world_size=ep_size`。Buffer 直接以显式身份初始化 SHMEM，无需创建 Gloo/HCCL 进程组。
 
 `group` 默认值为 `None`，可以省略；此时必须提供 `rank/world_size`，不会自动使用框架的默认进程组。库仅执行本 rank 的配置检查，调用方保证所有 rank 的配置、设备映射和调用顺序一致。LL 也支持此方式，但返回容量缓冲区 `[C,H]`，即使设置 `do_cpu_sync=True`，也不会通过进程组取得精确接收行数。
 
 ### 可选的 Gloo/HCCL 进程组
 
-框架已有 EP 进程组、需要借助它进行跨 rank 配置检查，或 LL 需要精确接收行数时，可以传入 `group=ep_group`。该组必须已初始化，后端为 Gloo 或 HCCL；由组内成员顺序确定 EP rank 和 world size，不能同时传入 `rank/world_size`。
+框架已有 EP 进程组、需要借助它进行跨 rank 配置检查，或 LL 需要精确接收行数时，可以传入 `group=ep_group`。首页示例使用此方式。该组必须已初始化，后端为 Gloo 或 HCCL；由组内成员顺序确定 EP rank 和 world size，不能同时传入 `rank/world_size`。
 
 | 使用位置 | 进程组的作用 |
 | --- | --- |
@@ -45,7 +45,7 @@ Modified by Joyce_An 2026
 
 ### 容量与运行时
 
-`Buffer/ElasticBuffer` 的 Runtime 接受 EP2/4/8/16/32/64/128/256，以及 2 MiB～32 GiB、按 2 MiB 对齐的对称工作区。各 rank 的容量相同。**这是资源准入范围；算子的 EP、shape 和容量限制另见 Elastic 文档。**
+`Buffer/ElasticBuffer` 的普通 Runtime 接受 EP2/4/8/16/32/64/128/256/512。对称工作区至少 2 MiB，按 2 MiB 对齐，字节数不能超过 int64 上限；实际分配受设备内存和 SHMEM 地址空间限制。各 rank 的容量相同。**这是资源准入范围；算子的 EP、shape 和容量限制另见 Elastic 文档。**
 
 `ElasticBuffer` 使用 MTE+URMA Session。`num_bytes` 可显式指定；省略时由 HT size hint 计算，不能据此满足 LL 的固定 8 GiB 要求。`Buffer` 使用 MTE 配置，要求显式进程组、`num_scaleup_bytes` 和 `explicitly_destroy=True`，拒绝非零 `num_scaleout_bytes`；资源构造不启用 V1 通信算法。
 
@@ -67,7 +67,7 @@ Modified by Joyce_An 2026
 
 `EventOverlap` 保留事件及相关 Tensor；不能用 `EventOverlap(None)` 表示已经完成。`register_hook_after_wait()` 注册的 hook 在添加等待后执行一次，不是设备执行完成回调。上下文管理器退出也会添加等待。指定 `release_handle=True` 后释放包装所持引用，该包装不能再次等待。
 
-HT 的 `async_with_compute_stream=True` 允许通过返回事件连接后续计算，但计数与容量检查仍可能发生 Host 同步。LL 只接受默认流选项。`ElasticBuffer.barrier()` 只支持显式 `with_cpu_sync=True, sequential=True` 的同步用法。
+HT 的 `async_with_compute_stream=True` 不在返回前为计算流添加输出依赖，调用方通过返回事件连接后续计算。fresh Notify 仍回读计数；Dispatch 保留原生流等待及跨 rank 工作区复用检查；传入进程组时仍执行启动前一致性检查。cached Combine 复用 handle 的计数和布局，通过通信流上的 barrier 保护工作区，不保证所有调用均无 Host 阻塞。LL 只接受默认流选项。`ElasticBuffer.barrier()` 只支持显式 `with_cpu_sync=True, sequential=True` 的同步用法。
 
 ## 上游兼容与平台命名
 
@@ -93,7 +93,7 @@ HT 的 `async_with_compute_stream=True` 允许通过返回事件连接后续计�
 
 - `ElasticBuffer` 支持 `group=None` 配合 keyword-only 的 `rank/world_size`；传入有效进程组时由组取得身份。`get_buffer_size_hint()` 对应使用 `group=None, world_size=ep_size`，或传入进程组而省略 `world_size`。`None` 表示选择显式身份方式，不表示禁止传入进程组。
 - `dispatch(do_expand=None)` 用于区分省略与显式传值。fresh 默认 expanded；cached 继承原 handle 的布局，显式冲突会报错。普通去重布局不在支持范围内。
-- `EPHandle` 增加 `is_low_latency`，指明实际执行路径，调用方据此遵守相应权重和返回约定。
-- 配置、拓扑及调优查询只在实际实现的范围内可用；保留签名的方法可能报 `NotImplementedError`。V1 通信、autograd 和训练反向不在本版本支持范围内。
+- `EPHandle` 增加 `is_low_latency`，用于标识实际执行路径；combine 自动沿用该路径。
+- 配置、拓扑及调优查询只在实际实现的范围内可用；保留签名的方法可能报 `NotImplementedError`。V1 通信和内置 autograd 不在本版本支持范围内。HT 的手动反向通信接线见 [Elastic 接口](elastic.md#前向与反向通信)；LL 暂不支持该流程。
 
 API 契约和导入测试、资源/事件测试、设备通信测试分别运行，入口见[测试说明](../tests/README.md)。

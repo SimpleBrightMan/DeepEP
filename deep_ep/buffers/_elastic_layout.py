@@ -12,6 +12,13 @@ def integer(name, value, lower, upper):
         raise ValueError(f"{name} must be an integer in [{lower}, {upper}]")
 
 
+def validate_hidden(hidden, fp8=False):
+    integer("hidden", hidden, 1, 7168)
+    alignment = 128 if fp8 else 16
+    if hidden % alignment:
+        raise ValueError(f"hidden must be a multiple of {alignment}")
+
+
 def workspace_layout(world, tokens, topk, experts=1024, chunk_tokens=256):
     """Mirror MakeNotifyTiling; launch also compares this with the native result."""
     if type(world) is not int or world not in WORLD_SIZES:
@@ -63,7 +70,7 @@ def workspace_layout(world, tokens, topk, experts=1024, chunk_tokens=256):
     return layout
 
 
-def dispatch_layout(world, tokens, topk, experts, rows, fp8=False, weights=False):
+def dispatch_layout(world, tokens, topk, experts, rows, fp8=False, weights=False, hidden=7168):
     if world not in WORLD_SIZES:
         raise ValueError("Payload dispatch supports EP2/4/8/16/32/64/128/256/512")
     notify = workspace_layout(world, tokens, topk, experts)
@@ -75,10 +82,11 @@ def dispatch_layout(world, tokens, topk, experts, rows, fp8=False, weights=False
         raise TypeError("fp8 must be bool")
     if type(weights) is not bool:
         raise TypeError("weights must be bool")
+    validate_hidden(hidden, fp8)
     routes = tokens * topk
     weight_capacity = (routes + 59) // 60 * 60 if weights else 0
     weight_inbox_stride = 512 + weight_capacity // 60 * 512 if weight_capacity else 0
-    row_bytes = 7168 if fp8 else 14336
+    row_bytes = hidden * (1 if fp8 else 2)
     inbox_stride = 512 + ((tokens * topk + 1) // 2) * 512 if fp8 else 0
     regions = (
         ("sync", world * 49152 + 65536),
@@ -86,7 +94,7 @@ def dispatch_layout(world, tokens, topk, experts, rows, fp8=False, weights=False
         ("input", tokens * row_bytes),
         ("output", rows * row_bytes),
         ("weights", rows * 4),
-        ("scales", rows * 224 if fp8 else 0),
+        ("scales", rows * (hidden // 128) * 4 if fp8 else 0),
         ("inbox", world * inbox_stride),
         ("peer_book", world * 512),
         ("done", world * 512),
@@ -115,7 +123,7 @@ def _combine_resident_bytes(world, tokens, chunk_tokens=256):
     return ((world * chunks * 8 + 31) // 32 + (groups * chunks * 4 + 31) // 32) * 32
 
 
-def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256):
+def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256, hidden=7168):
     if world not in WORLD_SIZES:
         raise ValueError("Combine supports EP2/4/8/16/32/64/128/256/512")
     integer("tokens", tokens, 1, 16384)
@@ -123,6 +131,7 @@ def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256):
     integer("rows", rows, 1, world * tokens * topk)
     integer("gather_rows", gather_rows, 1, world * tokens * topk)
     integer("chunk_tokens", chunk_tokens, 1, 16384)
+    validate_hidden(hidden)
     if world * tokens * topk >= 2**31:
         raise ValueError("Combine metadata indexing exceeds int32")
     chunks = (tokens + chunk_tokens - 1) // chunk_tokens + min(4, tokens, chunk_tokens) - 1
@@ -137,7 +146,7 @@ def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256):
         ("output", tokens),
     ):
         result[name] = cursor
-        cursor += (count * 14336 + 511) // 512 * 512
+        cursor += (count * hidden * 2 + 511) // 512 * 512
     for name, size in (
         ("weight_recv", tokens * topk * 4),
         ("weight_local_done", 64 * 512),
@@ -146,12 +155,14 @@ def combine_layout(world, tokens, topk, rows, gather_rows, chunk_tokens=256):
         result[name] = cursor
         cursor += (size + 511) // 512 * 512
     result["workspace_bytes"] = cursor
+    if cursor > MAX_BYTES:
+        raise ValueError("Combine workspace exceeds the int64 byte-size limit")
     return result
 
 
-def elastic_size_hint(world, tokens, topk, experts, rows, gather_rows, fp8=False):
-    dispatch = dispatch_layout(world, tokens, topk, experts, rows, fp8, weights=True)["workspace_bytes"]
-    combine = combine_layout(world, tokens, topk, rows, gather_rows)["workspace_bytes"]
+def elastic_size_hint(world, tokens, topk, experts, rows, gather_rows, fp8=False, hidden=7168):
+    dispatch = dispatch_layout(world, tokens, topk, experts, rows, fp8, weights=True, hidden=hidden)["workspace_bytes"]
+    combine = combine_layout(world, tokens, topk, rows, gather_rows, hidden=hidden)["workspace_bytes"]
     # A fixed boundary prevents fresh/cached calls with different shapes or
     # BF16/FP8 dispatch from ever overlapping outstanding combine output copies.
     half = (max(dispatch, combine) + PAGE_BYTES - 1) // PAGE_BYTES * PAGE_BYTES
