@@ -43,6 +43,14 @@ def test_compute_replay_requires_explicit_scope_and_has_no_fake_dispatch(tmp_pat
     assert "COMPUTE REPLAY" in (tmp_path / "timer_breakdown.txt").read_text()
 
 
+def test_issue_interval_is_not_reported_as_completion():
+    events = [event("AIC_GMM1_0", 5, 45), event("AIC_GMM2_ISSUE_0", 50, 80)]
+    result = rank_breakdown(events, 0, compute_replay=True)
+    assert result["status"] == "ok"
+    assert result["gmm2_semantics"] == "issue_not_completion"
+    assert result["gmm2_spans_us"] == 30
+
+
 @pytest.mark.parametrize("name", ["AIV_DISPATCH_0", "AIV_COMBINE_0", "AIV_UNPERMUTE", "AIV_INPUT_CROSS_RANK_SYNC", "AIV_FINAL_CROSS_RANK_WAIT"])
 def test_compute_replay_rejects_communication_trace(name):
     with pytest.raises(ValueError, match="communication event"):

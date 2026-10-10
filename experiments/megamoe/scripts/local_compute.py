@@ -69,6 +69,12 @@ def worker(args):
         results.append(dict(iteration=iteration, host_wall_seconds=elapsed))
         print(f"[SMOKE] device={args.worker} iteration={iteration} finite/nonzero/repeatable", flush=True)
     output_hash = hashlib.sha256(memoryview(previous.numpy())).hexdigest()
+    if args.reference_dir:
+        reference = json.loads((args.reference_dir / f"device_{args.worker}.json").read_text())
+        if (reference["bs"], reference["device"], reference["seed"]) != (args.bs, args.worker, 20261010 + args.worker):
+            raise RuntimeError("Reference shape/device/seed does not match this run")
+        if reference["output_sha256"] != output_hash:
+            raise RuntimeError(f"Full output differs from reference device={args.worker} BS={args.bs}")
     measurements = []
     if args.profile:
         from deep_ep_experimental.megamoe.performance import read_kernel_samples
@@ -107,7 +113,7 @@ def worker(args):
                   tokens_per_expert=rows//e, workspace_bytes=plan.workspace_bytes,
                   communication_initialized=False, input="synthetic locally pre-dispatched FP8",
                   validation="finite, nonzero, repeatability; NOT full numerical golden",
-                  performance_valid=False, reason="functional smoke on shared devices; host wall is not kernel performance",
+                  performance_valid=False, reason="device exclusivity not automatically verified; host wall is not kernel Duration",
                   torch=torch.__version__, torch_npu=torch_npu.__version__, device_name=soc,
                   source_commit=subprocess.check_output(["git", "rev-parse", "HEAD"],
                       cwd=Path(__file__).resolve().parents[3], text=True).strip(),
@@ -115,6 +121,10 @@ def worker(args):
                   output_sha256=output_hash, metric="megamoe_compute_replay_kernel_duration_us",
                   kernel_measurements=measurements, warmup=args.warmup,
                   profile_iters=args.profile_iters, profile_rounds=args.profile_rounds)
+    binary = Path(_C.__file__).with_name("libmegamoe_kernel.so")
+    with binary.open("rb") as stream:
+        report["kernel_binary_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+    report["reference_dir"] = str(args.reference_dir) if args.reference_dir else None
     (args.output / f"device_{args.worker}.json").write_text(json.dumps(report, indent=2))
 
 
@@ -128,6 +138,7 @@ def main():
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--profile-iters", type=int, default=50)
     p.add_argument("--profile-rounds", type=int, default=3)
+    p.add_argument("--reference-dir", type=Path, help="Require full output fingerprints to match a prior identical case")
     p.add_argument("--output", type=Path)
     p.add_argument("--worker", type=int, help=argparse.SUPPRESS)
     args = p.parse_args()
@@ -137,12 +148,19 @@ def main():
         p.error("devices must be distinct IDs in [0,7]")
     if args.warmup < 1 or args.profile_iters < 2 or args.profile_rounds < 1:
         p.error("warmup>=1, profile-iters>=2, profile-rounds>=1 required")
+    if args.reference_dir:
+        args.reference_dir = args.reference_dir.resolve()
+        if not args.reference_dir.is_dir():
+            p.error("reference-dir must exist")
     if args.worker is not None:
         worker(args)
         return
     args.output = (args.output or Path("benchmark-runs") / datetime.now().strftime("local_compute_%Y%m%d_%H%M%S")).resolve()
     args.output.mkdir(parents=True, exist_ok=False)
     print(f"[OUTPUT] {args.output}", flush=True)
+    if args.profile:
+        snapshot = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=30, check=True)
+        (args.output / "npu_before.txt").write_text(snapshot.stdout)
     procs, streams = [], []
     try:
         for device in args.devices:
@@ -153,6 +171,8 @@ def main():
             if args.profile:
                 cmd += ["--profile", "--warmup", str(args.warmup), "--profile-iters", str(args.profile_iters),
                         "--profile-rounds", str(args.profile_rounds)]
+            if args.reference_dir:
+                cmd += ["--reference-dir", str(args.reference_dir)]
             procs.append(subprocess.Popen(cmd, stdout=stream, stderr=subprocess.STDOUT,
                 env=dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")))
         deadline = time.monotonic() + args.timeout
@@ -177,7 +197,11 @@ def main():
             stream.close()
     reports = [json.loads((args.output / f"device_{d}.json").read_text()) for d in args.devices]
     (args.output / "summary.json").write_text(json.dumps(reports, indent=2))
-    print(f"[PASS] {len(reports)} independent devices; NO SHMEM/HCCL; NOT a performance result", flush=True)
+    if args.profile:
+        snapshot = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=30, check=True)
+        (args.output / "npu_after.txt").write_text(snapshot.stdout)
+    print(f"[PASS] {len(reports)} independent devices; NO SHMEM/HCCL; "
+          + ("kernel Duration collected, check device exclusivity" if args.profile else "functional smoke only"), flush=True)
 
 
 if __name__ == "__main__":
