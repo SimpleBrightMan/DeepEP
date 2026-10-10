@@ -27,7 +27,7 @@ struct CatlassGroupedMatmulLayouts {
 
 // Shared AIC/AIV0 pipeline mechanics; projection semantics belong to GMM1/GMM2 below.
 namespace detail {
-template <class Config>
+template <class Config, uint32_t BStages = 2>
 class A8W4MatmulPipeline {
     using C = typename Config::KernelConfig;
     using A = typename C::ElementAType;
@@ -50,10 +50,11 @@ class A8W4MatmulPipeline {
         Catlass::Gemm::Tile::PackedMxA8W4TileCopyTla<Arch, A, LayoutA, W, LayoutB, A, LayoutDequantizedB, SA,
                                                      ScaleALayout, SB, ScaleBLayout, Out, LayoutC, void, false,
                                                      Catlass::Gemm::Tile::ScaleGranularity::PER_TENSOR>;
-    using Policy = Catlass::Gemm::MmadA8W4Mx<Arch, true, false, 16, 1, 2, 2, 2, 2>;
+    using L1Map = A8W4L1Layout<BStages>;
+    using Policy = Catlass::Gemm::MmadA8W4Mx<Arch, true, false, 16, 1, 2, BStages, 2, 2>;
     using Mmad = Catlass::Gemm::Block::MegaMoeBlockMmadA8W4<Policy, L1, L0, A, A, Out, void, TileCopy>;
     using Prologue =
-        Catlass::Gemm::Block::MegaMoeBlockPrologueA8W4<Arch, 2, Catlass::Gemm::GemmType<W, LayoutB>,
+        Catlass::Gemm::Block::MegaMoeBlockPrologueA8W4<Arch, BStages, Catlass::Gemm::GemmType<W, LayoutB>,
                                                        Catlass::Gemm::GemmType<A, LayoutDequantizedB>, L1, TileCopy>;
     using Resource = Catlass::Gemm::Block::MegaMoeResource;
 
@@ -62,8 +63,8 @@ class A8W4MatmulPipeline {
         __aicore__ inline void Begin()
         {
             this->Activate();
-            for (uint16_t i = 0; i < 2; ++i) {
-                AscendC::CrossCoreSetFlag<4, PIPE_MTE1>(8 + i);
+            for (uint16_t i = 0; i < BStages; ++i) {
+                AscendC::CrossCoreSetFlag<4, PIPE_MTE1>(L1Map::EMPTY_FLAG + i);
             }
         }
         __aicore__ inline void End(bool outputDrained)
@@ -90,8 +91,8 @@ class A8W4MatmulPipeline {
         __aicore__ inline void End(bool /*outputDrained*/)
         {
             // Consume the final free-buffer tokens before another slice reuses the flags/L1.
-            for (uint16_t i = 0; i < 2; ++i) {
-                AscendC::CrossCoreWaitFlag<4, PIPE_MTE3>(8 + i);
+            for (uint16_t i = 0; i < BStages; ++i) {
+                AscendC::CrossCoreWaitFlag<4, PIPE_MTE3>(L1Map::EMPTY_FLAG + i);
             }
             op.Deactivate();
         }
@@ -180,7 +181,7 @@ public:
 
 protected:
     __aicore__ inline void ComputeProjection(uint32_t m, uint32_t weightN, uint32_t rows, uint32_t cols,
-                                             uint32_t outputN, bool prefetchA = false)
+                                             uint32_t outputN)
     {
         auto a = Tensor<A>(addr_.aGlobal, tla::MakeLayout<A, LayoutA>(config_.m, config_.k));
         auto sa =
@@ -192,7 +193,7 @@ protected:
         auto tileSA = tla::GetTile(sa, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.scaleK));
         auto tileSB = tla::GetTile(sb, tla::MakeCoord(0, weightN), tla::MakeShape(config_.scaleK, cols));
         auto tileC = tla::GetTile(c, tla::MakeCoord(m, outputN), tla::MakeShape(rows, cols));
-        block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U, prefetchA);
+        block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U);
     }
 
     __aicore__ inline void DequantizeWeight(uint32_t weightN, uint32_t rows, uint32_t cols)
@@ -255,8 +256,8 @@ public:
 
 // GMM2 owns the down projection and always writes row-major output.
 template <class Config>
-class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config> {
-    using Pipeline = detail::A8W4MatmulPipeline<Config>;
+class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config, 4> {
+    using Pipeline = detail::A8W4MatmulPipeline<Config, 4>;
 
 public:
     __aicore__ inline CatlassGmm2(const Config& config, const GMMAddrInfo& addr)
@@ -266,7 +267,7 @@ public:
 
     __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols)
     {
-        Pipeline::ComputeProjection(m, n, rows, cols, n, true);
+        Pipeline::ComputeProjection(m, n, rows, cols, n);
     }
     __aicore__ inline void Dequantize(uint32_t n, uint32_t rows, uint32_t cols)
     {

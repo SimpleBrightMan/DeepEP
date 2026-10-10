@@ -14,6 +14,7 @@
 
 #include "resource.hpp"
 #include "a8w4_k_plan.hpp"
+#include "a8w4_l1_layout.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/coord.hpp"
 #include "catlass/numeric_size.hpp"
@@ -38,6 +39,7 @@ public:
     using LayoutPrologueB = typename TileCopy::LayoutPrologueB;
 
     static constexpr uint32_t L1B_STAGES = DispatchPolicy::L1B_STAGES;
+    using L1Map = MegaMoeImpl::GmmKernel::A8W4L1Layout<L1B_STAGES>;
 
     struct Params {
         TileShapeL1 tileShapeL1;
@@ -59,7 +61,7 @@ public:
     static_assert(std::is_same_v<LayoutIn, layout::Weight4BitnZ>, "MegaMoE requires packed NZ weights");
     static_assert(tla::get<1>(TileShapeL1{}) * tla::get<2>(TileShapeL1{}) <= 64 * 1024,
                   "Single-AIV weight output exceeds its UB stage");
-    static_assert(L1B_STAGES == 2, "MegaMoE uses two weight stages");
+    static_assert(L1B_STAGES == 2 || L1B_STAGES == 4, "Unsupported weight stage count");
 
     CATLASS_DEVICE
     MegaMoeBlockPrologueA8W4(const Params& params, bool activate = true)
@@ -70,7 +72,7 @@ public:
         }
         for (uint32_t i = 0; i < L1B_STAGES; i++) {
             // Assign L1/L0A/L0B space for each stages
-            l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(i * 384U * 1024U);
+            l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(L1Map::B(i));
         }
         // Packed inputs occupy [0,64KiB); the four
         // output slots interleave 256-byte vectors throughout [64,192KiB).
@@ -123,7 +125,7 @@ public:
     {
         uint32_t kSize = tla::get<0>(params.layoutPrologueB.originShape());
         const auto kPlan =
-            MegaMoeImpl::GmmKernel::MakeA8W4KPlan(actualBlockShape.m(), actualBlockShape.n(), allowDynamicB);
+            MegaMoeImpl::GmmKernel::MakeA8W4KPlan(actualBlockShape.m(), actualBlockShape.n(), allowDynamicB, L1Map::A_BYTES);
         const uint32_t kL1Size = kPlan.kb;
         const uint32_t halfK = kL1Size / 2U;
         const uint32_t kGmLoop = CeilDiv(kSize, kL1Size);
@@ -291,8 +293,8 @@ public:
     static constexpr uint32_t SHIFT_LEFT_SIZE = 0x4;
 
     static constexpr int32_t SYNC_MODE = 4;
-    constexpr static uint16_t AIV_SYNC_AIC_FLAG = 6;
-    constexpr static uint16_t AIC_SYNC_AIV_FLAG = 8;
+    constexpr static uint16_t AIV_SYNC_AIC_FLAG = L1Map::FULL_FLAG;
+    constexpr static uint16_t AIC_SYNC_AIV_FLAG = L1Map::EMPTY_FLAG;
 
     static constexpr int64_t UB_STAGES = 4;
 
