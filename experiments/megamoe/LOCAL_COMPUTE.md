@@ -386,6 +386,8 @@ device 1–7 各三次 BS4096 调用，完整输出均与此前各卡原基线�
 zyx 最终恢复并保留新库 `build-k9sovwtj`，未改变 hkq，也未停止或重置他人任务。
 CPU 定向测试89项通过，包含实际完成通道头文件的编译/执行，覆盖0/1/2/3/36/113任务的
 credit复用及尾部全回收；该模型不替代NPU的真实内存可见性和时序验证。timer C++/Python协议一致性通过。
+服务器 Linux/zyx 全套测试 **226项通过**，日志 `/home/zyx/gmm1-async-pytest.log`。
+Windows全套曾因缺少bash和Linux打包平台检查失败10项；未修改这些无关测试，改在目标Linux环境完成验收。
 
 ```bash
 # 已激活 zyx、source CANN，位于本分支仓库根目录
