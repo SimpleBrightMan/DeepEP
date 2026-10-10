@@ -746,7 +746,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
             gmm2TileSequence = &pairwiseTileSequence;
         }
         timer_.SetSlice(state.expertIdx, tokenStartIndexInExpert, sliceTokenCount);
-        // TokenCombine逐tile记录ISSUE；slice出口仍保留FIX完成和发布边界。
+        // TokenCombine逐tile记录ISSUE；独立slice在出口排空，wave上下文由调用者统一收尾。
         if constexpr (g_coreType == AIC && CombineQuantMode != COMBINE_NO_QUANT) {
             timer_.StartSpan(AscendTimer::AIC_GMM2);
         }
@@ -771,7 +771,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
         if constexpr (tokenCombine && g_coreType == AIC) {
             // 只在“有 GEMM2 tile”的分支通知：一个实际生产核完成本 slice 的全部
             // tile 后加一。空核不通知；同一核有多个 tile 也只通知一次。
-            // RunGmm2A8W4内CatlassGmm2已析构并完成FIX_S；发布必须保持在该调用之后。
+            // 无wave上下文时，RunGmm2A8W4内的局部对象已析构并完成FIX_S。
             // wave 上下文仍有在途 FIX；由调用者在 End 后统一发布，不能提前通知消费者。
             if (gmm2WaveContext == nullptr) {
                 NotifyTokenCombineSliceReady(params_, state.expertIdx, tokenStartIndexInExpert);

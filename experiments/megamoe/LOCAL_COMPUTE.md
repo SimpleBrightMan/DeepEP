@@ -218,3 +218,94 @@ CPU定向测试87项通过，协议校验通过；最终协议22类动态事件�
 在阶段切换前完成排空。需要成对维护AIC/AIV0的credit、输出完成及AIV1消费者顺序。
 必须在设备可用时完成输出回归、真实通信模式回归以及timer-off A/B/A测试后才保留。
 本轮找到可证实的主要等待位置，但未完成因果消除实验、未交付新的性能收益、未宣称追平DS。
+
+## 实验三：GMM2 wave 内生命周期复用
+
+分支 `codex/megamoe-gmm2-wave-lifetime`，设备实现提交 `14a7a3e`，基于上面的生命周期诊断版。
+这次只改变非量化 routed GMM2 的生命周期及其完成发布粒度，不改 wave 大小、任务顺序、
+tile、K 分块、缓冲槽位、权重布局或数学运算。不是仅在 compute-only 下删除同步。
+
+### 改动与依赖
+
+- `mega_moe_wave_a8w4.hpp::RunGmm2CombineForWaveRange` 持有一个 GMM2 上下文，连续处理同一 wave 的专家 slice。
+- `stage/mega_moe_gmm2_combine.hpp` 沿用相同 tile scheduler，向持久 `CatlassGmm2` 更新地址/形状。
+  第一次实际有任务时 Begin，之后保留 AIC/AIV0 的 credit、L1/L0/scale 游标。
+- `catlass_gmm/mega_moe_grouped_matmul.hpp` 的原生 L0C unit flag 继续保护输出复用。
+  在 wave 尾部 End，仍先等待 FIX_S，再恢复 MM layout、回收事件，才允许 GMM1 复用这些资源。
+- `mega_moe_arch35.hpp` 在持久上下文分支不提前发布 slice 就绪。
+  wave End 后重放轻量分核计算，仅为实际有任务的 AIC 发布一次；不建立随专家数增长的 pending 数组。
+  空专家/空核不通知，多个 tile 仍只计一个生产核。共享专家、量化路径保持局部对象生命周期。
+
+代价是本 wave 的 Combine 最早只能在 wave 收尾后消费，而不是逐专家 slice 提前消费。
+这需要真实通信模式回归及性能验证；本地计算提速不能直接宣称为完整 MegaMoE 收益。
+
+### 同卡 A/B/A 结果
+
+2026-10-10，B070 / zyx / Ascend950DT_9582，EP8 形状、BS4096、H7168、I3072、E384、TopK6、S0，
+本地预置输入、每专家512行，固定 device 1/seed 20261011。
+0号卡有其他用户进程，因此不运行整机 EP8 性能；device 1 测量快照未见其他进程。
+没有资源预约锁，不能保证整个采样窗口独占，仍建议独占环境复测。
+所有性能值都是 timer-off profiler kernel Duration，20次预热、三轮各50次、每轮取后25次均值。
+
+| 同卡版本 | 三轮均值（μs） | 三轮平均（μs） |
+| --- | --- | ---: |
+| A：生命周期诊断基线 | 4117.942、4118.024、4118.576 | 4118.181 |
+| B：GMM2 wave 生命周期复用 | 4026.579、4026.675、4026.775 | 4026.676 |
+| A：回装同一基线 wheel | 4117.848、4117.771、4118.110 | 4117.909 |
+
+以两次 A 共六轮平均4118.045μs为参照，B减少 **91.369μs / 2.219%**。
+BS4096完整输出hash均为 `fc7018250c83458e8bb0ee60ea213fcee7a7d13561efc7ba8b8dbf9ade034444`。
+基线设备库SHA256 `e7ba6ff7cd4c4f3a61222334e261f3572720f62485c503cb613e77ec161cc0c2`；
+新库 `389aad5887ab778fa50a7b459f81e56689cefc567f2c25cc0b9cf60377fc9446`，
+wheel为服务器 `dist/build-9yhoysf4/ascend_deepep-0.1.0.dev5-cp312-cp312-linux_aarch64.whl`。
+runner source_commit不是安装库版本，回装A时需按设备库SHA辨认。
+
+同一新库每次调用打开timer后为4047.082、4046.201、4046.598μs，平均4046.627μs，
+相对 B timer-off 增加19.951μs / **0.495%**。未增加测量用同步；最终单独trace不混入off性能。
+
+### 因果证据及不能相加的时间
+
+同一rank/group 0的单独trace：
+
+| 项目 | A | B |
+| --- | ---: | ---: |
+| GMM2逻辑任务数 | 84 | 84 |
+| GMM2 Begin/End次数 | 48 | 16 |
+| GMM2 End累计（μs） | 241.420 | 78.457 |
+| 其中FIX_DRAIN累计（μs） | 233.853 | 75.419 |
+| GMM2换专家间隙均值（μs） | 6.122 | 0.989 |
+| GMM2 ISSUE累计（μs） | 1152.057 | 1212.914 |
+| GMM1原生边界累计（μs） | 2656.779 | 2654.170 |
+
+End减少与off性能改善同时出现，支持“逐slice排空限制重叠”的判断。
+但ISSUE增加约61μs，说明部分原来位于边界的等待/工作转移到连续发射内；
+不能把减少的163μs End直接当作E2E收益，也不能把嵌套FIX_DRAIN再加一次。
+GMM1基本未变，与本次仅修改GMM2生命周期的范围一致。
+
+原始数据在服务器 `/home/zyx/wave-lifetime-baseline/`、`wave-lifetime-v1/`、
+`wave-lifetime-baseline-after/`、`wave-lifetime-v1-on/`，其中前两个含 `progress.json` 和原始timer事件。
+BS8、BS96、BS4104分别先运行新库，再回装基线用 `--reference-dir` 对照，完整输出hash一致；
+数据位于 `wave-lifetime-v1-bs{8,96,4104}/` 和 `wave-lifetime-baseline-bs{8,96,4104}/`。
+这些覆盖很小slice、旋转分核及513行/专家跨wave尾块，但仍属于输出等价回归，不是独立Golden。
+87项CPU定向测试与timer协议校验通过，B070设备编译通过。完整通信及共享/量化模式未验收。
+
+### 已测优化账本与下一步
+
+1. 已保留的逐tile FIX等待删除：此前八卡本地计算4196.252→4114.466μs，约81.786μs / 1.949%。
+   原理是按消费者所需粒度保留slice完成边界，不逐tile强制Scalar排空。
+2. 本轮GMM2 wave复用：在诊断基线之上约91.369μs / 2.219%。两轮测量范围及诊断代码不同，
+   不直接相加百分比或宣称严格总加速比。
+3. A窗口K512：此前比FIX-only慢约21μs；B四槽：此前慢约16μs，均已撤回。
+   不能因DS有更多缓冲就认为在本后端一定有效；其资源生命周期、输出依赖也不同。
+
+补测同卡原始未优化wheel（`dist/build-nd4hz8_d/`，设备库SHA256
+`6f2a3169bc886b711353492eb2b63aab42d3e635233531dfff37d558ef94f959`），
+三轮4195.380、4196.423、4196.103μs，平均4195.969μs，完整输出也与上述固定输入基线一致。
+因此本次同卡直接测得的组合效果是 **4195.969→4026.676μs，减少169.292μs / 4.035%**，
+不是将两次实验的百分比相加；原始版数据位于 `/home/zyx/wave-lifetime-original/`。
+
+当前约4027μs尚不构成“已追平DS”的证据：DS同机4007–4032μs是完整通信及不同输入数值口径。
+接下来先做同输入完整通信对照，确认延迟发布没有抵消计算收益；若有损失，优先研究按完成事件
+异步发布slice，而非继续扩大wave。计算侧下一重点是GMM1逐逻辑tile的FIX_S→GM ready发布，
+与DS的FIX→AIV1原生完成事件、L0C→UB消费路径对比。应成对修改生产者/消费者，
+不能直接删除GMM1的FIX_S，否则SwiGLU可能读取未完成的数据。

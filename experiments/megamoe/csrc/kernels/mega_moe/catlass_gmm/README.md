@@ -22,7 +22,11 @@ AIC 不发送或等待 AIV1 的 `+16` 标志。AIV0 在 slice 结束时排空两
 `Begin()`/`End()` 管理每个 slice 的事件启动/排空、MM layout 切换和 ping-pong 起点，
 因此 GMM2 可以继续使用同一组 L1/L0/UB 和 event ID；对象存活不等于持续占用硬件事件。
 AIV1 的 context 保持休眠，不建立 prologue 缓冲区视图、不操作 CATLASS 同步标志，继续执行 Dispatch、SwiGLU 和 Combine。
-GMM2 使用独立的 `CatlassGmm2` 局部对象。GMM1/GMM2 只共用内部的 AIC/AIV0 pipeline；
+本实验分支中，非量化 routed GMM2 在同一个 wave 内使用持久 `gmm2WaveContext_`，只更新地址/形状，
+不在专家 slice 边界重置 AIC/AIV0 credit、L1/L0 和 scale 游标。wave 结束时调用一次 `End()`，
+完成 FIX_S、恢复 MM layout 和回收事件后，再按原分核计算发布各 slice 就绪计数。
+这不跨 GMM1/GMM2 切换保留硬件状态；共享专家、量化/逐 tile 消费路径继续使用局部 `CatlassGmm2`。
+GMM1/GMM2 只共用内部的 AIC/AIV0 pipeline；
 gate/up 合并投影及输出偏移由 `CatlassGmm1` 管理，单投影和行主序输出由 `CatlassGmm2` 管理。
 L1 分配为两组 B64KiB、两组 A128KiB、两组 scaleA32KiB 和两组 scaleB32KiB，共 512 KiB。
 L1 地址分配：B 在 0/384 KiB，A 在 128/256 KiB，scaleA 在 64/448 KiB，scaleB 在 96/480 KiB。

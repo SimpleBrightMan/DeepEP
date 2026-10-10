@@ -7,8 +7,10 @@ Modified by Joyce_An 2026
 
 ## 本分支：零通信本地计算
 
-`codex/megamoe-lifecycle-study` 基于 `codex/megamoe-compute-opt`，诊断 GMM1/GMM2 的批内与批间推进。
-本轮不改变计算和同步协议；新增的 Begin/End/FIX_DRAIN 是原生边界的无同步观测，非性能优化开关。
+`codex/megamoe-gmm2-wave-lifetime` 基于 `codex/megamoe-lifecycle-study`，实验性地延长同一 GMM2 wave 内的流水生命周期。
+保持 tile、缓冲容量和任务顺序，延续 AIC/AIV0 credit 与游标；在 wave 尾部排空 FIX 后统一发布 slice 完成。
+这是完成发布粒度的改变，可能影响真实 Combine 重叠；不能把本地计算回归当成完整通信验收。
+Begin/End/FIX_DRAIN 仍是原生边界的无同步观测，非性能优化开关。
 不建立SHMEM/HCCL、不执行通信预热；保留 GMM1 → SwiGLU → GMM2 调度和数学运算。
 构建后运行 `python experiments/megamoe/scripts/local_compute.py --bs 4096`，默认八卡独立功能验证。
 加 `--profile` 采集 timer-off kernel Duration；加 `--trace` 在性能采样结束后单独保存流水图。
