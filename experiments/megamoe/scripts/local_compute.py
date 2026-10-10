@@ -18,6 +18,9 @@ def worker(args):
     from deep_ep_experimental.megamoe.reference import make_weights, quantize_input
 
     torch.npu.set_device(args.worker)
+    soc = torch.npu.get_device_name(args.worker)
+    if "950" not in soc:
+        raise RuntimeError(f"Local compute currently requires Ascend950, got {soc}")
     e, h, intermediate, topk = 48, 7168, 3072, 6
     rows = args.bs * topk
     counts = torch.full((e,), rows // e, dtype=torch.int32)
@@ -37,8 +40,9 @@ def worker(args):
     w1, w2 = transform_weights_for_mega_moe(pair(raw[0]), pair(raw[1]))
     w1 = w1.select(args.bs <= _C.small_batch_max_tokens)
     # 最后一个参数选择local-only构造；不调用SymmBuffer、torch.distributed或SHMEM初始化。
+    # dav-c310的util_set_ffts_config为空操作，与Ascend950 SHMEM自身使用0的约定一致。
     plan = _C.Plan(example, intermediate, topk, e, 8, args.bs, True, 0, 8,
-                   _C.local_ffts_config(), 0, 0, args.worker)
+                   0, 0, 0, args.worker)
     torch.npu.synchronize()
     plan.prepare_local_compute(dispatch, dispatch_sf, counts)
     results = []
@@ -62,7 +66,10 @@ def worker(args):
                   communication_initialized=False, input="synthetic locally pre-dispatched FP8",
                   validation="finite, nonzero, repeatability; NOT full numerical golden",
                   performance_valid=False, reason="functional smoke on shared devices; host wall is not kernel performance",
-                  torch=torch.__version__, torch_npu=torch_npu.__version__, iterations=results)
+                  torch=torch.__version__, torch_npu=torch_npu.__version__, device_name=soc,
+                  source_commit=subprocess.check_output(["git", "rev-parse", "HEAD"],
+                      cwd=Path(__file__).resolve().parents[3], text=True).strip(),
+                  seed=20261010 + args.worker, timer=False, iterations=results)
     (args.output / f"device_{args.worker}.json").write_text(json.dumps(report, indent=2))
 
 

@@ -538,6 +538,9 @@ void Plan::prepare_local_compute(torch::Tensor data, torch::Tensor scales, torch
     }
     const size_t bytes = block_counts.size() * sizeof(int32_t);
     ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(info.expertRevTokenNumsPtr, bytes, block_counts.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE));
+    // BF16 0xffff为NaN；未被GMM2完整覆盖的输出必须让smoke失败，不能误读旧显存。
+    const size_t output_bytes = rows * static_cast<int64_t>(tiling_.h) * sizeof(uint16_t);
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemset(info.gmm2MmadResPtr, output_bytes, 0xff, output_bytes));
     replay_counts_ = counts.to(workspace_.device());
     local_rows_ = rows;
     compute_replay_ = true;
