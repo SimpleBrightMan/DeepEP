@@ -30,15 +30,24 @@ def test_invalid_config_does_not_launch(launcher, monkeypatch, args):
     assert error.value.code == 2
 
 
-def test_collects_only_requested_devices(launcher, monkeypatch, tmp_path):
+@pytest.mark.parametrize("profile", [False, True])
+def test_collects_only_requested_devices(launcher, monkeypatch, tmp_path, profile):
     output = tmp_path / "run"
-    monkeypatch.setattr(sys, "argv", ["local_compute.py", "--devices", "1", "3", "--output", str(output)])
+    monkeypatch.setattr(sys, "argv", ["local_compute.py", "--devices", "1", "3", "--output", str(output)]
+                        + (["--profile", "--profile-iters", "8", "--trace"] if profile else []))
+    if profile:
+        from types import SimpleNamespace
+        monkeypatch.setattr(launcher.subprocess, "run", lambda *a, **kw: SimpleNamespace(stdout="no processes"))
     calls = []
 
     class Completed:
         returncode = 0
 
         def __init__(self, command, **kwargs):
+            assert ("--profile" in command) == profile
+            assert ("--trace" in command) == profile
+            if profile:
+                assert command[command.index("--profile-iters") + 1] == "8"
             device = int(command[command.index("--worker") + 1])
             calls.append(device)
             (output / f"device_{device}.json").write_text(json.dumps({"device": device}))

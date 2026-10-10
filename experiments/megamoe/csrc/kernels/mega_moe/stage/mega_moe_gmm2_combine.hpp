@@ -680,9 +680,7 @@ __aicore__ inline void Gmm2AicMmadA8W4(BlockMmad& blockMmad, Scheduler& schedule
             // MMAD/后继tile仍由unit flag保护L0C复用，不能把每tile的Scalar排空当成依赖。
             AscendC::SetFlag<AscendC::HardEvent::FIX_S>(0);
             AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(0);
-            if constexpr (NotifyCombineTileReady) {
-                AscendC::WriteGmByPassDCache(gmmAddrInfo.gmmToEpilogueFlag, ++(*gmTileSequence));
-            }
+            AscendC::WriteGmByPassDCache(gmmAddrInfo.gmmToEpilogueFlag, ++(*gmTileSequence));
         } else if constexpr (IsLayered && !IsShared) {
             NotifyCombineConsumersOfTileCompletion(rowOffsetInExpert + mLoc, groupSyncSlotLayout,
                                                    gmmAddrInfo.gmm2CombineSyncCounter);

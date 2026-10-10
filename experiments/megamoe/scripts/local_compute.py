@@ -51,9 +51,9 @@ def worker(args):
     print(f"[READY] device={args.worker} workspace_bytes={plan.workspace_bytes}; no communication", flush=True)
     results = []
     previous = None
-    def call():
+    def call(timer=None):
         plan.forward(example, None, ids, probabilities, w1[0], w2[0], w1[1], w2[1],
-                     None, None, None, None, None, None)
+                     timer, None, None, None, None, None)
 
     for iteration in range(args.iters):
         begin = time.perf_counter()
@@ -109,6 +109,25 @@ def worker(args):
         actual = plan.local_compute_output().float().cpu()
         if not torch.equal(actual, previous):
             raise RuntimeError(f"Output changed after profiled repetitions device={args.worker}")
+    trace_report = None
+    if args.trace:
+        from deep_ep_experimental.megamoe.timer.breakdown import compact_events, rank_breakdown
+        from deep_ep_experimental.megamoe.timer.trace_parser import trace_events, first_start_cycle
+        if not _C.timer_enabled:
+            raise RuntimeError("Installed wheel was built without timer")
+        timer = torch.zeros(_C.timer_numel, dtype=torch.int64, device="npu")
+        call(timer)
+        torch.npu.synchronize()
+        events = compact_events(timer.cpu().numpy(), args.worker)
+        trace_report = rank_breakdown(events, args.worker, compute_replay=True)
+        if trace_report["status"] != "ok":
+            raise RuntimeError(f"Invalid compute-only timer trace: {trace_report}")
+        if not torch.equal(plan.local_compute_output().float().cpu(), previous):
+            raise RuntimeError("Timer pass changed the output")
+        trace = dict(traceEvents=trace_events(events, "keep", first_start_cycle(events), time_origin="rank"),
+                     displayTimeUnit="us", scope="local_compute", gmm2_semantics=trace_report["gmm2_semantics"])
+        (args.output / f"device_{args.worker}_timer.json").write_text(json.dumps(trace, separators=(",", ":")))
+        print(f"[TRACE] device={args.worker} events={len(events)} {trace_report['gmm2_semantics']}", flush=True)
     report = dict(passed=True, device=args.worker, ep_shape=8, bs=args.bs, local_experts=e,
                   tokens_per_expert=rows//e, workspace_bytes=plan.workspace_bytes,
                   communication_initialized=False, input="synthetic locally pre-dispatched FP8",
@@ -120,7 +139,8 @@ def worker(args):
                   seed=20261010 + args.worker, timer=False, iterations=results,
                   output_sha256=output_hash, metric="megamoe_compute_replay_kernel_duration_us",
                   kernel_measurements=measurements, warmup=args.warmup,
-                  profile_iters=args.profile_iters, profile_rounds=args.profile_rounds)
+                  profile_iters=args.profile_iters, profile_rounds=args.profile_rounds,
+                  separate_trace=trace_report)
     binary = Path(_C.__file__).with_name("libmegamoe_kernel.so")
     with binary.open("rb") as stream:
         report["kernel_binary_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -139,6 +159,7 @@ def main():
     p.add_argument("--profile-iters", type=int, default=50)
     p.add_argument("--profile-rounds", type=int, default=3)
     p.add_argument("--reference-dir", type=Path, help="Require full output fingerprints to match a prior identical case")
+    p.add_argument("--trace", action="store_true", help="Collect one separate diagnostic trace AFTER all timer-off samples")
     p.add_argument("--output", type=Path)
     p.add_argument("--worker", type=int, help=argparse.SUPPRESS)
     args = p.parse_args()
@@ -173,6 +194,8 @@ def main():
                         "--profile-rounds", str(args.profile_rounds)]
             if args.reference_dir:
                 cmd += ["--reference-dir", str(args.reference_dir)]
+            if args.trace:
+                cmd += ["--trace"]
             procs.append(subprocess.Popen(cmd, stdout=stream, stderr=subprocess.STDOUT,
                 env=dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")))
         deadline = time.monotonic() + args.timeout
