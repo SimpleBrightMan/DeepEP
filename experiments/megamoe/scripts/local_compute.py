@@ -119,6 +119,20 @@ def worker(args):
         call(timer)
         torch.npu.synchronize()
         events = compact_events(timer.cpu().numpy(), args.worker)
+        # 利用设备已写入的坐标，不增加读时钟/同步；保留原始区间供边界分析。
+        from deep_ep_experimental.megamoe.timer import protocol as protocol
+        from deep_ep_experimental.megamoe.timer.parse_timer_csv import core_info
+        raw = timer.cpu().numpy()
+        cores = {core_info(core): core for core in range(protocol.N_CORE_COUNT)}
+        for event in events:
+            family, _, index = event["name"].rpartition("_")
+            if family not in protocol.DYNAMIC_NAMES or not index.isdecimal():
+                continue
+            core = cores[(event["group_id"], event["core_type"], event["sub_id"])]
+            slot = len(protocol.FIXED_NAMES) + protocol.DYNAMIC_NAMES.index(family) * protocol.MAX_DYNAMIC_ITER + int(index)
+            event.update(protocol.task_metadata(raw, core, slot))
+            event["wave_id"] = int(raw[protocol.WAVE_ID_OFFSET + core * protocol.WAVE_ID_PER_CORE + slot])
+        (args.output / f"device_{args.worker}_events.json").write_text(json.dumps(events, separators=(",", ":")))
         trace_report = rank_breakdown(events, args.worker, compute_replay=True)
         if trace_report["status"] != "ok":
             raise RuntimeError(f"Invalid compute-only timer trace: {trace_report}")
