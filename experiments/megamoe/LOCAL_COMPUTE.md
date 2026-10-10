@@ -288,6 +288,10 @@ BS8、BS96、BS4104分别先运行新库，再回装基线用 `--reference-dir` 
 数据位于 `wave-lifetime-v1-bs{8,96,4104}/` 和 `wave-lifetime-baseline-bs{8,96,4104}/`。
 这些覆盖很小slice、旋转分核及513行/专家跨wave尾块，但仍属于输出等价回归，不是独立Golden。
 87项CPU定向测试与timer协议校验通过，B070设备编译通过。完整通信及共享/量化模式未验收。
+随后在空闲device 1–7同时运行BS4096，每卡三个重复调用，七卡完整输出均与此前各卡基线hash一致；
+记录在 `/home/zyx/wave-lifetime-v1-seven-devices/`。这是七个独立本地计算进程的功能回归，
+不是EP7，也不是完整EP8通信测试。未使用被其他用户占用的device 0。
+服务器zyx最终保留新库 `build-9yhoysf4`；没有修改hkq或停止他人进程。
 
 ### 已测优化账本与下一步
 
