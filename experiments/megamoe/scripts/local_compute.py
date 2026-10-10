@@ -23,6 +23,7 @@ def worker(args):
         raise RuntimeError(f"Local compute currently requires Ascend950, got {soc}")
     e, h, intermediate, topk = 48, 7168, 3072, 6
     rows = args.bs * topk
+    print(f"[PREP] device={args.worker} BS={args.bs} local_experts={e} rows={rows}; local input/weights", flush=True)
     counts = torch.full((e,), rows // e, dtype=torch.int32)
     rng = np.random.default_rng(20261010 + args.worker)
     data, scales = quantize_input(rng.normal(0, .1, (rows, h)).astype(np.float32))
@@ -45,6 +46,7 @@ def worker(args):
                    0, 0, 0, args.worker)
     torch.npu.synchronize()
     plan.prepare_local_compute(dispatch, dispatch_sf, counts)
+    print(f"[READY] device={args.worker} workspace_bytes={plan.workspace_bytes}; no communication", flush=True)
     results = []
     previous = None
     for iteration in range(args.iters):

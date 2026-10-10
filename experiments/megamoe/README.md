@@ -5,7 +5,15 @@ Modified by Joyce_An 2026
 
 # MegaMoE Prefill Beta
 
-## 本分支：计算重放诊断（compute replay）
+## 本分支：零通信本地计算
+
+`codex/megamoe-local-compute` 新增本地预置输入入口，基于 `codex/megamoe-compute-replay`。
+不建立SHMEM/HCCL、不执行通信预热；保留GMM1 → SwiGLU → GMM2原设备流水。
+构建后运行 `python experiments/megamoe/scripts/local_compute.py --bs 4096`，默认八卡独立功能验证。
+环境、限制和验证记录见 [LOCAL_COMPUTE.md](LOCAL_COMPUTE.md)。
+下面保留的 `batch_launch.py` 仍是原通信预热版，**不是**新的零通信入口。
+
+## 原入口：计算重放诊断（compute replay）
 
 基于 `codex/megamoe-local-ep8` 的 `a859c17`。本分支的 benchmark 默认只测计算重放，
 不是完整 MoE，不作为生产或精度基线；下文原有 API 默认仍运行完整 MoE，只有显式调用

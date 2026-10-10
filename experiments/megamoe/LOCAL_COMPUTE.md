@@ -30,3 +30,14 @@ python experiments/megamoe/scripts/local_compute.py
 
 本地地址兼容区由普通NPU tensor持有，不注册对称堆。local-only Plan在准备完成前拒绝forward，
 避免错误地进入通信路径；数据/计数/容量/设备必须匹配。输入计数冻结，测试与真实路由输入不同。
+
+## 2026-10-10 实机验证
+
+- Ascend950DT_9582，CANN B070，Torch 2.12.0+cpu，torch_npu 2.12.0.post2。
+- 原始基线`c4790e6`；原生扩展及设备库已成功构建，计算实现验证提交`7da0228`。
+- BS4096，H7168，I3072，TopK6，无共享专家；EP8形状每卡48专家，每专家512 token。
+- 单卡0和八卡0–7各执行3轮；全部输出finite/nonzero，重复结果逐元素相同。
+- GMM2输出先填NaN，确保未覆盖输出不能误判通过；不等价于完整数值Golden。
+- 每卡Plan workspace为7,393,402,880字节；这不含权重、输入、本地地址兼容区和框架缓存。
+- 服务器八卡日志及汇总：`/home/zyx/smoke-local-compute-ep8/`。
+- 默认不启用timer；本次只验证功能，没有发布可比较的kernel性能结论。
