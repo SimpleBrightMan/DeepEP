@@ -9,10 +9,14 @@
 - [x] GMM1：FIX异步full通知、AIV1 MTE2等待、消费后empty归还；同wave保持流水状态。
 - [x] 配套低开销生命周期timer，GMM1/GMM2异步区间明确标为ISSUE。
 - [x] 合入main工作树并恢复完整通信benchmark默认行为，保留旧main对照分支。
-- [ ] 完成目标Linux全套CPU回归并推送main与对照分支。
+- [x] 目标Linux全套CPU回归234项通过，main与旧main对照分支一并推送。
 
 计算回归证据见 [LOCAL_COMPUTE.md](LOCAL_COMPUTE.md)。不包含扩大A窗口/四槽B两个负收益试验。
 本地输入诊断入口保持独立，不把“跳过通信”作为main的默认性能路径。
+main的计算源码与已上机验证的 `00afaca` 完全相同；完整通信benchmark相对旧main只增加口径元数据，
+没有隐式priming或开启compute replay。Linux测试记录在 `/home/zyx/megamoe-main-validation-pytest.log`。
+本次仅运行CPU测试和只读计划检查，没有重跑NPU、重新安装wheel或改变现有实验环境。
+完整EP8通信正确性/性能仍由下面的五BS验收确认，不能将CPU通过或纯计算输出一致当作已完成这项验收。
 
 ## 第一优先级：旧main与新main完整EP8比较
 
