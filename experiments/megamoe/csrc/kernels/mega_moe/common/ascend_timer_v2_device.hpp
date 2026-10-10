@@ -133,6 +133,25 @@ public:
         WriteEnd(timingId, AscendC::GetSystemCycle());
     }
 
+    // 旁路观察已有生命周期边界，不改变活动tile状态，不增加任何流水同步。
+    __aicore__ inline int BeginBoundary(AscendTimer::DynamicTimingType type)
+    {
+        if (!Enabled()) {
+            return -1;
+        }
+        int index = BeginRaw(static_cast<int>(type), AscendC::GetSystemCycle());
+        if (index >= 0) {
+            WriteWave(DynamicTimingIndex(static_cast<int>(type), index), waveId_);
+        }
+        return index;
+    }
+    __aicore__ inline void EndBoundary(AscendTimer::DynamicTimingType type, int index)
+    {
+        if (Enabled() && index >= 0) {
+            EndRaw(static_cast<int>(type), index, AscendC::GetSystemCycle());
+        }
+    }
+
     // 每次 slice 独立记录；依赖等待会把当前执行段拆成真实的前后两段。
     __aicore__ inline void StartSpan(AscendTimer::DynamicTimingType type)
     {

@@ -45,19 +45,29 @@ def compact_events(raw, rank):
     return events
 
 
-def rank_breakdown(events, rank):
+def rank_breakdown(events, rank, *, compute_replay=False):
     """A visible trace envelope is not profiler E2E, nor pure Cube execution time."""
     result = dict(rank=rank, status="unavailable")
     active = [e for e in events if "WAIT" not in e["name"] and event_family(e["name"]) != "KERNEL_TIMING"]
     families = defaultdict(list)
     for event in active:
         families[event_family(event["name"])].append(event)
+    result["gmm2_semantics"] = "issue_not_completion" if families["AIC_GMM2_ISSUE"] else "native_completion"
+    families["AIC_GMM2"] += families["AIC_GMM2_ISSUE"]
+    result["gmm1_semantics"] = "issue_not_completion" if families["AIC_GMM1_ISSUE"] else "native_completion"
+    families["AIC_GMM1"] += families["AIC_GMM1_ISSUE"]
     required = ("AIV_DISPATCH", "AIC_GMM1", "AIC_GMM2", "AIV_UNPERMUTE")
+    if compute_replay:
+        result["measurement"] = "compute_replay"
+        required = ("AIC_GMM1", "AIC_GMM2")
+        forbidden = ("AIV_DISPATCH", "AIV_COMBINE", "AIV_UNPERMUTE", "AIV_INPUT_CROSS_RANK_SYNC", "AIV_FINAL_CROSS_RANK_WAIT")
+        if any(event_family(e["name"]) in forbidden for e in events):
+            raise ValueError(f"rank={rank}: communication event present in compute replay")
     missing = [name for name in required if not families[name]]
     if missing:
         return dict(result, reason="missing " + ", ".join(missing))
     origin = min(e["start_cycle"] for e in active)
-    dispatch = min(e["start_cycle"] for e in families["AIV_DISPATCH"])
+    dispatch = origin if compute_replay else min(e["start_cycle"] for e in families["AIV_DISPATCH"])
     gmm = families["AIC_GMM1"] + families["AIC_GMM2"]
     first = min(e["start_cycle"] for e in gmm)
     last = max(e["end_cycle"] for e in gmm)
@@ -86,8 +96,9 @@ def rank_breakdown(events, rank):
         result,
         status="ok",
         final_aic_group=lane[0],
-        head_us=us(dispatch - origin),
-        launch_us=us(first - dispatch),
+        head_us=None if compute_replay else us(dispatch - origin),
+        launch_us=None if compute_replay else us(first - dispatch),
+        setup_us=us(first - origin) if compute_replay else None,
         gmm_window_us=us(last - first),
         tail_us=us(end - last),
         visible_span_us=us(end - origin),
@@ -95,7 +106,7 @@ def rank_breakdown(events, rank):
         gmm2_spans_us=us(spans["AIC_GMM2"]),
         gmm_uncovered_us=us(last - first - total),
         input_sync_max_us=max((us(e["end_cycle"] - e["start_cycle"]) for e in sync), default=None),
-        dispatch_at_us=us(dispatch - origin),
+        dispatch_at_us=None if compute_replay else us(dispatch - origin),
         first_gmm_at_us=us(first - origin),
         last_gmm_at_us=us(last - origin),
         visible_end_at_us=us(end - origin),
@@ -109,8 +120,10 @@ def write_breakdown(records, output_dir, case_label):
         "head=[0,dispatch); launch=[dispatch,first_gmm); GMM=[first_gmm,last_gmm); tail=[last_gmm,end)",
         "GMM1/GMM2 spans use final_aic_group only; uncovered includes its start skew and unrecorded gaps",
         "spans may contain internal waits; uncovered is NOT proven hardware idle",
+        "AIC_GMM2_ISSUE ends after issuing FIX, not after FIX completes; see per-rank gmm2_semantics",
     )
     rows = (
+        "setup_us",
         "head_us",
         "launch_us",
         "gmm_window_us",
@@ -126,6 +139,8 @@ def write_breakdown(records, output_dir, case_label):
         "last_gmm_at_us",
         "visible_end_at_us",
     )
+    if any(r.get("measurement") == "compute_replay" for r in records):
+        notes += ("COMPUTE REPLAY: setup=[first visible event,first_gmm); head/launch/dispatch are N/A; no MoE output",)
     lines = [f"[TIMER-BREAKDOWN] case={case_label}", *(f"[TIMER-BREAKDOWN] {note}" for note in notes)]
     for offset in range(0, len(records), 8):
         batch = records[offset : offset + 8]

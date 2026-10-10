@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by SimpleBright_Man 2026
 
-"""Launch MegaMoE on explicitly configured hosts sharing one checkout."""
+"""Launch MegaMoE locally (EP8) or on configured hosts sharing one checkout."""
 
 import argparse
 from datetime import datetime
@@ -10,7 +10,7 @@ import ipaddress
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import signal
@@ -38,8 +38,8 @@ def select_hosts(config, ep, master=None):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ep-size", type=int, choices=(32, 64, 128), default=64)
-    parser.add_argument("--hosts-file", type=Path, required=True, help="User-owned JSON with hosts and optional master")
+    parser.add_argument("--ep-size", type=int, choices=(8, 32, 64, 128), default=64)
+    parser.add_argument("--hosts-file", type=Path, help="Required for multi-node; omit for local EP8")
     parser.add_argument("--master-ip")
     parser.add_argument("--shared-code", type=Path, default=Path(os.environ.get("SHARED_CODE", ROOT)))
     parser.add_argument("--config", default="deepseek_v4_pro")
@@ -98,28 +98,41 @@ def make_plan(args):
         raise ValueError("Master/SHMEM ports must be distinct unprivileged TCP ports")
     if args.timeout <= 0 or (args.parse_timer and args.no_timer):
         raise ValueError("Invalid timeout or --parse-timer with --no-timer")
+    if args.wheel and args.skip_build:
+        raise ValueError("Use either --wheel or --skip-build")
+    local = args.ep_size == 8
+    if local and (args.hosts_file or args.master_ip):
+        raise ValueError("EP8 runs on this machine; omit --hosts-file and --master-ip")
+    if not local and args.hosts_file is None:
+        raise ValueError("Multi-node launch requires --hosts-file")
     user, auth = os.environ.get("REMOTE_USER", getpass.getuser()), os.environ.get("SSH_AUTH", "key")
-    if not re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9_.-]*", user) or auth not in {"key", "password"}:
+    if local:
+        user, auth = getpass.getuser(), "local"
+    elif not re.fullmatch(r"[a-zA-Z0-9_][a-zA-Z0-9_.-]*", user) or auth not in {"key", "password"}:
         raise ValueError("Invalid REMOTE_USER or SSH_AUTH (key/password)")
-    ssh_port = int(os.environ.get("SSH_PORT", "22"))
+    ssh_port = 22 if local else int(os.environ.get("SSH_PORT", "22"))
     if not 1 <= ssh_port <= 65535:
         raise ValueError("Invalid SSH_PORT")
-    hosts = select_hosts(json.loads(args.hosts_file.read_text(encoding="utf-8")), args.ep_size, args.master_ip)
+    hosts = ["127.0.0.1"] if local else select_hosts(
+        json.loads(args.hosts_file.read_text(encoding="utf-8")), args.ep_size, args.master_ip
+    )
     environment = {name: os.environ.get(name, "") for name in ("CONDA_BASE", "CONDA_ENV", "ASCEND_ENV")}
     missing = [name for name, value in environment.items() if not value.strip()]
-    if missing:
+    if missing and not local:
         raise ValueError("Set remote environment explicitly: " + ", ".join(missing))
     for name in ("CONDA_BASE", "ASCEND_ENV"):
-        if not Path(environment[name]).is_absolute():
+        if not local and not PurePosixPath(environment[name]).is_absolute():
             raise ValueError(f"{name} must be an absolute path on each remote host")
     wheel = str(args.wheel.resolve(strict=True)) if args.wheel else None
     return dict(
         root=str(root),
+        local=local,
         hosts=hosts,
         config=config,
         input=args.input,
         routing=args.routing,
         mode=args.mode,
+        measurement="full_moe",
         timer=not args.no_timer,
         parse_timer=not args.no_timer and args.parse_timer is not False,
         wheel=wheel,
@@ -140,7 +153,7 @@ def remote_script(plan, run_dir, rank, stage, bs=None):
     q = shlex.quote
     command = '"$PYTHON" -I ' + shlex.join(
         [
-            str(Path(plan["root"]) / "experiments/megamoe/scripts/batch_node.py"),
+            (Path(plan["root"]) / "experiments/megamoe/scripts/batch_node.py").as_posix(),
             stage,
             "--run-dir",
             str(run_dir),
@@ -149,15 +162,23 @@ def remote_script(plan, run_dir, rank, stage, bs=None):
         ]
         + (["--bs", str(bs)] if bs is not None else [])
     )
-    # 独立进程组只包含本阶段的子进程；连接断开/中断不使用全局 pkill。
-    return f"""set -eo pipefail
-source {q(plan["conda_base"] + "/etc/profile.d/conda.sh")}
+    if plan.get("local", False):
+        # 本机复用调用者已激活的框架/CANN 环境，不要求 SSH 或重新激活 Conda。
+        setup = f"""export PYTHON={q(sys.executable)}
+export LD_LIBRARY_PATH={q(plan["root"] + "/third-party/shmem/install/shmem/lib:" + str(Path(sys.prefix) / "lib") + ":")}"${{LD_LIBRARY_PATH:-}}"
+"""
+    else:
+        setup = f"""source {q(plan["conda_base"] + "/etc/profile.d/conda.sh")}
 conda activate {q(plan["conda_env"])}
 TASK_CONDA_PREFIX="${{CONDA_PREFIX:?Conda activation failed}}"
 source {q(plan["ascend_env"])}
 export PYTHON="$TASK_CONDA_PREFIX/bin/python"
 export PATH="$TASK_CONDA_PREFIX/bin:$PATH"
 export LD_LIBRARY_PATH={q(plan["root"] + "/third-party/shmem/install/shmem/lib:")}"$TASK_CONDA_PREFIX/lib:${{LD_LIBRARY_PATH:-}}"
+"""
+    # 独立进程组只包含本阶段的子进程；连接断开/中断不使用全局 pkill。
+    return f"""set -eo pipefail
+{setup}
 unset PYTHONHOME PYTHONPATH ASCEND_LAUNCH_BLOCKING
 cd /tmp
 set -m
@@ -209,6 +230,8 @@ def run_stage(plan, run_dir, stage, ranks=None, bs=None, password=None):
                 command += ["-o", "BatchMode=yes"]
                 env.pop("SSHPASS", None)
             command += [f"{plan['user']}@{plan['hosts'][rank]}", "bash -s"]
+            if plan.get("local", False):
+                command = ["bash", "-s"]
             print(f"[START] {stage} node={rank} host={plan['hosts'][rank]} log={path}", flush=True)
             proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, env=env)
             pending[proc] = (rank, path)
@@ -406,7 +429,7 @@ def main(argv=None):
     if args.plan:
         return
     if sys.platform != "linux":
-        raise RuntimeError("Multi-node launch requires a Linux controller with the shared checkout mounted")
+        raise RuntimeError("MegaMoE launch requires Linux with the checkout available")
     import fcntl
 
     root = Path(plan["root"])

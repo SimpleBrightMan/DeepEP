@@ -42,6 +42,7 @@ def main():
     parser.add_argument("directory", type=Path, help="One case's timer directory")
     parser.add_argument("--ranks", type=parse_ranks, default=parse_ranks("0-7"))
     parser.add_argument("--include-wait", action="store_true")
+    parser.add_argument("--compute-replay", action="store_true", help="Compute-only trace; no Dispatch/Unpermute boundaries")
     parser.add_argument("--merge", action="store_true", help="Additionally merge the selected ranks only")
     parser.add_argument(
         "--time-origin",
@@ -50,6 +51,8 @@ def main():
         help="sync is an approximate barrier-anchor alignment, NOT absolute time",
     )
     args = parser.parse_args()
+    if args.compute_replay and args.time_origin == "sync":
+        parser.error("Compute replay has no cross-rank sync anchor; use --time-origin rank")
     events = {}
     for rank in args.ranks:
         stem = args.directory / f"rank_{rank}_npu_time"
@@ -63,7 +66,7 @@ def main():
             raise ValueError(f"rank={rank}: empty trace; check timer-enabled build and collection")
     bases = {rank: first_start_cycle(raw) for rank, raw in events.items()}
     write_breakdown(
-        [rank_breakdown(raw, rank) for rank, raw in events.items()], args.directory, args.directory.parent.name
+        [rank_breakdown(raw, rank, compute_replay=args.compute_replay) for rank, raw in events.items()], args.directory, args.directory.parent.name
     )
     if args.time_origin == "sync":
         bases, _ = synchronized_rank_bases(events)

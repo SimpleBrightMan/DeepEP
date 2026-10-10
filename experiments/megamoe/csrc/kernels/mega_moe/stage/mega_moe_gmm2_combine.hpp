@@ -660,7 +660,8 @@ __aicore__ inline void Gmm2AicMmadA8W4(BlockMmad& blockMmad, Scheduler& schedule
         uint32_t nLoc = Get<N_VALUE>(blockCoord);
         AscendTimerTileScope tileTimer(
             (IsShared || NotifyCombineTileReady || TokenCombine) ? gmmAddrInfo.timer : nullptr,
-            IsShared ? AscendTimer::AIC_SHARED_GMM2 : AscendTimer::AIC_GMM2, mLoc, nLoc, Get<M_VALUE>(actualShape),
+            IsShared ? AscendTimer::AIC_SHARED_GMM2 :
+                (TokenCombine ? AscendTimer::AIC_GMM2_ISSUE : AscendTimer::AIC_GMM2), mLoc, nLoc, Get<M_VALUE>(actualShape),
             config.tileN);
 
         if constexpr (Config::IS_WAVE_FLAG_GRAINED) {
@@ -674,14 +675,12 @@ __aicore__ inline void Gmm2AicMmadA8W4(BlockMmad& blockMmad, Scheduler& schedule
         }
 
         blockMmad.Compute(mLoc, nLoc, Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape));
-        if constexpr ((NotifyCombineTileReady || TokenCombine) && !IsShared) {
-            // 保留 tile 基线的 FIX 完成边界；token 路径改在 slice 结束后发布行前缀，
-            // 不再推进 GMM1/SwiGLU 复用的配对序号。
+        if constexpr (NotifyCombineTileReady && !IsShared) {
+            // 只有逐tile消费者需要此处确认FIX完成。TokenCombine在slice出口排空并发布，
+            // MMAD/后继tile仍由unit flag保护L0C复用，不能把每tile的Scalar排空当成依赖。
             AscendC::SetFlag<AscendC::HardEvent::FIX_S>(0);
             AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(0);
-            if constexpr (NotifyCombineTileReady) {
-                AscendC::WriteGmByPassDCache(gmmAddrInfo.gmmToEpilogueFlag, ++(*gmTileSequence));
-            }
+            AscendC::WriteGmByPassDCache(gmmAddrInfo.gmmToEpilogueFlag, ++(*gmTileSequence));
         } else if constexpr (IsLayered && !IsShared) {
             NotifyCombineConsumersOfTileCompletion(rowOffsetInExpert + mLoc, groupSyncSlotLayout,
                                                    gmmAddrInfo.gmm2CombineSyncCounter);
@@ -773,7 +772,8 @@ template <typename ElementC, bool IsShared, bool IsLayered, bool NotifyCombineTi
 __aicore__ inline void Gmm2ExecA8W4(Scheduler& scheduler, const GMMAddrInfo& gmmAddrInfo, const Config& config,
                                     uint32_t startLoopIdx, uint32_t tileNum, uint32_t expertTokenCount,
                                     uint32_t rowOffsetInExpert, const Params* params = nullptr,
-                                    int32_t* gmTileSequence = nullptr)
+                                    int32_t* gmTileSequence = nullptr,
+                                    CatlassGmm2<Config>* waveKernel = nullptr)
 {
     using KernelConfig = typename Config::KernelConfig;
     using ElementA = typename KernelConfig::ElementAType;
@@ -803,6 +803,14 @@ __aicore__ inline void Gmm2ExecA8W4(Scheduler& scheduler, const GMMAddrInfo& gmm
     WorkSetType workSet{scheduler, gmA, gmB, gmScaleA, gmScaleB, gmBias, gmC};
 
     if constexpr (g_coreType == AscendC::AIC) {
+        if (waveKernel != nullptr) {
+            waveKernel->UpdateProblem(config, gmmAddrInfo);
+            waveKernel->Begin();
+            Gmm2AicMmadA8W4<IsShared, IsLayered, NotifyCombineTileReady, TokenCombine>(
+                *waveKernel, workSet.scheduler, gmmAddrInfo, config, startLoopIdx, tileNum, expertTokenCount,
+                rowOffsetInExpert, gmTileSequence);
+            return;
+        }
         CatlassGmm2<Config> blockMmad(config, gmmAddrInfo);
         Gmm2AicMmadA8W4<IsShared, IsLayered, NotifyCombineTileReady, TokenCombine>(
             blockMmad, workSet.scheduler, gmmAddrInfo, config, startLoopIdx, tileNum, expertTokenCount,
@@ -811,6 +819,12 @@ __aicore__ inline void Gmm2ExecA8W4(Scheduler& scheduler, const GMMAddrInfo& gmm
         if (GetSubBlockIdx() == 0U) {
             AscendTimerSpanScope prologueTimer(IsShared ? gmmAddrInfo.timer : nullptr,
                                                AscendTimer::AIV_SHARED_GMM2_PROLOGUE);
+            if (waveKernel != nullptr) {
+                waveKernel->UpdateProblem(config, gmmAddrInfo);
+                waveKernel->Begin();
+                Gmm2Aiv0PrologueA8W4(*waveKernel, workSet.scheduler, config, startLoopIdx, tileNum);
+                return;
+            }
             CatlassGmm2<Config> blockPrologue(config, gmmAddrInfo);
             Gmm2Aiv0PrologueA8W4(blockPrologue, workSet.scheduler, config, startLoopIdx, tileNum);
         } else if constexpr (NotifyCombineTileReady) {
@@ -891,7 +905,8 @@ __aicore__ inline void RunGmm2A8W4(const AscendC::Shape<int64_t, int64_t, int64_
                                    const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx,
                                    const BlockJobContext& blockJob, uint32_t expertTokenCount,
                                    uint32_t rowOffsetInExpert, const Params* params = nullptr,
-                                   int32_t* gmTileSequence = nullptr, bool reverseBlocks = false)
+                                   int32_t* gmTileSequence = nullptr, bool reverseBlocks = false,
+                                   void* waveContext = nullptr)
 {
     static_assert(!IsShared || !NotifyCombineTileReady, "Shared expert GMM2 has its own completion counter");
     static_assert(!IsLayered || !NotifyCombineTileReady, "Layered GMM2 selects its synchronization through IsLayered");
@@ -920,7 +935,8 @@ __aicore__ inline void RunGmm2A8W4(const AscendC::Shape<int64_t, int64_t, int64_
     GmmKernel::Gmm2ExecA8W4<ElementC, IsShared, IsLayered, NotifyCombineTileReady, TokenCombine,
                             GmmKernel::BlockScheduler, decltype(config)>(scheduler, gmmAddrInfo, config, startLoopIdx,
                                                                          tileNum, expertTokenCount, rowOffsetInExpert,
-                                                                         params, gmTileSequence);
+                                                                         params, gmTileSequence,
+                                                                         reinterpret_cast<GmmKernel::CatlassGmm2<decltype(config)>*>(waveContext));
 
     startBlockIdx = (startBlockIdx + tileNum) % config.blockNum;
 }
@@ -1170,12 +1186,12 @@ __aicore__ inline uint32_t GetTokenCombineProducerCount(const MoeStageCommonConf
     return tiles < job.totalJobs ? tiles : job.totalJobs;
 }
 
-// 由调用方保证仅实际生产核、每 slice 调用一次。先完成 FIX 写出，再发布完成计数。
+// 仅实际生产核、每slice一次；调用方必须先退出RunGmm2A8W4。
+// CatlassGmm2析构经Cube::End已完成FIX_S并释放计算资源，这里只发布，不重复排空。
 // AtomicAdd 只操作就绪标志，不改变输出数值，也不改变 Dispatch/Combine 的通信粒度。
 __aicore__ inline void NotifyTokenCombineSliceReady(const Params& params, uint32_t expertIdx, uint32_t rowStart)
 {
     if constexpr (g_coreType == AIC) {
-        SyncFuncStatic<HardEvent::FIX_S, EVENT_ID0>();
         AscendC::AtomicAdd(GetTokenCombineReadyCounter(params, expertIdx, rowStart), 1);
     }
 }

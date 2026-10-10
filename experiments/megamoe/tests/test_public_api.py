@@ -221,6 +221,22 @@ def test_public_workflow_output_stats_timer_and_preparation_reuse(backend, bf16)
     assert b._plan.bs == 1 and b._plan_bs == 1
 
 
+def test_compute_replay_checks_preparation_and_native_support(backend):
+    b = backend.buffer
+    with pytest.raises(RuntimeError, match="priming forward"):
+        b.enable_compute_replay()
+    b.prepare(17)
+    with pytest.raises(RuntimeError, match="rebuild this branch"):
+        b.enable_compute_replay()
+    calls = []
+    b._plan.enable_compute_replay = lambda: calls.append(b._plan_bs)
+    b.enable_compute_replay()
+    assert calls == [17]
+    b.prepare(16)
+    with pytest.raises(RuntimeError, match="rebuild this branch"):
+        b.enable_compute_replay()  # 新 BS 是新计划，不能沿用上一 BS 的快照。
+
+
 def test_output_and_stats_aliases_rejected_before_launch(backend):
     b = backend.buffer
     y = Tensor(np.zeros((17, 1024)), "bfloat16")

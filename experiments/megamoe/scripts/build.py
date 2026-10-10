@@ -61,7 +61,9 @@ def build(root=ROOT, *, rebuild_shmem=False):
     def submodule(name, revision):
         source = root / "third-party" / name
         if not (source / ".git").exists():
-            run(["git", "submodule", "update", "--init", "--recursive", "--", f"third-party/{name}"])
+            # MegaMoE 只使用 CATLASS 头文件，不拉取 Python DSL 的 LLVM/Triton 依赖。
+            recursive = [] if name == "catlass" else ["--recursive"]
+            run(["git", "submodule", "update", "--init", *recursive, "--", f"third-party/{name}"])
 
         # 不对已初始化子模块自动 checkout，避免覆盖用户修改或隐藏版本漂移。
         def git(*args):

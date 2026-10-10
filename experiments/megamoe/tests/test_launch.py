@@ -119,7 +119,8 @@ def test_build_isolates_git_libraries_and_preserves_framework_environment(tmp_pa
         check_environment(command, env)
         assert check
         if command[0] == "git":
-            assert command[1:6] == ["submodule", "update", "--init", "--recursive", "--"]
+            recursive = [] if command[-1] == "third-party/catlass" else ["--recursive"]
+            assert command[1:-1] == ["submodule", "update", "--init", *recursive, "--"]
             clones.append(command[-1])
         elif command[1:4] == ["-m", "pip", "install"]:
             # Stop before package installation or compilation; only dependency preparation is exercised.
@@ -147,6 +148,136 @@ def test_build_isolates_git_libraries_and_preserves_framework_environment(tmp_pa
     assert len(queries) == 4
     assert len(framework_checks) == 1
     assert dict(os.environ) == original_environment
+
+
+def test_local_plan_needs_no_remote_environment(monkeypatch, capsys):
+    for key in ("CONDA_BASE", "CONDA_ENV", "ASCEND_ENV", "SHARED_CODE", "BS_VALUES", "MASTER_PORT", "SHMEM_PORT"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("SSH_AUTH", "invalid-unused")
+    monkeypatch.setenv("SSH_PORT", "invalid-unused")
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *a, **kw: pytest.fail("process during plan"))
+    monkeypatch.setattr(Path, "mkdir", lambda *a, **kw: pytest.fail("write during plan"))
+    launcher.main(["--ep-size", "8", "--bs-values", "96", "--plan"])
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["local"] and plan["hosts"] == ["127.0.0.1"]
+    assert plan["timer"] and plan["parse_timer"]
+    assert plan["config"]["bs_values"] == [96]
+    script = launcher.remote_script(plan, Path("/tmp/run"), 0, "run", 96)
+    assert "conda activate" not in script
+    assert "cd /tmp" in script and "unset PYTHONHOME PYTHONPATH" in script
+
+
+@pytest.mark.parametrize("extra", [["--hosts-file", "unused.json"], ["--master-ip", "192.0.2.1"]])
+def test_local_rejects_remote_targets(extra):
+    with pytest.raises(ValueError, match="EP8 runs on this machine"):
+        launcher.make_plan(launcher.parse_args(["--ep-size", "8", *extra]))
+
+
+def test_multinode_still_requires_hosts():
+    with pytest.raises(ValueError, match="requires --hosts-file"):
+        launcher.make_plan(launcher.parse_args([]))
+
+
+def test_full_moe_supports_accuracy_and_shared_experts(tmp_path):
+    plan = launcher.make_plan(launcher.parse_args(["--ep-size", "8", "--mode", "accuracy"]))
+    assert plan["mode"] == "accuracy" and plan["measurement"] == "full_moe"
+    config = json.loads((ROOT / "experiments/megamoe/python/deep_ep_experimental/megamoe/configs/deepseek_v4_pro.json").read_text())
+    config["model"]["num_shared_experts"] = 1
+    path = tmp_path / "shared.json"
+    path.write_text(json.dumps(config))
+    plan = launcher.make_plan(launcher.parse_args(["--ep-size", "8", "--config", str(path)]))
+    assert plan["config"]["model"]["num_shared_experts"] == 1
+
+
+def test_full_moe_summary_rejects_compute_replay_results(tmp_path, capsys):
+    from deep_ep_experimental.megamoe.performance import summarize_rounds
+
+    report = summarize_rounds([[4000.0, 3900.0, 3800.0, 3700.0]] * 8, 8)
+    path = tmp_path / "bs_4096/rank_0/bs_4096/profiling.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(report))
+    launcher.summarize(tmp_path, [4096], 8)
+    assert "MegaMoe E2E=" in capsys.readouterr().out
+    report["metric"] = "megamoe_compute_replay_duration_us"
+    path.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="performance report"):
+        launcher.summarize(tmp_path, [4096], 8)
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_local_stage_uses_bash_and_propagates_failure(tmp_path, monkeypatch, exit_code):
+    plan = launcher.make_plan(launcher.parse_args(["--ep-size", "8", "--bs-values", "96"]))
+    (tmp_path / "logs").mkdir()
+    import io
+
+    commands = []
+
+    class Process:
+        stdin = io.BytesIO()
+
+        def poll(self):
+            return exit_code
+
+    def start(command, **kwargs):
+        commands.append(command)
+        assert kwargs["env"].get("SSHPASS") is None
+        return Process()
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", start)
+    if exit_code:
+        with pytest.raises(RuntimeError, match="run node=0 exit=7"):
+            launcher.run_stage(plan, tmp_path, "run", bs=96)
+    else:
+        launcher.run_stage(plan, tmp_path, "run", bs=96)
+    assert commands == [["bash", "-s"]]
+
+
+def test_local_stage_executes_isolated_worker(tmp_path, monkeypatch):
+    # 真正经过 bash/子进程，确认不是仅生成了一个正确外观的命令。
+    script = tmp_path / "experiments/megamoe/scripts/batch_node.py"
+    script.parent.mkdir(parents=True)
+    script.write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "p = Path(sys.argv[sys.argv.index('--run-dir') + 1])\n"
+        "(p / 'probe.json').write_text(json.dumps(dict(args=sys.argv[1:], "
+        "isolated=sys.flags.isolated, cwd=os.getcwd(), pythonpath=os.getenv('PYTHONPATH'))))\n"
+    )
+    run_dir = tmp_path / "run"
+    (run_dir / "logs").mkdir(parents=True)
+    plan = launcher.make_plan(launcher.parse_args(["--ep-size", "8", "--bs-values", "96"]))
+    plan["root"] = str(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "shadow"))
+    launcher.run_stage(plan, run_dir, "run", bs=96)
+    probe = json.loads((run_dir / "probe.json").read_text())
+    assert probe["isolated"] == 1 and probe["pythonpath"] is None
+    assert Path(probe["cwd"]).resolve() != tmp_path.resolve()
+    assert probe["args"] == ["run", "--run-dir", str(run_dir), "--node-rank", "0", "--bs", "96"]
+
+
+def test_local_commands_keep_eight_ranks_and_timer(tmp_path):
+    spec = importlib.util.spec_from_file_location("megamoe_batch_node", SCRIPTS / "batch_node.py")
+    node = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(node)
+    plan = launcher.make_plan(launcher.parse_args(["--ep-size", "8", "--bs-values", "96"]))
+    command = node.benchmark_command(plan, tmp_path, 0, 96)
+    for option, value in (("--nnodes", "1"), ("--nproc-per-node", "8"),
+                          ("--master-addr", "127.0.0.1"), ("--timer-ranks", "0-7")):
+        assert command[command.index(option) + 1] == value
+    assert "--timer" in command
+    golden = node.golden_command(plan, tmp_path, 0, 96)
+    assert golden[golden.index("--ep-size") + 1] == "8"
+    assert golden[golden.index("--ranks") + 1] == "0-7"
+    plan["timer"] = False
+    assert "--timer" not in node.benchmark_command(plan, tmp_path, 0, 96)
+
+
+def test_main_five_batch_plan_keeps_full_communication_measurement():
+    plan = launcher.make_plan(launcher.parse_args(["--ep-size", "8", "--bs-values", "32,96,256,1024,4096"]))
+    assert plan["measurement"] == "full_moe"
+    assert plan["config"]["bs_values"] == [32, 96, 256, 1024, 4096]
+    assert plan["config"]["model"]["num_shared_experts"] == 0
+    assert plan["timer"] and plan["parse_timer"]
 
 
 @pytest.mark.parametrize("git_exit", [0, 7])

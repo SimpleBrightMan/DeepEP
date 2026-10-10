@@ -211,6 +211,7 @@ def run(args, config, group):
         timer_ranks=timer_ranks,
         host_coordination="tcpstore",
         device_communication="shmem_mte",
+        measurement="full_moe",
         api="fp8_fp4_mega_moe",
         numerical_contract="ascend_post_gmm2_route_weight_v1",
         created_utc=datetime.now(timezone.utc).isoformat(),
@@ -337,6 +338,7 @@ def run(args, config, group):
             timings = [sample["duration_us"] for sample in samples]
             per_rank = group.all_gather(timings, f"profiling BS={bs}")
             report = summarize_rounds(per_rank, int(os.environ["LOCAL_WORLD_SIZE"]))
+            report["measurement"] = "full_moe"
             report["alignment"] = config["alignment"]
             (case / "profiling.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
             if rank == 0:

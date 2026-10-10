@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 #include <acl/acl.h>
 #include "shmem.h"
@@ -294,7 +295,7 @@ void CheckTensor(const torch::Tensor& t, int64_t dims, const char* name)
 
 Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world,
            int64_t max_tokens, bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts,
-           uint64_t symmetric_address, int64_t symmetric_bytes)
+           uint64_t symmetric_address, int64_t symmetric_bytes, int64_t local_rank)
     : ffts_(ffts)
 {
     CheckTensor(example, 2, "plan input");
@@ -307,6 +308,14 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     TORCH_CHECK(ranks_per_node == 0 || (ranks_per_node > 0 && ranks_per_node <= world && world % ranks_per_node == 0),
                 "Plan ranks_per_node must divide EP");
     const auto required = buffer_size(world, experts, max_tokens, topk, example.size(1));
+    if (local_rank >= 0) {
+        TORCH_CHECK(local_rank < world && is_a8w4 && shared_experts == 0,
+                    "Local compute requires valid virtual rank, W4A8 and no shared experts");
+        // 仅提供Init所需的本地地址视图；没有对称堆、远端映射或设备通信初始化。
+        local_buffer_ = torch::zeros({required}, example.options().dtype(torch::kUInt8));
+        symmetric_address = reinterpret_cast<uint64_t>(local_buffer_.data_ptr());
+        symmetric_bytes = required;
+    }
     TORCH_CHECK(symmetric_address != 0 && symmetric_bytes >= required, "MegaMoE symmetric buffer needs ", required,
                 " bytes, got ", symmetric_bytes);
     platform_ = GetPlatformInfo();
@@ -323,13 +332,14 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
 
     // peer 地址和 context 只在准备阶段解析，不在每次 forward 中重新分配、同步拷贝。
     Mc2Aclnn::Mc2MoeContext context{};
-    const int rank = aclshmem_my_pe();
+    const int rank = local_rank >= 0 ? static_cast<int>(local_rank) : aclshmem_my_pe();
     TORCH_CHECK(rank >= 0 && rank < world && world <= Mc2Aclnn::HCCL_MAX_RANK_SIZE, "Invalid SHMEM rank/world: ", rank,
                 "/", world);
     context.epRankId = static_cast<uint32_t>(rank);
     context.rankSizePerServer = static_cast<uint32_t>(world);
     for (int64_t peer = 0; peer < world; ++peer) {
-        void* address = aclshmem_ptr(reinterpret_cast<void*>(symmetric_address), static_cast<int32_t>(peer));
+        void* address = local_rank >= 0 ? reinterpret_cast<void*>(symmetric_address) :
+            aclshmem_ptr(reinterpret_cast<void*>(symmetric_address), static_cast<int32_t>(peer));
         TORCH_CHECK(address != nullptr, "rank=", rank, " prepare: cannot resolve peer=", peer);
         context.epHcclBuffer_[peer] = reinterpret_cast<uint64_t>(address);
     }
@@ -345,6 +355,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<torch::Tensor> out)
 {
     CheckTensor(x, 2, "x");
+    TORCH_CHECK(!local_buffer_.defined() || compute_replay_,
+                "Local compute requires prepare_local_compute before forward; communication is forbidden");
     CheckTensor(topk_ids, 2, "topk_ids");
     CheckTensor(topk_weights, 2, "topk_weights");
     CheckTensor(weight1, 3, "weight1");
@@ -446,7 +458,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     torch::Tensor y = out.has_value() ? *out : torch::empty(x.sizes(), x.options().dtype(torch::kBFloat16));
     CheckTensor(y, 2, "out");
     TORCH_CHECK(y.scalar_type() == torch::kBFloat16 && y.sizes() == x.sizes(), "out must be BF16 [BS, H]");
-    torch::Tensor expert_tokens = torch::empty({experts}, x.options().dtype(torch::kInt32));
+    torch::Tensor expert_tokens = compute_replay_ ? replay_counts_ :
+        torch::empty({experts}, x.options().dtype(torch::kInt32));
 
     const auto stream = c10_npu::getCurrentNPUStream();
     auto ptr = [](const torch::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
@@ -455,7 +468,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                        opt(x_scales), ptr(topk_ids), ptr(topk_weights), ptr(weight1), ptr(weight2), ptr(weight_scales1),
                        ptr(weight_scales2), opt(shared_weight1), opt(shared_weight2), opt(shared_weight_scales1),
                        opt(shared_weight_scales2), ptr(y), ptr(expert_tokens), ptr(workspace_), opt(timer),
-                       reinterpret_cast<const uint8_t*>(&tiling_), ffts_);
+                       reinterpret_cast<const uint8_t*>(&tiling_), ffts_, compute_replay_);
     // The direct kernel launch bypasses the PyTorch dispatcher; record that
     // every argument remains live until the current NPU stream reaches it.
     for (const auto* tensor : {&x, &topk_ids, &topk_weights, &weight1, &weight2, &weight_scales1, &weight_scales2,
@@ -474,7 +487,73 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     if (x_scales) {
         c10_npu::NPUCachingAllocator::recordStream(x_scales->storage().data_ptr(), stream);
     }
+    if (local_buffer_.defined()) {
+        c10_npu::NPUCachingAllocator::recordStream(local_buffer_.storage().data_ptr(), stream);
+    }
+    replay_counts_ = expert_tokens;
     return {y, expert_tokens};
+}
+
+void Plan::enable_compute_replay()
+{
+    TORCH_CHECK(tiling_.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 &&
+                    tiling_.sharedExpertNum == 0, "Compute replay requires W4A8 with no shared experts");
+    TORCH_CHECK(replay_counts_.defined(), "Compute replay requires a complete priming forward first");
+    // 完整 forward 留下 Dispatch 输入和专家计数；切换前保证设备已完成，不能重放半成品。
+    TORCH_CHECK(aclrtSynchronizeDevice() == ACL_SUCCESS, "Compute replay priming synchronization failed");
+    compute_replay_ = true;
+}
+
+void Plan::prepare_local_compute(torch::Tensor data, torch::Tensor scales, torch::Tensor counts)
+{
+    TORCH_CHECK(local_buffer_.defined(), "prepare_local_compute requires a local-only Plan");
+    CheckTensor(data, 2, "local dispatched data");
+    CheckTensor(scales, 2, "local dispatched scales");
+    TORCH_CHECK(data.device() == workspace_.device() && scales.device() == workspace_.device(),
+                "Local input must be on the Plan device");
+    TORCH_CHECK(data.element_size() == 1 && scales.element_size() == 1 &&
+                data.size(1) == tiling_.h && scales.size(0) == data.size(0) &&
+                scales.size(1) == tiling_.h / 32 && data.size(0) <= tiling_.maxOutputSize,
+                "Local input must be packed E4M3 [rows,H] and E8M0 [rows,H/32] within workspace capacity");
+    TORCH_CHECK(counts.device().is_cpu() && counts.scalar_type() == torch::kInt32 &&
+                counts.dim() == 1 && counts.is_contiguous() && counts.numel() == tiling_.moeExpertPerRank,
+                "Local counts must be contiguous CPU int32 [local_experts]");
+    int64_t rows = 0;
+    for (int64_t e = 0; e < counts.numel(); ++e) {
+        TORCH_CHECK(counts.data_ptr<int32_t>()[e] >= 0, "Negative local expert count: expert=", e);
+        rows += counts.data_ptr<int32_t>()[e];
+    }
+    TORCH_CHECK(rows > 0 && rows == data.size(0), "Local counts sum must match nonempty dispatched rows");
+    // Torch队列先完成，随后同步D2D/H2D复制；准备不进入性能区间。
+    TORCH_CHECK(aclrtSynchronizeDevice() == ACL_SUCCESS, "Local input preparation synchronization failed");
+    auto* base = static_cast<uint8_t*>(workspace_.data_ptr());
+    const MegaMoeImpl::WorkspaceInfo info(base, &tiling_);
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(info.dispatchRevDataPtr, data.nbytes(), data.data_ptr(), data.nbytes(), ACL_MEMCPY_DEVICE_TO_DEVICE));
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(info.dispatchRevScalePtr, scales.nbytes(), scales.data_ptr(), scales.nbytes(), ACL_MEMCPY_DEVICE_TO_DEVICE));
+    // MTE count表按AIC block-major布局，每个计算核有相同的完整专家计数。
+    const int64_t stride = AlignUp<int64_t>(counts.numel(), MegaMoeImpl::INT_CACHELINE);
+    std::vector<int32_t> block_counts(platform_.aic * stride, 0);
+    for (uint32_t block = 0; block < platform_.aic; ++block) {
+        std::copy_n(counts.data_ptr<int32_t>(), counts.numel(), block_counts.data() + block * stride);
+    }
+    const size_t bytes = block_counts.size() * sizeof(int32_t);
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(info.expertRevTokenNumsPtr, bytes, block_counts.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE));
+    // BF16 0xffff为NaN；未被GMM2完整覆盖的输出必须让smoke失败，不能误读旧显存。
+    const size_t output_bytes = rows * static_cast<int64_t>(tiling_.h) * sizeof(uint16_t);
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemset(info.gmm2MmadResPtr, output_bytes, 0xff, output_bytes));
+    replay_counts_ = counts.to(workspace_.device());
+    local_rows_ = rows;
+    compute_replay_ = true;
+}
+
+torch::Tensor Plan::local_compute_output()
+{
+    TORCH_CHECK(local_buffer_.defined() && compute_replay_, "Local compute not prepared");
+    auto result = torch::empty({local_rows_, static_cast<int64_t>(tiling_.h)}, workspace_.options().dtype(torch::kBFloat16));
+    TORCH_CHECK(aclrtSynchronizeDevice() == ACL_SUCCESS, "Local compute output synchronization failed");
+    const MegaMoeImpl::WorkspaceInfo info(static_cast<uint8_t*>(workspace_.data_ptr()), &tiling_);
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(result.data_ptr(), result.nbytes(), info.gmm2MmadResPtr, result.nbytes(), ACL_MEMCPY_DEVICE_TO_DEVICE));
+    return result;
 }
 
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden)

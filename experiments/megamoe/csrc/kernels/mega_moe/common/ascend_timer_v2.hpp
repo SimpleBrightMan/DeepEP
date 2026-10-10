@@ -22,6 +22,7 @@ enum FixedTiming {
     FIXED_TIMING_COUNT
 };
 
+// ISSUE新槽改变raw buffer大小，旧buffer不能被误解为新的异步发射语义。
 enum DynamicTimingType {
     AIV_DISPATCH = 0,
     AIV_SWIGLU_WAIT,
@@ -39,6 +40,13 @@ enum DynamicTimingType {
     AIC_SHARED_GMM2,
     AIV_SHARED_GMM2_PROLOGUE,
     AIV_SHARED_SWIGLU,
+    AIC_GMM2_ISSUE,
+    AIC_GMM1_BEGIN,
+    AIC_GMM1_END,
+    AIC_GMM2_BEGIN,
+    AIC_GMM2_END,
+    AIC_GMM2_FIX_DRAIN,
+    AIC_GMM1_ISSUE,
     DYNAMIC_TYPE_COUNT_ENUM
 };
 

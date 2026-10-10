@@ -68,6 +68,7 @@ public:
         typename std::conditional<Std::IsSame<QuantOutType, fp4x2_e2m1_t>::value, uint8_t, QuantOutType>::type;
     using QuantScaleOutType = typename std::conditional<(QuantMode >= E5M2_QUANT), fp8_e8m0_t, float>::type;
     __aicore__ inline MegaMoe(){};
+    __aicore__ inline void SetComputeReplay(bool enabled) { computeReplay_ = enabled; }
     __aicore__ inline void Init(GM_ADDR context, GM_ADDR x, GM_ADDR topkIds, GM_ADDR topkWeights, GM_ADDR weight1,
                                 GM_ADDR weight2, GM_ADDR xActiveMask, GM_ADDR weightScales1, GM_ADDR weightScales2,
                                 GM_ADDR scales, GM_ADDR sharedWeight1, GM_ADDR sharedWeight2,
@@ -86,6 +87,7 @@ private:
     __aicore__ inline void InitTokenUnpermuteConfig();
 
 protected:
+    bool computeReplay_ = false;
     __aicore__ inline void SendAndQuantBuffInit();
     __aicore__ inline void DispatchBuffInit();
     __aicore__ inline void InitQuantTokenBufferConfig();
@@ -97,7 +99,8 @@ protected:
                                                    uint32_t sliceTokenCount,
                                                    WaveCombineBufferConfig& combineBufferConfig,
                                                    uint32_t& combineRowSequence, int32_t& pairwiseTileSequence,
-                                                   bool isFinalCombine, bool reverseBlocks = false);
+                                                   bool isFinalCombine, bool reverseBlocks = false,
+                                                   void* gmm2WaveContext = nullptr);
     template <bool WaitForTokenCountReady>
     __aicore__ inline void PrepareGmmExpertState(ExpertLoopState& state, uint32_t expertIdx);
     __aicore__ inline void ProcessSharedExpertGmm1(int32_t& gmm1TileReadySequence);
@@ -718,7 +721,7 @@ template <bool SourceGmm1Fused>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert(
     ExpertLoopState& state, GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, uint32_t tokenStartIndexInExpert,
     uint32_t sliceTokenCount, WaveCombineBufferConfig& combineBufferConfig, uint32_t& combineRowSequence,
-    int32_t& pairwiseTileSequence, bool isFinalCombine, bool reverseBlocks)
+    int32_t& pairwiseTileSequence, bool isFinalCombine, bool reverseBlocks, void* gmm2WaveContext)
 {
     constexpr bool tokenCombine = ENABLE_A8W4 && CombineQuantMode == COMBINE_NO_QUANT;
     constexpr bool pairwiseCombine = !tokenCombine && CombineQuantMode == COMBINE_NO_QUANT;
@@ -743,7 +746,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
             gmm2TileSequence = &pairwiseTileSequence;
         }
         timer_.SetSlice(state.expertIdx, tokenStartIndexInExpert, sliceTokenCount);
-        // 非量化路径保留逐 tile FIX 完成边界；其他路径保留原有 slice 完成边界。
+        // TokenCombine逐tile记录ISSUE；独立slice在出口排空，wave上下文由调用者统一收尾。
         if constexpr (g_coreType == AIC && CombineQuantMode != COMBINE_NO_QUANT) {
             timer_.StartSpan(AscendTimer::AIC_GMM2);
         }
@@ -755,7 +758,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
         RunGmm2A8W4<ActivationQuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType, GMM1_TILE_M,
                     TopkWeightsPrefetch, false, false, true, pairwiseCombine, tokenCombine, SourceGmm1Fused>(
             sliceProblemShape, gmmAddrInfo, startBlockIdx, gmmExecutionConfig_.blockJob, expertTokenCount,
-            tokenStartIndexInExpert, &params_, gmm2TileSequence, reverseBlocks);
+            tokenStartIndexInExpert, &params_, gmm2TileSequence, reverseBlocks, gmm2WaveContext);
         if constexpr (g_coreType == AIC && CombineQuantMode != COMBINE_NO_QUANT) {
             timer_.EndSpan(AscendTimer::AIC_GMM2);
         }
@@ -768,16 +771,21 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
         if constexpr (tokenCombine && g_coreType == AIC) {
             // 只在“有 GEMM2 tile”的分支通知：一个实际生产核完成本 slice 的全部
             // tile 后加一。空核不通知；同一核有多个 tile 也只通知一次。
-            // helper 等待 FIX 写出后再发布，避免 AIV1 读取尚未完成的 GEMM2 输出。
-            NotifyTokenCombineSliceReady(params_, state.expertIdx, tokenStartIndexInExpert);
+            // 无wave上下文时，RunGmm2A8W4内的局部对象已析构并完成FIX_S。
+            // wave 上下文仍有在途 FIX；由调用者在 End 后统一发布，不能提前通知消费者。
+            if (gmm2WaveContext == nullptr) {
+                NotifyTokenCombineSliceReady(params_, state.expertIdx, tokenStartIndexInExpert);
+            }
         }
     }
 
     if constexpr (tokenCombine) {
         // 发送行归属与 GEMM2 tile 分核独立：无配对计算 tile 的 AIV1 仍可能有行要发。
         // AIC 通知已在上方完成，这里的通用发送入口对 AIC 直接返回。
-        RunTokenCombineSlice(commonConfig_, waveCombineJob_, params_, state, tokenStartIndexInExpert, sliceTokenCount,
-                             timer_, waveCombineScratch_);
+        if (!computeReplay_) {
+            RunTokenCombineSlice(commonConfig_, waveCombineJob_, params_, state, tokenStartIndexInExpert, sliceTokenCount,
+                                 timer_, waveCombineScratch_);
+        }
         return;
     }
 
@@ -838,7 +846,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::PrepareGmmExpertState(E
                                                                                uint32_t expertIdx)
 {
     if constexpr (WaitForTokenCountReady) {
-        if (GetSubBlockIdx() == 0U && !state.expertCountTableReady) {
+        if (!computeReplay_ && GetSubBlockIdx() == 0U && !state.expertCountTableReady) {
             WaitForMoeExpertTokenCountReady(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr, countWorkspace_, 0U);
             state.expertCountTableReady = true;
         }
@@ -911,6 +919,33 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
     // 保存入口时的溢出模式，计算期间关闭溢出检查。
     int64_t oriOverflowMode = GetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>();
     SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(0);
+
+    if constexpr (ENABLE_A8W4) {
+        if (computeReplay_) {
+            // 只清计算握手 flag；Dispatch 数据、scale、专家计数均保留 priming 的真实值。
+            // 不运行 Quant/Route/跨卡握手；GMM 内部的 CV 和激活依赖仍完整保留。
+            SendAndQuantBuffInit();
+            if constexpr (g_coreType == AIV) {
+                timer_.Start(AscendTimer::AIV_RESET);
+            }
+            ResetSyncStatus<TopkWeightsPrefetch>(aivJob_, params_, resetBatchElementCount_, resetTensor_);
+            if constexpr (g_coreType == AIV) {
+                PipeBarrier<PIPE_ALL>();
+                timer_.End(AscendTimer::AIV_RESET);
+            }
+            SyncAll<false>();
+            int32_t readySequence = 0;
+            derived.ProcessMoeExpertStages(readySequence);
+            // 不做 Combine/Unpermute，仍排空本地计算后才结束 kernel。
+            PipeBarrier<PIPE_ALL>();
+            SyncAll<false>();
+            SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(oriOverflowMode);
+            exceptionDump_.UpdateStage(MegaMoeImpl::Stage::COMPLETE);
+            timer_.End(AscendTimer::KERNEL_TIMING);
+            timer_.FlushDynamicCounts();
+            return;
+        }
+    }
 
     // Decode: dual-AIV Quant/Route/reset; prefill shared: Route follows the public barrier.
     exceptionDump_.UpdateStage(MegaMoeImpl::Stage::INPUT_PREPARE);
