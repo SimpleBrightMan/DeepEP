@@ -772,7 +772,8 @@ template <typename ElementC, bool IsShared, bool IsLayered, bool NotifyCombineTi
 __aicore__ inline void Gmm2ExecA8W4(Scheduler& scheduler, const GMMAddrInfo& gmmAddrInfo, const Config& config,
                                     uint32_t startLoopIdx, uint32_t tileNum, uint32_t expertTokenCount,
                                     uint32_t rowOffsetInExpert, const Params* params = nullptr,
-                                    int32_t* gmTileSequence = nullptr)
+                                    int32_t* gmTileSequence = nullptr,
+                                    CatlassGmm2<Config>* waveKernel = nullptr)
 {
     using KernelConfig = typename Config::KernelConfig;
     using ElementA = typename KernelConfig::ElementAType;
@@ -802,6 +803,14 @@ __aicore__ inline void Gmm2ExecA8W4(Scheduler& scheduler, const GMMAddrInfo& gmm
     WorkSetType workSet{scheduler, gmA, gmB, gmScaleA, gmScaleB, gmBias, gmC};
 
     if constexpr (g_coreType == AscendC::AIC) {
+        if (waveKernel != nullptr) {
+            waveKernel->UpdateProblem(config, gmmAddrInfo);
+            waveKernel->Begin();
+            Gmm2AicMmadA8W4<IsShared, IsLayered, NotifyCombineTileReady, TokenCombine>(
+                *waveKernel, workSet.scheduler, gmmAddrInfo, config, startLoopIdx, tileNum, expertTokenCount,
+                rowOffsetInExpert, gmTileSequence);
+            return;
+        }
         CatlassGmm2<Config> blockMmad(config, gmmAddrInfo);
         Gmm2AicMmadA8W4<IsShared, IsLayered, NotifyCombineTileReady, TokenCombine>(
             blockMmad, workSet.scheduler, gmmAddrInfo, config, startLoopIdx, tileNum, expertTokenCount,
@@ -810,6 +819,12 @@ __aicore__ inline void Gmm2ExecA8W4(Scheduler& scheduler, const GMMAddrInfo& gmm
         if (GetSubBlockIdx() == 0U) {
             AscendTimerSpanScope prologueTimer(IsShared ? gmmAddrInfo.timer : nullptr,
                                                AscendTimer::AIV_SHARED_GMM2_PROLOGUE);
+            if (waveKernel != nullptr) {
+                waveKernel->UpdateProblem(config, gmmAddrInfo);
+                waveKernel->Begin();
+                Gmm2Aiv0PrologueA8W4(*waveKernel, workSet.scheduler, config, startLoopIdx, tileNum);
+                return;
+            }
             CatlassGmm2<Config> blockPrologue(config, gmmAddrInfo);
             Gmm2Aiv0PrologueA8W4(blockPrologue, workSet.scheduler, config, startLoopIdx, tileNum);
         } else if constexpr (NotifyCombineTileReady) {
@@ -890,7 +905,8 @@ __aicore__ inline void RunGmm2A8W4(const AscendC::Shape<int64_t, int64_t, int64_
                                    const GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx,
                                    const BlockJobContext& blockJob, uint32_t expertTokenCount,
                                    uint32_t rowOffsetInExpert, const Params* params = nullptr,
-                                   int32_t* gmTileSequence = nullptr, bool reverseBlocks = false)
+                                   int32_t* gmTileSequence = nullptr, bool reverseBlocks = false,
+                                   void* waveContext = nullptr)
 {
     static_assert(!IsShared || !NotifyCombineTileReady, "Shared expert GMM2 has its own completion counter");
     static_assert(!IsLayered || !NotifyCombineTileReady, "Layered GMM2 selects its synchronization through IsLayered");
@@ -919,7 +935,8 @@ __aicore__ inline void RunGmm2A8W4(const AscendC::Shape<int64_t, int64_t, int64_
     GmmKernel::Gmm2ExecA8W4<ElementC, IsShared, IsLayered, NotifyCombineTileReady, TokenCombine,
                             GmmKernel::BlockScheduler, decltype(config)>(scheduler, gmmAddrInfo, config, startLoopIdx,
                                                                          tileNum, expertTokenCount, rowOffsetInExpert,
-                                                                         params, gmTileSequence);
+                                                                         params, gmTileSequence,
+                                                                         reinterpret_cast<GmmKernel::CatlassGmm2<decltype(config)>*>(waveContext));
 
     startBlockIdx = (startBlockIdx + tileNum) % config.blockNum;
 }

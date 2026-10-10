@@ -99,7 +99,8 @@ protected:
                                                    uint32_t sliceTokenCount,
                                                    WaveCombineBufferConfig& combineBufferConfig,
                                                    uint32_t& combineRowSequence, int32_t& pairwiseTileSequence,
-                                                   bool isFinalCombine, bool reverseBlocks = false);
+                                                   bool isFinalCombine, bool reverseBlocks = false,
+                                                   void* gmm2WaveContext = nullptr);
     template <bool WaitForTokenCountReady>
     __aicore__ inline void PrepareGmmExpertState(ExpertLoopState& state, uint32_t expertIdx);
     __aicore__ inline void ProcessSharedExpertGmm1(int32_t& gmm1TileReadySequence);
@@ -720,7 +721,7 @@ template <bool SourceGmm1Fused>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert(
     ExpertLoopState& state, GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, uint32_t tokenStartIndexInExpert,
     uint32_t sliceTokenCount, WaveCombineBufferConfig& combineBufferConfig, uint32_t& combineRowSequence,
-    int32_t& pairwiseTileSequence, bool isFinalCombine, bool reverseBlocks)
+    int32_t& pairwiseTileSequence, bool isFinalCombine, bool reverseBlocks, void* gmm2WaveContext)
 {
     constexpr bool tokenCombine = ENABLE_A8W4 && CombineQuantMode == COMBINE_NO_QUANT;
     constexpr bool pairwiseCombine = !tokenCombine && CombineQuantMode == COMBINE_NO_QUANT;
@@ -757,7 +758,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
         RunGmm2A8W4<ActivationQuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType, GMM1_TILE_M,
                     TopkWeightsPrefetch, false, false, true, pairwiseCombine, tokenCombine, SourceGmm1Fused>(
             sliceProblemShape, gmmAddrInfo, startBlockIdx, gmmExecutionConfig_.blockJob, expertTokenCount,
-            tokenStartIndexInExpert, &params_, gmm2TileSequence, reverseBlocks);
+            tokenStartIndexInExpert, &params_, gmm2TileSequence, reverseBlocks, gmm2WaveContext);
         if constexpr (g_coreType == AIC && CombineQuantMode != COMBINE_NO_QUANT) {
             timer_.EndSpan(AscendTimer::AIC_GMM2);
         }
@@ -771,7 +772,10 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
             // 只在“有 GEMM2 tile”的分支通知：一个实际生产核完成本 slice 的全部
             // tile 后加一。空核不通知；同一核有多个 tile 也只通知一次。
             // RunGmm2A8W4内CatlassGmm2已析构并完成FIX_S；发布必须保持在该调用之后。
-            NotifyTokenCombineSliceReady(params_, state.expertIdx, tokenStartIndexInExpert);
+            // wave 上下文仍有在途 FIX；由调用者在 End 后统一发布，不能提前通知消费者。
+            if (gmm2WaveContext == nullptr) {
+                NotifyTokenCombineSliceReady(params_, state.expertIdx, tokenStartIndexInExpert);
+            }
         }
     }
 

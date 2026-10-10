@@ -48,6 +48,10 @@ private:
         GmmKernel::Config<true, 0, QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType, false,
                           TopkWeightsPrefetch, false, false, false, true, FuseGateUp>;
     GmmKernel::CatlassGmm1<typename Gmm1Config::ProblemConfig> gmm1CatlassContext_;
+    using Gmm2Config =
+        GmmKernel::Config<true, 0, ActivationQuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType,
+                          QuantScaleOutType, false, TopkWeightsPrefetch, false, false, false, true, FuseGateUp>;
+    GmmKernel::CatlassGmm2<typename Gmm2Config::ProblemConfig> gmm2WaveContext_;
 
     using MegaMoeBase::commonConfig_;
     using MegaMoeBase::countWorkspace_;
@@ -378,6 +382,12 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm2
 {
     uint32_t waveGmm2ExpertEndExclusive =
         waveEndPosition.expertIdx + (waveEndPosition.tokenIndexInExpert == 0U ? 0U : 1U);
+    const uint32_t waveStartBlockIdx = startBlockIdx;
+    void* waveContext = nullptr;
+    if constexpr (CombineQuantMode == COMBINE_NO_QUANT) {
+        // 只跨同类 GMM2 slice 保留 credit/缓冲游标；离开 wave 前必须归还共享硬件资源。
+        waveContext = &gmm2WaveContext_;
+    }
     for (uint32_t expertIdx = waveBeginPosition.expertIdx; expertIdx < waveGmm2ExpertEndExclusive; ++expertIdx) {
         uint32_t sliceTokenStartIndexInExpert =
             expertIdx == waveBeginPosition.expertIdx ? waveBeginPosition.tokenIndexInExpert : 0U;
@@ -396,7 +406,30 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm2
             // W4 的 GMM2/Combine 调度集中在基类，派生模板只负责提供当前专家 slice。
             this->template RunGmm2CombineForExpert<FuseGateUp>(
                 gmm2State, gmm2AddrInfo, startBlockIdx, sliceTokenStartIndexInExpert, sliceTokenCount,
-                combineBufferConfig, combineRowSequence, gmm1TileReadySequence, isFinalCombine, true);
+                combineBufferConfig, combineRowSequence, gmm1TileReadySequence, isFinalCombine, true, waveContext);
+        }
+    }
+    if constexpr (CombineQuantMode == COMBINE_NO_QUANT) {
+        // End 内先等待 FIX，再恢复 MM layout/回收 credit。所有通知必须在该完成边界之后。
+        gmm2WaveContext_.End();
+        if constexpr (g_coreType == AIC) {
+            // 重放轻量分核计算，避免分配随专家数增长的 pending 数组。不重新执行 GEMM。
+            uint32_t notifyStartBlockIdx = waveStartBlockIdx;
+            const auto& job = gmmExecutionConfig_.blockJob;
+            const uint32_t nTiles = Ops::Base::CeilDiv(commonConfig_.tokenHiddenDim, uint32_t(L1_TILE_N));
+            for (uint32_t expert = waveBeginPosition.expertIdx; expert < waveGmm2ExpertEndExclusive; ++expert) {
+                const uint32_t rowBegin = expert == waveBeginPosition.expertIdx
+                    ? waveBeginPosition.tokenIndexInExpert : 0U;
+                const uint32_t rowEnd = expert == waveEndPosition.expertIdx
+                    ? waveEndPosition.tokenIndexInExpert
+                    : GetExpertTokenCountFromWorkspace(params_.workspaceInfo.expertRevTokenNumsPtr,
+                                                       countWorkspace_, commonConfig_.moeExpertPerRank, expert);
+                const uint32_t tiles = GetMGroupCountForRows(rowEnd - rowBegin, GMM1_TILE_M) * nTiles;
+                if (GetGmmFirstOwnedTile(job.jobIndex, job.totalJobs, notifyStartBlockIdx, true) < tiles) {
+                    NotifyTokenCombineSliceReady(params_, expert, rowBegin);
+                }
+                notifyStartBlockIdx = (notifyStartBlockIdx + tiles) % job.totalJobs;
+            }
         }
     }
     if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {

@@ -285,6 +285,13 @@ class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config, true> {
     using Pipeline = detail::A8W4MatmulPipeline<Config, true>;
 
 public:
+    __aicore__ inline CatlassGmm2() = default;
+    using Pipeline::Begin;
+    using Pipeline::End;
+    __aicore__ inline void UpdateProblem(const Config& config, const GMMAddrInfo& addr)
+    {
+        Pipeline::UpdateProblem(config, addr, addr.gmm2OutGlobal);
+    }
     __aicore__ inline CatlassGmm2(const Config& config, const GMMAddrInfo& addr)
         : Pipeline(config, addr, addr.gmm2OutGlobal)
     {
