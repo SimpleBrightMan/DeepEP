@@ -745,7 +745,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
             gmm2TileSequence = &pairwiseTileSequence;
         }
         timer_.SetSlice(state.expertIdx, tokenStartIndexInExpert, sliceTokenCount);
-        // 非量化路径保留逐 tile FIX 完成边界；其他路径保留原有 slice 完成边界。
+        // TokenCombine逐tile记录ISSUE；slice出口仍保留FIX完成和发布边界。
         if constexpr (g_coreType == AIC && CombineQuantMode != COMBINE_NO_QUANT) {
             timer_.StartSpan(AscendTimer::AIC_GMM2);
         }

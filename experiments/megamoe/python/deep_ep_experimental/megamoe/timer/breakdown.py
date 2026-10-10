@@ -52,6 +52,8 @@ def rank_breakdown(events, rank, *, compute_replay=False):
     families = defaultdict(list)
     for event in active:
         families[event_family(event["name"])].append(event)
+    result["gmm2_semantics"] = "issue_not_completion" if families["AIC_GMM2_ISSUE"] else "native_completion"
+    families["AIC_GMM2"] += families["AIC_GMM2_ISSUE"]
     required = ("AIV_DISPATCH", "AIC_GMM1", "AIC_GMM2", "AIV_UNPERMUTE")
     if compute_replay:
         result["measurement"] = "compute_replay"
@@ -116,6 +118,7 @@ def write_breakdown(records, output_dir, case_label):
         "head=[0,dispatch); launch=[dispatch,first_gmm); GMM=[first_gmm,last_gmm); tail=[last_gmm,end)",
         "GMM1/GMM2 spans use final_aic_group only; uncovered includes its start skew and unrecorded gaps",
         "spans may contain internal waits; uncovered is NOT proven hardware idle",
+        "AIC_GMM2_ISSUE ends after issuing FIX, not after FIX completes; see per-rank gmm2_semantics",
     )
     rows = (
         "setup_us",

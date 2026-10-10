@@ -660,7 +660,8 @@ __aicore__ inline void Gmm2AicMmadA8W4(BlockMmad& blockMmad, Scheduler& schedule
         uint32_t nLoc = Get<N_VALUE>(blockCoord);
         AscendTimerTileScope tileTimer(
             (IsShared || NotifyCombineTileReady || TokenCombine) ? gmmAddrInfo.timer : nullptr,
-            IsShared ? AscendTimer::AIC_SHARED_GMM2 : AscendTimer::AIC_GMM2, mLoc, nLoc, Get<M_VALUE>(actualShape),
+            IsShared ? AscendTimer::AIC_SHARED_GMM2 :
+                (TokenCombine ? AscendTimer::AIC_GMM2_ISSUE : AscendTimer::AIC_GMM2), mLoc, nLoc, Get<M_VALUE>(actualShape),
             config.tileN);
 
         if constexpr (Config::IS_WAVE_FLAG_GRAINED) {
@@ -674,9 +675,9 @@ __aicore__ inline void Gmm2AicMmadA8W4(BlockMmad& blockMmad, Scheduler& schedule
         }
 
         blockMmad.Compute(mLoc, nLoc, Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape));
-        if constexpr ((NotifyCombineTileReady || TokenCombine) && !IsShared) {
-            // 保留 tile 基线的 FIX 完成边界；token 路径改在 slice 结束后发布行前缀，
-            // 不再推进 GMM1/SwiGLU 复用的配对序号。
+        if constexpr (NotifyCombineTileReady && !IsShared) {
+            // 只有逐tile消费者需要此处确认FIX完成。TokenCombine在slice出口排空并发布，
+            // MMAD/后继tile仍由unit flag保护L0C复用，不能把每tile的Scalar排空当成依赖。
             AscendC::SetFlag<AscendC::HardEvent::FIX_S>(0);
             AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(0);
             if constexpr (NotifyCombineTileReady) {

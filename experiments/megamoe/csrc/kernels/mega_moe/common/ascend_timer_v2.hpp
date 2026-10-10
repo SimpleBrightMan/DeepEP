@@ -39,6 +39,8 @@ enum DynamicTimingType {
     AIC_SHARED_GMM2,
     AIV_SHARED_GMM2_PROLOGUE,
     AIV_SHARED_SWIGLU,
+    // 新槽改变raw buffer大小，旧buffer不能被误解为新的异步发射语义。
+    AIC_GMM2_ISSUE,
     DYNAMIC_TYPE_COUNT_ENUM
 };
 
