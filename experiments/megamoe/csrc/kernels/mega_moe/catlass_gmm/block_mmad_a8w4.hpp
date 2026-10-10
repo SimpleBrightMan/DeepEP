@@ -311,7 +311,7 @@ public:
               class TensorBias = EmptyClass>
     CATLASS_DEVICE void operator()(TensorA& tensorA, TensorC& tensorC, GemmCoord const& actualShape,
                                    TensorMxScaleA const& tensorMxScaleA = {}, TensorMxScaleB const& tensorMxScaleB = {},
-                                   bool allowDynamicB = false, TensorBias const& tensorBias = {})
+                                   bool allowDynamicB = false, bool prefetchA = false, TensorBias const& tensorBias = {})
     {
         // Check L1TileShape
         if constexpr (HAS_BIAS) {
@@ -355,7 +355,7 @@ public:
             AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[l0CListId]);
         }
 
-        const auto kPlan = MegaMoeImpl::GmmKernel::MakeA8W4KPlan(mBlockActual, nBlockActual, allowDynamicB);
+        const auto kPlan = MegaMoeImpl::GmmKernel::MakeA8W4KPlan(mBlockActual, nBlockActual, allowDynamicB, prefetchA);
         const uint32_t ka = kPlan.ka;
         const uint32_t kb = kPlan.kb;
         const uint32_t kL1Loop = CeilDiv(kBlockActual, kb);
@@ -411,9 +411,11 @@ public:
             } else {
                 AscendC::CrossCoreWaitFlag<AIC_SYNC_AIV_MODE, PIPE_MTE1>(AIV_SYNC_AIC_FLAG + l1BListId);
             }
-            // One fence covers scale and A transfers at each K-window boundary.
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(0);
+            // 同一A窗口的后半段已经依赖过就绪事件；没有新搬运就无需重复fence。
+            if (kOffset == aStart || kOffset == scaleStart) {
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(0);
+            }
             auto tensorL1MxScaleA =
                 tla::MakeTensor(l1MxScaleATensorList[l1MxScaleAListId], scaleLayoutA, Arch::PositionL1{});
             auto tensorL1MxScaleB =

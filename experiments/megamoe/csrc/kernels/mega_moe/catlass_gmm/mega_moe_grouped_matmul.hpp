@@ -180,7 +180,7 @@ public:
 
 protected:
     __aicore__ inline void ComputeProjection(uint32_t m, uint32_t weightN, uint32_t rows, uint32_t cols,
-                                             uint32_t outputN)
+                                             uint32_t outputN, bool prefetchA = false)
     {
         auto a = Tensor<A>(addr_.aGlobal, tla::MakeLayout<A, LayoutA>(config_.m, config_.k));
         auto sa =
@@ -192,7 +192,7 @@ protected:
         auto tileSA = tla::GetTile(sa, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.scaleK));
         auto tileSB = tla::GetTile(sb, tla::MakeCoord(0, weightN), tla::MakeShape(config_.scaleK, cols));
         auto tileC = tla::GetTile(c, tla::MakeCoord(m, outputN), tla::MakeShape(rows, cols));
-        block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U);
+        block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U, prefetchA);
     }
 
     __aicore__ inline void DequantizeWeight(uint32_t weightN, uint32_t rows, uint32_t cols)
@@ -266,7 +266,7 @@ public:
 
     __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols)
     {
-        Pipeline::ComputeProjection(m, n, rows, cols, n);
+        Pipeline::ComputeProjection(m, n, rows, cols, n, true);
     }
     __aicore__ inline void Dequantize(uint32_t n, uint32_t rows, uint32_t cols)
     {
