@@ -15,29 +15,31 @@
 本地输入诊断入口保持独立，不把“跳过通信”作为main的默认性能路径。
 main的计算源码与已上机验证的 `00afaca` 完全相同；完整通信benchmark相对旧main只增加口径元数据，
 没有隐式priming或开启compute replay。Linux测试记录在 `/home/zyx/megamoe-main-validation-pytest.log`。
-本次仅运行CPU测试和只读计划检查，没有重跑NPU、重新安装wheel或改变现有实验环境。
-完整EP8通信正确性/性能仍由下面的五BS验收确认，不能将CPU通过或纯计算输出一致当作已完成这项验收。
+合入前先完成CPU测试和只读计划检查，随后按用户要求实际运行完整EP8验收。
+2026-10-10两版五BS全量精度、三组交替性能均完成，见 [EP8_MAIN_VALIDATION.md](EP8_MAIN_VALIDATION.md)。
 
 ## 第一优先级：旧main与新main完整EP8比较
 
-- [ ] 独占8张NPU后，先检查完整通信正确性，再比较性能。
-- [ ] BS依次为 **32、96、256、1024、4096**；DeepSeek V4 Pro、FP8/FP4、balanced、无共享专家。
-- [ ] 旧main与新main使用相同CANN、框架、输入seed、路由、warmup、iters与profiler配置。
-- [ ] 两边均保存timer；保持现有“性能采样timer-off、另外采一批timer”的同口径默认行为。
-- [ ] 记录每rank结果和rank-max-mean，同时保留现有rank-min-mean；不可交叉比较二者。
-- [ ] 每版至少3组，建议A/B/A；每次切分支重建/安装对应wheel，禁止误用另一版本的`--skip-build`。
-- [ ] 核对Dispatch→GMM1→SwiGLU→GMM2→Combine→Unpermute全部执行，日志不得出现COMPUTE-REPLAY。
+- [x] 每轮开始确认8张NPU无其他进程，先检查完整通信正确性，再比较性能。
+- [x] BS依次为 **32、96、256、1024、4096**；DeepSeek V4 Pro、FP8/FP4、balanced、无共享专家。
+- [x] 旧main与新main使用相同CANN、框架、输入seed、路由、warmup、iters与profiler配置。
+- [x] 两边均保存timer；保持现有“性能采样timer-off、另外采一批timer”的同口径默认行为。
+- [x] 记录每rank结果和rank-max-mean，同时保留现有rank-min-mean；不可交叉比较二者。
+- [x] 完成A/B/A/B/A/B三组成对运行；两版分别构建，每次显式安装正确wheel并校验身份。
+- [x] 使用完整Dispatch→GMM1→SwiGLU→GMM2→Combine→Unpermute，不启用COMPUTE-REPLAY。
 - [ ] 尤其检查wave尾统一发布是否推迟Combine，避免计算提速被通信尾部抵消。
+
+以下为现有E2E日志口径rank-min-mean的三组平均；rank-max及每组明细见验收报告。
 
 | BS | 旧main μs | 新main μs | 减少μs / % | 精度 | timer目录 |
 | --- | --- | --- | --- | --- | --- |
-| 32 | 待测 | 待测 | 待测 | 待验收 | 待记录 |
-| 96 | 待测 | 待测 | 待测 | 待验收 | 待记录 |
-| 256 | 待测 | 待测 | 待测 | 待验收 | 待记录 |
-| 1024 | 待测 | 待测 | 待测 | 待验收 | 待记录 |
-| 4096 | 待测 | 待测 | 待测 | 待验收 | 待记录 |
+| 32 | 877.645 | 842.393 | 35.252 / 4.017% | 两版全量PASS | 见验收报告 |
+| 96 | 912.328 | 875.788 | 36.540 / 4.005% | 两版全量PASS | 见验收报告 |
+| 256 | 967.723 | 929.505 | 38.219 / 3.949% | 两版全量PASS | 见验收报告 |
+| 1024 | 1286.250 | 1255.669 | 30.581 / 2.378% | 两版全量PASS | 见验收报告 |
+| 4096 | 4455.515 | 4254.149 | 201.365 / 4.519% | 两版全量PASS | 见验收报告 |
 
-用户进行这轮设备测试；本次不为补历史profiler指标重跑程序。
+本轮已由代理在CPU7运行；没有为补历史纯计算profiler缺失指标而重跑历史实验。
 
 ## 第二优先级：解释已有纯计算profiler
 
@@ -78,7 +80,7 @@ python experiments/megamoe/scripts/compare_e2e.py /实际旧版输出目录 /实
 它不能证明设备独占，不能用一组输出冒充多组重复测试。
 
 timer目录为 `<输出目录>/bs_<B>/bs_<B>/timer/`，各rank JSON和CSV保留原时间轴。
-本次没有替用户重跑这五个BS；上表保持待测，不填入纯计算数据。
+上表来自本轮实际完整EP8运行，不是纯计算数据；详细源码/wheel身份与原始结果路径见验收报告。
 
 ## 后续候选：先证据、后单变量实验
 
