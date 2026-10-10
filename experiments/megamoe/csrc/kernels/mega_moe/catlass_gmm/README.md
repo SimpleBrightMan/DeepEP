@@ -15,11 +15,12 @@ GMM 使用 CATLASS 的 `PackedMxA8W4TileCopyTla`、MX MMAD 和 NZ 权重反量�
 - `resource.hpp`：本地存储的非拥有视图；不创建 TPipe，不重置 Wave 中其他阶段的事件。
 
 AIC 以 mode 4 的 flag 8/9 发布 L1 B 空闲，AIV0 以 flag 6/7 发布权重就绪。
-AIC 不发送或等待 AIV1 的 `+16` 标志。AIV0 在 slice 结束时排空两个空闲标志，AIC/Vector block 在 `End()` 中回收内部事件。
+上述权重通道不使用 AIV1 的 `+16` 标志；异步 GMM1 完成通道另用 AIV1 flag 12/13（full）、14/15（empty）。
+AIV0 在生命周期结束时排空两个空闲标志，AIC/Vector block 在 `End()` 中回收内部事件。
 路由 GMM1 的 `gmm1CatlassContext_` 由 `MegaMoeA8W4Wave` 持有，跨专家切片和 Wave 复用同一个
 `CatlassGmm1` 及其 `BlockMmad`/Prologue 成员。固定缓冲区视图和 event ID 只在构造时设置一次；
 专家切换通过 `UpdateProblem()` 更新 M/N/K、scaleK、GM 地址和权重布局。
-`Begin()`/`End()` 管理每个 slice 的事件启动/排空、MM layout 切换和 ping-pong 起点，
+`Begin()`/`End()` 管理事件启动/排空、MM layout 切换和 ping-pong 起点，
 因此 GMM2 可以继续使用同一组 L1/L0/UB 和 event ID；对象存活不等于持续占用硬件事件。
 AIV1 的 context 保持休眠，不建立 prologue 缓冲区视图、不操作 CATLASS 同步标志，继续执行 Dispatch、SwiGLU 和 Combine。
 本实验分支中，非量化 routed GMM2 在同一个 wave 内使用持久 `gmm2WaveContext_`，只更新地址/形状，
@@ -35,7 +36,11 @@ VF 和 UB→L1 DMA 使用相同的交错步长，DMA 将当前 stage 的向量�
 AIV0 在第一半块反量化前等待对应 L1 B 槽位空闲。
 AIC 先发起 scale 再发起 A 搬运，每个 K 窗口使用一个 MTE2→MTE1 完成事件；L0A/B 同步轮转并共用一个 M→MTE1 空闲事件。
 scale L1 视图按实际窗口的成对 scale 数量创建，保持完整 K4096 窗口及尾窗口的紧凑布局。
-GMM1 发布 tile 完成标志前已有 FIX_S 等待，End(true) 跳过 slice 末尾重复的 FIX_S。
+非量化、非 TopkWeightsPrefetch 的 routed GMM1 在 wave 内保持 AIC/AIV0 状态：
+GM 序号仅发布“已提交”，AIV1 在 MTE2 上等待该 tile 的真实 FIX full，再读取 GM、执行 SwiGLU。
+SwiGLU 结束后通过 MTE3 归还 empty；两槽 credit 防止完成事件被重复发布，GM 输出仍按 tile 独立寻址。
+AIC 不再逐 tile 等 FIX_S；wave End 仍完成 FIX 排空后才切换 GMM2 资源，整个 routed 阶段结束时回收最终 credit。
+其他 GMM1 路径保留原来的逐 tile FIX_S 完成发布及 End(true)。
 CATLASS 行主序写回时执行 MM layout 状态切换、跨核 token 排空及尾 K 补零。
 
 A 与 scale 的事件独立保护各自窗口，B 由跨核标志保护。64 对齐的 B 块在 MTE1 等待就绪；不足 64 对齐的尾块在 MTE2 等待并补零，再通知 MTE1。

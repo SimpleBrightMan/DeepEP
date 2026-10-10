@@ -929,7 +929,8 @@ __aicore__ inline void RunGmm1Generic(
         expertIdx, pingpongIdx, blockMmadContext, allowWeightL2Bypass);
 }
 
-// 调度器已确认 ready，只执行一个 SwiGLU tile；函数不依赖物理 AIV 子核编号。
+// 调度器已确认可消费：同步模式检查ready，异步模式检查issued并在MTE2排入FIX full等待。
+// 这里只执行一个SwiGLU tile；函数不依赖物理AIV子核编号，不自行建立完成事件通道。
 // 路由及非量化共享激活由 AIV1 优先级调度；量化共享尾部由 AIV0 调用。
 // 共享 activationToGmm2Flag=nullptr，使用独立的共享激活完成标记。
 template <typename ElementA, typename ElementB, typename ElementC, typename ElementMxScaleA, typename ElementMxScaleB,

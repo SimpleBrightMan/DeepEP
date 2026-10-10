@@ -313,3 +313,91 @@ BS8、BS96、BS4104分别先运行新库，再回装基线用 `--reference-dir` 
 异步发布slice，而非继续扩大wave。计算侧下一重点是GMM1逐逻辑tile的FIX_S→GM ready发布，
 与DS的FIX→AIV1原生完成事件、L0C→UB消费路径对比。应成对修改生产者/消费者，
 不能直接删除GMM1的FIX_S，否则SwiGLU可能读取未完成的数据。
+
+## GMM1 异步完成通知：codex/megamoe-gmm1-async-completion
+
+基于 `9eda05f`（上述 GMM2 wave 版），设备实现 `f0eb5c6`。
+本实验保持 GM 输出布局和 SwiGLU 数学实现，不同时迁移 DS 的 L0C→UB 输出路径。
+仅非量化、非 TopkWeightsPrefetch 的 routed A8W4 Wave 启用；共享 GMM1 和其他路径保持原协议。
+
+### 生产、消费及资源回收
+
+阅读顺序：`common/gmm1_async_completion.hpp` →
+`stage/mega_moe_gmm1_activation.hpp::Gmm1AicMmadA8W4` →
+`mega_moe_wave_a8w4.hpp::TryRunReadyActivation` / `ProcessMoeExpertStages`。
+这些路径均相对 `csrc/kernels/mega_moe/`。
+
+1. AIV1 初始化两个 empty credit。AIC 在 FIX 队列上等待对应 empty，然后提交 gate/up 的计算和写出。
+2. AIC 把 full 通知排在两个投影的 FIX 输出之后，同时通过原 GM 序号发布 **issued**，不再逐 tile 等 FIX_S。
+   issued 只保证已提交；不能据此直接读输出。
+3. AIV1 先探测 issued，成功后在 **MTE2** 队列等待该槽的 full，随后排入 GM→UB 读取和 SwiGLU。
+   FIX 真正完成输出后 full 才释放，消费者不会读取未完成数据。
+4. SwiGLU 沿用原读入、计算、量化、写出依赖，完成后通过 MTE3 归还 empty。
+   两槽 credit 保护的是完成事件复用；输出 GM 仍按专家/tile 独立寻址，不是新加两槽 GM 环形缓存。
+5. AIC/AIV0 在同一 GMM1 wave 内延续缓冲游标及 credit，不逐专家 slice 重启。
+   wave End 仍排空 FIX，再恢复 MM layout，才让 GMM2 复用 L1/L0 等资源；不跨阶段冒险保留状态。
+6. routed 阶段最后消费两槽最终 empty，包括未使用槽，避免事件遗留到下一次 kernel 调用。
+
+完成 full 使用 AIV1 flag 12/13，empty 使用 14/15；生产者通知/等待用 AIV1 selector `16|flag`，
+消费者等待使用本地低4位，与 AIV0 权重 flag 6/7、8/9 分离。
+保留原 L0C unit flag；empty 不替代 MMAD/FIX 的内部资源依赖。
+由于 AIV1 还负责 Dispatch，必须先确认 issued 再排入消费等待，不能预先等尚未提交任务的 FIX。
+
+### 同卡 A/B/A 性能
+
+2026-10-10，环境、输入、seed、测量选样与上一节相同，device 1、EP8 形状、BS4096。
+计时为零通信本地计算 kernel Duration，20 次预热，三轮各 50 次取后 25 次；timer 关闭。
+
+| 版本 | 三轮均值（μs） | 平均（μs） |
+| --- | --- | ---: |
+| A：已有 GMM2 wave 版 | 4027.154、4026.821、4027.035 | 4027.004 |
+| B：增加 GMM1 异步完成 + wave 复用 | 3923.770、3923.602、3923.318 | 3923.563 |
+| A：回装同一旧 wheel | 4026.794、4026.964、4027.234 | 4026.997 |
+
+两次 A 共六轮平均 4027.000μs，B 减少 **103.437μs / 2.569%**。
+这是通知协议和必要的 wave 生命周期延长的组合收益，未独立归因到某一条指令。
+相对上一节同卡原始未优化库 4195.969μs，总减少约 **272.405μs / 6.492%**；
+原始值是较早的同卡补测，不是本轮重新回装原始库的 A/B/A。
+
+timer-on 每次预热/测量调用均打点，三轮 3933.178、3933.585、3933.434μs，平均 3933.399μs；
+相对 B 增加 **9.836μs / 0.251%**，满足本 case 约1%的目标。
+性能 off 与单独 trace 分开。新事件追加为 `AIC_GMM1_ISSUE`，没有把旧完成区间悄悄改义。
+GMM1 ISSUE 结束不是 FIX 完成；SwiGLU 区间可能包含 MTE2 上的 FIX 依赖，不能解读为纯向量忙碌时间。
+没有为了时间戳增加 Scalar 完成等待。
+
+group 0 诊断中 GMM1 Begin/End 从36次降到16次；新 GMM1 ISSUE 累计2481.630μs，
+wave End 累计77.739μs，GMM2 ISSUE累计1210.599μs。
+旧 GMM1 是完成区间、新的是发射区间，不直接相减为加速量；上述数据也不跨核累加为E2E。
+
+### 回归、版本和复现
+
+BS8、96、4096、4104（513行/专家，尾块）均完整 GMM2 输出 hash 与原基线一致，
+每 case 三次调用，并检查单独 timer pass 输出不变。属于输出等价回归，不是独立数学 Golden。
+BS4096 输出仍为 `fc7018250c83458e8bb0ee60ea213fcee7a7d13561efc7ba8b8dbf9ade034444`。
+新设备库 SHA256：`30a117c2fc9728d070b64c69b04b54ff98ea944c126f41b0bfae34d39ad5e73f`，
+wheel：`dist/build-k9sovwtj/ascend_deepep-0.1.0.dev5-cp312-cp312-linux_aarch64.whl`。
+A 的 wheel、SHA 与上一节 GMM2 wave 版相同。
+
+服务器证据：`/home/zyx/gmm1-async-baseline/`、`gmm1-async-baseline-after/`、
+`gmm1-async-v1/`、`gmm1-async-v1-on/`、`gmm1-async-v1-bs{8,96,4104}/`。
+新 trace JSON 同时兼容 group/core/sub_id 分组；重新构建后再解析新23类动态事件协议。
+device 1–7 各三次 BS4096 调用，完整输出均与此前各卡原基线一致，记录在
+`/home/zyx/gmm1-async-v1-seven-devices/`；七卡独立本地计算，不是 EP7/EP8 通信测试。
+zyx 最终恢复并保留新库 `build-k9sovwtj`，未改变 hkq，也未停止或重置他人任务。
+CPU 定向测试89项通过，包含实际完成通道头文件的编译/执行，覆盖0/1/2/3/36/113任务的
+credit复用及尾部全回收；该模型不替代NPU的真实内存可见性和时序验证。timer C++/Python协议一致性通过。
+
+```bash
+# 已激活 zyx、source CANN，位于本分支仓库根目录
+bash experiments/megamoe/scripts/build.sh
+export LD_LIBRARY_PATH="$PWD/third-party/shmem/install/shmem/lib:${LD_LIBRARY_PATH:-}"
+python experiments/megamoe/scripts/local_compute.py --devices 1 --bs 4096 --profile --trace
+# 单独测量 timer 开销
+python experiments/megamoe/scripts/local_compute.py --devices 1 --bs 4096 --profile --profile-timer
+```
+
+0号卡有他人进程，未用于测试；device 1 采样前后没有其他进程，但没有资源预约锁。
+目前未验收完整 EP8 通信、共享/量化路径、不均衡或空专家路由的设备行为，不作为生产合并结论。
+不能将本地计算3924μs与 DS 的完整通信4007–4032μs直接比较、宣称追平。
+下一步优先在独占机器上对照完整通信正确性和 E2E，尤其检查 AIV1 Dispatch/SwiGLU/Combine 的互相影响；
+随后再单独研究 L0C→UB 输出，不能把本轮收益解释成已消除 GM 中转成本。
