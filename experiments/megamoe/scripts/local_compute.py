@@ -144,7 +144,8 @@ def worker(args):
         if not torch.equal(plan.local_compute_output().float().cpu(), previous):
             raise RuntimeError("Timer pass changed the output")
         trace = dict(traceEvents=trace_events(events, "keep", first_start_cycle(events), time_origin="rank"),
-                     displayTimeUnit="us", scope="local_compute", gmm2_semantics=trace_report["gmm2_semantics"])
+                     displayTimeUnit="us", scope="local_compute", gmm1_semantics=trace_report["gmm1_semantics"],
+                     gmm2_semantics=trace_report["gmm2_semantics"])
         (args.output / f"device_{args.worker}_timer.json").write_text(json.dumps(trace, separators=(",", ":")))
         print(f"[TRACE] device={args.worker} events={len(events)} {trace_report['gmm2_semantics']}", flush=True)
     report = dict(passed=True, device=args.worker, ep_shape=8, bs=args.bs, local_experts=e,

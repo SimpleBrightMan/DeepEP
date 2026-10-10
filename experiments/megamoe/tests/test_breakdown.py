@@ -51,6 +51,16 @@ def test_issue_interval_is_not_reported_as_completion():
     assert result["gmm2_spans_us"] == 30
 
 
+def test_both_gmms_can_have_independent_issue_semantics():
+    events = [event("AIC_GMM1_ISSUE_0", 5, 45), event("AIC_GMM1_END_0", 45, 49),
+              event("AIC_GMM2_ISSUE_0", 50, 80)]
+    result = rank_breakdown(events, 0, compute_replay=True)
+    assert result["status"] == "ok"
+    assert result["gmm1_semantics"] == result["gmm2_semantics"] == "issue_not_completion"
+    assert result["gmm1_spans_us"] == 40
+    assert result["gmm_uncovered_us"] == 5  # End不能并入ISSUE伪装为MMAD时间。
+
+
 @pytest.mark.parametrize("name", ["AIV_DISPATCH_0", "AIV_COMBINE_0", "AIV_UNPERMUTE", "AIV_INPUT_CROSS_RANK_SYNC", "AIV_FINAL_CROSS_RANK_WAIT"])
 def test_compute_replay_rejects_communication_trace(name):
     with pytest.raises(ValueError, match="communication event"):
