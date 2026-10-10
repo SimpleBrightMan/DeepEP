@@ -2,9 +2,11 @@
 import argparse
 from datetime import datetime
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
+import statistics
 import sys
 import time
 
@@ -49,10 +51,13 @@ def worker(args):
     print(f"[READY] device={args.worker} workspace_bytes={plan.workspace_bytes}; no communication", flush=True)
     results = []
     previous = None
-    for iteration in range(args.iters):
-        begin = time.perf_counter()
+    def call():
         plan.forward(example, None, ids, probabilities, w1[0], w2[0], w1[1], w2[1],
                      None, None, None, None, None, None)
+
+    for iteration in range(args.iters):
+        begin = time.perf_counter()
+        call()
         torch.npu.synchronize()
         elapsed = time.perf_counter() - begin
         actual = plan.local_compute_output().float().cpu()
@@ -63,6 +68,41 @@ def worker(args):
         previous = actual
         results.append(dict(iteration=iteration, host_wall_seconds=elapsed))
         print(f"[SMOKE] device={args.worker} iteration={iteration} finite/nonzero/repeatable", flush=True)
+    output_hash = hashlib.sha256(memoryview(previous.numpy())).hexdigest()
+    measurements = []
+    if args.profile:
+        from deep_ep_experimental.megamoe.performance import read_kernel_samples
+        for _ in range(args.warmup):
+            call()
+        torch.npu.synchronize()
+        # 仅在批次前排入小型计算，避免host来不及提交；不计入MegaMoE kernel Duration。
+        prefix = torch.zeros(16 * 1024 * 1024, device="npu", dtype=torch.float32)
+        profiler = torch_npu.profiler
+        for repeat in range(args.profile_rounds):
+            directory = args.output / f"profile_device_{args.worker}_round_{repeat}"
+            with profiler.profile(
+                activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
+                on_trace_ready=profiler.tensorboard_trace_handler(str(directory)),
+                record_shapes=False, profile_memory=False, with_stack=False,
+                experimental_config=profiler._ExperimentalConfig(
+                    profiler_level=profiler.ProfilerLevel.Level0,
+                    export_type=profiler.ExportType.Text,
+                    data_simplification=False)):
+                for _ in range(8):
+                    torch.exp(prefix, out=prefix)
+                for _ in range(args.profile_iters):
+                    call()
+                torch.npu.synchronize()
+            samples = read_kernel_samples(directory, args.profile_iters)
+            durations = [sample["duration_us"] for sample in samples]
+            measured = durations[len(durations) // 2:]
+            measurements.append(dict(round=repeat, samples=samples,
+                mean_us=statistics.mean(measured), median_us=statistics.median(measured),
+                min_us=min(measured), max_us=max(measured), selection="tail_half_ceil"))
+            print(f"[KERNEL] device={args.worker} round={repeat} mean={measurements[-1]['mean_us']:.3f}us timer=off", flush=True)
+        actual = plan.local_compute_output().float().cpu()
+        if not torch.equal(actual, previous):
+            raise RuntimeError(f"Output changed after profiled repetitions device={args.worker}")
     report = dict(passed=True, device=args.worker, ep_shape=8, bs=args.bs, local_experts=e,
                   tokens_per_expert=rows//e, workspace_bytes=plan.workspace_bytes,
                   communication_initialized=False, input="synthetic locally pre-dispatched FP8",
@@ -71,7 +111,10 @@ def worker(args):
                   torch=torch.__version__, torch_npu=torch_npu.__version__, device_name=soc,
                   source_commit=subprocess.check_output(["git", "rev-parse", "HEAD"],
                       cwd=Path(__file__).resolve().parents[3], text=True).strip(),
-                  seed=20261010 + args.worker, timer=False, iterations=results)
+                  seed=20261010 + args.worker, timer=False, iterations=results,
+                  output_sha256=output_hash, metric="megamoe_compute_replay_kernel_duration_us",
+                  kernel_measurements=measurements, warmup=args.warmup,
+                  profile_iters=args.profile_iters, profile_rounds=args.profile_rounds)
     (args.output / f"device_{args.worker}.json").write_text(json.dumps(report, indent=2))
 
 
@@ -81,6 +124,10 @@ def main():
     p.add_argument("--devices", type=int, nargs="+", default=list(range(8)))
     p.add_argument("--iters", type=int, default=3)
     p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--profile", action="store_true", help="Collect timer-off device kernel Duration; requires exclusive devices for performance claims")
+    p.add_argument("--warmup", type=int, default=20)
+    p.add_argument("--profile-iters", type=int, default=50)
+    p.add_argument("--profile-rounds", type=int, default=3)
     p.add_argument("--output", type=Path)
     p.add_argument("--worker", type=int, help=argparse.SUPPRESS)
     args = p.parse_args()
@@ -88,6 +135,8 @@ def main():
         p.error("BS must be in [8,65536] and divisible by 8; iters>=2 and timeout>0")
     if len(set(args.devices)) != len(args.devices) or any(d not in range(8) for d in args.devices):
         p.error("devices must be distinct IDs in [0,7]")
+    if args.warmup < 1 or args.profile_iters < 2 or args.profile_rounds < 1:
+        p.error("warmup>=1, profile-iters>=2, profile-rounds>=1 required")
     if args.worker is not None:
         worker(args)
         return
@@ -101,6 +150,9 @@ def main():
             streams.append(stream)
             cmd = [sys.executable, str(Path(__file__).resolve()), "--bs", str(args.bs),
                    "--iters", str(args.iters), "--output", str(args.output), "--worker", str(device)]
+            if args.profile:
+                cmd += ["--profile", "--warmup", str(args.warmup), "--profile-iters", str(args.profile_iters),
+                        "--profile-rounds", str(args.profile_rounds)]
             procs.append(subprocess.Popen(cmd, stdout=stream, stderr=subprocess.STDOUT,
                 env=dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")))
         deadline = time.monotonic() + args.timeout
