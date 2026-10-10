@@ -1,4 +1,4 @@
-"""Zero-communication functional smoke test of the original MegaMoE compute pipeline."""
+"""Zero-communication MegaMoE validation, optional kernel profiling and separate tracing."""
 import argparse
 from datetime import datetime
 import json

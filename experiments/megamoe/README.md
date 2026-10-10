@@ -7,9 +7,10 @@ Modified by Joyce_An 2026
 
 ## 本分支：零通信本地计算
 
-`codex/megamoe-local-compute` 新增本地预置输入入口，基于 `codex/megamoe-compute-replay`。
-不建立SHMEM/HCCL、不执行通信预热；保留GMM1 → SwiGLU → GMM2原设备流水。
+`codex/megamoe-compute-opt` 基于 `codex/megamoe-local-compute`，优化 GMM2 完成边界。
+不建立SHMEM/HCCL、不执行通信预热；保留 GMM1 → SwiGLU → GMM2 调度和数学运算。
 构建后运行 `python experiments/megamoe/scripts/local_compute.py --bs 4096`，默认八卡独立功能验证。
+加 `--profile` 采集 timer-off kernel Duration；加 `--trace` 在性能采样结束后单独保存流水图。
 环境、限制和验证记录见 [LOCAL_COMPUTE.md](LOCAL_COMPUTE.md)。
 下面保留的 `batch_launch.py` 仍是原通信预热版，**不是**新的零通信入口。
 
