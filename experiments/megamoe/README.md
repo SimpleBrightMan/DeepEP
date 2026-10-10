@@ -7,7 +7,8 @@ Modified by Joyce_An 2026
 
 ## 本分支：零通信本地计算
 
-`codex/megamoe-compute-opt` 基于 `codex/megamoe-local-compute`，优化 GMM2 完成边界。
+`codex/megamoe-lifecycle-study` 基于 `codex/megamoe-compute-opt`，诊断 GMM1/GMM2 的批内与批间推进。
+本轮不改变计算和同步协议；新增的 Begin/End/FIX_DRAIN 是原生边界的无同步观测，非性能优化开关。
 不建立SHMEM/HCCL、不执行通信预热；保留 GMM1 → SwiGLU → GMM2 调度和数学运算。
 构建后运行 `python experiments/megamoe/scripts/local_compute.py --bs 4096`，默认八卡独立功能验证。
 加 `--profile` 采集 timer-off kernel Duration；加 `--trace` 在性能采样结束后单独保存流水图。

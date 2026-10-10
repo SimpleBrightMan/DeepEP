@@ -1,6 +1,6 @@
 # 零通信本地计算验证
 
-本分支 `codex/megamoe-compute-opt` 基于 `codex/megamoe-local-compute`，
+计算优化基线 `codex/megamoe-compute-opt` 基于 `codex/megamoe-local-compute`，
 后者基于 `codex/megamoe-compute-replay`。保持计算调度和数学运算，优化 GMM2 完成边界。
 原分支需要SHMEM初始化和一次完整forward作为priming；本分支新增local-only Plan，
 在host准备专家连续FP8输入、E8M0 scales及每AIC一份block-major专家计数。
@@ -123,3 +123,98 @@ DS 未在本次同机同输入条件下重新测试，因此不能把历史可�
 而单纯在当前生命周期中增加槽位还会增加初始化和切换成本。
 之后再检查短 K 的 L1→L0 等待、MMAD 连续发射及编译器生成代码。
 目前证据支持“过早完成等待贡献约2%”，不支持“剩余差距全是 FIX 或全是矩阵乘指令本身”。
+
+## 生命周期定位实验：codex/megamoe-lifecycle-study
+
+本轮按“既有 trace → 必要的批次边界 → 依据证据决定是否复用状态”的顺序进行。
+未拆独立 GMM2，未修改缓冲数量、tile、调度或原生同步。目标是定位，而非把未知收益作为优化交付。
+
+### 如何复现
+
+新协议追加生命周期事件，必须重新构建设备库和 Python 包；旧 raw buffer 与新协议不兼容。
+在已激活 zyx、已 source CANN、已设置 SHMEM 库搜索路径的仓库根目录运行：
+
+```bash
+bash experiments/megamoe/scripts/build.sh
+# 性能阶段关闭timer，结束后单独保存包含坐标的原始事件及精简流水。
+python experiments/megamoe/scripts/local_compute.py --devices 0 --bs 4096 --profile --trace
+# 单独的开销实验：每个预热/测量调用都打开timer，不用最后一次trace稀释开销。
+python experiments/megamoe/scripts/local_compute.py --devices 0 --bs 4096 --profile --profile-timer
+# 将上面输出目录替换为实际目录；对DS的rank_N_npu_time.json也可运行。
+python experiments/megamoe/scripts/analyze_gmm_progress.py \
+  benchmark-runs/<本次目录>/device_0_events.json --output benchmark-runs/<本次目录>/progress.json
+```
+
+`device_N_events.json` 保存已有的 expert/row/wave 坐标；`device_N_timer.json` 仍是无WAIT条的精简概览。
+分析器分别统计每核 GMM 区间、相邻区间间隔、start-to-start 节奏和原生生命周期观测。
+坐标缺失时输出 unknown，绝不将序号猜成专家编号。DS 的 `_part0/_part1` 保持分段，
+片段计数与任务计数分开；片段间隔不拼成持续计算区间。不同核的累计时间不能相加当E2E。
+
+### 第一轮事实与测量边界
+
+- 未加新打点前，我方本地计算 timer-off 三轮：4114.268、4115.250、4114.655μs。
+- DS同机完整MegaMoE三轮：4032.162、4013.463、4007.378μs，指标为每轮最慢rank取值后的均值。
+- DS采用本地参考提交 `253b474`，原始上游 `8491bbb`；依赖按锁定的 DeepJIT `65f5139`、
+  magic_enum `b233b96` 准备，安装在zyx，不改hkq。DS源码目录 `/home/zyx/DeepGEMM-lifecycle-study`。
+- 形状相同，DS采用balanced routing；我方是每专家512行的本地预置输入，数值seed/通信口径不同。
+  因此这些数字只能用于定位，不能作为同输入、同执行范围的正式加速比。
+- DS首轮timer-on/off差异在噪声范围内，不能宣称负开销。服务器快照未见占用不能证明整段独占。
+
+新增Begin/End版（`ad859bc`）完整GMM2输出与旧基线相同，BS96和BS4104尾块回归也通过。
+该版timer-off三轮4117.929、4118.010、4117.994μs；每次调用启用timer后4152.261、4152.060、4152.383μs，
+均值开销0.832%。打点关闭时比未加观测版约多3.3μs，诊断代码本身也可能改变代码生成，不能忽略。
+
+group 0的一次观测如下；这些是区间统计，不是纯硬件忙碌时间：
+
+| 原生边界 | 次数 | 平均μs | 累计μs |
+| --- | ---: | ---: | ---: |
+| GMM1 Begin | 36 | 0.121 | 4.351 |
+| GMM1 End | 36 | 0.107 | 3.859 |
+| GMM2 Begin | 48 | 0.103 | 4.927 |
+| GMM2 End | 48 | 4.967 | 238.404 |
+
+32核的GMM2 End累计在236.453–242.638μs之间。说明成本集中在GMM2收尾，而非普遍的Begin初始化。
+同任务坐标内GMM2间隔均值0.112μs，换专家后约6.061μs，GMM2→GMM1约5.765μs。
+GMM1区间36条累计2660.115μs；DS72条累计2508.397μs，但我方是原生完成边界、DS是ISSUE，不能据此断言MMAD差多少。
+我方GMM2 ISSUE累计1151.848μs，DS84任务（140片段）累计1225.536μs；我方大量收尾在ISSUE区间外。
+因此旧账本的“GMM2条带累计差”不能沿用到新的ISSUE版本。
+
+原始证据位于服务器 `/home/zyx/lifecycle-existing-bs4096/`、`lifecycle-boundary-off/`、
+`lifecycle-boundary-on/`、`lifecycle-boundary-bs96/`、`lifecycle-boundary-bs4104/`；
+DS三轮在 `/home/zyx/ds-lifecycle-ep8/`、`ds-lifecycle-ep8-r2/`、`ds-lifecycle-ep8-r3/`。
+
+### 安全性与实验三的约束
+
+新增 `BeginBoundary/EndBoundary` 只读取时钟、写独占timer区，不调用PIPE_ALL或增加flag等待，
+也不改当前tile的活动状态。`AIC_GMM2_FIX_DRAIN` 嵌套在End内部，两者不能相加。
+事件后缀分别是每阶段生命周期调用序号，Begin/End按调用顺序对应，并保留expert/row/wave坐标。
+Begin记录入口slice坐标，End/FIX_DRAIN可能沿用最后一个tile坐标；以同核、同阶段、调用序号配对，
+不要要求两者row_count相同，也不要把End坐标当成整个批次范围。
+
+`Cube::End` 必须在恢复MM布局之前等待FIX；`NotifyTokenCombineSliceReady` 必须在输出完成后发布。
+只复用C++对象不等于能够删除该等待。真实通信路径也必须正确，不能利用compute-only没有消费者而删除同步，
+再把这个诊断版的提速当成可迁移收益。
+若要跨同类任务延续credit，需要同时处理旧slice的延迟完成发布、L0C复用和AIV0缓冲索引，
+并在GMM1/GMM2资源切换前保留最终排空。未满足这些约束前不删除End。
+
+### FIX细分观测与当前结论
+
+最终设备代码 `0d1554e`，安装wheel `dist/build-kiyur6a9/ascend_deepep-0.1.0.dev5-cp312-cp312-linux_aarch64.whl`，
+设备库SHA256为 `e7ba6ff7cd4c4f3a61222334e261f3572720f62485c503cb613e77ec161cc0c2`。
+准备性能采样时发现其他进程占用八卡，主动中断了自己的采样；`/home/zyx/lifecycle-fix-off/`
+是不完整且共跑的结果，不得引用为性能数据，后续timer-on命令没有执行。
+占用快照在 `/home/zyx/lifecycle-fix-shared-device.txt`。未停止他人任务。
+
+按已获授权仅执行共跑功能/诊断，结果在 `/home/zyx/lifecycle-fix-functional/`。
+BS4096完整GMM2输出与基线hash一致，timer解析及32核边界分析成功。
+group 0的48次GMM2 End共240.949μs，其中FIX_DRAIN为233.747μs；32核FIX_DRAIN/End比例均值约96.88%。
+这支持“End中的原生FIX完成等待占主导”，但共跑时长不能作为优化收益估计。
+FIX_S等待还可能覆盖尚未完成的前序MMAD，不等价于纯FIX执行或HBM写出耗时。
+最终增加FIX_DRAIN后尚未验收timer开销，不能套用前版0.832%的结论。
+CPU定向测试87项通过，协议校验通过；最终协议22类动态事件，追加观测没有新增同步调用。
+
+实验三尚未实施：简单复用Begin状态不针对主要成本；直接删除End违反输出就绪和资源复用协议。
+后续最小有意义的候选是同一GMM2段内允许后续计算提前推进，同时延迟发布旧slice就绪，
+在阶段切换前完成排空。需要成对维护AIC/AIV0的credit、输出完成及AIV1消费者顺序。
+必须在设备可用时完成输出回归、真实通信模式回归以及timer-off A/B/A测试后才保留。
+本轮找到可证实的主要等待位置，但未完成因果消除实验、未交付新的性能收益、未宣称追平DS。

@@ -78,6 +78,8 @@ def worker(args):
     measurements = []
     if args.profile:
         from deep_ep_experimental.megamoe.performance import read_kernel_samples
+        if args.profile_timer and not _C.timer_enabled:
+            raise RuntimeError("Cannot measure timer overhead: installed wheel was built without timer")
         measure_timer = torch.zeros(_C.timer_numel, dtype=torch.int64, device="npu") if args.profile_timer else None
         for _ in range(args.warmup):
             call(measure_timer)
