@@ -45,6 +45,7 @@ enum DynamicTimingType {
     AIC_GMM1_END,
     AIC_GMM2_BEGIN,
     AIC_GMM2_END,
+    AIC_GMM2_FIX_DRAIN,
     DYNAMIC_TYPE_COUNT_ENUM
 };
 

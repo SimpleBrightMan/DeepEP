@@ -21,6 +21,7 @@ def launcher():
     ["--iters", "1"], ["--timeout", "0"],
     ["--devices", "0", "0"], ["--devices", "8"],
     ["--warmup", "0"], ["--profile-iters", "1"], ["--profile-rounds", "0"],
+    ["--profile-timer"],
 ])
 def test_invalid_config_does_not_launch(launcher, monkeypatch, args):
     monkeypatch.setattr(sys, "argv", ["local_compute.py", *args])

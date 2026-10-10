@@ -67,12 +67,19 @@ class A8W4MatmulPipeline {
                 AscendC::CrossCoreSetFlag<4, PIPE_MTE1>(8 + i);
             }
         }
-        __aicore__ inline void End(bool outputDrained)
+        __aicore__ inline void End(bool outputDrained, AscendTimerDevice* timer)
         {
             // Finish GM stores before the base restores the MM layout and the next slice reuses L0C.
             if (!outputDrained) {
+                int index = -1;
+                if constexpr (IsGmm2) {
+                    if (timer != nullptr) index = timer->BeginBoundary(AscendTimer::AIC_GMM2_FIX_DRAIN);
+                }
                 AscendC::SetFlag<AscendC::HardEvent::FIX_S>(0);
                 AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(0);
+                if constexpr (IsGmm2) {
+                    if (timer != nullptr) timer->EndBoundary(AscendTimer::AIC_GMM2_FIX_DRAIN, index);
+                }
             }
             this->Deactivate();
         }
@@ -88,7 +95,7 @@ class A8W4MatmulPipeline {
         {
             op.Activate();
         }
-        __aicore__ inline void End(bool /*outputDrained*/)
+        __aicore__ inline void End(bool /*outputDrained*/, AscendTimerDevice* /*timer*/)
         {
             // Consume the final free-buffer tokens before another slice reuses the flags/L1.
             for (uint16_t i = 0; i < 2; ++i) {
@@ -189,7 +196,7 @@ public:
             if constexpr (g_coreType == AscendC::AIC) {
                 if (timer_ != nullptr) index = timer_->BeginBoundary(event);
             }
-            block_.End(outputDrained);
+            block_.End(outputDrained, timer_);
             if constexpr (g_coreType == AscendC::AIC) {
                 if (timer_ != nullptr) timer_->EndBoundary(event, index);
             }

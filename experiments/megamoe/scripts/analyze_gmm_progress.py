@@ -12,11 +12,14 @@ def normalize(data):
     origin = min((e["start_cycle"] for e in events if "start_cycle" in e), default=0)
     result = []
     for event in events:
-        match = re.fullmatch(r"AIC_(GMM[12])(_ISSUE)?(?:_\d+)?", event.get("name", ""))
+        match = re.fullmatch(r"AIC_(GMM[12])(?:_(ISSUE|BEGIN|END|FIX_DRAIN))?(?:_(\d+))?(?:_part\d+)?", event.get("name", ""))
         if not match:
             continue
         args = event.get("args", {})
         group = event.get("group_id", args.get("group_id"))
+        track = re.fullmatch(r"group_(\d+)_AIC_(\d+)", str(event.get("tid", "")), re.IGNORECASE)
+        if group is None and track:
+            group = int(track[1])
         if group is None:
             raise ValueError("GMM event has no group_id; cannot infer core identity")
         if "start_cycle" in event:
@@ -29,8 +32,10 @@ def normalize(data):
         if end <= start:
             raise ValueError("GMM event must have positive duration")
         result.append(dict(rank=event.get("rank", args.get("rank", event.get("pid", 0))),
-            group=group, sub=event.get("sub_id", args.get("sub_id", 0)),
-            phase=match[1], semantics="issue" if match[2] else "native_boundary",
+            group=group, sub=event.get("sub_id", args.get("sub_id", int(track[2]) if track else 0)),
+            phase=match[1], semantics="issue" if match[2] == "ISSUE" else "native_boundary",
+            boundary_kind=match[2] if match[2] in ("BEGIN", "END", "FIX_DRAIN") else None,
+            sequence=match[3],
             start=start, end=end,
             task={k: event.get(k, args.get(k)) for k in ("expert_id", "row_start", "row_count", "wave_id")}))
     if not result:
@@ -41,6 +46,8 @@ def normalize(data):
 def boundary(a, b):
     if a["phase"] != b["phase"]:
         return a["phase"] + "_to_" + b["phase"]
+    if a["sequence"] is not None and a["sequence"] == b["sequence"]:
+        return "same_task_fragment_resume"
     # 坐标相等不是 pipeline 生命周期相同；这里只分类已知的任务位置。
     ta, tb = a["task"], b["task"]
     if any(ta[k] is None or tb[k] is None for k in ("expert_id", "row_start", "row_count")):
@@ -65,10 +72,20 @@ def analyze(data):
         lanes[(event["rank"], event["group"], event["sub"])].append(event)
     reports = []
     for lane, events in sorted(lanes.items(), key=lambda item: str(item[0])):
+        lifecycle = defaultdict(list)
+        for event in events:
+            if event["boundary_kind"]:
+                lifecycle[event["phase"] + ":" + event["boundary_kind"]].append(event["end"] - event["start"])
+        events = [e for e in events if e["boundary_kind"] is None]
+        if not events:
+            raise ValueError(f"Only lifecycle markers without GMM tasks on lane {lane}")
         events.sort(key=lambda e: e["start"])
         durations, gaps, cadence = defaultdict(list), defaultdict(list), defaultdict(list)
+        sequences = defaultdict(set)
         for event in events:
             durations[event["phase"] + ":" + event["semantics"]].append(event["end"] - event["start"])
+            if event["sequence"] is not None:
+                sequences[event["phase"]].add(event["sequence"])
         for a, b in zip(events, events[1:]):
             gap = b["start"] - a["end"]
             if gap < -1e-6:
@@ -79,6 +96,8 @@ def analyze(data):
         reports.append(dict(rank=lane[0], group_id=lane[1], sub_id=lane[2],
             first_us=events[0]["start"], last_us=events[-1]["end"],
             interval_stats={k: stats(v) for k, v in durations.items()},
+            task_sequence_counts={k: len(v) for k, v in sequences.items()},
+            native_lifecycle_stats={k: stats(v) for k, v in lifecycle.items()},
             gap_stats={k: stats(v) for k, v in gaps.items()},
             start_to_start_stats={k: stats(v) for k, v in cadence.items()}))
     return dict(semantics="Observed scalar intervals and progression, not MMAD busy time. Task coordinates are not Begin/End IDs. Do not sum parallel lanes or subtract unmatched task durations.", lanes=reports)

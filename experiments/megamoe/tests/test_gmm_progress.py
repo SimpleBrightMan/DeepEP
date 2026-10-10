@@ -45,3 +45,23 @@ def test_overlap_rejected():
 def test_no_events_rejected():
     with pytest.raises(ValueError, match="No AIC"):
         progress.analyze([])
+
+
+def test_ds_compact_track_without_repeated_args():
+    lane = progress.analyze([dict(name="AIC_GMM2_ISSUE_0", ph="X", ts=1, dur=2, pid=0, tid="group_3_AIC_0")])["lanes"][0]
+    assert lane["group_id"] == 3
+
+
+def test_boundary_markers_not_double_counted_in_gmm_ledger():
+    lane = progress.analyze([event("AIC_GMM2_BEGIN_0", 0, 1), event("AIC_GMM2_ISSUE_0", 2, 10),
+                             event("AIC_GMM2_END_0", 13, 5)])["lanes"][0]
+    assert lane["native_lifecycle_stats"]["GMM2:END"]["total_us"] == 5
+    assert lane["interval_stats"]["GMM2:issue"]["total_us"] == 10
+
+
+def test_ds_split_issue_keeps_unrecorded_wait_gap():
+    lane = progress.analyze([event("AIC_GMM2_ISSUE_28_part0", 1, 10),
+                             event("AIC_GMM2_ISSUE_28_part1", 16, 2)])["lanes"][0]
+    assert lane["interval_stats"]["GMM2:issue"]["total_us"] == 12
+    assert lane["task_sequence_counts"]["GMM2"] == 1
+    assert lane["gap_stats"]["GMM2:same_task_fragment_resume"]["total_us"] == 5
