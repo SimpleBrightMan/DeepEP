@@ -1171,12 +1171,12 @@ __aicore__ inline uint32_t GetTokenCombineProducerCount(const MoeStageCommonConf
     return tiles < job.totalJobs ? tiles : job.totalJobs;
 }
 
-// 由调用方保证仅实际生产核、每 slice 调用一次。先完成 FIX 写出，再发布完成计数。
+// 仅实际生产核、每slice一次；调用方必须先退出RunGmm2A8W4。
+// CatlassGmm2析构经Cube::End已完成FIX_S并释放计算资源，这里只发布，不重复排空。
 // AtomicAdd 只操作就绪标志，不改变输出数值，也不改变 Dispatch/Combine 的通信粒度。
 __aicore__ inline void NotifyTokenCombineSliceReady(const Params& params, uint32_t expertIdx, uint32_t rowStart)
 {
     if constexpr (g_coreType == AIC) {
-        SyncFuncStatic<HardEvent::FIX_S, EVENT_ID0>();
         AscendC::AtomicAdd(GetTokenCombineReadyCounter(params, expertIdx, rowStart), 1);
     }
 }

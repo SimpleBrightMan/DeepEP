@@ -770,7 +770,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
         if constexpr (tokenCombine && g_coreType == AIC) {
             // 只在“有 GEMM2 tile”的分支通知：一个实际生产核完成本 slice 的全部
             // tile 后加一。空核不通知；同一核有多个 tile 也只通知一次。
-            // helper 等待 FIX 写出后再发布，避免 AIV1 读取尚未完成的 GEMM2 输出。
+            // RunGmm2A8W4内CatlassGmm2已析构并完成FIX_S；发布必须保持在该调用之后。
             NotifyTokenCombineSliceReady(params_, state.expertIdx, tokenStartIndexInExpert);
         }
     }
