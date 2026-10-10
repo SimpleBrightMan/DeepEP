@@ -7,6 +7,7 @@
 #include "kernels/mega_moe/common/mega_moe_constants.hpp"
 
 namespace py = pybind11;
+extern "C" int rtGetC2cCtrlAddr(uint64_t*, uint32_t*);
 
 PYBIND11_MODULE(_C, module)
 {
@@ -17,10 +18,20 @@ PYBIND11_MODULE(_C, module)
     py::class_<Plan>(module, "Plan")
         .def(py::init<torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t, int64_t, uint64_t,
                       uint64_t, int64_t>())
+        .def(py::init<torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t, int64_t, uint64_t,
+                      uint64_t, int64_t, int64_t>())
         .def("forward", &Plan::forward)
         .def("enable_compute_replay", &Plan::enable_compute_replay)
+        .def("prepare_local_compute", &Plan::prepare_local_compute)
+        .def("local_compute_output", &Plan::local_compute_output)
         .def_property_readonly("workspace_bytes", &Plan::workspace_bytes);
     module.def("ffts_config", [] { return shmemx_get_ffts_config(); });
+    module.def("local_ffts_config", [] {
+        uint64_t address = 0;
+        uint32_t length = 0;
+        TORCH_CHECK(rtGetC2cCtrlAddr(&address, &length) == 0, "rtGetC2cCtrlAddr failed");
+        return address;
+    });
     module.attr("timer_numel") = AscendTimer::TOTAL_BUFFER_SIZE;
 #ifdef DEEPEP_MEGAMOE_TIMER
     module.attr("timer_enabled") = true;
