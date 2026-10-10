@@ -10,6 +10,10 @@
 这里为保留三版统一口径，分别读取各自三轮历史样本，不混入回装A后的三轮。
 这些数字不是完整EP8通信E2E，也不是旧main与新main的五BS测试结果。
 
+**后续补充：** 刚完成的完整EP8测试确实导出了MAC/MTE/FIX、指令cache miss与Cube utilization，
+已从30份rank0 `kernel_details.csv` 提取，见 [完整EP8硬件指标](EP8_PROFILER_METRICS.md)。
+本页“没有硬件指标”仅限历史纯计算三版，不能概括后来的Level1采样。
+
 ## 采样核对
 
 - Ascend950DT_9582 / CANN B070 / zyx，device 1，EP8形状，BS4096。
@@ -85,8 +89,8 @@ Device_id, Name, Type, Accelerator Core, Start Time(us), Duration(us), Wait Time
 | wave切换是否损失 | Begin/End次数、同核任务推进、完整通信尾部 | 不能跨核累加区间作E2E，也不能把ISSUE端点当完成 |
 
 当前main的完整通信 `performance.py::collect_profile` 本来就使用 `Level1 + PipeUtilization`；
-用户下一轮旧/新main五BS测试会请求这个指标集合。需检查B070实际导出列，不能预先保证所有硬件字段都存在。
-该集合不等价于已采集全部HBM/L2/cache指标。不要把这轮完整通信数据与历史Level0纯计算数据拼成同口径对照。
+后续旧/新main五BS测试已完成，核实B070实际导出了49列及有效的流水数值，见上述补充报告。
+该集合有指令cache miss，但没有HBM/L2带宽及L2数据cache命中率。不要把完整通信数据与历史Level0纯计算数据拼成同口径对照。
 若要对4196→3924的纯计算后端做硬件bound归因，需要另外同口径采两版；本次遵守“不重跑程序”，只列为TODO。
 
 ## 原始证据定位
