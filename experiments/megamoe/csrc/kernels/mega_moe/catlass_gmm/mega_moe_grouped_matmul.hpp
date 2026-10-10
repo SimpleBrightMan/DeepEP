@@ -4,6 +4,7 @@
 #define MEGA_MOE_CATLASS_GROUPED_MATMUL_H
 
 #include "../common/mega_moe_types.hpp"
+#include "../common/ascend_timer_v2_device.hpp"
 #include "catlass/gemm/block/block_mmad.hpp"
 #include "catlass/gemm/gemm_type.hpp"
 #include "block_mmad_a8w4.hpp"
@@ -27,7 +28,7 @@ struct CatlassGroupedMatmulLayouts {
 
 // Shared AIC/AIV0 pipeline mechanics; projection semantics belong to GMM1/GMM2 below.
 namespace detail {
-template <class Config>
+template <class Config, bool IsGmm2 = false>
 class A8W4MatmulPipeline {
     using C = typename Config::KernelConfig;
     using A = typename C::ElementAType;
@@ -107,6 +108,7 @@ class A8W4MatmulPipeline {
     } addr_;
     GM_ADDR output_ = nullptr;
     bool active_ = false;
+    AscendTimerDevice* timer_ = nullptr;
 
     template <class Element, class Layout>
     __aicore__ inline auto Tensor(GM_ADDR address, const Layout& layout)
@@ -145,6 +147,7 @@ public:
                           std::is_same_v<SB, typename Next::ElementMxScaleBType>,
                       "Cannot change GMM element types");
         config_.m = config.m;
+        timer_ = addr.timer;
         config_.n = config.n;
         config_.k = config.k;
         config_.scaleK = config.scaleK;
@@ -163,7 +166,15 @@ public:
             }
         }
         if (!active_) {
+            constexpr auto event = IsGmm2 ? AscendTimer::AIC_GMM2_BEGIN : AscendTimer::AIC_GMM1_BEGIN;
+            int index = -1;
+            if constexpr (g_coreType == AscendC::AIC) {
+                if (timer_ != nullptr) index = timer_->BeginBoundary(event);
+            }
             block_.Begin();
+            if constexpr (g_coreType == AscendC::AIC) {
+                if (timer_ != nullptr) timer_->EndBoundary(event, index);
+            }
             active_ = true;
         }
     }
@@ -173,7 +184,15 @@ public:
     __aicore__ inline void End(bool outputDrained = false)
     {
         if (active_) {
+            constexpr auto event = IsGmm2 ? AscendTimer::AIC_GMM2_END : AscendTimer::AIC_GMM1_END;
+            int index = -1;
+            if constexpr (g_coreType == AscendC::AIC) {
+                if (timer_ != nullptr) index = timer_->BeginBoundary(event);
+            }
             block_.End(outputDrained);
+            if constexpr (g_coreType == AscendC::AIC) {
+                if (timer_ != nullptr) timer_->EndBoundary(event, index);
+            }
             active_ = false;
         }
     }
@@ -255,8 +274,8 @@ public:
 
 // GMM2 owns the down projection and always writes row-major output.
 template <class Config>
-class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config> {
-    using Pipeline = detail::A8W4MatmulPipeline<Config>;
+class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config, true> {
+    using Pipeline = detail::A8W4MatmulPipeline<Config, true>;
 
 public:
     __aicore__ inline CatlassGmm2(const Config& config, const GMMAddrInfo& addr)

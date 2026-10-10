@@ -18,16 +18,16 @@ def test_classification_and_ledger():
               event("AIC_GMM2_ISSUE_0", 25, 5, **task),
               event("AIC_GMM2_ISSUE_1", 32, 5, expert_id=2, row_start=0, row_count=256)]
     lane = progress.analyze(events)["lanes"][0]
-    assert lane["gap_stats"]["same_phase_same_task_coordinates"]["total_us"] == 1
-    assert lane["gap_stats"]["GMM1_to_GMM2"]["total_us"] == 3
-    assert lane["gap_stats"]["same_phase_expert_change"]["total_us"] == 2
+    assert lane["gap_stats"]["GMM1:same_phase_same_task_coordinates"]["total_us"] == 1
+    assert lane["gap_stats"]["GMM1:GMM1_to_GMM2"]["total_us"] == 3
+    assert lane["gap_stats"]["GMM2:same_phase_expert_change"]["total_us"] == 2
     assert sum(v["total_us"] for v in lane["interval_stats"].values()) + sum(v["total_us"] for v in lane["gap_stats"].values()) == 36
     assert "GMM2:issue" in lane["interval_stats"]
 
 
 def test_missing_coordinates_never_infer_batch():
     lane = progress.analyze([event("AIC_GMM2_ISSUE_0", 0, 5), event("AIC_GMM2_ISSUE_1", 6, 5)])["lanes"][0]
-    assert set(lane["gap_stats"]) == {"same_phase_unknown_task"}
+    assert set(lane["gap_stats"]) == {"GMM2:same_phase_unknown_task"}
 
 
 def test_raw_cycles_and_parallel_lanes():

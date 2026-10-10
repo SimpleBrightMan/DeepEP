@@ -9,6 +9,7 @@ import statistics
 
 def normalize(data):
     events = data.get("traceEvents", []) if isinstance(data, dict) else data
+    origin = min((e["start_cycle"] for e in events if "start_cycle" in e), default=0)
     result = []
     for event in events:
         match = re.fullmatch(r"AIC_(GMM[12])(_ISSUE)?(?:_\d+)?", event.get("name", ""))
@@ -19,7 +20,8 @@ def normalize(data):
         if group is None:
             raise ValueError("GMM event has no group_id; cannot infer core identity")
         if "start_cycle" in event:
-            start, end = event["start_cycle"] / 1000, event["end_cycle"] / 1000
+            # 先在整数域减原点，避免绝对cycle转float损失纳秒精度。
+            start, end = (event["start_cycle"] - origin) / 1000, (event["end_cycle"] - origin) / 1000
         else:
             if event.get("ph") != "X":
                 continue
@@ -71,7 +73,7 @@ def analyze(data):
             gap = b["start"] - a["end"]
             if gap < -1e-6:
                 raise ValueError(f"Overlapping GMM intervals on lane {lane}; cannot add a serial ledger")
-            key = boundary(a, b)
+            key = a["phase"] + ":" + boundary(a, b)
             gaps[key].append(max(0, gap))
             cadence[key].append(b["start"] - a["start"])
         reports.append(dict(rank=lane[0], group_id=lane[1], sub_id=lane[2],

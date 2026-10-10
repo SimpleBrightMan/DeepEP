@@ -78,8 +78,9 @@ def worker(args):
     measurements = []
     if args.profile:
         from deep_ep_experimental.megamoe.performance import read_kernel_samples
+        measure_timer = torch.zeros(_C.timer_numel, dtype=torch.int64, device="npu") if args.profile_timer else None
         for _ in range(args.warmup):
-            call()
+            call(measure_timer)
         torch.npu.synchronize()
         # 仅在批次前排入小型计算，避免host来不及提交；不计入MegaMoE kernel Duration。
         prefix = torch.zeros(16 * 1024 * 1024, device="npu", dtype=torch.float32)
@@ -97,7 +98,7 @@ def worker(args):
                 for _ in range(8):
                     torch.exp(prefix, out=prefix)
                 for _ in range(args.profile_iters):
-                    call()
+                    call(measure_timer)
                 torch.npu.synchronize()
             samples = read_kernel_samples(directory, args.profile_iters)
             durations = [sample["duration_us"] for sample in samples]
@@ -105,7 +106,7 @@ def worker(args):
             measurements.append(dict(round=repeat, samples=samples,
                 mean_us=statistics.mean(measured), median_us=statistics.median(measured),
                 min_us=min(measured), max_us=max(measured), selection="tail_half_ceil"))
-            print(f"[KERNEL] device={args.worker} round={repeat} mean={measurements[-1]['mean_us']:.3f}us timer=off", flush=True)
+            print(f"[KERNEL] device={args.worker} round={repeat} mean={measurements[-1]['mean_us']:.3f}us timer={args.profile_timer}", flush=True)
         actual = plan.local_compute_output().float().cpu()
         if not torch.equal(actual, previous):
             raise RuntimeError(f"Output changed after profiled repetitions device={args.worker}")
@@ -124,15 +125,17 @@ def worker(args):
         from deep_ep_experimental.megamoe.timer.parse_timer_csv import core_info
         raw = timer.cpu().numpy()
         cores = {core_info(core): core for core in range(protocol.N_CORE_COUNT)}
-        for event in events:
+        detailed_events = [dict(event) for event in events]
+        for event in detailed_events:
             family, _, index = event["name"].rpartition("_")
             if family not in protocol.DYNAMIC_NAMES or not index.isdecimal():
                 continue
             core = cores[(event["group_id"], event["core_type"], event["sub_id"])]
             slot = len(protocol.FIXED_NAMES) + protocol.DYNAMIC_NAMES.index(family) * protocol.MAX_DYNAMIC_ITER + int(index)
-            event.update(protocol.task_metadata(raw, core, slot))
+            event.update({key: int(value) if isinstance(value, np.integer) else value
+                          for key, value in protocol.task_metadata(raw, core, slot).items()})
             event["wave_id"] = int(raw[protocol.WAVE_ID_OFFSET + core * protocol.WAVE_ID_PER_CORE + slot])
-        (args.output / f"device_{args.worker}_events.json").write_text(json.dumps(events, separators=(",", ":")))
+        (args.output / f"device_{args.worker}_events.json").write_text(json.dumps(detailed_events, separators=(",", ":")))
         trace_report = rank_breakdown(events, args.worker, compute_replay=True)
         if trace_report["status"] != "ok":
             raise RuntimeError(f"Invalid compute-only timer trace: {trace_report}")
@@ -150,7 +153,7 @@ def worker(args):
                   torch=torch.__version__, torch_npu=torch_npu.__version__, device_name=soc,
                   source_commit=subprocess.check_output(["git", "rev-parse", "HEAD"],
                       cwd=Path(__file__).resolve().parents[3], text=True).strip(),
-                  seed=20261010 + args.worker, timer=False, iterations=results,
+                  seed=20261010 + args.worker, timer=args.profile_timer, iterations=results,
                   output_sha256=output_hash, metric="megamoe_compute_replay_kernel_duration_us",
                   kernel_measurements=measurements, warmup=args.warmup,
                   profile_iters=args.profile_iters, profile_rounds=args.profile_rounds,
@@ -169,6 +172,7 @@ def main():
     p.add_argument("--iters", type=int, default=3)
     p.add_argument("--timeout", type=int, default=1800)
     p.add_argument("--profile", action="store_true", help="Collect timer-off device kernel Duration; requires exclusive devices for performance claims")
+    p.add_argument("--profile-timer", action="store_true", help="Overhead experiment: enable timer on EVERY profiled call; requires --profile")
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--profile-iters", type=int, default=50)
     p.add_argument("--profile-rounds", type=int, default=3)
@@ -177,6 +181,8 @@ def main():
     p.add_argument("--output", type=Path)
     p.add_argument("--worker", type=int, help=argparse.SUPPRESS)
     args = p.parse_args()
+    if args.profile_timer and not args.profile:
+        p.error("--profile-timer requires --profile")
     if args.bs < 1 or args.bs > 65536 or args.bs % 8 or args.iters < 2 or args.timeout < 1:
         p.error("BS must be in [8,65536] and divisible by 8; iters>=2 and timeout>0")
     if len(set(args.devices)) != len(args.devices) or any(d not in range(8) for d in args.devices):
@@ -210,6 +216,8 @@ def main():
                 cmd += ["--reference-dir", str(args.reference_dir)]
             if args.trace:
                 cmd += ["--trace"]
+            if args.profile_timer:
+                cmd += ["--profile-timer"]
             procs.append(subprocess.Popen(cmd, stdout=stream, stderr=subprocess.STDOUT,
                 env=dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")))
         deadline = time.monotonic() + args.timeout

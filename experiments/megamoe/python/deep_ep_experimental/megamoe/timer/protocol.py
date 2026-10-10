@@ -34,6 +34,10 @@ DYNAMIC_NAMES = [
     "AIV_SHARED_GMM2_PROLOGUE",
     "AIV_SHARED_SWIGLU",
     "AIC_GMM2_ISSUE",
+    "AIC_GMM1_BEGIN",
+    "AIC_GMM1_END",
+    "AIC_GMM2_BEGIN",
+    "AIC_GMM2_END",
 ]
 
 # W4 动态槽保存 tile/slice；其他路径保持原有区间协议。
