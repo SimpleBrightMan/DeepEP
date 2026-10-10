@@ -43,6 +43,7 @@ private:
     static constexpr uint32_t EPILOGUE_TILE_M = MegaMoeBase::EPILOGUE_TILE_M;
     // 一个逻辑任务对应一对 gate/up；生产、SwiGLU 和 GMM2 ready 必须使用同一粒度。
     static constexpr uint32_t GMM1_TASK_N = FuseGateUp ? GMM1_FUSED_TILE_N : L1_TILE_N;
+    static constexpr bool ASYNC_GMM1 = CombineQuantMode == COMBINE_NO_QUANT && !TopkWeightsPrefetch;
 
     using Gmm1Config =
         GmmKernel::Config<true, 0, QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType, false,
@@ -125,6 +126,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm1
         gmmExecutionConfig_, syncWorkspaceLayout_, params_.workspaceInfo, moeWeightTensorListAddrs_, epilogueOp_,
         gmmAddrInfo, state, tokenStartIndexInExpert, gmm1TilesPerMGroup);
     gmmAddrInfo.timer = timer_.Enabled() ? &timer_ : nullptr;
+    gmmAddrInfo.gmm1AsyncCompletion = ASYNC_GMM1;
     if (computeReplay_) {
         // 输入已在 priming 中完成；本次没有 Dispatch producer，不能等待其被清零的 flag。
         gmmAddrInfo.dispatchToGmm1Flag = nullptr;
@@ -230,7 +232,7 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::NextAiv
     }
 }
 
-// 只探测本核下一个 GMM1 tile。AIC 按序发布，因此队首未就绪时，后续本核 tile 也不可能就绪。
+// 只探测本核下一个GMM1 tile；异步模式的GM序号仅表示已提交，随后由MTE2等待真实FIX完成。
 template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunReadyActivation(
     const AivTaskCursor& cursor, int32_t& readySequence)
@@ -269,11 +271,19 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     addr.timer = timer_.Enabled() ? &timer_ : nullptr;
     timer_.SetWave(static_cast<int64_t>(cursor.wave));
     timer_.SetSlice(begin.expertIdx, begin.tokenIndexInExpert, rows);
+    if constexpr (ASYNC_GMM1) {
+        // issued探测成功才排入等待，避免抢占AIV1后阻止尚未提交任务所需的Dispatch。
+        Gmm1AsyncCompletion::WaitConsumer(readySequence);
+    }
     RunReadyGmm1ActivationTileA8W4<QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
                                    GMM1_TILE_M, TopkWeightsPrefetch, FuseGateUp>(
         epilogueOp_, state.problemShape, addr, gmmExecutionConfig_.blockJob, cursor.nextTile,
         static_cast<uint32_t>(begin.globalTokenIndex));
     timer_.ClearSlice();
+    if constexpr (ASYNC_GMM1) {
+        // 归还事件槽；输出GM独立寻址不复用，SwiGLU的读入/量化/写出均保持原依赖。
+        Gmm1AsyncCompletion::ReleaseConsumer(readySequence);
+    }
     if constexpr (!TopkWeightsPrefetch) {
         ++readySequence;
     }
@@ -339,6 +349,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         dispatch.expertIdx = commonConfig_.moeExpertPerRank;
     }
     uint32_t dispatchGroups = 0U;
+    if constexpr (ASYNC_GMM1) Gmm1AsyncCompletion::InitConsumer();
     uint64_t dispatchWave = 0U;
     while (hasActivation || hasCombine || !shared.done || dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
         if (hasActivation && TryRunReadyActivation(activation, readySequence)) {
@@ -562,6 +573,10 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
                 currentWaveNeedsGmm1 = IsPositionWithinWave(gmm1Position, currentWaveMGroupCount);
             }
         }
+        if constexpr (ASYNC_GMM1) {
+            // 不跨GMM1/GMM2资源切换保留状态；FIX完成后才恢复MM layout并归还L1/L0 credit。
+            gmm1CatlassContext_.End();
+        }
         UpdateGmmLoopCount(gmmLoopCount_, LoopCountIndex::GMM1, ++gmm1Count);
         if (gmm2LagActive) {
             // 滞后一拍：本轮消费上一 Wave 的 GMM2/Combine；当前 Wave 边界缓存到下一轮。
@@ -593,6 +608,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
                                    gmm1TileReadySequence);
         UpdateGmmLoopCount(gmmLoopCount_, LoopCountIndex::GMM2, ++gmm2Count);
     }
+    if constexpr (ASYNC_GMM1 && g_coreType == AIC) Gmm1AsyncCompletion::DrainProducer();
     timer_.SetWave(AscendTimer::NO_WAVE);
 }
 

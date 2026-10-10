@@ -54,6 +54,8 @@ def rank_breakdown(events, rank, *, compute_replay=False):
         families[event_family(event["name"])].append(event)
     result["gmm2_semantics"] = "issue_not_completion" if families["AIC_GMM2_ISSUE"] else "native_completion"
     families["AIC_GMM2"] += families["AIC_GMM2_ISSUE"]
+    result["gmm1_semantics"] = "issue_not_completion" if families["AIC_GMM1_ISSUE"] else "native_completion"
+    families["AIC_GMM1"] += families["AIC_GMM1_ISSUE"]
     required = ("AIV_DISPATCH", "AIC_GMM1", "AIC_GMM2", "AIV_UNPERMUTE")
     if compute_replay:
         result["measurement"] = "compute_replay"

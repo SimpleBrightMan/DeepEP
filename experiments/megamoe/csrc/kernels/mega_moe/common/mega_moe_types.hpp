@@ -78,6 +78,8 @@ struct GMMAddrInfo {
     __gm__ int32_t* sharedExpertGmm2TileCounter;
     // 仅 Wave 调试采集设置；其他调用保持空指针。
     AscendTimerDevice* timer = nullptr;
+    // 仅非量化、非prefetch的routed Wave启用；GM计数此时表示issued而非completed。
+    bool gmm1AsyncCompletion = false;
 };
 
 #if defined(ENABLE_MEGA_MOE_LAYERED_KERNEL)

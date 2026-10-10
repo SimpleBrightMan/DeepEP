@@ -16,6 +16,7 @@
 
 #include "kernel_operator.h"
 #include "../common/ascend_timer_v2_device.hpp"
+#include "../common/gmm1_async_completion.hpp"
 #include "kernel_tiling/kernel_tiling.h"
 #include "kernel_operator_list_tensor_intf.h"
 #include "lib/matmul_intf.h"
@@ -264,7 +265,8 @@ __aicore__ inline void Gmm1AicMmadA8W4(BlockMmad& blockMmad, WorkSet& workSet, c
         uint32_t mLoc = Get<M_VALUE>(blockCoord);
         uint32_t nLoc = Get<N_VALUE>(blockCoord);
         AscendTimerTileScope tileTimer(gmmAddrInfo.timer,
-                                       IsShared ? AscendTimer::AIC_SHARED_GMM1 : AscendTimer::AIC_GMM1, mLoc, nLoc,
+                                       IsShared ? AscendTimer::AIC_SHARED_GMM1 :
+                                           (gmmAddrInfo.gmm1AsyncCompletion ? AscendTimer::AIC_GMM1_ISSUE : AscendTimer::AIC_GMM1), mLoc, nLoc,
                                        Get<M_VALUE>(actualShape), config.tileN);
         uint32_t waveIdx = mLoc / config.tileM;
         if (waveIdx != lastWaveWaited) {
@@ -272,14 +274,21 @@ __aicore__ inline void Gmm1AicMmadA8W4(BlockMmad& blockMmad, WorkSet& workSet, c
             lastWaveWaited = waveIdx;
         }
 
+        if (gmmAddrInfo.gmm1AsyncCompletion) {
+            Gmm1AsyncCompletion::AcquireProducer(gmm1TileReadySequence);
+        }
         blockMmad.Compute(mLoc, nLoc, Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape));
 
-        AscendC::SetFlag<AscendC::HardEvent::FIX_S>(0);
-        AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(0);
+        if (gmmAddrInfo.gmm1AsyncCompletion) {
+            Gmm1AsyncCompletion::PublishCompleted(gmm1TileReadySequence);
+        } else {
+            AscendC::SetFlag<AscendC::HardEvent::FIX_S>(0);
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(0);
+        }
         if constexpr (TopkWeightsPrefetch) {
             NotifyGmm1TileStatus(gmmAddrInfo, expertIdx, loopIdx);
         } else if (gmmAddrInfo.gmmToEpilogueFlag != nullptr) {
-            // Shared GMM1 stores raw output; shared activation uses an independent readiness protocol.
+            // 异步分支这里只发布issued。消费者必须再等FIX full，不能把GM序号当作完成。
             AscendC::WriteGmByPassDCache(gmmAddrInfo.gmmToEpilogueFlag, ++gmm1TileReadySequence);
         }
     }
@@ -770,10 +779,10 @@ __aicore__ inline void RunGmm1CatlassTiles(CatlassGmm1<Config>& kernel, WorkSet&
     if constexpr (g_coreType == AscendC::AIC) {
         Gmm1AicMmadA8W4<CatlassGmm1<Config>, IsShared, TopkWeightsPrefetch>(
             kernel, workSet, params, addr, config, startLoopIdx, tileNum, readySequence, expertIdx);
-        kernel.End(true);  // Tile readiness publication already drained FIX.
+        if (!addr.gmm1AsyncCompletion) kernel.End(true);  // 同步路径逐tile已排空FIX。
     } else {
         Gmm1Aiv0PrologueA8W4(kernel, workSet.scheduler, config, startLoopIdx, tileNum);
-        kernel.End();
+        if (!addr.gmm1AsyncCompletion) kernel.End();
     }
 }
 

@@ -39,6 +39,7 @@ DYNAMIC_NAMES = [
     "AIC_GMM2_BEGIN",
     "AIC_GMM2_END",
     "AIC_GMM2_FIX_DRAIN",
+    "AIC_GMM1_ISSUE",
 ]
 
 # W4 动态槽保存 tile/slice；其他路径保持原有区间协议。
