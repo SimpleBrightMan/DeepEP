@@ -112,7 +112,8 @@ __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidde
     uint32_t sequence = 0U;
     for (uint32_t index = 0; index < range.count; index += rowsPerSlot) {
         const uint64_t row = range.start + index;
-        const uint32_t count = Min(rowsPerSlot, range.count - index);
+        const uint32_t remaining = static_cast<uint32_t>(range.count - index);
+        const uint32_t count = rowsPerSlot < remaining ? rowsPerSlot : remaining;
         const uint32_t slot = sequence++ % DOUBLE_BUFFER;
         const auto event = slot == 0U ? EVENT_ID0 : EVENT_ID1;
         // 未声明可复用span的其他后端保持原单行槽，不访问未初始化的fp8PackTensor。
