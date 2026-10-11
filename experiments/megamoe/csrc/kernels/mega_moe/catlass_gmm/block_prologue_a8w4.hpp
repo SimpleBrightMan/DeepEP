@@ -72,13 +72,16 @@ public:
             // Assign L1/L0A/L0B space for each stages
             l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(i * 384U * 1024U);
         }
-        // 两个完整 B 块：packed 输入 [0,64KiB)，FP8 输出 [64,192KiB)。
-        // 仍按 256B 向量交错，不采用已测退化的连续输出槽布局。
-        for (uint32_t i = 0; i < UB_STAGES; i++) {
+        // 三个 packed 输入槽 [0,96KiB)，两个 FP8 输出槽 [96,224KiB)。
+        // 输入只等 V 读完，输出只等 MTE3 读完，两套游标/credit 不再绑定。
+        for (uint32_t i = 0; i < UB_INPUT_STAGES; i++) {
             ubCastInTensor[i] = params.resource.ubBuf.template GetBufferByByte<ElementIn>(i * UB_INPUT_BYTES);
+            ubInputEventList[i] = i;
+        }
+        for (uint32_t i = 0; i < UB_OUTPUT_STAGES; i++) {
             ubCastOutTensor[i] = params.resource.ubBuf.template GetBufferByByte<ElementOut>(
-                UB_STAGES * UB_INPUT_BYTES + i * 256U);
-            ubEventList[i] = i;
+                UB_INPUT_STAGES * UB_INPUT_BYTES + i * 256U);
+            ubOutputEventList[i] = i;
         }
         if (activate) {
             Activate();
@@ -91,10 +94,12 @@ public:
         if (active_ || AscendC::GetSubBlockIdx() != 0) {
             return;
         }
-        l1BListId = ubListId = 0;
-        for (uint32_t i = 0; i < UB_STAGES; ++i) {
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(ubEventList[i]);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubEventList[i]);
+        l1BListId = ubInputListId = ubOutputListId = 0;
+        for (uint32_t i = 0; i < UB_INPUT_STAGES; ++i) {
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[i]);
+        }
+        for (uint32_t i = 0; i < UB_OUTPUT_STAGES; ++i) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubOutputEventList[i]);
         }
         active_ = true;
     }
@@ -105,9 +110,11 @@ public:
         if (!active_) {
             return;
         }
-        for (uint32_t i = 0; i < UB_STAGES; i++) {
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubEventList[i]);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(ubEventList[i]);
+        for (uint32_t i = 0; i < UB_INPUT_STAGES; i++) {
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[i]);
+        }
+        for (uint32_t i = 0; i < UB_OUTPUT_STAGES; i++) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubOutputEventList[i]);
         }
         active_ = false;
     }
@@ -141,7 +148,8 @@ public:
             auto l1Tile = GetTile(tensorL1B, tla::MakeCoord(0, 0),
                                   tla::MakeShape(actualK, actualBlockShape.n()));
             ProcessL1Nz(l1Tile, gmTile);
-            ubListId = (ubListId + 1U) % UB_STAGES;
+            ubInputListId = (ubInputListId + 1U) % UB_INPUT_STAGES;
+            ubOutputListId = (ubOutputListId + 1U) % UB_OUTPUT_STAGES;
             // 整块写 L1 后发布同一个 full；AIC 的消费形状及事件编号完全不变。
             AscendC::CrossCoreSetFlag<SYNC_MODE, PIPE_MTE3>(AIV_SYNC_AIC_FLAG + l1BListId);
             l1BListId = (l1BListId + 1) % L1B_STAGES;
@@ -151,7 +159,7 @@ public:
     template <class TensorOut, class TensorIn>
     __aicore__ inline void ProcessL1Nz(const TensorOut& tensorOut, const TensorIn& tensorIn)
     {
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(ubEventList[ubListId]);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[ubInputListId]);
         uint32_t shapeN;
         uint32_t shapeK;
 
@@ -161,27 +169,27 @@ public:
         auto layoutCastIn = tla::MakeLayout<ElementOut, layout::Weight4BitnZ>(shapeK, shapeN);
         auto layoutCastOut = tla::MakeLayout<ElementOut, layout::nZ>(shapeK, shapeN);
 
-        auto tensorCastIn = tla::MakeTensor(ubCastInTensor[ubListId], layoutCastIn, Catlass::Arch::PositionUB{});
-        auto tensorCastOut = tla::MakeTensor(ubCastOutTensor[ubListId], layoutCastOut, Catlass::Arch::PositionUB{});
+        auto tensorCastIn = tla::MakeTensor(ubCastInTensor[ubInputListId], layoutCastIn, Catlass::Arch::PositionUB{});
+        auto tensorCastOut = tla::MakeTensor(ubCastOutTensor[ubOutputListId], layoutCastOut, Catlass::Arch::PositionUB{});
 
         CopyNzInWeightTensor(tensorCastIn, tensorIn);
 
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(ubEventList[ubListId]);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(ubEventList[ubListId]);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(ubInputEventList[ubInputListId]);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(ubInputEventList[ubInputListId]);
 
         AscendC::CrossCoreWaitFlag<SYNC_MODE, PIPE_MTE3>(AIC_SYNC_AIV_FLAG + l1BListId);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubEventList[ubListId]);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubOutputEventList[ubOutputListId]);
 
         AntiQuantComputeNz(tensorCastOut, tensorCastIn);
 
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubEventList[ubListId]);
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(ubEventList[ubListId]);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubOutputEventList[ubOutputListId]);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(ubOutputEventList[ubOutputListId]);
 
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(ubEventList[ubListId]);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[ubInputListId]);
 
         CopyUb2L1(tensorOut, tensorCastOut);
 
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubEventList[ubListId]);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubOutputEventList[ubOutputListId]);
     }
 
     template <class TensorDst, class TensorSrc>
@@ -211,7 +219,7 @@ public:
 
         params.loopKNum = tla::get<0, 1>(tensorCastIn.shape());
         params.nRealSizeAlign = tla::get<1, 1>(tensorCastIn.shape()) * AscendC::BLOCK_CUBE;
-        params.innerDstStride = AscendC::GetVecLen() * UB_STAGES;
+        params.innerDstStride = AscendC::GetVecLen() * UB_OUTPUT_STAGES;
         params.innerLoopNum = (params.nRealSizeAlign * tla::get<0, 0>(tensorCastIn.shape())) /
                               static_cast<uint64_t>(AscendC::GetVecLen());
         params.loopKDstStride = params.innerLoopNum * params.innerDstStride;
@@ -272,7 +280,7 @@ public:
         const uint32_t elements = tla::get<0, 1>(srcTensor.shape()) * C0_SIZE_B8 * tla::get<1, 0>(srcTensor.shape()) *
                                   tla::get<1, 1>(srcTensor.shape());
         AscendC::DataCopyParams dataCopyParams(elements / VECTOR_BYTES, VECTOR_BYTES / BLOCK_BYTES,
-                                               (UB_STAGES - 1U) * VECTOR_BYTES / BLOCK_BYTES, 0);
+                                               (UB_OUTPUT_STAGES - 1U) * VECTOR_BYTES / BLOCK_BYTES, 0);
         auto dstOffset = dstTensor.layout()(dstTensor.coord());
         AscendC::DataCopy(dstTensor.data()[dstOffset], srcTensor.data(), dataCopyParams);
     }
@@ -287,18 +295,21 @@ public:
     constexpr static uint16_t AIV_SYNC_AIC_FLAG = 6;
     constexpr static uint16_t AIC_SYNC_AIV_FLAG = 8;
 
-    static constexpr int64_t UB_STAGES = 2;
+    static constexpr int64_t UB_INPUT_STAGES = 3;
+    static constexpr int64_t UB_OUTPUT_STAGES = 2;
     static constexpr uint32_t UB_INPUT_BYTES = 32U * 1024U;
     static constexpr uint32_t UB_OUTPUT_BYTES = 64U * 1024U;
-    static_assert(UB_STAGES * (UB_INPUT_BYTES + UB_OUTPUT_BYTES) <= ArchTag::UB_SIZE);
+    static_assert(UB_INPUT_STAGES * UB_INPUT_BYTES + UB_OUTPUT_STAGES * UB_OUTPUT_BYTES <= ArchTag::UB_SIZE);
 
     bool active_ = false;
     uint32_t l1BListId{0};
-    uint32_t ubListId{0};
-    int32_t ubEventList[UB_STAGES];
+    uint32_t ubInputListId{0};
+    uint32_t ubOutputListId{0};
+    int32_t ubInputEventList[UB_INPUT_STAGES];
+    int32_t ubOutputEventList[UB_OUTPUT_STAGES];
 
-    AscendC::LocalTensor<ElementIn> ubCastInTensor[UB_STAGES];
-    AscendC::LocalTensor<ElementOut> ubCastOutTensor[UB_STAGES];
+    AscendC::LocalTensor<ElementIn> ubCastInTensor[UB_INPUT_STAGES];
+    AscendC::LocalTensor<ElementOut> ubCastOutTensor[UB_OUTPUT_STAGES];
     AscendC::LocalTensor<ElementOut> l1BTensorList[L1B_STAGES];
 };
 }  // namespace Catlass::Gemm::Block
