@@ -14,6 +14,7 @@
 
 #include "../common/mega_moe_mxfp8_utils.hpp"
 #include "../common/mega_moe_utils.hpp"
+#include "mega_moe_unpermute_fused.hpp"
 
 namespace MegaMoeImpl {
 
@@ -272,6 +273,64 @@ __aicore__ inline MegaMoeUnpermuteBufferConfig CreateTokenUnpermuteBuffers(const
     return bufferConfig;
 }
 
+#if defined(__DAV_C310__)
+// 仅复用host已经批准的dataRes/dataResFp32前缀，不侵占其后的top-k权重区。
+// 同一token的top-k结果在GM连续，以一次2D搬运收集；两个槽分别由MTE3归还。
+__aicore__ inline bool TryFusedTokenUnpermute(const MoeStageCommonConfig& common, const Params& params,
+                                             TokenUnpermuteScratch& scratch,
+                                             const MegaMoeUnpermuteBufferConfig& buffers,
+                                             const WorkRange& range,
+                                             const GlobalTensor<bfloat16_t>& input,
+                                             GlobalTensor<bfloat16_t>& output)
+{
+    const uint32_t prefixBytes = (buffers.inputBufferCount + 1U) *
+        (buffers.bf16SlotElementCount * sizeof(bfloat16_t) + buffers.fp32SlotElementCount * sizeof(float));
+    const uint32_t capacity = common.topK == 0U ? 0U : prefixBytes / (2U * common.topK * sizeof(bfloat16_t));
+    uint32_t chunk = (capacity / 128U) * 128U;
+    chunk = chunk < common.tokenHiddenDim ? chunk : common.tokenHiddenDim;
+    // 非整向量尾部保留原实现；不能越界读GM或使用未初始化的BF16 lane。
+    if (common.sharedExpertNum != 0U || common.tokenHiddenDim % 128U != 0U || chunk == 0U ||
+        common.topK > 65535U) return false;
+    const uint32_t slotElements = common.topK * chunk;
+    LocalTensor<bfloat16_t> packed(TPosition::VECCALC, 0U, 2U * slotElements);
+    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+    uint32_t sequence = 0U;
+    for (uint32_t batch = 0; batch < range.count; batch += buffers.tokensPerBatch) {
+        const uint32_t count = Min(static_cast<uint32_t>(buffers.tokensPerBatch), range.count - batch);
+        LoadTokenUnpermuteWeights<float>(common, params, scratch, range.start, batch, count);
+        for (uint32_t local = 0; local < count; ++local) {
+            const uint64_t token = range.start + batch + local;
+            for (uint32_t channel = 0; channel < common.tokenHiddenDim; channel += chunk) {
+                const uint32_t columns = Min(chunk, common.tokenHiddenDim - channel);
+                const uint32_t slot = sequence++ % 2U;
+                const auto event = static_cast<TEventID>(slot);
+                auto tile = packed[slot * slotElements];
+                WaitFlag<HardEvent::MTE3_MTE2>(event);
+                DataCopyPad(tile, input[token * common.topK * common.tokenHiddenDim + channel],
+                    {static_cast<uint16_t>(common.topK), columns * 2U,
+                     (common.tokenHiddenDim - columns) * 2U, 0U, 0U}, {false, 0U, 0U, 0U});
+                SetFlag<HardEvent::MTE2_V>(event);
+                WaitFlag<HardEvent::MTE2_V>(event);
+                WeightedUnpermuteVf(reinterpret_cast<__ubuf__ bfloat16_t*>(tile.GetPhyAddr()),
+                    reinterpret_cast<__ubuf__ float*>(scratch.topKWeightsTensor.GetPhyAddr()) + local * common.topK,
+                    common.topK, columns);
+                SetFlag<HardEvent::V_MTE3>(event);
+                WaitFlag<HardEvent::V_MTE3>(event);
+                DataCopy(output[token * common.tokenHiddenDim + channel], tile, columns);
+                SetFlag<HardEvent::MTE3_MTE2>(event);
+            }
+        }
+        // 下一批会覆写同一权重区，必须保证本批VF已经读完权重；不排空输出MTE3。
+        SetFlag<HardEvent::V_MTE2>(EVENT_ID2);
+        WaitFlag<HardEvent::V_MTE2>(EVENT_ID2);
+    }
+    WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+    return true;
+}
+#endif
+
 // 原型：MegaMoe::Unpermute。执行当前 token 分区的完整 Unpermute 流水。
 template <uint8_t CombineMode, typename TopkWeightsType, bool TopkWeightsPrefetch, uint32_t Gmm1TileM>
 __aicore__ inline void UnpermuteTokens(const TokenUnpermuteConfig& context, const MoeStageCommonConfig& common,
@@ -291,6 +350,13 @@ __aicore__ inline void UnpermuteTokens(const TokenUnpermuteConfig& context, cons
     expandedX.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(params.peermemInfo.combineSendPtr));
     GlobalTensor<bfloat16_t> output;
     output.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(params.y2GmAddr));
+
+#if defined(__DAV_C310__)
+    if constexpr (CombineMode == COMBINE_NO_QUANT && !TopkWeightsPrefetch &&
+                  Std::IsSame<TopkWeightsType, float>::value) {
+        if (TryFusedTokenUnpermute(common, params, scratch, bufferConfig, tokenRange, expandedX, output)) return;
+    }
+#endif
 
     constexpr TEventID outputBufferEvent = EVENT_ID0;
     SetFlag<HardEvent::MTE3_V>(outputBufferEvent);
