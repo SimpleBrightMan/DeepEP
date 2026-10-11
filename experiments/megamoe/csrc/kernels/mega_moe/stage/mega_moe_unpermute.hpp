@@ -354,6 +354,9 @@ __aicore__ inline void UnpermuteTokens(const TokenUnpermuteConfig& context, cons
 #if defined(__DAV_C310__)
     if constexpr (CombineMode == COMBINE_NO_QUANT && !TopkWeightsPrefetch &&
                   Std::IsSame<TopkWeightsType, float>::value) {
+        // 3510下DISABLE映射硬件mode4=NOTALLOC_KEEP，与DS归并读策略一致。
+        // 保留已有L2命中、不为一次性消费分配新行；不改完成边界或数据布局。
+        expandedX.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
         if (TryFusedTokenUnpermute(common, params, scratch, bufferConfig, tokenRange, expandedX, output)) return;
     }
 #endif
