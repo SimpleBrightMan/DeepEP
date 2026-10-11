@@ -223,7 +223,14 @@ protected:
 
     __aicore__ inline void DequantizeWeight(uint32_t weightN, uint32_t rows, uint32_t cols)
     {
-        auto b = Tensor<W>(addr_.bGlobal, block_.params.layoutPrologueB);
+        AscendC::GlobalTensor<W> weight;
+        weight.SetGlobalBuffer(reinterpret_cast<__gm__ W*>(addr_.bGlobal));
+        // 单 M-block 专家没有跨 M 的权重复用，避免流式权重挤占输入/元数据缓存。
+        // 多 M-block 保持默认缓存；不改变权重布局、数值或完成协议。
+        if (config_.m <= 256U) {
+            weight.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+        }
+        auto b = tla::MakeTensor(weight, block_.params.layoutPrologueB, Catlass::Arch::PositionGM{});
         auto tileB = tla::GetTile(b, tla::MakeCoord(0, weightN), tla::MakeShape(config_.k, cols));
         block_.op(tileB, Catlass::GemmCoord{rows, cols, config_.k}, block_.params, config_.m < 256U);
     }
