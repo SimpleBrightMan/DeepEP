@@ -32,7 +32,7 @@ def test_actual_cursor_moves_preserve_slots_and_single_owner(tmp_path):
         pytest.skip("host C++ compiler unavailable; run on build host")
     cube_fields = ("l1AListId", "l1BListId", "l0AListId", "l0BListId", "l0CListId",
                    "l1MxScaleAListId", "l1MxScaleBListId")
-    vector_fields = ("l1BListId", "ubListId")
+    vector_fields = ("l1BListId", "ubInputListId", "ubOutputListId")
     definitions = []
     exercises = []
     for name, filename, fields in (
@@ -46,7 +46,7 @@ def test_actual_cursor_moves_preserve_slots_and_single_owner(tmp_path):
             "\n".join("unsigned " + f + "=0;" for f in fields) + "\n" + move_body(filename) + "\n};")
         checks = "\n".join("assert(dst." + f + " == expected." + f + ");" for f in fields)
         initial = "\n".join("src." + f + " = (trial * " + str(2 * i + 3) + ") % " +
-                             ("4" if f == "ubListId" else "2") + ";" for i, f in enumerate(fields))
+                             ("3" if f == "ubInputListId" else "2") + ";" for i, f in enumerate(fields))
         exercises.append("{ " + name + " src, dst;\n" + initial + "\n" +
             "src.active_=true; auto expected=src; src.MovePipelineTo(dst);\n" +
             "assert(!src.active_ && dst.active_);\n" + checks + "\n" +
