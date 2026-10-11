@@ -63,7 +63,7 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
     const auto& tiling = *reinterpret_cast<const MegaMoeTilingData*>(tiling_host);
     static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
     // 按本次实际 BS 编译期特化；不改变 wave 预算、Dispatch/Combine 或共享专家策略。
-    if (is_a8w4 && tiling.bs <= MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS) {
+    if (is_a8w4 && tiling.bs <= MegaMoeImpl::W4A8_PAIRED_GATE_UP_MAX_TOKENS) {
         mega_moe_kernel<true, true><<<block_dim, ub_bytes, stream>>>(
             context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
             shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,

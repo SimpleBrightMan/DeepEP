@@ -41,7 +41,7 @@ def worker(args):
         return torch.from_numpy(w).npu(), torch.from_numpy(sf).npu().view(torch.float8_e8m0fnu)
 
     w1, w2 = transform_weights_for_mega_moe(pair(raw[0]), pair(raw[1]))
-    w1 = w1.select(args.bs <= _C.small_batch_max_tokens)
+    w1 = w1.select(args.bs <= _C.paired_gate_up_max_tokens)
     # 最后一个参数选择local-only构造；不调用SymmBuffer、torch.distributed或SHMEM初始化。
     # dav-c310的util_set_ffts_config为空操作，与Ascend950 SHMEM自身使用0的约定一致。
     plan = _C.Plan(example, intermediate, topk, e, 8, args.bs, True, 0, 8,

@@ -31,7 +31,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 4:
+    if getattr(extension, "api_protocol", None) != 5:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -470,7 +470,7 @@ def _run(
         raise TypeError("Weight dtype differs from buffer mma_type")
     prepared_inputs = ()
     if w1.dtype == torch.uint8:
-        fused = data.shape[0] <= _extension().small_batch_max_tokens
+        fused = data.shape[0] <= _extension().paired_gate_up_max_tokens
         if isinstance(l1_weights, _RoutedWeightPair):
             prepared_inputs = (*l1_weights, *l1_weights._planar)
             w1, s1 = l1_weights.select(fused)

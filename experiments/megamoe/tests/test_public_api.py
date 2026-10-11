@@ -170,6 +170,7 @@ def backend(monkeypatch):
         timer_enabled=True,
         timer_numel=64,
         small_batch_max_tokens=256,
+        paired_gate_up_max_tokens=1024,
     )
     monkeypatch.setattr(api, "_extension", lambda: ext)
     buffer = api.SymmBuffer(Group(), 4, 17, 2, 1024, 256)
@@ -330,17 +331,17 @@ def test_routed_layout_switches_with_actual_bs_without_hot_path_cast(backend, bf
     # Preparing weights must not share writable storage with the caller's raw scales.
     assert w1.select(False)[1].untyped_storage().data_ptr() != raw[0][1].untyped_storage().data_ptr()
     casts = sum(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events)
-    for bs in (96, 256, 257, 4096, 96):
+    for bs in (96, 256, 257, 1024, 1025, 4096, 96):
         output = Tensor(np.zeros((bs, 1024)), "bfloat16")
         x = Tensor(np.ones((bs, 1024)), "bfloat16") if bf16 else None
         api.fp8_fp4_mega_moe(output, w1, w2, b, x=x)
         launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
-        selected = w1.select(bs <= 256)
+        selected = w1.select(bs <= backend.ext.paired_gate_up_max_tokens)
         assert launch[4] is selected[0] and launch[6] is selected[1]
         assert b._plan.bs == bs  # actual BS, not max capacity or per-expert M
     assert sum(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events) == casts
     with pytest.raises(ValueError, match="keep its returned l1 pair intact"):
-        api.fp8_fp4_mega_moe(Tensor(np.zeros((257, 1024)), "bfloat16"), tuple(w1), w2, b)
+        api.fp8_fp4_mega_moe(Tensor(np.zeros((1025, 1024)), "bfloat16"), tuple(w1), w2, b)
 
 
 @pytest.mark.parametrize("layout", [True, False])

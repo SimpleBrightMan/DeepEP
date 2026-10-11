@@ -93,6 +93,8 @@ constexpr uint32_t ACTIVATION_N_HALF = 2U;
 constexpr uint32_t GMM1_FUSED_TILE_N = L1_TILE_N / ACTIVATION_N_HALF;
 // W4A8 的 host wave 预算和 device Dispatch 共用同一实际每卡 BS 边界。
 constexpr uint32_t W4A8_SMALL_BATCH_MAX_TOKENS = 256U;
+// 配对权重布局与通信小batch策略分开：本实验仅扩展GMM1配对，不改wave预算/通信路径。
+constexpr uint32_t W4A8_PAIRED_GATE_UP_MAX_TOKENS = 1024U;
 }  // namespace MegaMoeImpl
 
 #endif  // MEGA_MOE_CONSTANTS_H
