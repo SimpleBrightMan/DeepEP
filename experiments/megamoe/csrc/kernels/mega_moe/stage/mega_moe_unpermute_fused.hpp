@@ -34,10 +34,19 @@ __simd_vf__ inline void WeightedUnpermuteVf(__ubuf__ bfloat16_t* inputs, __ubuf_
     asc_duplicate_scalar(zero, 0);
     auto output = inputs;
     for (uint32_t channel = 0; channel < channels; channel += 128U) {
-        vector_float sum0, sum1;
+        vector_float sum0, sum1, firstScale;
         auto input = inputs + channel;
         auto weight = weights;
-        for (uint32_t item = 0; item < topK; ++item) {
+        // 首项剥离：仍以第一个乘积初始化，保持signed-zero/舍入语义；
+        // 避免在每128列、每个expert内动态分支。调用方已保证topK非零。
+        vector_bfloat16_t firstValue;
+        asc_loadalign_postupdate(firstValue, input, channels);
+        asc_loadalign_brc_postupdate(firstScale, weight, 1);
+        asc_intlv(reinterpret_cast<vector_bfloat16_t&>(sum0),
+                  reinterpret_cast<vector_bfloat16_t&>(sum1), zero, firstValue);
+        asc_mul(sum0, sum0, firstScale, mask32);
+        asc_mul(sum1, sum1, firstScale, mask32);
+        for (uint32_t item = 1; item < topK; ++item) {
             vector_bfloat16_t value;
             vector_float low, high, scale;
             asc_loadalign_postupdate(value, input, channels);
@@ -46,13 +55,8 @@ __simd_vf__ inline void WeightedUnpermuteVf(__ubuf__ bfloat16_t* inputs, __ubuf_
                       reinterpret_cast<vector_bfloat16_t&>(high), zero, value);
             asc_mul(low, low, scale, mask32);
             asc_mul(high, high, scale, mask32);
-            if (item == 0U) {
-                sum0 = low;
-                sum1 = high;
-            } else {
-                asc_add(sum0, sum0, low, mask32);
-                asc_add(sum1, sum1, high, mask32);
-            }
+            asc_add(sum0, sum0, low, mask32);
+            asc_add(sum1, sum1, high, mask32);
         }
         vector_bfloat16_t out0, out1, packed, unused;
         asc_float2bfloat16_rn(out0, sum0, mask32, ASC_POSITION_EVEN);
