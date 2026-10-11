@@ -445,6 +445,13 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::SendAndQuantBuffInit()
         LocalTensor<bfloat16_t>(TPosition::VECCALC, xInAlignAddr2, xInAlignSize / sizeof(bfloat16_t));
 
     uint32_t routeRingAddr = xInAlignAddr2 + xInAlignSize;
+    // FP8分支不使用mxTemp/xIn；只复用这五段，不能覆盖前面的reset零值或后面的route ring。
+    // 同一span已在下方清零并等待V_MTE2，确保通信记录的padding保持良性零值。
+    uint32_t fp8PackRows = (routeRingAddr - mxTempTensorAddr) / (DOUBLE_BUFFER * xOutTensorSize);
+    quantScratch_.fp8PackRowsPerSlot = Min(fp8PackRows, 65535U);
+    quantScratch_.fp8PackTensor = LocalTensor<uint8_t>(
+        TPosition::VECCALC, mxTempTensorAddr,
+        DOUBLE_BUFFER * quantScratch_.fp8PackRowsPerSlot * xOutTensorSize);
     /*
      * h%64==32（scale 组数为奇数）时，量化链路存在三处"计算不覆盖、却进入定长通信记录或参与
      * 计算"的跨 launch UB 残留：xIn 尾部（进 ComputeMaxExp 尾块 mask 内 lane）、xOut 记录的

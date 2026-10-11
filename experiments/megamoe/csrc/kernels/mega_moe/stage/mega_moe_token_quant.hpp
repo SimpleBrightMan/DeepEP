@@ -47,6 +47,9 @@ struct QuantProcessScratch {
     LocalTensor<ActivationType> xOutTensor0;
     LocalTensor<ActivationType> xOutTensor1;
     LocalTensor<uint16_t> mxTempTensor;
+    // 仅FP8打包时复用整个量化scratch；两槽容量由真实连续span推导。
+    LocalTensor<uint8_t> fp8PackTensor;
+    uint32_t fp8PackRowsPerSlot = 1U;
 };
 
 template <typename TopkWeightsType, typename ActivationType, bool TopkWeightsPrefetch>
@@ -96,21 +99,35 @@ __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidde
     scales.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(params.inputScaleGmAddr));
     output.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(params.peermemInfo.quantTokenScalePtr));
     const uint32_t scaleBytes = config.quantScaleNumAlignPerToken;
+    const uint32_t rowsPerSlot = scratch.fp8PackRowsPerSlot;
+    const uint32_t slotBytes = rowsPerSlot * config.quantTokenScaleAlignBytes;
+    // GM->UB DataCopyPad的dstStride以32B为单位，blockLen以byte为单位。
+    // 自动对齐仅占用每行内部padding；记录stride和scale起点均32B对齐。
+    const uint32_t inputGap = (config.quantTokenScaleAlignBytes -
+        Ops::Base::CeilAlign(hidden, static_cast<uint32_t>(ALIGN_32))) / ALIGN_32;
+    const uint32_t scaleGap = (config.quantTokenScaleAlignBytes -
+        Ops::Base::CeilAlign(scaleBytes, static_cast<uint32_t>(ALIGN_32))) / ALIGN_32;
     SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
     SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
-    for (uint32_t index = 0; index < range.count; ++index) {
+    uint32_t sequence = 0U;
+    for (uint32_t index = 0; index < range.count; index += rowsPerSlot) {
         const uint64_t row = range.start + index;
-        const auto event = index % DOUBLE_BUFFER == 0 ? EVENT_ID0 : EVENT_ID1;
-        auto buffer = (index % DOUBLE_BUFFER == 0 ? scratch.xOutTensor0 : scratch.xOutTensor1)
-                          .template ReinterpretCast<uint8_t>();
+        const uint32_t count = Min(rowsPerSlot, range.count - index);
+        const uint32_t slot = sequence++ % DOUBLE_BUFFER;
+        const auto event = slot == 0U ? EVENT_ID0 : EVENT_ID1;
+        // 未声明可复用span的其他后端保持原单行槽，不访问未初始化的fp8PackTensor。
+        auto buffer = rowsPerSlot > 1U ? scratch.fp8PackTensor[slot * slotBytes]
+            : (slot == 0U ? scratch.xOutTensor0 : scratch.xOutTensor1).template ReinterpretCast<uint8_t>();
         WaitFlag<HardEvent::MTE3_MTE2>(event);
-        DataCopyPad(buffer, input[row * hidden], {1U, hidden, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-        DataCopyPad(buffer[config.quantTokenAlignBytes], scales[row * scaleBytes], {1U, scaleBytes, 0U, 0U, 0U},
+        DataCopyPad(buffer, input[row * hidden], {static_cast<uint16_t>(count), hidden, 0U, inputGap, 0U},
+                    {false, 0U, 0U, 0U});
+        DataCopyPad(buffer[config.quantTokenAlignBytes], scales[row * scaleBytes],
+                    {static_cast<uint16_t>(count), scaleBytes, 0U, scaleGap, 0U},
                     {false, 0U, 0U, 0U});
         SetFlag<HardEvent::MTE2_MTE3>(event);
         WaitFlag<HardEvent::MTE2_MTE3>(event);
         DataCopyPad(output[row * config.quantTokenScaleAlignBytes], buffer,
-                    {1U, config.quantTokenScaleAlignBytes, 0U, 0U, 0U});
+                    {1U, count * config.quantTokenScaleAlignBytes, 0U, 0U, 0U});
         SetFlag<HardEvent::MTE3_MTE2>(event);
     }
     WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
