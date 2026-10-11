@@ -29,6 +29,7 @@ template <class ArchTag, uint32_t L1B_STAGES_, class InType_, class OutType_, cl
 struct MegaMoeBlockPrologueA8W4 {
 public:
     using DispatchPolicy = MxA8W4Prologue<ArchTag, L1B_STAGES_>;
+    using Buffers = MegaMoeImpl::GmmKernel::A8W4BufferPlan;
     using ElementIn = typename InType_::Element;
     using ElementOut = typename OutType_::Element;
     using LayoutIn = typename InType_::Layout;
@@ -59,7 +60,7 @@ public:
     static_assert(std::is_same_v<LayoutIn, layout::Weight4BitnZ>, "MegaMoE requires packed NZ weights");
     static_assert(tla::get<1>(TileShapeL1{}) * tla::get<2>(TileShapeL1{}) <= 64 * 1024,
                   "Single-AIV weight output exceeds its UB stage");
-    static_assert(L1B_STAGES == 2, "MegaMoE uses two weight stages");
+    static_assert(L1B_STAGES == Buffers::BStages, "AIC/AIV0 must share the B stage count");
 
     CATLASS_DEVICE
     MegaMoeBlockPrologueA8W4(const Params& params, bool activate = true)
@@ -70,7 +71,8 @@ public:
         }
         for (uint32_t i = 0; i < L1B_STAGES; i++) {
             // Assign L1/L0A/L0B space for each stages
-            l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(i * 384U * 1024U);
+            l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(
+                Buffers::BBase + i * Buffers::BBytes);
         }
         // 三个 packed 输入槽 [0,96KiB)，两个 FP8 输出槽 [96,224KiB)。
         // 输入只等 V 读完，输出只等 MTE3 读完，两套游标/credit 不再绑定。
@@ -152,18 +154,21 @@ public:
         }
         for (uint32_t kLoopIdx = 0; kLoopIdx < kGmLoop; ++kLoopIdx) {
             uint32_t actualK = Min(kL1Size, kSize - kLoopIdx * kL1Size);
-            auto layout = tla::MakeLayout<ElementOut, LayoutOut>(kL1Size, actualBlockShape.n());
-            auto tensorL1B = tla::MakeTensor(l1BTensorList[l1BListId], layout, Arch::PositionL1{});
-            auto gmTile = GetTile(bGlobal, tla::MakeCoord(kLoopIdx * kL1Size, 0),
-                                  tla::MakeShape(actualK, actualBlockShape.n()));
-            auto l1Tile = GetTile(tensorL1B, tla::MakeCoord(0, 0),
-                                  tla::MakeShape(actualK, actualBlockShape.n()));
-            ProcessL1Nz(l1Tile, gmTile);
-            ubInputListId = (ubInputListId + 1U) % UB_INPUT_STAGES;
-            ubOutputListId = (ubOutputListId + 1U) % UB_OUTPUT_STAGES;
-            // 整块写 L1 后发布同一个 full；AIC 的消费形状及事件编号完全不变。
-            AscendC::CrossCoreSetFlag<SYNC_MODE, PIPE_MTE3>(AIV_SYNC_AIC_FLAG + l1BListId);
-            l1BListId = (l1BListId + 1) % L1B_STAGES;
+            for (uint32_t n = 0; n < actualBlockShape.n(); n += kPlan.bColumns) {
+                const uint32_t columns = Min(kPlan.bColumns, actualBlockShape.n() - n);
+                auto layout = tla::MakeLayout<ElementOut, LayoutOut>(kL1Size, columns);
+                auto tensorL1B = tla::MakeTensor(l1BTensorList[l1BListId], layout, Arch::PositionL1{});
+                auto gmTile = GetTile(bGlobal, tla::MakeCoord(kLoopIdx * kL1Size, n),
+                                      tla::MakeShape(actualK, columns));
+                auto l1Tile = GetTile(tensorL1B, tla::MakeCoord(0, 0),
+                                      tla::MakeShape(actualK, columns));
+                ProcessL1Nz(l1Tile, gmTile);
+                ubInputListId = (ubInputListId + 1U) % UB_INPUT_STAGES;
+                ubOutputListId = (ubOutputListId + 1U) % UB_OUTPUT_STAGES;
+                // 小M每K窗口依次发布N0/N128；每个独立64KiB槽均有自己的full/empty。
+                AscendC::CrossCoreSetFlag<SYNC_MODE, PIPE_MTE3>(AIV_SYNC_AIC_FLAG + l1BListId);
+                l1BListId = (l1BListId + 1) % L1B_STAGES;
+            }
         }
     }
 
@@ -303,8 +308,8 @@ public:
     static constexpr uint32_t SHIFT_LEFT_SIZE = 0x4;
 
     static constexpr int32_t SYNC_MODE = 4;
-    constexpr static uint16_t AIV_SYNC_AIC_FLAG = 6;
-    constexpr static uint16_t AIC_SYNC_AIV_FLAG = 8;
+    constexpr static uint16_t AIV_SYNC_AIC_FLAG = Buffers::BFull;
+    constexpr static uint16_t AIC_SYNC_AIV_FLAG = Buffers::BEmpty;
 
     static constexpr int64_t UB_INPUT_STAGES = 3;
     static constexpr int64_t UB_OUTPUT_STAGES = 2;

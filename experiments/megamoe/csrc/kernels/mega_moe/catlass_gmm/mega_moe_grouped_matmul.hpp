@@ -38,6 +38,7 @@ class A8W4MatmulPipeline {
     using SA = typename C::ElementMxScaleAType;
     using SB = typename C::ElementMxScaleBType;
     using Arch = Catlass::Arch::Ascend950;
+    using Buffers = A8W4BufferPlan;
     using LayoutA = CatlassGroupedMatmulLayouts::LayoutA;
     using LayoutB = CatlassGroupedMatmulLayouts::LayoutB<true, true>;
     using LayoutC = CatlassGroupedMatmulLayouts::LayoutC;
@@ -52,10 +53,11 @@ class A8W4MatmulPipeline {
         Catlass::Gemm::Tile::PackedMxA8W4TileCopyTla<Arch, A, LayoutA, W, LayoutB, A, LayoutDequantizedB, SA,
                                                      ScaleALayout, SB, ScaleBLayout, Out, LayoutC, void, false,
                                                      Catlass::Gemm::Tile::ScaleGranularity::PER_TENSOR>;
-    using Policy = Catlass::Gemm::MmadA8W4Mx<Arch, true, false, 16, 1, 2, 2, 2, 2>;
+    using Policy = Catlass::Gemm::MmadA8W4Mx<Arch, true, false, 8, 1,
+                                           Buffers::AStages, Buffers::BStages, 2, 2>;
     using Mmad = Catlass::Gemm::Block::MegaMoeBlockMmadA8W4<Policy, L1, L0, A, A, Out, void, TileCopy>;
     using Prologue =
-        Catlass::Gemm::Block::MegaMoeBlockPrologueA8W4<Arch, 2, Catlass::Gemm::GemmType<W, LayoutB>,
+        Catlass::Gemm::Block::MegaMoeBlockPrologueA8W4<Arch, Buffers::BStages, Catlass::Gemm::GemmType<W, LayoutB>,
                                                        Catlass::Gemm::GemmType<A, LayoutDequantizedB>, L1, TileCopy>;
     using Resource = Catlass::Gemm::Block::MegaMoeResource;
 
@@ -64,8 +66,8 @@ class A8W4MatmulPipeline {
         __aicore__ inline void Begin()
         {
             this->Activate();
-            for (uint16_t i = 0; i < 2; ++i) {
-                AscendC::CrossCoreSetFlag<4, PIPE_MTE1>(8 + i);
+            for (uint16_t i = 0; i < Buffers::BStages; ++i) {
+                AscendC::CrossCoreSetFlag<4, PIPE_MTE1>(Buffers::BEmpty + i);
             }
         }
         __aicore__ inline void End(bool outputDrained, AscendTimerDevice* timer)
@@ -99,8 +101,8 @@ class A8W4MatmulPipeline {
         __aicore__ inline void End(bool /*outputDrained*/, AscendTimerDevice* /*timer*/)
         {
             // Consume the final free-buffer tokens before another slice reuses the flags/L1.
-            for (uint16_t i = 0; i < 2; ++i) {
-                AscendC::CrossCoreWaitFlag<4, PIPE_MTE3>(8 + i);
+            for (uint16_t i = 0; i < Buffers::BStages; ++i) {
+                AscendC::CrossCoreWaitFlag<4, PIPE_MTE3>(Buffers::BEmpty + i);
             }
             op.Deactivate();
         }

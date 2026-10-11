@@ -45,8 +45,9 @@ def test_actual_cursor_moves_preserve_slots_and_single_owner(tmp_path):
             "bool active_=false;\n" +
             "\n".join("unsigned " + f + "=0;" for f in fields) + "\n" + move_body(filename) + "\n};")
         checks = "\n".join("assert(dst." + f + " == expected." + f + ");" for f in fields)
-        initial = "\n".join("src." + f + " = (trial * " + str(2 * i + 3) + ") % " +
-                             ("3" if f == "ubInputListId" else "2") + ";" for i, f in enumerate(fields))
+        stages = {"l1AListId": 3, "l1BListId": 4, "ubInputListId": 3}
+        initial = "\n".join("src." + f + " = (trial + " + str(i) + ") % " +
+                             str(stages.get(f, 2)) + ";" for i, f in enumerate(fields))
         exercises.append("{ " + name + " src, dst;\n" + initial + "\n" +
             "src.active_=true; auto expected=src; src.MovePipelineTo(dst);\n" +
             "assert(!src.active_ && dst.active_);\n" + checks + "\n" +

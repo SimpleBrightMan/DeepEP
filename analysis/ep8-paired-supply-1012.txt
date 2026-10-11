@@ -1,0 +1,26 @@
+e34: coherent small-M paired supply (experimental, not main)
+
+Parent: e31 / 100fa05, based on authorized main 24b4221.
+For M<=128, A/B L1 K512; B is TWO separate K512*N128 slots,
+not an oversized K512*N256 slot. L0 consumes K256*N128 twice,
+reusing A across N halves and releasing A only after both MMADs.
+For larger M retain K256/N256 supply and K128/N256 MMAD.
+
+Shared physical L1 ownership for both stages:
+A 3*64KiB [0,192), B 4*64KiB [192,448),
+SA 2*16KiB [448,480), SB 2*16KiB [480,512).
+Cross-core B-full flags 4..7 / B-empty 8..11; async output 12..15 unchanged.
+MTE1_MTE2 A credits 0..2, scale credits 3..4, padding fence 7.
+M_MTE1 L0A credits 0..1, L0B credits 2..3 (different lifetimes).
+Each L0C N half issues UPDATE on its final K; whole-tile FIX consumes both.
+All producer/consumer/scale/UB cursors survive inherited phase handoff.
+
+Not changed: wave scheduling, output FIX/GM/SwiGLU protocol, quantization,
+dispatch/combine, timer instrumentation, FP4 values and scale compensation.
+This is one coherent backend experiment: not an isolated buffer-count ablation.
+The earlier e14/e24 split-N trials did NOT have this K512 paired L1 supply.
+
+Gate: actual shared-plan CPU compilation and ownership model, native build,
+EP8 eight-rank full accuracy all five balanced shapes, then timer-off perf.
+CPU models do not prove DMA byte layout/flag timing. Broader skew/tail device
+validation and repeated comparable performance are required before main.
