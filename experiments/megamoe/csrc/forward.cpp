@@ -270,6 +270,8 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
             CeilDiv<uint64_t>(t.hiddenDim / MegaMoeImpl::ACTIVATION_N_HALF, MegaMoeImpl::GMM1_FUSED_TILE_N);
         t.mGroupsPerWave =
             static_cast<uint32_t>(CeilDiv<uint64_t>(static_cast<uint64_t>(p.aic) * 2U, gmm1_tasks_per_m_group));
+        // 实验：只改变同类任务的连续提交预算，保持资源归还边界。
+        t.mGroupsPerWave *= 2U;
     } else {
         // 大 batch 和 A8W8 的预算包括 GMM2 的最低任务量约束。
         const uint64_t gmm1_tiles = CeilDiv<uint64_t>(t.hiddenDim, 256U);

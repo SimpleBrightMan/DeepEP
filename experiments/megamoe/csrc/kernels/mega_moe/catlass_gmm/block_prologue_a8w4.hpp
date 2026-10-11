@@ -232,16 +232,17 @@ public:
         AscendC::Reg::RegTensor<int8_t> wAndReg;
         AscendC::Reg::RegTensor<int8_t> wLoad;
         AscendC::Reg::RegTensor<int8_t> wShl;
-        AscendC::Reg::RegTensor<int8_t> wShr0;
         AscendC::Reg::RegTensor<int8_t> wShr1;
-        AscendC::Reg::RegTensor<int8_t> wSel;
         AscendC::Reg::RegTensor<int8_t> wAnd;
 
         AscendC::Reg::MaskReg preg = AscendC::Reg::CreateMask<uint8_t, AscendC::Reg::MaskPattern::ALL>();
         AscendC::Reg::MaskReg pregVsel = AscendC::Reg::CreateMask<uint16_t, AscendC::Reg::MaskPattern::ALL>();
 
         AscendC::Reg::Duplicate<int8_t, AscendC::Reg::MaskMergeMode::ZEROING>(wShrReg, E2M1_SHIFT_RIGHT_SIZE, preg);
-        AscendC::Reg::Duplicate<int8_t, AscendC::Reg::MaskMergeMode::ZEROING>(wShlReg, SHIFT_LEFT_SIZE, preg);
+        // uint16(4) 在相邻两个 byte lane 中产生 [4,0]，对应低/高 nibble。
+        // 参考 DeepSeek 的交替移位方式，避免分别右移后再 Select；NZ 地址和缩放不变。
+        AscendC::Reg::Duplicate<uint16_t, AscendC::Reg::MaskMergeMode::ZEROING>(
+            (AscendC::Reg::RegTensor<uint16_t>&)wShlReg, static_cast<uint16_t>(SHIFT_LEFT_SIZE), pregVsel);
         AscendC::Reg::Duplicate<int8_t, AscendC::Reg::MaskMergeMode::ZEROING>(wAndReg, E2M1_AND_MASK, preg);
 
         for (uint16_t loopKIdx = 0; loopKIdx < params.loopKNum; ++loopKIdx) {
@@ -254,11 +255,9 @@ public:
                     (AscendC::Reg::RegTensor<uint8_t>&)wLoad, (__ubuf__ uint8_t*&)params.weightInUbAddr,
                     aregWeightB8In);
 
-                AscendC::Reg::ShiftRight(wShr0, wLoad, wShrReg, preg);
                 AscendC::Reg::ShiftLeft(wShl, wLoad, wShlReg, preg);
                 AscendC::Reg::ShiftRight(wShr1, wShl, wShrReg, preg);
-                AscendC::Reg::Select(wSel, wShr1, wShr0, pregVsel);
-                AscendC::Reg::And(wAnd, wSel, wAndReg, preg);
+                AscendC::Reg::And(wAnd, wShr1, wAndReg, preg);
 
                 AscendC::Reg::AddrReg aregWeightB8Out = AscendC::Reg::CreateAddrReg<uint8_t>(
                     loopKIdx, params.loopKDstStride, innerLoopIdx, params.innerDstStride);
