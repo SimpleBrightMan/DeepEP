@@ -170,7 +170,7 @@ def backend(monkeypatch):
         timer_enabled=True,
         timer_numel=64,
         small_batch_max_tokens=256,
-        paired_gate_up_max_tokens=1024,
+        paired_gate_up_max_tokens=4096,
     )
     monkeypatch.setattr(api, "_extension", lambda: ext)
     buffer = api.SymmBuffer(Group(), 4, 17, 2, 1024, 256)
@@ -318,11 +318,12 @@ def test_shared_fp4_preparation_retains_planar_weights_and_scales(backend):
 @pytest.mark.parametrize("bf16", [False, True])
 def test_routed_layout_switches_with_actual_bs_without_hot_path_cast(backend, bf16):
     b = backend.buffer
-    b.num_max_tokens_per_rank = 4096
-    b.x = Tensor(np.zeros((4096, 1024)), "float8_e4m3fn")
-    b.x_sf = Tensor(np.zeros((4096, 32)), "float8_e8m0fnu")
-    b.topk_idx = Tensor(np.tile([0, 1], (4096, 1)), "int32")
-    b.topk_weights = Tensor(np.ones((4096, 2)), "float32")
+    capacity = backend.ext.paired_gate_up_max_tokens + 1
+    b.num_max_tokens_per_rank = capacity
+    b.x = Tensor(np.zeros((capacity, 1024)), "float8_e4m3fn")
+    b.x_sf = Tensor(np.zeros((capacity, 32)), "float8_e8m0fnu")
+    b.topk_idx = Tensor(np.tile([0, 1], (capacity, 1)), "int32")
+    b.topk_weights = Tensor(np.ones((capacity, 2)), "float32")
     raw = weights()
     for weight, _ in raw:
         weight.npu_format = 2
@@ -331,7 +332,7 @@ def test_routed_layout_switches_with_actual_bs_without_hot_path_cast(backend, bf
     # Preparing weights must not share writable storage with the caller's raw scales.
     assert w1.select(False)[1].untyped_storage().data_ptr() != raw[0][1].untyped_storage().data_ptr()
     casts = sum(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events)
-    for bs in (96, 256, 257, 1024, 1025, 4096, 96):
+    for bs in (96, 256, 257, 1024, 1025, capacity - 1, capacity, 96):
         output = Tensor(np.zeros((bs, 1024)), "bfloat16")
         x = Tensor(np.ones((bs, 1024)), "bfloat16") if bf16 else None
         api.fp8_fp4_mega_moe(output, w1, w2, b, x=x)
@@ -341,7 +342,7 @@ def test_routed_layout_switches_with_actual_bs_without_hot_path_cast(backend, bf
         assert b._plan.bs == bs  # actual BS, not max capacity or per-expert M
     assert sum(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events) == casts
     with pytest.raises(ValueError, match="keep its returned l1 pair intact"):
-        api.fp8_fp4_mega_moe(Tensor(np.zeros((1025, 1024)), "bfloat16"), tuple(w1), w2, b)
+        api.fp8_fp4_mega_moe(Tensor(np.zeros((capacity, 1024)), "bfloat16"), tuple(w1), w2, b)
 
 
 @pytest.mark.parametrize("layout", [True, False])
