@@ -72,11 +72,12 @@ public:
             // Assign L1/L0A/L0B space for each stages
             l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(i * 384U * 1024U);
         }
-        // Packed inputs occupy [0,64KiB); the four
-        // output slots interleave 256-byte vectors throughout [64,192KiB).
+        // 两个完整 B 块：packed 输入 [0,64KiB)，FP8 输出 [64,192KiB)。
+        // 仍按 256B 向量交错，不采用已测退化的连续输出槽布局。
         for (uint32_t i = 0; i < UB_STAGES; i++) {
-            ubCastInTensor[i] = params.resource.ubBuf.template GetBufferByByte<ElementIn>(i * 16U * 1024U);
-            ubCastOutTensor[i] = params.resource.ubBuf.template GetBufferByByte<ElementOut>(64U * 1024U + i * 256U);
+            ubCastInTensor[i] = params.resource.ubBuf.template GetBufferByByte<ElementIn>(i * UB_INPUT_BYTES);
+            ubCastOutTensor[i] = params.resource.ubBuf.template GetBufferByByte<ElementOut>(
+                UB_STAGES * UB_INPUT_BYTES + i * 256U);
             ubEventList[i] = i;
         }
         if (activate) {
@@ -125,7 +126,6 @@ public:
         const auto kPlan =
             MegaMoeImpl::GmmKernel::MakeA8W4KPlan(actualBlockShape.m(), actualBlockShape.n(), allowDynamicB);
         const uint32_t kL1Size = kPlan.kb;
-        const uint32_t halfK = kL1Size / 2U;
         const uint32_t kGmLoop = CeilDiv(kSize, kL1Size);
 
         // AIV1 runs dispatch/epilogue concurrently and must never enter this pipeline.
@@ -136,23 +136,20 @@ public:
             uint32_t actualK = Min(kL1Size, kSize - kLoopIdx * kL1Size);
             auto layout = tla::MakeLayout<ElementOut, LayoutOut>(kL1Size, actualBlockShape.n());
             auto tensorL1B = tla::MakeTensor(l1BTensorList[l1BListId], layout, Arch::PositionL1{});
-            for (uint32_t offset = 0; offset < actualK; offset += halfK) {
-                const uint32_t count = Min(halfK, actualK - offset);
-                auto gmTile = GetTile(bGlobal, tla::MakeCoord(kLoopIdx * kL1Size + offset, 0),
-                                      tla::MakeShape(count, actualBlockShape.n()));
-                auto l1Tile =
-                    GetTile(tensorL1B, tla::MakeCoord(offset, 0), tla::MakeShape(count, actualBlockShape.n()));
-                ProcessL1Nz(l1Tile, gmTile, offset == 0U);
-                ubListId = (ubListId + 1U) % UB_STAGES;
-            }
-            // Publish only after both halves are stored in the same L1 B slot.
+            auto gmTile = GetTile(bGlobal, tla::MakeCoord(kLoopIdx * kL1Size, 0),
+                                  tla::MakeShape(actualK, actualBlockShape.n()));
+            auto l1Tile = GetTile(tensorL1B, tla::MakeCoord(0, 0),
+                                  tla::MakeShape(actualK, actualBlockShape.n()));
+            ProcessL1Nz(l1Tile, gmTile);
+            ubListId = (ubListId + 1U) % UB_STAGES;
+            // 整块写 L1 后发布同一个 full；AIC 的消费形状及事件编号完全不变。
             AscendC::CrossCoreSetFlag<SYNC_MODE, PIPE_MTE3>(AIV_SYNC_AIC_FLAG + l1BListId);
             l1BListId = (l1BListId + 1) % L1B_STAGES;
         }
     }
 
     template <class TensorOut, class TensorIn>
-    __aicore__ inline void ProcessL1Nz(const TensorOut& tensorOut, const TensorIn& tensorIn, bool firstHalf)
+    __aicore__ inline void ProcessL1Nz(const TensorOut& tensorOut, const TensorIn& tensorIn)
     {
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(ubEventList[ubListId]);
         uint32_t shapeN;
@@ -172,9 +169,7 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(ubEventList[ubListId]);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(ubEventList[ubListId]);
 
-        if (firstHalf) {
-            AscendC::CrossCoreWaitFlag<SYNC_MODE, PIPE_MTE3>(AIC_SYNC_AIV_FLAG + l1BListId);
-        }
+        AscendC::CrossCoreWaitFlag<SYNC_MODE, PIPE_MTE3>(AIC_SYNC_AIV_FLAG + l1BListId);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubEventList[ubListId]);
 
         AntiQuantComputeNz(tensorCastOut, tensorCastIn);
@@ -271,8 +266,7 @@ public:
     template <class TensorDst, class TensorSrc>
     __aicore__ inline void CopyUb2L1(TensorDst const& dstTensor, TensorSrc const& srcTensor)
     {
-        // VF stores one 256-byte vector every 1024 bytes. Gather this slot's
-        // vectors into contiguous NZ L1, skipping the other three UB slots.
+        // 将交错输出中的当前槽收集为连续 NZ L1；跨过其他 UB 槽的向量。
         constexpr uint32_t VECTOR_BYTES = 256U;
         constexpr uint32_t BLOCK_BYTES = 32U;
         const uint32_t elements = tla::get<0, 1>(srcTensor.shape()) * C0_SIZE_B8 * tla::get<1, 0>(srcTensor.shape()) *
@@ -293,7 +287,10 @@ public:
     constexpr static uint16_t AIV_SYNC_AIC_FLAG = 6;
     constexpr static uint16_t AIC_SYNC_AIV_FLAG = 8;
 
-    static constexpr int64_t UB_STAGES = 4;
+    static constexpr int64_t UB_STAGES = 2;
+    static constexpr uint32_t UB_INPUT_BYTES = 32U * 1024U;
+    static constexpr uint32_t UB_OUTPUT_BYTES = 64U * 1024U;
+    static_assert(UB_STAGES * (UB_INPUT_BYTES + UB_OUTPUT_BYTES) <= ArchTag::UB_SIZE);
 
     bool active_ = false;
     uint32_t l1BListId{0};
