@@ -30,6 +30,7 @@ struct CatlassGroupedMatmulLayouts {
 namespace detail {
 template <class Config, bool IsGmm2 = false>
 class A8W4MatmulPipeline {
+    template <class, bool> friend class A8W4MatmulPipeline;
     using C = typename Config::KernelConfig;
     using A = typename C::ElementAType;
     using W = typename C::ElementBType;
@@ -126,6 +127,37 @@ class A8W4MatmulPipeline {
     }
 
 public:
+    template <class NextConfig, bool NextGmm2>
+    __aicore__ inline void HandoffTo(A8W4MatmulPipeline<NextConfig, NextGmm2>& next)
+    {
+        using Next = A8W4MatmulPipeline<NextConfig, NextGmm2>;
+        static_assert(std::is_same_v<Mmad, typename Next::Mmad> &&
+                      std::is_same_v<Prologue, typename Next::Prologue>,
+                      "Pipeline handoff requires identical physical layouts and event policy");
+        // 两端不能同时 active。调度器只从当前唯一 owner 向 inactive 的下一阶段交接。
+        if (!active_) return;
+        if constexpr (g_coreType == AscendC::AIC) {
+            block_.MovePipelineTo(next.block_);
+        } else {
+            block_.op.MovePipelineTo(next.block_.op);
+        }
+        next.active_ = true;
+        active_ = false;
+    }
+
+    __aicore__ inline void DrainOutput()
+    {
+        // Combine 的 GM ready 仍要求真正 FIX 完成；只保留资源，不提前发布数据。
+        if constexpr (g_coreType == AscendC::AIC) {
+            if (!active_) return;
+            int index = -1;
+            if (timer_ != nullptr) index = timer_->BeginBoundary(AscendTimer::AIC_GMM2_FIX_DRAIN);
+            AscendC::SetFlag<AscendC::HardEvent::FIX_S>(0);
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(0);
+            if (timer_ != nullptr) timer_->EndBoundary(AscendTimer::AIC_GMM2_FIX_DRAIN, index);
+        }
+    }
+
     // Construct fixed buffer views once, without touching shared hardware events.
     __aicore__ inline A8W4MatmulPipeline() : block_(resource_) {}
     __aicore__ inline A8W4MatmulPipeline(const Config& config, const GMMAddrInfo& addr, GM_ADDR output)
@@ -252,6 +284,9 @@ public:
     __aicore__ inline CatlassGmm1() = default;
     using Pipeline::Begin;
     using Pipeline::End;
+    __aicore__ inline Pipeline& PipelineRef() { return *this; }
+    template <class Next>
+    __aicore__ inline void HandoffTo(Next& next) { Pipeline::HandoffTo(next.PipelineRef()); }
 
     template <class ProblemConfig>
     __aicore__ inline void UpdateProblem(const ProblemConfig& config, const GMMAddrInfo& addr)
@@ -295,6 +330,10 @@ public:
     __aicore__ inline CatlassGmm2() = default;
     using Pipeline::Begin;
     using Pipeline::End;
+    using Pipeline::DrainOutput;
+    __aicore__ inline Pipeline& PipelineRef() { return *this; }
+    template <class Next>
+    __aicore__ inline void HandoffTo(Next& next) { Pipeline::HandoffTo(next.PipelineRef()); }
     __aicore__ inline void UpdateProblem(const Config& config, const GMMAddrInfo& addr)
     {
         Pipeline::UpdateProblem(config, addr, addr.gmm2OutGlobal);

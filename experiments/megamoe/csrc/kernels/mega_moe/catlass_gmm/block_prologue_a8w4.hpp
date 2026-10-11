@@ -105,6 +105,17 @@ public:
     }
 
     CATLASS_DEVICE
+    void MovePipelineTo(MegaMoeBlockPrologueA8W4& next)
+    {
+        // 输入三槽与输出两槽独立轮转；交接必须同时保留两个游标和未消费的 credit。
+        next.l1BListId = l1BListId;
+        next.ubInputListId = ubInputListId;
+        next.ubOutputListId = ubOutputListId;
+        next.active_ = active_;
+        active_ = false;
+    }
+
+    CATLASS_DEVICE
     void Deactivate()
     {
         if (!active_) {

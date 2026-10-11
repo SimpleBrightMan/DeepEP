@@ -394,9 +394,13 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm2
     uint32_t waveGmm2ExpertEndExclusive =
         waveEndPosition.expertIdx + (waveEndPosition.tokenIndexInExpert == 0U ? 0U : 1U);
     const uint32_t waveStartBlockIdx = startBlockIdx;
+    if constexpr (ASYNC_GMM1) {
+        // AIC/AIV0 使用完全相同的 L1/L0/UB 布局；不排空、不重置槽号。
+        gmm1CatlassContext_.HandoffTo(gmm2WaveContext_);
+    }
     void* waveContext = nullptr;
     if constexpr (CombineQuantMode == COMBINE_NO_QUANT) {
-        // 只跨同类 GMM2 slice 保留 credit/缓冲游标；离开 wave 前必须归还共享硬件资源。
+        // 异步路径接收 GMM1 的相同物理流水；其他路径仍在本 wave 内独占并归还。
         waveContext = &gmm2WaveContext_;
     }
     for (uint32_t expertIdx = waveBeginPosition.expertIdx; expertIdx < waveGmm2ExpertEndExclusive; ++expertIdx) {
@@ -421,8 +425,12 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm2
         }
     }
     if constexpr (CombineQuantMode == COMBINE_NO_QUANT) {
-        // End 内先等待 FIX，再恢复 MM layout/回收 credit。所有通知必须在该完成边界之后。
-        gmm2WaveContext_.End();
+        // ready 仍在真正的 FIX 完成之后；异步路径只省去资源销毁/重建。
+        if constexpr (ASYNC_GMM1) {
+            gmm2WaveContext_.DrainOutput();
+        } else {
+            gmm2WaveContext_.End();
+        }
         if constexpr (g_coreType == AIC) {
             // 重放轻量分核计算，避免分配随专家数增长的 pending 数组。不重新执行 GEMM。
             uint32_t notifyStartBlockIdx = waveStartBlockIdx;
@@ -445,6 +453,9 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm2
     }
     if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {
         DrainCombineRowBuffers(combineRowSequence, combineBufferConfig.rowBufferCount);
+    }
+    if constexpr (ASYNC_GMM1) {
+        gmm2WaveContext_.HandoffTo(gmm1CatlassContext_);
     }
 }
 
@@ -573,10 +584,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
                 currentWaveNeedsGmm1 = IsPositionWithinWave(gmm1Position, currentWaveMGroupCount);
             }
         }
-        if constexpr (ASYNC_GMM1) {
-            // 不跨GMM1/GMM2资源切换保留状态；FIX完成后才恢复MM layout并归还L1/L0 credit。
-            gmm1CatlassContext_.End();
-        }
+        // 异步 GMM1 的 FIX full 保护消费者；下一阶段接管同一流水，不另加 Scalar 排空。
         UpdateGmmLoopCount(gmmLoopCount_, LoopCountIndex::GMM1, ++gmm1Count);
         if (gmm2LagActive) {
             // 滞后一拍：本轮消费上一 Wave 的 GMM2/Combine；当前 Wave 边界缓存到下一轮。
@@ -608,7 +616,11 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
                                    gmm1TileReadySequence);
         UpdateGmmLoopCount(gmmLoopCount_, LoopCountIndex::GMM2, ++gmm2Count);
     }
-    if constexpr (ASYNC_GMM1 && g_coreType == AIC) Gmm1AsyncCompletion::DrainProducer();
+    if constexpr (ASYNC_GMM1) {
+        // 每次 GMM2 后资源归还给 GMM1 owner，包括尾轮；最终且仅最终回收硬件 credit。
+        gmm1CatlassContext_.End();
+        if constexpr (g_coreType == AIC) Gmm1AsyncCompletion::DrainProducer();
+    }
     timer_.SetWave(AscendTimer::NO_WAVE);
 }
 

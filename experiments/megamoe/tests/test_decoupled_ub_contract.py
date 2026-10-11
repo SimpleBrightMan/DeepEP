@@ -3,6 +3,23 @@ import unittest
 
 
 class DecoupledUbContract(unittest.TestCase):
+    def test_handoff_preserves_independent_ring_positions(self):
+        # 覆盖零任务、两套环回绕及多次 GMM1/GMM2 交接；不能把输出游标冒充输入游标。
+        for first in range(13):
+            for second in range(13):
+                for third in range(13):
+                    owner = (0, 0, 0)
+                    observed = []
+                    for count in (first, second, third):
+                        next_owner = tuple(owner)
+                        for _ in range(count):
+                            observed.append(next_owner)
+                            b, src, dst = next_owner
+                            next_owner = ((b + 1) % 2, (src + 1) % 3, (dst + 1) % 2)
+                        owner = next_owner
+                    self.assertEqual(observed, [(i % 2, i % 3, i % 2)
+                                                for i in range(first + second + third)])
+
     def test_address_sets_are_disjoint_and_within_arch_limit(self):
         inputs = [set(range(i * 32768, (i + 1) * 32768)) for i in range(3)]
         outputs = [set(98304 + slot * 256 + vector * 512 + byte

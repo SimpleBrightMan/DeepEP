@@ -270,6 +270,24 @@ public:
         active_ = true;
     }
 
+    // 调用者保证 next 不持有硬件资源；只交接同一物理布局的游标，不重新投放 credit。
+    // 已发出的 DMA/MMAD/FIX 仍由原事件依赖保护，next 从准确的下一槽继续。
+    CATLASS_DEVICE
+    void MovePipelineTo(MegaMoeBlockMmadA8W4& next)
+    {
+        static_assert(ENABLE_UNIT_FLAG && L0C_STAGES == 1 && !ENABLE_L1_RESIDENT && !HAS_BIAS,
+                      "Handoff requires unit-flag L0C ownership and no resident operand cache");
+        next.l1AListId = l1AListId;
+        next.l1BListId = l1BListId;
+        next.l0AListId = l0AListId;
+        next.l0BListId = l0BListId;
+        next.l0CListId = l0CListId;
+        next.l1MxScaleAListId = l1MxScaleAListId;
+        next.l1MxScaleBListId = l1MxScaleBListId;
+        next.active_ = active_;
+        active_ = false;
+    }
+
     CATLASS_DEVICE
     void Deactivate()
     {
