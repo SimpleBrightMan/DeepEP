@@ -3,7 +3,7 @@ set -eo pipefail
 root=$(cd -- "$(dirname -- "$0")" && pwd)
 rank="$1"; method="$2"; run="$3"
 source /root/miniconda3/etc/profile.d/conda.sh
-conda activate zyx
+conda activate /root/miniconda3/envs/zyx
 source /home/pkg/b070/cann-9.2.0/set_env.sh
 export LD_LIBRARY_PATH="$root/shmem:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 export OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1

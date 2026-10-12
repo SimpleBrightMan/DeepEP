@@ -1,5 +1,6 @@
 """Isolated EP128 performance-only retry on authorized racks 07+01."""
 import concurrent.futures
+import argparse
 import hashlib
 import json
 from pathlib import Path
@@ -20,8 +21,11 @@ import openpyxl
 import paramiko
 
 def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--resume-preparation',action='store_true',help='Resume only before any performance stage was launched')
+    args=parser.parse_args()
     assert hashlib.sha256(WHEEL.read_bytes()).hexdigest()==SHA
-    OUT.mkdir(exist_ok=False)
+    OUT.mkdir(exist_ok=args.resume_preparation)
     book=openpyxl.load_workbook('C:/Project/Agent/乌兰512p_8柜.xlsx',read_only=True,data_only=True)
     secrets={}
     for rack in ('07','01'):
@@ -31,6 +35,13 @@ def main():
     state=dict(status='preparing',remote=REMOTE,native_commit='db2c017',wheel_sha256=SHA,
         started=time.time(),accuracy='not_run_user_requested',topology='07+01; changed from historical07+05',
         hosts=[dict(rack=r,node=n,ip=secrets[r,n][0]) for r,n in ORDER],stages=[])
+    if args.resume_preparation:
+        previous=json.loads((OUT/'campaign.json').read_text(encoding='utf-8'))
+        assert previous['status']=='stopped' and not previous['stages'], 'Partial/running performance must not be restarted'
+        assert all(previous[k]==state[k] for k in ('remote','native_commit','wheel_sha256','hosts'))
+        state=previous
+        state.setdefault('preparation_retries',[]).append(dict(at=time.time(),previous_error=state.pop('error',None)))
+        state['status']='preparing'
     def save():
         (OUT/'campaign.json').write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
     def connect(key):
@@ -64,7 +75,7 @@ def main():
     save()
     try:
         parallel(idle)
-        deps=OUT/'dependencies'; deps.mkdir()
+        deps=OUT/'dependencies'; deps.mkdir(exist_ok=args.resume_preparation)
         for name in ('aclshmem_bootstrap_config_store.so','aclshmem_bootstrap_uid.so','libshmem.so','libshmem_utils.so'):
             fetch(ORDER[0],'/home/zyx/ep32-main-24b4221/shmem/lib/'+name,deps/name)
         for source,name in [('ep128-ds-test.py','test_mega_moe.py'),('ep128-ds-utils.py','utils.py'),('ep128-ds-measure.py','megamoe_measure.py')]:
@@ -73,7 +84,11 @@ def main():
         save()
         def prepare(key):
             # 只创建隔离目录和缺失的zyx副本，不更新他人的hkq环境。
-            command(key,f'test ! -e {REMOTE} && mkdir -p {REMOTE}/shmem {REMOTE}/ds-python {REMOTE}/ds-harness')
+            if args.resume_preparation:
+                actual=command(key,f'sha256sum {REMOTE}/{WHEEL.name}').split()[0]
+                assert actual==SHA, (key,'deployed wheel changed')
+            else:
+                command(key,f'test ! -e {REMOTE} && mkdir -p {REMOTE}/shmem {REMOTE}/ds-python {REMOTE}/ds-harness')
             c=connect(key)
             try:
                 with c.open_sftp() as s:
@@ -85,8 +100,9 @@ def main():
             finally: c.close()
             result=command(key,f'''set -e
 if [ ! -d /root/miniconda3/envs/zyx ]; then
- /root/miniconda3/bin/conda create --offline -y --name zyx --clone /root/miniconda3/envs/hkq > {REMOTE}/clone.log 2>&1
+ /root/miniconda3/bin/conda create --offline -y --prefix /root/miniconda3/envs/zyx --clone /root/miniconda3/envs/hkq > {REMOTE}/clone-prefix.log 2>&1
 fi
+test -x /root/miniconda3/envs/zyx/bin/python
 /root/miniconda3/envs/zyx/bin/python -I -m zipfile -e {REMOTE}/{WHEEL.name} {REMOTE}/package
 tar -xzf {REMOTE}/ep128-ds-package.tar.gz -C {REMOTE}/ds-python
 tar -xzf {REMOTE}/ep128-ds-deps.tar.gz -C {REMOTE}/ds-python
