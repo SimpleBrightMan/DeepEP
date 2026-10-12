@@ -16,7 +16,7 @@ if [ "$(npu-smi info | grep -c 'No running processes found in NPU' || true)" != 
 fi
 cd /tmp
 if [ "$method" = probe ]; then
-    exec timeout --signal=TERM --kill-after=10s 120s python -I -c 'import torch,torch_npu; print(torch.__version__,torch_npu.__version__,flush=True); assert torch.__version__=="2.12.0+cpu" and torch_npu.__version__=="2.12.0.post2"; [(torch.npu.set_device(i),torch.ones(1,device=f"npu:{i}"),torch.npu.synchronize(),print("DEVICE_OK",i,flush=True)) for i in range(8)]'
+    exec timeout --signal=TERM --kill-after=10s 300s python -I -c 'import torch,torch_npu; print(torch.__version__,torch_npu.__version__,flush=True); assert torch.__version__=="2.12.0+cpu" and torch_npu.__version__=="2.12.0.post2"; [(torch.npu.set_device(i),torch.ones(1,device=f"npu:{i}"),torch.npu.synchronize(),print("DEVICE_OK",i,flush=True)) for i in range(8)]'
 fi
 options=()
 if [ "$method" = ours ]; then

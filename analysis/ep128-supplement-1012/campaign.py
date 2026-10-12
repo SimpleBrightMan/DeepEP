@@ -131,11 +131,16 @@ sha256sum {REMOTE}/{WHEEL.name} {REMOTE}/ds-python/deep_gemm/include/deep_gemm/m
             parallel(prepare)
         state['status']='device_probe'; save()
         def probe(key):
-            value=command(key,f'bash {REMOTE}/run_node.sh 0 probe probe',timeout=150)
-            (OUT/f'probe-{key[0]}-{key[1]}.log').write_text(value)
-            assert value.count('DEVICE_OK')==8,(key,value)
-            print('PROBE_OK',*key,flush=True)
-        parallel(probe)
+            try:
+                value=command(key,f'bash {REMOTE}/run_node.sh 0 probe probe',timeout=340)
+                (OUT/f'probe-{key[0]}-{key[1]}.log').write_text(value)
+                assert value.count('DEVICE_OK')==8,(key,value)
+                print('PROBE_OK',*key,flush=True)
+            except Exception as error:
+                (OUT/f'probe-{key[0]}-{key[1]}-failed-{int(time.time())}.log').write_text(str(error),encoding='utf-8')
+                return str(error)
+        errors=[value for value in parallel(probe) if value]
+        if errors: raise RuntimeError('Device preflight failures: '+'; '.join(errors))
         for method,run in [('ours','ours1'),('ds','ds1'),('ds','ds2'),('ours','ours2')]:
             parallel(idle)
             rec=dict(method=method,run=run,status='launching',jobs=[],started=time.time())
