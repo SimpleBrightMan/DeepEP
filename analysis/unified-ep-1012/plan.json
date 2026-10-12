@@ -1,0 +1,16 @@
+{
+  "native_commit": "db2c017eaebf1cea2b2d4ec89f0516dc19b6de68",
+  "base_main": "24b42213de5241c9a9126ccd8b91c80f35a89cec",
+  "branch": "codex/megamoe-best-unified-ep8-32-128-1012",
+  "wheel_sha256": "f39cc15c9c252a689b6e2bbdde4fcc78d9566be73d0a1cce5577048bd2962cc3",
+  "ep": [8, 32, 128], "bs": [32, 96, 256, 1024, 4096],
+  "performance_repeats": 2,
+  "metric": "mean of last10 per-round min-rank kernel Duration, full communication",
+  "secondary_metric": "mean of last10 per-round max-rank kernel Duration",
+  "timer": "separate diagnostic call after timer-off performance in repeat1, rank0 only",
+  "accuracy": "new unified pass checks16 tokens/rank/case and all-rank expert-count contract; prior EP8 full8rank5shape plus skew1/random1031 PASS",
+  "topology": "EP8 rack07CPU7; EP32 rack07CPU7,CPU1,CPU2,CPU3; EP128 rack07all8+rack05all8",
+  "deployment": "same exact wheel extracted into unique isolated path; no pip install or main changes",
+  "exclusions": "e56 UB reservation, e57 one-credit GM, e58 directCV, e59 K-loop specialization and e60 unvalidated scale transpose",
+  "acceptance": "No universal DS parity claim. Report each EP separately, missing/failed results explicitly. Historical main/DS reference measurements retain original date and scope; do not present them as fresh paired ablation."
+}

@@ -1,0 +1,1 @@
+{"schema_version":1,"model":{"hidden":7168,"intermediate_hidden":3072,"num_experts":384,"num_topk":6,"num_shared_experts":0},"bs_values":[32,96,256,1024,4096],"warmup":10,"iters":20,"seed":20260922}
