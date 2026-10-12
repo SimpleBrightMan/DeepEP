@@ -9,6 +9,7 @@
 #include "catlass/gemm/gemm_type.hpp"
 #include "block_mmad_a8w4.hpp"
 #include "block_prologue_a8w4.hpp"
+#include <c_api/asc_simd.h>
 
 namespace MegaMoeImpl::GmmKernel {
 
@@ -28,6 +29,16 @@ struct CatlassGroupedMatmulLayouts {
 
 // Shared AIC/AIV0 pipeline mechanics; projection semantics belong to GMM1/GMM2 below.
 namespace detail {
+// B070 的 L2CacheAlter 没有 LAST 分支；直接编码3510高4位读取提示，保留低60位地址。
+// 激活和激活尺度跨输出列块复用，使用与 DS 一致的 NORMAL_LAST_VICTIM。
+__aicore__ inline constexpr uint64_t ReusedActivationReadAddress(uint64_t address)
+{
+    constexpr uint64_t shift = 60U;
+    constexpr uint64_t mask = (uint64_t{1} << shift) - 1U;
+    return (address & mask) |
+        (static_cast<uint64_t>(asc_load_l2_cache_mode::NORMAL_LAST_VICTIM) << shift);
+}
+
 template <class Config, bool IsGmm2 = false>
 class A8W4MatmulPipeline {
     template <class, bool> friend class A8W4MatmulPipeline;
@@ -242,9 +253,11 @@ protected:
     __aicore__ inline void ComputeProjection(uint32_t m, uint32_t weightN, uint32_t rows, uint32_t cols,
                                              uint32_t outputN)
     {
-        auto a = Tensor<A>(addr_.aGlobal, tla::MakeLayout<A, LayoutA>(config_.m, config_.k));
+        auto aAddress = reinterpret_cast<GM_ADDR>(ReusedActivationReadAddress(reinterpret_cast<uint64_t>(addr_.aGlobal)));
+        auto saAddress = reinterpret_cast<GM_ADDR>(ReusedActivationReadAddress(reinterpret_cast<uint64_t>(addr_.aScaleGlobal)));
+        auto a = Tensor<A>(aAddress, tla::MakeLayout<A, LayoutA>(config_.m, config_.k));
         auto sa =
-            Tensor<SA>(addr_.aScaleGlobal, tla::MakeMxScaleLayout<SA, LayoutScaleA, false>(config_.m, config_.scaleK));
+            Tensor<SA>(saAddress, tla::MakeMxScaleLayout<SA, LayoutScaleA, false>(config_.m, config_.scaleK));
         auto sb =
             Tensor<SB>(addr_.bScaleGlobal, tla::MakeMxScaleLayout<SB, LayoutScaleB, true>(config_.scaleK, config_.n));
         auto c = Tensor<Out>(output_, tla::MakeLayout<Out, LayoutC>(config_.m, config_.n));
