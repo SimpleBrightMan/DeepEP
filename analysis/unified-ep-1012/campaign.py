@@ -30,6 +30,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--resume', action='store_true', help='Only resume after every launched stage completed; never restart a partial phase')
     args = parser.parse_args()
     plan = json.loads((HERE/'plan.json').read_text())
     wheel = WORKSPACE/'tmp'/WHEEL_NAME
@@ -44,9 +45,19 @@ def main():
     public = [dict(rack=r, node=n, ip=secrets[r,n][0], global_node_rank=i) for i,(r,n) in enumerate(ORDER)]
     if args.dry_run:
         print(json.dumps(dict(plan=plan, hosts=public), ensure_ascii=False, indent=2)); return
-    args.output.mkdir(parents=True, exist_ok=False)
-    state = dict(status='preparing', plan=plan, hosts=public, remote_root=REMOTE, stages=[],
-                 runner_sha256=digest(Path(__file__)), started=time.time())
+    if args.resume:
+        state=json.loads((args.output/'campaign.json').read_text(encoding='utf-8'))
+        def settled(s):
+            return s['status']=='complete' or (s['stage']=='accuracy' and s['status']=='cancelled_by_user')
+        if state['status']!='stopped' or not all(settled(s) for s in state['stages']):
+            raise RuntimeError('Resume requires stopped state with no partial/running phase')
+        if state['plan']!=plan or state['hosts']!=public or state['remote_root']!=REMOTE:
+            raise RuntimeError('Resume configuration changed')
+        state.setdefault('resumes',[]).append(dict(at=time.time(),previous_error=state.pop('error',None),runner_sha256=digest(Path(__file__))))
+    else:
+        args.output.mkdir(parents=True, exist_ok=False)
+        state = dict(status='preparing', plan=plan, hosts=public, remote_root=REMOTE, stages=[],
+                     runner_sha256=digest(Path(__file__)), started=time.time())
 
     def save():
         (args.output/'campaign.json').write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -112,6 +123,12 @@ def main():
             client.close()
 
     def phase(ep, stage, run):
+        # 用户明确取消的精度阶段不重启；保留取消记录，不伪装为通过。
+        if stage=='accuracy' and any(s['ep']==ep and s['run']==run and s['status']=='cancelled_by_user' for s in state['stages']):
+            print('SKIP_USER_CANCELLED_ACCURACY', ep, flush=True)
+            return
+        if any(s['ep']==ep and s['run']==run and s['status']=='complete' for s in state['stages']):
+            return
         keys = ORDER[:ep//8]
         idle(keys, f'ep{ep}-{run}-before')
         label=f'ep{ep}-{run}'
@@ -165,8 +182,20 @@ def main():
 
     save()
     try:
-        idle(ORDER, 'initial')
-        parallel(ORDER, prepare)
+        idle(ORDER, f"resume{len(state.get('resumes',[]))}" if args.resume else 'initial')
+        if args.resume:
+            # 原测试均已正常退出；只读校验已有隔离环境，不覆盖代码、数据或输出。
+            def verify(key):
+                actual=execute(key, f'sha256sum {REMOTE}/{WHEEL_NAME}').split()[0]
+                if actual!=plan['wheel_sha256']:
+                    raise RuntimeError(f'{key}: resumed wheel hash mismatch')
+                for name in ('entry.py','run_node.sh','config.json'):
+                    actual=execute(key, f'sha256sum {REMOTE}/{name}').split()[0]
+                    if actual!=digest(HERE/name):
+                        raise RuntimeError(f'{key}: resumed {name} mismatch')
+            parallel(ORDER,verify)
+        else:
+            parallel(ORDER, prepare)
         state['deployment']='all16 same isolated wheel'; save()
         for ep in (8,32,128):
             phase(ep, 'golden', 'golden')
