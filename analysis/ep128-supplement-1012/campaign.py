@@ -23,9 +23,12 @@ import paramiko
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--resume-preparation',action='store_true',help='Resume only before any performance stage was launched')
+    parser.add_argument('--resume-preflight',action='store_true',help='Verify completed deployments without upload and retry the unstarted device preflight')
     args=parser.parse_args()
+    assert not (args.resume_preparation and args.resume_preflight)
+    resume=args.resume_preparation or args.resume_preflight
     assert hashlib.sha256(WHEEL.read_bytes()).hexdigest()==SHA
-    OUT.mkdir(exist_ok=args.resume_preparation)
+    OUT.mkdir(exist_ok=resume)
     book=openpyxl.load_workbook('C:/Project/Agent/乌兰512p_8柜.xlsx',read_only=True,data_only=True)
     secrets={}
     for rack in ('07','01'):
@@ -35,7 +38,7 @@ def main():
     state=dict(status='preparing',remote=REMOTE,native_commit='db2c017',wheel_sha256=SHA,
         started=time.time(),accuracy='not_run_user_requested',topology='07+01; changed from historical07+05',
         hosts=[dict(rack=r,node=n,ip=secrets[r,n][0]) for r,n in ORDER],stages=[])
-    if args.resume_preparation:
+    if resume:
         previous=json.loads((OUT/'campaign.json').read_text(encoding='utf-8'))
         assert previous['status']=='stopped' and not previous['stages'], 'Partial/running performance must not be restarted'
         assert all(previous[k]==state[k] for k in ('remote','native_commit','wheel_sha256','hosts'))
@@ -75,11 +78,12 @@ def main():
     save()
     try:
         parallel(idle)
-        deps=OUT/'dependencies'; deps.mkdir(exist_ok=args.resume_preparation)
-        for name in ('aclshmem_bootstrap_config_store.so','aclshmem_bootstrap_uid.so','libshmem.so','libshmem_utils.so'):
-            fetch(ORDER[0],'/home/zyx/ep32-main-24b4221/shmem/lib/'+name,deps/name)
-        for source,name in [('ep128-ds-test.py','test_mega_moe.py'),('ep128-ds-utils.py','utils.py'),('ep128-ds-measure.py','megamoe_measure.py')]:
-            fetch(ORDER[0],'/home/zyx/'+source,deps/name)
+        deps=OUT/'dependencies'; deps.mkdir(exist_ok=resume)
+        if not args.resume_preflight:
+            for name in ('aclshmem_bootstrap_config_store.so','aclshmem_bootstrap_uid.so','libshmem.so','libshmem_utils.so'):
+                fetch(ORDER[0],'/home/zyx/ep32-main-24b4221/shmem/lib/'+name,deps/name)
+            for source,name in [('ep128-ds-test.py','test_mega_moe.py'),('ep128-ds-utils.py','utils.py'),('ep128-ds-measure.py','megamoe_measure.py')]:
+                fetch(ORDER[0],'/home/zyx/'+source,deps/name)
         state['dependency_sha256']={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in deps.iterdir()}
         save()
         def prepare(key):
@@ -112,7 +116,19 @@ sha256sum {REMOTE}/{WHEEL.name} {REMOTE}/ds-python/deep_gemm/include/deep_gemm/m
             assert result.split()[0]==SHA,(key,result)
             (OUT/f'identity-{key[0]}-{key[1]}.txt').write_text(result)
             print('PREPARED',*key,flush=True)
-        parallel(prepare)
+        if args.resume_preflight:
+            def verify(key):
+                identity=(OUT/f'identity-{key[0]}-{key[1]}.txt').read_text().splitlines()
+                expected={WHEEL.name:SHA,'ds-python/deep_gemm/include/deep_gemm/mega_moe.hpp':identity[1].split()[0]}
+                expected.update({name:hashlib.sha256((HERE/name).read_bytes()).hexdigest() for name in ('entry.py','ds_entry.py','run_node.sh','config.json')})
+                expected.update({('shmem/' if p.suffix=='.so' else 'ds-harness/')+p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in deps.iterdir()})
+                actual=command(key,'sha256sum '+' '.join(shlex.quote(REMOTE+'/'+name) for name in expected))
+                hashes={line.split(maxsplit=1)[1].removeprefix(REMOTE+'/'):line.split()[0] for line in actual.splitlines()}
+                assert hashes==expected,(key,'deployed file identity changed; do not overwrite automatically')
+                print('VERIFIED',*key,flush=True)
+            parallel(verify)
+        else:
+            parallel(prepare)
         state['status']='device_probe'; save()
         def probe(key):
             value=command(key,f'bash {REMOTE}/run_node.sh 0 probe probe',timeout=150)
