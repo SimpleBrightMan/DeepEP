@@ -24,9 +24,11 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--resume-preparation',action='store_true',help='Resume only before any performance stage was launched')
     parser.add_argument('--resume-preflight',action='store_true',help='Verify completed deployments without upload and retry the unstarted device preflight')
+    parser.add_argument('--resume-ds-failure',action='store_true',help='After completed ours1 and exited failed ds1, verify deployment and run ds1_retry1/ds2/ours2 without overwriting evidence')
     args=parser.parse_args()
-    assert not (args.resume_preparation and args.resume_preflight)
-    resume=args.resume_preparation or args.resume_preflight
+    assert sum((args.resume_preparation,args.resume_preflight,args.resume_ds_failure))<=1
+    resume=args.resume_preparation or args.resume_preflight or args.resume_ds_failure
+    verify_only=args.resume_preflight or args.resume_ds_failure
     assert hashlib.sha256(WHEEL.read_bytes()).hexdigest()==SHA
     OUT.mkdir(exist_ok=resume)
     book=openpyxl.load_workbook('C:/Project/Agent/乌兰512p_8柜.xlsx',read_only=True,data_only=True)
@@ -40,10 +42,15 @@ def main():
         hosts=[dict(rack=r,node=n,ip=secrets[r,n][0]) for r,n in ORDER],stages=[])
     if resume:
         previous=json.loads((OUT/'campaign.json').read_text(encoding='utf-8'))
-        assert previous['status']=='stopped' and not previous['stages'], 'Partial/running performance must not be restarted'
+        assert previous['status']=='stopped', 'Running controller must not be restarted'
+        if args.resume_ds_failure:
+            assert [(s['run'],s['status']) for s in previous['stages']]==[('ours1','complete'),('ds1','failed')], 'Only the recorded first DS failure may resume'
+            assert all(len(s['jobs'])==16 and all('returncode' in j for j in s['jobs']) for s in previous['stages']), 'All launched jobs must have exited'
+        else:
+            assert not previous['stages'], 'Partial/running performance must not be restarted'
         assert all(previous[k]==state[k] for k in ('remote','native_commit','wheel_sha256','hosts'))
         state=previous
-        state.setdefault('preparation_retries',[]).append(dict(at=time.time(),previous_error=state.pop('error',None)))
+        state.setdefault('performance_retries' if args.resume_ds_failure else 'preparation_retries',[]).append(dict(at=time.time(),previous_error=state.pop('error',None)))
         state['status']='preparing'
     def save():
         (OUT/'campaign.json').write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -79,7 +86,7 @@ def main():
     try:
         parallel(idle)
         deps=OUT/'dependencies'; deps.mkdir(exist_ok=resume)
-        if not args.resume_preflight:
+        if not verify_only:
             for name in ('aclshmem_bootstrap_config_store.so','aclshmem_bootstrap_uid.so','libshmem.so','libshmem_utils.so'):
                 fetch(ORDER[0],'/home/zyx/ep32-main-24b4221/shmem/lib/'+name,deps/name)
             for source,name in [('ep128-ds-test.py','test_mega_moe.py'),('ep128-ds-utils.py','utils.py'),('ep128-ds-measure.py','megamoe_measure.py')]:
@@ -116,7 +123,7 @@ sha256sum {REMOTE}/{WHEEL.name} {REMOTE}/ds-python/deep_gemm/include/deep_gemm/m
             assert result.split()[0]==SHA,(key,result)
             (OUT/f'identity-{key[0]}-{key[1]}.txt').write_text(result)
             print('PREPARED',*key,flush=True)
-        if args.resume_preflight:
+        if verify_only:
             def verify(key):
                 identity=(OUT/f'identity-{key[0]}-{key[1]}.txt').read_text().splitlines()
                 expected={WHEEL.name:SHA,'ds-python/deep_gemm/include/deep_gemm/mega_moe.hpp':identity[1].split()[0]}
@@ -141,8 +148,11 @@ sha256sum {REMOTE}/{WHEEL.name} {REMOTE}/ds-python/deep_gemm/include/deep_gemm/m
                 return str(error)
         errors=[value for value in parallel(probe) if value]
         if errors: raise RuntimeError('Device preflight failures: '+'; '.join(errors))
-        for method,run in [('ours','ours1'),('ds','ds1'),('ds','ds2'),('ours','ours2')]:
+        runs=([('ds','ds1_retry1'),('ds','ds2'),('ours','ours2')] if args.resume_ds_failure else [('ours','ours1'),('ds','ds1'),('ds','ds2'),('ours','ours2')])
+        for method,run in runs:
             parallel(idle)
+            # 先检查全部节点，避免覆盖旧返回码、日志或部分输出。
+            parallel(lambda key: command(key,f'test ! -e {REMOTE}/{run}.log && test ! -e {REMOTE}/{run}.rc && test ! -e {REMOTE}/{run}'))
             rec=dict(method=method,run=run,status='launching',jobs=[],started=time.time())
             state['stages'].append(rec); state['status']=run; save()
             def launch(pair):
