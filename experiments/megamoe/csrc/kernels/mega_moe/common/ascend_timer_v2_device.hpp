@@ -55,7 +55,8 @@ public:
 
     __aicore__ inline bool DynamicEnabled() const
     {
-        return Enabled() && coreId_ < AscendTimer::DYNAMIC_TRACE_GROUPS * 3;
+        return Enabled() && coreId_ < AscendTimer::DYNAMIC_TRACE_GROUPS * 3 &&
+               (AscendTimer::DYNAMIC_TRACE_AIV0 != 0 || coreId_ % 3 != 1);
     }
 
     // 由调度层指定实际服务的 Wave，不能从本核任务序号反推。

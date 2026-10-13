@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from statistics import median
 
-from .protocol import CYCLE_TO_US, DYNAMIC_TRACE_GROUPS
+from .protocol import CYCLE_TO_US, DYNAMIC_TRACE_GROUPS, DYNAMIC_TRACE_AIV0
 
 SYNC_ANCHOR_EVENT = "AIV_INPUT_CROSS_RANK_SYNC"
 
@@ -223,6 +223,7 @@ def trace_events(
                     "time_origin": time_origin,
                     "timer_protocol": "passive_v1",
                     "dynamic_trace_groups": list(range(DYNAMIC_TRACE_GROUPS)),
+                    "dynamic_trace_aiv0": bool(DYNAMIC_TRACE_AIV0),
                     "observation": "scalar_issue_with_native_dependencies" if issue_observation else "native_boundary",
                     "dynamic_index_semantics": (
                         f"per_core_{granularity}" if granularity else "per_core_interval_not_expert_or_tile"

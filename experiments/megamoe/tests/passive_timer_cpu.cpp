@@ -7,9 +7,10 @@
 #define DEEPEP_MEGAMOE_TIMER
 using GM_ADDR = unsigned char*;
 static bool isAiv = false;
+static int blockId = 0;
 #define ASCEND_IS_AIV (isAiv)
 namespace AscendC {
-inline int GetBlockIdx() { return 0; }
+inline int GetBlockIdx() { return blockId; }
 inline int GetTaskRation() { return isAiv ? 2 : 1; }
 inline int GetSubBlockIdx() { return 0; }
 inline int64_t GetSystemCycle() { static int64_t cycle = 100; return ++cycle; }
@@ -61,4 +62,16 @@ int main() {
     timer.Init(reinterpret_cast<GM_ADDR>(data.data()));
     timer.Start(AscendTimer::KERNEL_TIMING);timer.End(AscendTimer::KERNEL_TIMING);
     assert(data[AscendTimer::N_TIMING_COUNTER_PER_CORE_ALIGN]>0);
+    isAiv=false;blockId=AscendTimer::DYNAMIC_TRACE_GROUPS;
+    timer.Init(reinterpret_cast<GM_ADDR>(data.data()));
+    assert(timer.Enabled() && !timer.DynamicEnabled());
+    timer.SetSlice(0,0,96);
+    assert(!timer.StartTile(AscendTimer::AIC_GMM1_ISSUE,0,0,96));
+    assert(timer.BeginBoundary(AscendTimer::AIC_GMM1_BEGIN)==-1);
+    timer.StartSpan(AscendTimer::AIV_DISPATCH);timer.EndSpan(AscendTimer::AIV_DISPATCH);
+    timer.Start(AscendTimer::KERNEL_TIMING);timer.End(AscendTimer::KERNEL_TIMING);
+    timer.FlushDynamicCounts();
+    const int core=blockId*3;
+    assert(data[core*AscendTimer::N_TIMING_COUNTER_PER_CORE_ALIGN]>0);
+    assert(data[AscendTimer::N_TIMING_COUNTER+core*AscendTimer::DYNAMIC_ITER_PER_CORE_ALIGN+AscendTimer::AIC_GMM1_ISSUE]==0);
 }

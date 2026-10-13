@@ -58,6 +58,8 @@ static constexpr int MAX_DYNAMIC_ITER = 4096;
 static constexpr int N_CORE_COUNT = 96;
 // 全核保留固定阶段边界；详细任务只采前六组，避免观测扰动供数/发射流水。
 static constexpr int DYNAMIC_TRACE_GROUPS = 6;
+// AIV0 位于权重供数关键路径；默认不在其每个 expert/slice 上读时钟、写元数据。
+static constexpr int DYNAMIC_TRACE_AIV0 = 0;
 static constexpr int DYNAMIC_TYPE_COUNT = DYNAMIC_TYPE_COUNT_ENUM;
 static constexpr int N_TIMING_ITEM_PER_CORE = FIXED_TIMING_COUNT + DYNAMIC_TYPE_COUNT * MAX_DYNAMIC_ITER;
 static constexpr int N_TIMING_COUNTER_PER_CORE = N_TIMING_ITEM_PER_CORE * 2;
