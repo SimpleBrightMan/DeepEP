@@ -24,6 +24,7 @@ def test_device_schema_and_extended_size():
 
     def names(enum, sentinel):
         body = re.search(r"enum\s+" + enum + r"\s*\{(.*?)\};", header, re.S)[1]
+        body = re.sub(r"//[^\n]*", "", body)
         return [item.split("=")[0].strip() for item in body.split(",") if item.strip() != sentinel]
 
     assert names("FixedTiming", "FIXED_TIMING_COUNT") == p.FIXED_NAMES
@@ -77,6 +78,10 @@ def test_binary_to_csv_to_trace_wait_metadata(raw_file):
     assert compute["args"]["n_tile"] == 1
     assert compute["args"]["wave_id"] == 4
     assert len(trace_events(events, "keep", first_start_cycle(events), include_wait=True)) == 4
+    prologue = next(event for event in trace if event["args"]["event_family"] == "AIV_GMM1_PROLOGUE")
+    assert "PROLOGUE_ISSUE" in prologue["name"]
+    assert prologue["args"]["timer_protocol"] == "passive_v1"
+    assert prologue["args"]["observation"] == "scalar_issue_with_native_dependencies"
 
 
 def test_truncated_and_overflow_rejected(raw_file):
