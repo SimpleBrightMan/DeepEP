@@ -80,7 +80,7 @@ public:
         }
     }
 
-    // 起点复用原有同步；Combine 结束点等待本核流水完成，计入异步搬运耗时。
+    // 只观察 Scalar 推进；异步搬运的完成由算法原有依赖保证，timer 不排空流水。
     __aicore__ inline bool StartTile(AscendTimer::DynamicTimingType type, uint32_t m, uint32_t n, uint32_t rows,
                                      uint32_t tileN = 256U)
     {
@@ -104,9 +104,6 @@ public:
         if (!Enabled() || !tileActive_) {
             return;
         }
-        if (activeType_ == static_cast<int>(AscendTimer::AIV_COMBINE)) {
-            AscendC::PipeBarrier<PIPE_ALL>();
-        }
         EndRaw(activeType_, activeIndex_, AscendC::GetSystemCycle());
         activeType_ = activeIndex_ = -1;
         tileActive_ = false;
@@ -118,7 +115,6 @@ public:
         if (!Enabled() || timingId < 0 || timingId >= AscendTimer::FIXED_TIMING_COUNT) {
             return;
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
         WriteWave(timingId, AscendTimer::NO_WAVE);
         WriteStart(timingId, AscendC::GetSystemCycle());
     }
@@ -129,7 +125,6 @@ public:
         if (!Enabled() || timingId < 0 || timingId >= AscendTimer::FIXED_TIMING_COUNT) {
             return;
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
         WriteEnd(timingId, AscendC::GetSystemCycle());
     }
 
@@ -158,7 +153,6 @@ public:
         if (!Enabled()) {
             return;
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
         activeType_ = static_cast<int>(type);
         activeWaveId_ = waveId_;
         activeIndex_ = BeginRaw(activeType_, AscendC::GetSystemCycle());
@@ -169,7 +163,6 @@ public:
         if (!Enabled() || activeType_ != static_cast<int>(type)) {
             return;
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
         EndRaw(activeType_, activeIndex_, AscendC::GetSystemCycle());
         activeType_ = -1;
         activeIndex_ = -1;
@@ -335,8 +328,8 @@ private:
     AscendTimerDevice* timer_;
 };
 
-// Prologue is a per-expert interval; keep the existing span completion semantics.
-// Declare before prologue resources so their cleanup completes before EndSpan.
+// Prologue 区间保留已有资源析构边界，但不额外强制异步流水完成。
+// 声明在资源之前，使原有析构先于 EndSpan；导出为 ISSUE/观察区间。
 class AscendTimerSpanScope {
 public:
     __aicore__ inline AscendTimerSpanScope(AscendTimerDevice* timer, AscendTimer::DynamicTimingType type)

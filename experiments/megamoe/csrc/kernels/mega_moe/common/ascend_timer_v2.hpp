@@ -47,6 +47,8 @@ enum DynamicTimingType {
     AIC_GMM2_END,
     AIC_GMM2_FIX_DRAIN,
     AIC_GMM1_ISSUE,
+    // 布局版本槽：不记录事件；使旧的排空式 trace 与被动 trace 长度不同，禁止误解码。
+    PASSIVE_TRACE_SCHEMA_V1,
     DYNAMIC_TYPE_COUNT_ENUM
 };
 

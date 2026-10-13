@@ -188,6 +188,17 @@ def trace_events(
                 "raw_event_name": event["name"],
                 "display_index_semantics": "per_core_per_family_per_wave_task_or_interval",
             }
+        # 被动 trace 不把 Scalar 返回当作 MTE/V/FIX 硬件完成。
+        family = event_family(event["name"])
+        issue_observation = family in {
+            "AIV_DISPATCH", "AIV_SWIGLU", "AIV_COMBINE",
+            "AIV_GMM1_PROLOGUE", "AIV_GMM2_PROLOGUE",
+            "AIV_SHARED_GMM1_PROLOGUE", "AIV_SHARED_GMM2_PROLOGUE", "AIV_SHARED_SWIGLU",
+            "AIV_INPUT_BUFFER_INIT", "AIV_QUANT", "AIV_ROUTE_MASK", "AIV_RESET",
+            "AIV_EXPORT_SYNC", "AIV_UNPERMUTE",
+        }
+        if issue_observation:
+            display_name = display_name.replace(family, family + "_ISSUE", 1)
         result.append(
             {
                 "ph": "X",
@@ -210,6 +221,8 @@ def trace_events(
                     "input_sync_mode": input_sync_mode,
                     "include_wait": include_wait,
                     "time_origin": time_origin,
+                    "timer_protocol": "passive_v1",
+                    "observation": "scalar_issue_with_native_dependencies" if issue_observation else "native_boundary",
                     "dynamic_index_semantics": (
                         f"per_core_{granularity}" if granularity else "per_core_interval_not_expert_or_tile"
                     ),
