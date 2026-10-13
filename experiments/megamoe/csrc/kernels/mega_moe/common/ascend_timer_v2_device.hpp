@@ -53,6 +53,11 @@ public:
         return timerAddr_ != nullptr && coreId_ >= 0 && coreId_ < AscendTimer::N_CORE_COUNT;
     }
 
+    __aicore__ inline bool DynamicEnabled() const
+    {
+        return Enabled() && coreId_ < AscendTimer::DYNAMIC_TRACE_GROUPS * 3;
+    }
+
     // 由调度层指定实际服务的 Wave，不能从本核任务序号反推。
     __aicore__ inline void SetWave(int64_t waveId)
     {
@@ -84,7 +89,7 @@ public:
     __aicore__ inline bool StartTile(AscendTimer::DynamicTimingType type, uint32_t m, uint32_t n, uint32_t rows,
                                      uint32_t tileN = 256U)
     {
-        if (!Enabled() || expert_ < 0) {
+        if (!DynamicEnabled() || expert_ < 0) {
             return false;
         }
         tileActive_ = true;
@@ -131,7 +136,7 @@ public:
     // 旁路观察已有生命周期边界，不改变活动tile状态，不增加任何流水同步。
     __aicore__ inline int BeginBoundary(AscendTimer::DynamicTimingType type)
     {
-        if (!Enabled()) {
+        if (!DynamicEnabled()) {
             return -1;
         }
         int index = BeginRaw(static_cast<int>(type), AscendC::GetSystemCycle());
@@ -150,7 +155,7 @@ public:
     // 每次 slice 独立记录；依赖等待会把当前执行段拆成真实的前后两段。
     __aicore__ inline void StartSpan(AscendTimer::DynamicTimingType type)
     {
-        if (!Enabled()) {
+        if (!DynamicEnabled()) {
             return;
         }
         activeType_ = static_cast<int>(type);

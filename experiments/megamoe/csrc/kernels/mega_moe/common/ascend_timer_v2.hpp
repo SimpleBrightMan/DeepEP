@@ -56,6 +56,8 @@ enum DynamicTimingType {
 // 为大 BS 的 tile 依赖等待预留空间，超限由主机校验明确报错。
 static constexpr int MAX_DYNAMIC_ITER = 4096;
 static constexpr int N_CORE_COUNT = 96;
+// 全核保留固定阶段边界；详细任务只采前六组，避免观测扰动供数/发射流水。
+static constexpr int DYNAMIC_TRACE_GROUPS = 6;
 static constexpr int DYNAMIC_TYPE_COUNT = DYNAMIC_TYPE_COUNT_ENUM;
 static constexpr int N_TIMING_ITEM_PER_CORE = FIXED_TIMING_COUNT + DYNAMIC_TYPE_COUNT * MAX_DYNAMIC_ITER;
 static constexpr int N_TIMING_COUNTER_PER_CORE = N_TIMING_ITEM_PER_CORE * 2;
