@@ -27,6 +27,7 @@
 #include "adv_api/reduce/reduce.h"
 #include "../common/mega_moe_gmm_common.hpp"
 #include "../common/mega_moe_utils.hpp"
+#include "../common/mega_moe_domain_rows.hpp"
 #include "../common/mega_moe_mxfp8_utils.hpp"
 #include "../mc2_common/mc2_kernel_utils.hpp"
 #include "../mc2_common/quantize_functions.hpp"
@@ -1226,6 +1227,45 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
         // 发送完成才结束计时和复用 metadata/UB；不增加全核或全卡同步。
         DrainCombineRowBuffers(rowSequence, buffers.rowBufferCount);
         done += count;
+    }
+    timer.ClearSlice();
+}
+
+// The caller has checked the original slice's GMM2 producer counter. Domain
+// segments only change communication ownership, never the input-ready identity.
+__aicore__ inline void RunReadyDomainTokenCombineSlice(const MoeStageCommonConfig& common, const Params& params,
+                                                       const ExpertLoopState& state, uint32_t rowStart,
+                                                       uint32_t rowCount, const DomainRowPlan& plan,
+                                                       AscendTimerDevice& timer, WaveCombineScratch& scratch)
+{
+    if constexpr (g_coreType == AIC) {
+        return;
+    }
+    if (GetSubBlockIdx() != 1U || plan.totalRows == 0U) {
+        return;
+    }
+    const uint64_t globalRowStart = static_cast<uint64_t>(state.globalTokenStartIndex) + rowStart;
+    GM_ADDR sliceOutput =
+        params.workspaceInfo.gmm2MmadResPtr + globalRowStart * common.tokenHiddenDim * sizeof(bfloat16_t);
+    auto buffers = InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 2U>(common, scratch);
+    uint32_t rowSequence = 0U;
+    timer.SetSlice(state.expertIdx, rowStart, rowCount);
+    for (uint32_t index = 0U; index < plan.segmentCount; ++index) {
+        const DomainRowSegment& segment = plan.segments[index];
+        const uint32_t relativeBegin = segment.expertRowBegin - rowStart;
+        for (uint32_t done = 0U; done < segment.rowCount;) {
+            uint32_t count = segment.rowCount - done;
+            count = count < WAVE_COMBINE_META_INFO_TOKEN_CAPACITY ? count : WAVE_COMBINE_META_INFO_TOKEN_CAPACITY;
+            AscendTimerTileScope rows(timer.Enabled() ? &timer : nullptr, AscendTimer::AIV_COMBINE,
+                                      relativeBegin + done, static_cast<uint32_t>(-1), count);
+            PreloadWaveCombineMetaInfo(params, scratch, globalRowStart + relativeBegin + done, count, 0U);
+            CombineWaveTokenRange<COMBINE_NO_QUANT>(common, buffers, scratch, params, sliceOutput, relativeBegin + done,
+                                                    count, 0U, rowSequence);
+            // Each segment uses its original row addresses. Drain before reusing
+            // metadata/events or returning to SwiGLU; no new cross-core barrier.
+            DrainCombineRowBuffers(rowSequence, buffers.rowBufferCount);
+            done += count;
+        }
     }
     timer.ClearSlice();
 }

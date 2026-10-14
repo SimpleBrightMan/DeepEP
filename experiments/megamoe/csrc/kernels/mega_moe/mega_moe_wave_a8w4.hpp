@@ -12,6 +12,10 @@
 #include "common/mega_moe_utils.hpp"
 #include "mega_moe_arch35.hpp"
 
+#ifndef MEGAMOE_PREFILL_COMBINE_DOMAIN_BALANCE
+#define MEGAMOE_PREFILL_COMBINE_DOMAIN_BALANCE 0
+#endif
+
 namespace MegaMoeImpl {
 
 #define TemplateMegaMoeA8W4WaveTypeClass                                                                    \
@@ -81,9 +85,18 @@ private:
         uint32_t nextTile = 0U;
         uint32_t tileCount = 0U;
     };
+    struct CombineTaskCursor {
+        AivTaskCursor task{};
+#if MEGAMOE_PREFILL_COMBINE_DOMAIN_BALANCE
+        // Scalar values survive SwiGLU overwriting the prefix table in UB.
+        DomainRowPlan domainPlan{};
+        bool domainPlanBuilt = false;
+        bool domainPlanValid = false;
+#endif
+    };
     __aicore__ inline bool NextAivSlice(AivTaskCursor& cursor, bool activation);
     __aicore__ inline bool TryRunReadyActivation(const AivTaskCursor& cursor, int32_t& readySequence);
-    __aicore__ inline bool TryRunReadyCombine(const AivTaskCursor& cursor);
+    __aicore__ inline bool TryRunReadyCombine(CombineTaskCursor& combine);
     __aicore__ inline void ProcessAiv1PriorityStages(int32_t& readySequence);
     __aicore__ inline bool IsPositionWithinWave(const ExpertTokenPosition& position, uint32_t waveMGroupCount) const
     {
@@ -272,8 +285,9 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
 }
 
 template <TemplateMegaMoeA8W4WaveTypeClass>
-__aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunReadyCombine(const AivTaskCursor& cursor)
+__aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunReadyCombine(CombineTaskCursor& combine)
 {
+    const AivTaskCursor& cursor = combine.task;
     const auto& begin = cursor.slice.begin;
     uint32_t rows = static_cast<uint32_t>(cursor.slice.end.globalTokenIndex - begin.globalTokenIndex);
     // 只轮换当前 AIV1 的通信任务，不修改成员中的物理核编号。
@@ -288,11 +302,32 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
         combineJob.jobIndex = combineJob.jobIndex >= shift ? combineJob.jobIndex - shift
                                                            : combineJob.jobIndex + combineJob.totalJobs - shift;
     }
-    // 本次只重映射完整任务，不新增 peer 分段。结合原有全局行前缀，等价首 owner 为
-    // (sliceGlobalRowStart + cursor.wave) mod 核数；同 wave 跨专家的 slice 使用同一偏移。
-    // 空任务判断必须使用轮换后的 owner，否则小 batch/尾片可能被错误跳过而漏发。
-    WorkRange owned = GetWaveCombineOwnedRange(combineJob, rows, begin.globalTokenIndex);
-    if (owned.count == 0U) {
+    // 原分工按连续行轮转 owner；域分工保留同一 wave 轮转，再分别平衡各域的原行片段。
+    // 判空与发送必须使用同一计划，不能按原连续区间跳过新分工中的非连续行。
+#if MEGAMOE_PREFILL_COMBINE_DOMAIN_BALANCE
+    // This experiment assumes contiguous four-card physical domains on one EP16 node.
+    const bool useDomainBalance =
+        UseDomainRowCombine(commonConfig_.worldSize, combineJob.totalJobs,
+                            commonConfig_.tokenNum > W4A8_SMALL_BATCH_MAX_TOKENS, tokenDispatchConfig_.ranksPerNode);
+    if (useDomainBalance && !combine.domainPlanBuilt) {
+        ReloadDispatchCumsumRange(commonConfig_, tokenDispatchScratch_, begin.expertIdx, begin.expertIdx);
+        DispatchPeerCounts counts{tokenDispatchScratch_.cumsumInfoTensor, begin.expertIdx * commonConfig_.worldSize};
+        DomainDispatchPeerOrder peers{commonConfig_.rankId, commonConfig_.worldSize, tokenDispatchConfig_.ranksPerNode};
+        const uint32_t visitStart = static_cast<uint32_t>(
+            (waveCombineJob_.jobIndex + cursor.wave + commonConfig_.rankId / DOMAIN_ROW_DOMAIN_SIZE) %
+            DOMAIN_ROW_DOMAIN_COUNT);
+        combine.domainPlanValid = BuildDomainRowPlan(
+            counts, peers, commonConfig_.worldSize, begin.tokenIndexInExpert, begin.tokenIndexInExpert + rows,
+            combineJob.jobIndex, combineJob.totalJobs, begin.globalTokenIndex, visitStart, combine.domainPlan);
+        combine.domainPlanBuilt = true;
+    }
+    const bool hasDomainPlan = useDomainBalance && combine.domainPlanValid;
+    uint32_t ownedRows = hasDomainPlan ? combine.domainPlan.totalRows
+                                       : GetWaveCombineOwnedRange(combineJob, rows, begin.globalTokenIndex).count;
+#else
+    uint32_t ownedRows = GetWaveCombineOwnedRange(combineJob, rows, begin.globalTokenIndex).count;
+#endif
+    if (ownedRows == 0U) {
         return true;
     }
     // 只读取当前 expert/slice 的计数；不同 slice 不共用槽，快核后续通知不能代偿慢核。
@@ -310,6 +345,13 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     // 当前 slice 已检查就绪，模板 true 跳过发送入口内的重复等待。计数只增不减，
     // 到本次算子结束前不会重置，因此检查与发送之间无需再次轮询。
     // timer 仍记录物理核；完整行发送及 UB 排空规则保持原样。
+#if MEGAMOE_PREFILL_COMBINE_DOMAIN_BALANCE
+    if (hasDomainPlan) {
+        RunReadyDomainTokenCombineSlice(commonConfig_, params_, state, begin.tokenIndexInExpert, rows,
+                                        combine.domainPlan, timer_, waveCombineScratch_);
+        return true;
+    }
+#endif
     RunTokenCombineSlice<true>(commonConfig_, combineJob, params_, state, begin.tokenIndexInExpert, rows, timer_,
                                waveCombineScratch_);
     return true;
@@ -320,9 +362,10 @@ template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessAiv1PriorityStages(
     int32_t& readySequence)
 {
-    AivTaskCursor activation{}, combine{};
+    AivTaskCursor activation{};
+    CombineTaskCursor combine{};
     bool hasActivation = NextAivSlice(activation, true);
-    bool hasCombine = NextAivSlice(combine, false);
+    bool hasCombine = NextAivSlice(combine.task, false);
     SharedActivationCursor shared{};
     shared.done = sharedExpertNum_ == 0U;
     ExpertTokenPosition dispatch{};
@@ -348,7 +391,11 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
             continue;
         }
         if (hasCombine && TryRunReadyCombine(combine)) {
-            hasCombine = NextAivSlice(combine, false);
+            hasCombine = NextAivSlice(combine.task, false);
+#if MEGAMOE_PREFILL_COMBINE_DOMAIN_BALANCE
+            combine.domainPlanBuilt = false;
+            combine.domainPlanValid = false;
+#endif
             continue;
         }
         // 没有可执行任务才退避；不能进入 Combine 的阻塞等待，否则可能挡住 GMM2 所需的 SwiGLU。

@@ -190,7 +190,8 @@ def build_configuration(environment=None):
         raise RuntimeError("DEEPEP_NPU_ARCH must be Ascend950; other targets are unqualified")
     beta = env.get("DEEPEP_BUILD_MEGAMOE", "OFF")
     timer = env.get("DEEPEP_MEGAMOE_TIMER", "OFF")
-    if beta not in {"ON", "OFF"} or timer not in {"ON", "OFF"}:
+    domain_balance = env.get("DEEPEP_MEGAMOE_COMBINE_DOMAIN_BALANCE", "ON")
+    if beta not in {"ON", "OFF"} or timer not in {"ON", "OFF"} or domain_balance not in {"ON", "OFF"}:
         raise RuntimeError("MegaMoE build options accept ON or OFF only")
     if timer == "ON" and beta != "ON":
         raise RuntimeError("MegaMoE timer requires DEEPEP_BUILD_MEGAMOE=ON")
@@ -271,7 +272,11 @@ def build_configuration(environment=None):
     result["source_sha256"] = source_fingerprint()
     compiler, compiler_version = find_host_compiler(env)
     result["compiler_path"] = compiler
-    result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON"}
+    result["megamoe"] = {
+        "enabled": beta == "ON",
+        "timer": timer == "ON",
+        "combine_domain_balance": beta == "ON" and domain_balance == "ON",
+    }
     if beta == "ON":
         catlass = Path(env.get("CATLASS_ROOT", str(ROOT / "third-party/catlass")))
         if not (catlass / "include/catlass/gemm/tile/copy_l1_to_l0a.hpp").is_file():
@@ -396,6 +401,7 @@ class CMakeBuild(build_ext):
             f"-DSHMEM_ROOT={configuration['SHMEM_ROOT']}",
             f"-DDEEPEP_BUILD_MEGAMOE={'ON' if megamoe.get('enabled', False) else 'OFF'}",
             f"-DDEEPEP_MEGAMOE_TIMER={'ON' if megamoe.get('timer', False) else 'OFF'}",
+            f"-DDEEPEP_MEGAMOE_COMBINE_DOMAIN_BALANCE={'ON' if megamoe.get('combine_domain_balance', False) else 'OFF'}",
             f"-DCATLASS_ROOT={configuration.get('CATLASS_ROOT', '')}",
             f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}",
             f"-DCMAKE_INSTALL_PREFIX={destination}",

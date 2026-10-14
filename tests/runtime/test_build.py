@@ -45,6 +45,12 @@ def test_beta_never_silently_enabled(build, value):
         build.build_configuration({"DEEPEP_NPU_ARCH": "Ascend950", "DEEPEP_BUILD_MEGAMOE": value})
 
 
+@pytest.mark.parametrize("value", ["on", "yes", "1", ""])
+def test_combine_domain_balance_rejects_invalid_option(build, value):
+    with pytest.raises(RuntimeError, match="MegaMoE"):
+        build.build_configuration({"DEEPEP_NPU_ARCH": "Ascend950", "DEEPEP_MEGAMOE_COMBINE_DOMAIN_BALANCE": value})
+
+
 def test_missing_sdk_rejected(build):
     with pytest.raises(RuntimeError, match="ASCEND_HOME_PATH"):
         build.build_configuration({"DEEPEP_NPU_ARCH": "Ascend950"})
@@ -289,6 +295,7 @@ def test_cache_survives_source_edits_but_not_toolchain_changes(build):
         "python_executable": "/python/bin/python",
         "shmem_device_headers": {"header.h": "before"},
         "build_environment": {"CXXFLAGS": ""},
+        "megamoe": {"enabled": True, "timer": True, "combine_domain_balance": False},
     }
     key = build.build_cache_key(configuration)
     assert build.build_cache_key({**configuration, "source_sha256": "after", "source_version": "2"}) == key
@@ -301,12 +308,18 @@ def test_cache_survives_source_edits_but_not_toolchain_changes(build):
         ("python_executable", "/new-python/bin/python"),
         ("shmem_device_headers", {"header.h": "after"}),
         ("build_environment", {"CXXFLAGS": "-g"}),
+        ("megamoe", {"enabled": True, "timer": True, "combine_domain_balance": True}),
     ):
         assert build.build_cache_key({**configuration, name: value}) != key
 
 
-@pytest.mark.parametrize("beta,timer", [(False, False), (True, False), (True, True)])
-def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkeypatch, tmp_path, beta, timer):
+@pytest.mark.parametrize(
+    "beta,timer,domain_balance",
+    [(False, False, False), (True, False, False), (True, False, True), (True, True, False), (True, True, True)],
+)
+def test_packaging_uses_cmake_capabilities_and_removes_old_library(
+    build, monkeypatch, tmp_path, beta, timer, domain_balance
+):
     from setuptools import Distribution, Extension
 
     # This CPU-only test mocks the build tools, including their discovery paths.
@@ -316,7 +329,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     monkeypatch.setitem(sys.modules, "pybind11", pybind11)
 
     configuration = {
-        "megamoe": {"enabled": beta, "timer": timer},
+        "megamoe": {"enabled": beta, "timer": timer, "combine_domain_balance": domain_balance},
         "CATLASS_ROOT": "/private/catlass" if beta else "",
         "source_sha256": "current",
         "source_version": "1",
@@ -361,6 +374,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     assert "-DDEEPEP_DEVICE_JOBS=6" in calls[0]
     assert f"-DDEEPEP_BUILD_MEGAMOE={'ON' if beta else 'OFF'}" in calls[0]
     assert f"-DDEEPEP_MEGAMOE_TIMER={'ON' if timer else 'OFF'}" in calls[0]
+    assert f"-DDEEPEP_MEGAMOE_COMBINE_DOMAIN_BALANCE={'ON' if domain_balance else 'OFF'}" in calls[0]
     assert f"-Dpybind11_DIR={pybind11_cmake_dir}" in calls[0]
     assert calls[1][-2:] == ["--parallel", "6"]
     assert not (destination / "libdeepep_notify.so").exists()
@@ -368,7 +382,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     info = json.loads((destination / "_build_info.json").read_text())
     assert info["capabilities"] == capabilities["capabilities"]
     assert info["source_sha256"] == "current"
-    assert info["megamoe"] == {"enabled": beta, "timer": timer}
+    assert info["megamoe"] == {"enabled": beta, "timer": timer, "combine_domain_balance": domain_balance}
     assert "CATLASS_ROOT" not in info
     assert not {"cmake_path", "compiler_path", "python_executable", "build_environment"}.intersection(info)
 

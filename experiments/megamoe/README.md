@@ -136,6 +136,38 @@ wheel 位于 `dist/build-*/`；运行前按构建输出设置 SHMEM 的 `LD_LIBR
 
 ## 3. 多机测试
 
+### EP16 四卡域 Combine 分工
+
+单机 EP16、每卡28个 AIC、`ranks_per_node=16` 的 W4A8 Prefill（实际 B>256）默认按四卡域分配 Combine
+行任务。域为连续 rank 0～3、4～7、8～11、12～15；各域分别均分给28个 AIV1，再把分工映射回
+原 Dispatch 行位置。域内 peer 次序和 token/top-k metadata 保持一致，GMM2 就绪仍按完整原 slice 检查。
+此项只改变 Combine 的通信 owner，Dispatch、GMM 分块、wave 预算和数值计算顺序沿用当前路径。
+不匹配上述条件的配置使用原连续行分工。
+
+默认 balanced、B4096 时，一个256行 slice 各域64行。原来每核拿一个9～10行的连续区间，新分工
+让每核从各域拿2～3行，总数仍为9～10行。域提交顺序按核和 Combine 自己的 wave 错峰；当前发送
+仍在全部本核片段排空后返回调度器，不增加抢占或跨核同步。它用于评估同组/跨组通信成本不均带来的
+拖尾，实际收益需在对应拓扑上测试。
+
+环境变量 `DEEPEP_MEGAMOE_COMBINE_DOMAIN_BALANCE=OFF` 可在构建前关闭此项作为对照：
+
+```bash
+DEEPEP_MEGAMOE_COMBINE_DOMAIN_BALANCE=ON bash experiments/megamoe/scripts/build.sh
+# 独立重编并安装旧分工的对照 wheel。
+DEEPEP_MEGAMOE_COMBINE_DOMAIN_BALANCE=OFF bash experiments/megamoe/scripts/build.sh
+```
+
+直接使用 CMake 时传 `-DDEEPEP_MEGAMOE_COMBINE_DOMAIN_BALANCE=ON` 或 `OFF`。Python 构建将该值
+纳入缓存键，并记录在 `_build_info.json` 的 `megamoe.combine_domain_balance`；A/B 保持相同输入、
+路由、wave、timer设置和软件环境，比较 `rank_max_mean_us`、逐轮最慢 rank 的 p95 及每核 Combine
+完成时间。CPU 分工测试直接编译生产头文件，可运行：
+
+```bash
+python -m pytest experiments/megamoe/tests/test_domain_rows.py -q
+```
+
+CPU 覆盖证明行归属和源 ordinal 守恒；CANN编译、通信完成可见性以及NPU输出精度仍需设备验证。
+
 ### 配置与启动
 
 所有节点需要相同绝对路径的共享 checkout、匹配的 Conda/CANN 环境、SSH 访问和每机8张空闲 NPU。

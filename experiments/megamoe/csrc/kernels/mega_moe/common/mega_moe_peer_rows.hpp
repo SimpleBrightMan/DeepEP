@@ -6,6 +6,12 @@
 
 #include <cstdint>
 
+#if defined(__NPU_DEVICE__) || defined(__DAV_C310_CUBE__) || defined(__DAV_C310_VEC__)
+#define MEGAMOE_PEER_ROWS_INLINE __aicore__ inline
+#else
+#define MEGAMOE_PEER_ROWS_INLINE inline
+#endif
+
 // Prefill 独立副本默认启用。改为 0 并重编 kernel 可对照原来的逐 slice 扫描路径。
 // 本开关不影响 host/device 布局、tiling ABI、通信顺序或配额语义。
 #ifndef MEGAMOE_PREFILL_PEER_FAST_PATH
@@ -16,7 +22,8 @@ namespace MegaMoeImpl {
 
 // 按卡内序号交错不同机器，先远端后本机；完整 peer 段仍连续落位，不新增 owner/ready 协议。
 // 同一专家的所有 slice 必须使用同一排列，否则 cut 余数会导致源行重复或遗漏。
-__aicore__ inline uint32_t GetDispatchPeer(uint32_t ordinal, uint32_t rank, uint32_t peers, uint32_t ranksPerNode)
+MEGAMOE_PEER_ROWS_INLINE uint32_t GetDispatchPeer(uint32_t ordinal, uint32_t rank, uint32_t peers,
+                                                  uint32_t ranksPerNode)
 {
     if (ranksPerNode == 0U || ranksPerNode >= peers) {
         return (rank + ordinal) % peers;
@@ -59,7 +66,7 @@ struct PeerRowCut {
 };
 
 template <typename PeerCounts>
-__aicore__ inline PeerRowLimits GetPeerRowLimits(const PeerCounts& counts, uint32_t peers)
+MEGAMOE_PEER_ROWS_INLINE PeerRowLimits GetPeerRowLimits(const PeerCounts& counts, uint32_t peers)
 {
     PeerRowLimits limits;
     for (uint32_t peer = 0U; peer < peers; ++peer) {
@@ -73,8 +80,9 @@ __aicore__ inline PeerRowLimits GetPeerRowLimits(const PeerCounts& counts, uint3
 
 // 同专家只在本核第一次实际参与 Dispatch 时扫描一次。换专家/EP 或 reset 后重新计算。
 template <typename PeerCounts>
-__aicore__ inline const PeerRowLimits& GetCachedPeerRowLimits(PeerRowLimitsCache& cache, const PeerCounts& counts,
-                                                              uint32_t expert, uint32_t peers)
+MEGAMOE_PEER_ROWS_INLINE const PeerRowLimits& GetCachedPeerRowLimits(PeerRowLimitsCache& cache,
+                                                                     const PeerCounts& counts, uint32_t expert,
+                                                                     uint32_t peers)
 {
     if (!cache.valid || cache.expert != expert || cache.peers != peers) {
         cache.limits = GetPeerRowLimits(counts, peers);
@@ -87,7 +95,8 @@ __aicore__ inline const PeerRowLimits& GetCachedPeerRowLimits(PeerRowLimitsCache
 
 // 只由真实最小行数证明“当前 slice 结束前没有 peer 提前耗尽”，不根据 BS 或均值猜测。
 // 若 minimum=0、发生偏斜耗尽或范围为空，交给原通用路径。
-__aicore__ inline bool CanUseRegularPeerSlice(const PeerRowLimits& limits, uint32_t peers, uint32_t begin, uint32_t end)
+MEGAMOE_PEER_ROWS_INLINE bool CanUseRegularPeerSlice(const PeerRowLimits& limits, uint32_t peers, uint32_t begin,
+                                                     uint32_t end)
 {
     return peers != 0U && begin < end && static_cast<uint64_t>(end) <= static_cast<uint64_t>(limits.minimum) * peers;
 }
@@ -104,7 +113,7 @@ struct RegularPeerSlice {
     uint32_t endExtra = 0U;
 
     // 返回相对 slice 起点的累计行数；中间乘法用 uint64，防止大 EP/行数时溢出。
-    __aicore__ inline uint32_t Prefix(uint32_t ordinal) const
+    MEGAMOE_PEER_ROWS_INLINE uint32_t Prefix(uint32_t ordinal) const
     {
         uint32_t beforeExtra = ordinal < beginExtra ? ordinal : beginExtra;
         uint32_t afterExtra = ordinal < endExtra ? ordinal : endExtra;
@@ -113,26 +122,26 @@ struct RegularPeerSlice {
     }
 
     // 源队列边界是 token ordinal，不是目标 row；保持原 token/top-k 身份。
-    __aicore__ inline uint32_t SourceBegin(uint32_t ordinal) const
+    MEGAMOE_PEER_ROWS_INLINE uint32_t SourceBegin(uint32_t ordinal) const
     {
         return beginRounds + static_cast<uint32_t>(ordinal < beginExtra);
     }
 
     // 配套的源队列结束位置，不读取 peer count，也不修改余数状态。
-    __aicore__ inline uint32_t SourceEnd(uint32_t ordinal) const
+    MEGAMOE_PEER_ROWS_INLINE uint32_t SourceEnd(uint32_t ordinal) const
     {
         return endRounds + static_cast<uint32_t>(ordinal < endExtra);
     }
 };
 
 // 调用者已验证 peers>0 及规则配额条件，任意 slice 边界均可转换，无需整除 EP。
-__aicore__ inline RegularPeerSlice CreateRegularPeerSlice(uint32_t peers, uint32_t begin, uint32_t end)
+MEGAMOE_PEER_ROWS_INLINE RegularPeerSlice CreateRegularPeerSlice(uint32_t peers, uint32_t begin, uint32_t end)
 {
     return {begin / peers, begin % peers, end / peers, end % peers};
 }
 
 // 每 peer 配额相同时用除法 O(1) 定位；其余规则配额对公式二分，无需线性扫描或共享表同步。
-__aicore__ inline uint32_t FindRegularPeerOrdinal(const RegularPeerSlice& slice, uint32_t peers, uint32_t row)
+MEGAMOE_PEER_ROWS_INLINE uint32_t FindRegularPeerOrdinal(const RegularPeerSlice& slice, uint32_t peers, uint32_t row)
 {
     uint32_t rowsPerPeer = slice.endRounds - slice.beginRounds;
     if (slice.beginExtra == slice.endExtra && rowsPerPeer != 0U) {
@@ -152,8 +161,8 @@ __aicore__ inline uint32_t FindRegularPeerOrdinal(const RegularPeerSlice& slice,
 }
 
 template <typename PeerCounts>
-__aicore__ inline PeerRowCut GetPeerRowCut(const PeerCounts& counts, uint32_t peers, const PeerRowLimits& limits,
-                                           uint32_t prefixRows)
+MEGAMOE_PEER_ROWS_INLINE PeerRowCut GetPeerRowCut(const PeerCounts& counts, uint32_t peers, const PeerRowLimits& limits,
+                                                  uint32_t prefixRows)
 {
     if (prefixRows == 0U || peers == 0U) {
         return {0U, 0U};
@@ -189,7 +198,7 @@ __aicore__ inline PeerRowCut GetPeerRowCut(const PeerCounts& counts, uint32_t pe
 }
 
 // 必须按同一 peer 排列依次调用；只消耗未耗尽 peer 的余数名额。
-__aicore__ inline uint32_t TakePeerRowPrefix(uint32_t count, PeerRowCut& cut)
+MEGAMOE_PEER_ROWS_INLINE uint32_t TakePeerRowPrefix(uint32_t count, PeerRowCut& cut)
 {
     uint32_t rows = count < cut.rounds ? count : cut.rounds;
     if (count > cut.rounds && cut.extraPeers != 0U) {
