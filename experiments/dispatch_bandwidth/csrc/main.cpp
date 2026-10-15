@@ -170,6 +170,11 @@ Options ParseOptions(int argc, char** argv)
             options.metadata_mode = value == "scalar" ? MetadataMode::Scalar
                                     : value == "dma"  ? MetadataMode::Dma
                                                       : MetadataMode::Preload;
+        } else if (name == "--traffic") {
+            if (value != "all" && value != "cross") {
+                throw std::invalid_argument("--traffic must be all or cross");
+            }
+            options.config.cross_only = value == "cross";
         } else if (name == "--scope") {
             if (value != "all" && value != "first-expert") {
                 throw std::invalid_argument("--scope must be all or first-expert");
@@ -178,6 +183,9 @@ Options ParseOptions(int argc, char** argv)
         } else {
             throw std::invalid_argument("Unknown argument: " + name);
         }
+    }
+    if (options.config.cross_only && seen.count("--workers") == 0U) {
+        options.config.worker_counts = {0U, 0U, options.config.cores};
     }
     for (const char* name : {"--rank", "--device", "--endpoint", "--output"}) {
         if (seen.count(name) == 0U) {
@@ -366,14 +374,15 @@ double ValidateTimers(const Options& options, const Plan& plan, const std::vecto
 std::string Report(const Options& options, const Plan& plan, const std::vector<Round>& rounds)
 {
     std::ostringstream json;
-    json << std::setprecision(17) << "{\n\"schema_version\":2,\"rank\":" << options.rank
+    json << std::setprecision(17) << "{\n\"schema_version\":3,\"rank\":" << options.rank
          << ",\"world\":" << options.config.world << ",\"device\":" << options.device
          << ",\"cores\":" << options.config.cores << ",\"group_size\":" << options.config.group_size
          << ",\"batch\":" << options.config.batch << ",\"hidden\":" << options.config.hidden
          << ",\"intermediate\":" << options.config.intermediate << ",\"experts\":" << options.config.experts
          << ",\"topk\":" << options.config.topk << ",\"scope\":\""
          << (options.config.first_expert ? "first-expert" : "all") << "\",\"metadata_mode\":\""
-         << MetadataModeName(options.metadata_mode) << "\",\"row_bytes\":" << plan.row_bytes
+         << MetadataModeName(options.metadata_mode) << "\",\"traffic_selection\":\""
+         << (options.config.cross_only ? "cross" : "all") << "\",\"row_bytes\":" << plan.row_bytes
          << ",\"scale_elements\":" << plan.scale_elements << ",\"buffer_count\":" << options.config.ring_slots
          << ",\"repeats\":" << options.repeats
          << ",\"cycles_per_us\":1000.0,\"timer_requested\":" << (options.timer_requested ? "true" : "false")
@@ -424,6 +433,9 @@ void WriteReport(const std::filesystem::path& destination, const std::string& re
 void Run(const Options& options)
 {
     const Plan plan = BuildPlan(options.config, options.rank);
+    if (plan.total_rows == 0U) {
+        throw std::invalid_argument("Selected traffic has no rows; increase --bs or --topk");
+    }
     Check(aclInit(nullptr), "aclInit");
     Check(aclrtSetDevice(static_cast<int32_t>(options.device)), "aclrtSetDevice");
     const char* soc = aclrtGetSocName();
@@ -529,7 +541,8 @@ void Run(const Options& options)
     std::cerr << "[rank " << options.rank << "] source_stride=" << plan.row_bytes << " rows=" << plan.total_rows
               << " workers=" << options.config.worker_counts[0] << ',' << options.config.worker_counts[1] << ','
               << options.config.worker_counts[2] << " metadata_mode=" << MetadataModeName(options.metadata_mode)
-              << " AIC/AIV=" << aic << '/' << aiv << '\n';
+              << " traffic=" << (options.config.cross_only ? "cross" : "all") << " AIC/AIV=" << aic << '/' << aiv
+              << '\n';
     for (uint32_t iteration = 0U; iteration < total_rounds; ++iteration) {
         // These resets and the collective are deliberately outside ACL timing.
         // Every measured round must produce its own output, not inherit warmup data.
@@ -597,7 +610,8 @@ int main(int argc, char** argv)
             std::cout << "Dispatch MTE benchmark: --rank R --device D --endpoint tcp://IP:PORT --output FILE\n"
                          "[--world 16 --bs 4096 --hidden 3584 --intermediate 1280 --experts 384 --topk 8]\n"
                          "[--group-size 4 --cores 28 --workers 2,5,21 --buffer-count 6 --repeat 1]\n"
-                         "[--scope all|first-expert --metadata-mode scalar|dma|preload]\n"
+                         "[--traffic all|cross --scope all|first-expert --metadata-mode scalar|dma|preload]\n"
+                         "[--workers defaults: all=2,5,21; cross=0,0,cores]\n"
                          "[--warmup 10 --iters 20 --timer]\n";
             return 0;
         }

@@ -1,0 +1,2 @@
+# Static PNG/SVG exports for sweep.py and plot_sweep.py; install in the launch environment.
+matplotlib>=3.6

@@ -160,7 +160,8 @@ they do not require NPUs.
 `--metadata-mode scalar|dma|preload` selects three implementations of the same
 Dispatch workload. The default is `dma`, removing per-row Scalar synchronization;
 select `scalar` explicitly to reproduce the original benchmark.
-Native reports use schema version 2 and include `metadata_mode`; aggregation
+Native reports use schema version 3 and include `metadata_mode` and
+`traffic_selection`; aggregation
 rejects mixed modes. Timer CSV and trace files also identify the mode.
 
 ```bash
@@ -250,3 +251,109 @@ extracted from the returned packed row. That path has an additional data
 dependency and cannot simply reuse the benchmark's precomputed zeros. A device
 batch implementation must keep this weight dependency and the consumers' layout
 correct while moving synchronization away from the Scalar row loop.
+
+## CROSS-only core sweep
+
+The `codex/dispatch-cross-bandwidth-sweep` branch adds `--traffic cross` and an
+automatic 40-case sweep. Every selected rank participates concurrently. Each
+kernel launches exactly N mixed groups and only their N AIV1 lanes perform
+copies; all N workers fetch from the twelve ranks outside their four-card group.
+LOCAL and GROUP own zero workers and zero output rows. The N values are logical
+communication workers, not a promise of stable physical core placement.
+
+Defaults for the sweep are BS=4096, EP=16, group size=4, E=384, TopK=8, I=1280,
+`metadata-mode=dma`, six data-ring slots, 10 warmups and 20 measured iterations.
+The four hidden sizes are **3712, 4096, 6144, 8192**; each is tested with
+**2, 4, 6, 8, 10, 12, 16, 20, 24, 28** CROSS workers. These are forty independent
+all-rank process groups, run sequentially on the same node. Task order and total
+selected rows stay fixed for each H while the worker count changes.
+
+| Hidden H | Aligned token storage | Valid scale bytes | Packed GET bytes/row | CROSS rows/card | GET bytes/card |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 3712 | 3840 | 116 | 3968 | 24576 | 97,517,568 |
+| 4096 | 4096 | 128 | 4224 | 24576 | 103,809,024 |
+| 6144 | 6144 | 192 | 6336 | 24576 | 155,713,536 |
+| 8192 | 8192 | 256 | 8448 | 24576 | 207,618,048 |
+
+For H=3712, the benchmark keeps the requested hidden dimension 3712; 3840 is
+only its packed source alignment. Output writes contain H valid token bytes,
+H/32 valid scale bytes and 32 metadata bytes. CROSS-only destinations are compact
+and retain the original source rank, token and TopK slot identities.
+
+With CANN loaded and a compatible SHMEM SDK prepared, run from the repository
+root on your allocated 16-card UBX node:
+
+```bash
+export SHMEM_ROOT="${SHMEM_ROOT:-$PWD/third-party/shmem/install/shmem}"
+export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:$ASCEND_HOME_PATH/lib64:${LD_LIBRARY_PATH:-}"
+# Only needed if matplotlib is missing from this Python environment:
+python -m pip install -r experiments/dispatch_bandwidth/requirements-sweep.txt
+bash experiments/dispatch_bandwidth/run_cross_sweep.sh
+```
+
+The shell entry point builds the native target, then starts the full sweep and
+plots the results. It checks the plotting dependency before NPU work. It does
+not install dependencies automatically. The run uses a unique results directory
+and retains every case's logs, raw rank reports and timers along with a combined
+JSON and CSV. The program prints the final paths of four PNG figures, one for
+each hidden size. Plotting uses a headless backend and requires no desktop.
+
+The default output layout is:
+
+```text
+benchmark-runs/dispatch_cross_sweep/cross_<timestamp>_<id>/
+  sweep.json
+  sweep.csv
+  h_3712/cores_2/rank_0.json ... rank_15.json
+  ...
+  plots/cross_bandwidth_h3712.png
+  plots/cross_bandwidth_h4096.png
+  plots/cross_bandwidth_h6144.png
+  plots/cross_bandwidth_h8192.png
+```
+
+To redraw from saved results, including a fresh verification of all native
+reports, use the actual path printed by the run:
+
+```bash
+python experiments/dispatch_bandwidth/plot_sweep.py \
+    /path/to/your-run/sweep.json --verify-raw
+```
+
+The one-click sweep always verifies raw reports before plotting. Standalone
+redrawing without `--verify-raw` validates the complete embedded summaries, which
+also permits moving only the combined JSON to a plotting machine. `--svg` adds
+four SVG exports. Shell `--plan` and `--help` skip compilation and SDK checks.
+
+Each figure uses the actual numeric worker counts on the x-axis and mean
+**CROSS read-payload GB/s per card** on the y-axis. Rank min/max indicate variation
+across the sixteen cards; plots share a y-axis range. A target reference, when
+shown, is explicitly distinguished from measured values. The plotter requires a
+complete, consistent Cartesian grid of successful cases. Missing or failed
+measurements are not filled with zeros or presented as a completed curve.
+
+To inspect the full plan without compiling, querying NPUs or writing output:
+
+```bash
+python experiments/dispatch_bandwidth/sweep.py --plan
+```
+
+To inspect one point after building:
+
+```bash
+python experiments/dispatch_bandwidth/run.py --traffic cross --cores 2 \
+    --hidden 3712 --bs-values 4096 --metadata-mode dma --timer
+```
+
+`--traffic cross` derives `--workers 0,0,N`; explicitly passing different worker
+counts is rejected. In `--traffic all`, the original three positive worker
+counts and concurrent LOCAL/GROUP/CROSS behavior remain available. `preload` is
+not the sweep default: two CROSS workers at BS4096 require 384 KiB of metadata
+per worker before adding the data ring, which may exceed UB. Selected traffic
+with zero rows is rejected before initializing ACL/SHMEM.
+
+These curves describe the measured Dispatch copy pipeline. Changing N changes
+the aggregate ring capacity and the request schedule; changing H changes packed
+record size, total transferred bytes and the source working set. Interpret the
+curves with these controls, rather than as a direct measurement of physical-link
+peak bandwidth. No performance values are synthesized by the sweep or plotter.

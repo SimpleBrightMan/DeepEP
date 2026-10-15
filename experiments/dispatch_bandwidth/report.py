@@ -20,6 +20,7 @@ COMMON_FIELDS = (
     "experts",
     "topk",
     "scope",
+    "traffic_selection",
     "metadata_mode",
     "row_bytes",
     "scale_elements",
@@ -82,6 +83,8 @@ def balanced_traffic_rows(raw):
         traffic = (
             "local" if peer == rank else "group" if peer // raw["group_size"] == rank // raw["group_size"] else "cross"
         )
+        if raw["traffic_selection"] == "cross" and traffic != "cross":
+            continue
         start, stop = peer * source_items, (peer + 1) * source_items
         for expert in range(selected_experts):
             residue = expert * world + rank
@@ -94,6 +97,8 @@ def _planned_workers(raw, traffic_rows):
     result = []
     for traffic in TRAFFIC:
         workers = raw["worker_counts"][traffic]
+        if workers == 0:
+            continue
         base, extra = divmod(traffic_rows[traffic], workers)
         result.extend((traffic, (base + int(worker < extra)) * raw["repeats"]) for worker in range(workers))
     return result
@@ -126,7 +131,7 @@ def validate_report(raw, *, expected_iterations=None):
     missing = required - set(raw)
     if missing:
         raise ReportError("Missing report field(s): " + ", ".join(sorted(missing)))
-    if type(raw["schema_version"]) is not int or raw["schema_version"] != 2:
+    if type(raw["schema_version"]) is not int or raw["schema_version"] != 3:
         raise ReportError("Unsupported schema_version")
     for name in (
         "world",
@@ -145,7 +150,7 @@ def validate_report(raw, *, expected_iterations=None):
         _integer(raw[name], name, 1)
     _integer(raw["rank"], "rank")
     _integer(raw["device"], "device")
-    if not 4 <= raw["world"] <= 16 or not 3 <= raw["cores"] <= 32:
+    if not 4 <= raw["world"] <= 16 or not 1 <= raw["cores"] <= 32:
         raise ReportError("world/cores are outside the native planner limits")
     if raw["rank"] >= raw["world"]:
         raise ReportError("rank must be within world")
@@ -164,6 +169,8 @@ def validate_report(raw, *, expected_iterations=None):
         raise ReportError("intermediate/buffer_count are outside the native planner limits")
     if raw["scope"] not in ("all", "first-expert"):
         raise ReportError("Invalid scope")
+    if raw["traffic_selection"] not in ("all", "cross"):
+        raise ReportError("Invalid traffic_selection")
     if raw["metadata_mode"] not in ("scalar", "dma", "preload"):
         raise ReportError("Invalid metadata_mode: expected scalar, dma or preload")
     scale_elements = (raw["hidden"] + 31) // 32
@@ -171,12 +178,17 @@ def validate_report(raw, *, expected_iterations=None):
     if raw["scale_elements"] != scale_elements or raw["row_bytes"] != row_bytes:
         raise ReportError("row_bytes/scale_elements disagree with padded FP8 + E8M0 layout")
     _positive(raw["cycles_per_us"], "cycles_per_us")
-    for name, minimum in (("traffic_rows", 0), ("worker_counts", 1)):
+    for name, minimum in (("traffic_rows", 0), ("worker_counts", 0)):
         _mapping(raw[name], TRAFFIC, name)
         for traffic in TRAFFIC:
             _integer(raw[name][traffic], f"{name}.{traffic}", minimum)
     if sum(raw["worker_counts"].values()) != raw["cores"]:
         raise ReportError("worker_counts must sum to cores")
+    if raw["traffic_selection"] == "cross":
+        if raw["worker_counts"] != dict(local=0, group=0, cross=raw["cores"]):
+            raise ReportError("CROSS-only selection requires all workers to own CROSS traffic")
+    elif raw["cores"] < 3 or any(count < 1 for count in raw["worker_counts"].values()):
+        raise ReportError("All-traffic selection requires three positive worker counts")
     expected_rows = balanced_traffic_rows(raw)
     if raw["traffic_rows"] != expected_rows:
         raise ReportError(f"traffic_rows disagree with balanced routing and scope: expected {expected_rows}")
@@ -335,13 +347,15 @@ def summarize_reports(reports, *, expected_world=None, expected_iterations=None)
             kernel_window_gbps_per_card=distribution([value["kernel_window_gbps"] for value in values]),
         )
     return dict(
-        schema_version=2,
-        mode="concurrent_local_group_cross",
+        schema_version=3,
+        mode="cross_only" if first["traffic_selection"] == "cross" else "concurrent_local_group_cross",
         configuration={name: first[name] for name in COMMON_FIELDS},
         metric="rank_local_class_payload_gbps",
         percentile_method="linear_interpolation",
         notes=[
-            "Three traffic classes execute concurrently in one kernel.",
+            "Only CROSS workers execute in each kernel."
+            if first["traffic_selection"] == "cross"
+            else "Three traffic classes execute concurrently in one kernel.",
             "Each class uses its own active workers' min(start)..max(end) on the same NPU.",
             "LOCAL includes local reads; measured spans also include local output and metadata writes.",
             "Kernel-window contributions use the ACL-event whole-kernel duration and a different timing scope.",
@@ -392,6 +406,7 @@ def export_timers(raw, directory):
                 "rank",
                 "device",
                 "metadata_mode",
+                "traffic_selection",
                 "iteration",
                 "group_id",
                 "traffic",
@@ -412,6 +427,7 @@ def export_timers(raw, directory):
                         raw["rank"],
                         raw["device"],
                         raw["metadata_mode"],
+                        raw["traffic_selection"],
                         measured["iteration"],
                         worker["group_id"],
                         worker["traffic"],
@@ -437,6 +453,7 @@ def export_timers(raw, directory):
                                 rank=raw["rank"],
                                 device=raw["device"],
                                 metadata_mode=raw["metadata_mode"],
+                                traffic_selection=raw["traffic_selection"],
                                 rows=worker["rows"],
                                 bytes=worker["rows"] * raw["row_bytes"],
                                 time_origin="rank_first_measured_start",
@@ -445,7 +462,15 @@ def export_timers(raw, directory):
                     )
     output = directory / f"rank_{raw['rank']}_trace.json"
     output.write_text(
-        json.dumps(dict(traceEvents=trace, displayTimeUnit="us", metadata_mode=raw["metadata_mode"]), indent=2),
+        json.dumps(
+            dict(
+                traceEvents=trace,
+                displayTimeUnit="us",
+                metadata_mode=raw["metadata_mode"],
+                traffic_selection=raw["traffic_selection"],
+            ),
+            indent=2,
+        ),
         encoding="utf-8",
     )
     return path, output

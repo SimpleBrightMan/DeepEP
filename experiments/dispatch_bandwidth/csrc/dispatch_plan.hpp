@@ -26,11 +26,13 @@ struct Config {
     uint32_t ring_slots = 6U;
     std::array<uint32_t, kTrafficKinds> worker_counts{2U, 5U, 21U};
     bool first_expert = false;
+    bool cross_only = false;
 };
 
 struct Plan {
     // Tasks are grouped by traffic, then divided into worker-owned intervals.
-    // destination retains the expert/peer ordered output row before regrouping.
+    // destination retains the selected expert/peer ordered output row before
+    // regrouping; cross-only destinations exclude all same-group rows.
     std::vector<CopyTask> tasks;
     std::vector<Worker> workers;
     std::array<uint64_t, kTrafficKinds> traffic_rows{};
@@ -66,10 +68,16 @@ inline void Validate(const Config& config, uint32_t rank)
     Require(rank < config.world, "rank must be less than world");
     Require(config.group_size >= 2U && config.group_size < config.world && config.world % config.group_size == 0U,
             "group_size must divide world and satisfy 1 < group_size < world");
-    Require(config.cores >= kTrafficKinds && config.cores <= 32U, "cores must be in [3,32]");
+    Require(config.cores >= (config.cross_only ? 1U : kTrafficKinds) && config.cores <= 32U,
+            "cores must be in [1,32] for cross-only or [3,32] for all traffic");
+    if (config.cross_only) {
+        Require(
+            config.worker_counts[0] == 0U && config.worker_counts[1] == 0U && config.worker_counts[2] == config.cores,
+            "cross-only traffic requires worker_counts={0,0,cores}");
+    }
     uint64_t workers = 0U;
     for (uint32_t count : config.worker_counts) {
-        Require(count > 0U, "each traffic class must have at least one worker");
+        Require(config.cross_only || count > 0U, "each traffic class must have at least one worker");
         workers += count;
     }
     Require(workers == config.cores, "worker_counts must sum to cores");
@@ -129,6 +137,9 @@ inline Plan BuildPlan(const Config& config, uint32_t rank)
                                                   : (peer / config.group_size == rank / config.group_size
                                                          ? static_cast<uint32_t>(Traffic::Group)
                                                          : static_cast<uint32_t>(Traffic::Cross));
+            if (config.cross_only && traffic != static_cast<uint32_t>(Traffic::Cross)) {
+                continue;
+            }
             for (uint64_t index = first; index < source_items; index += config.experts) {
                 if (destination >= full_rows) {
                     throw std::overflow_error("Generated rows exceed the balanced route capacity");
@@ -139,10 +150,17 @@ inline Plan BuildPlan(const Config& config, uint32_t rank)
             }
         }
     }
-    if (!config.first_expert && destination != full_rows) {
+    if (!config.first_expert && !config.cross_only && destination != full_rows) {
         throw std::logic_error("Balanced route conservation failed");
     }
-    plan.total_rows = static_cast<uint32_t>(destination);
+    uint64_t selected_rows = 0U;
+    for (const auto& queue : queues) {
+        selected_rows += queue.size();
+    }
+    if (destination != selected_rows) {
+        throw std::logic_error("Selected route row accounting failed");
+    }
+    plan.total_rows = static_cast<uint32_t>(selected_rows);
     plan.tasks.reserve(plan.total_rows);
     plan.workers.reserve(config.cores);
     for (uint32_t traffic = 0U; traffic < kTrafficKinds; ++traffic) {
@@ -151,6 +169,12 @@ inline Plan BuildPlan(const Config& config, uint32_t rank)
         const uint32_t begin = static_cast<uint32_t>(plan.tasks.size());
         plan.tasks.insert(plan.tasks.end(), queues[traffic].begin(), queues[traffic].end());
         const uint32_t workers = config.worker_counts[traffic];
+        if (workers == 0U) {
+            if (rows != 0U) {
+                throw std::logic_error("Selected traffic rows have no workers");
+            }
+            continue;
+        }
         const uint32_t base = static_cast<uint32_t>(rows / workers);
         const uint32_t extra = static_cast<uint32_t>(rows % workers);
         for (uint32_t worker = 0U; worker < workers; ++worker) {

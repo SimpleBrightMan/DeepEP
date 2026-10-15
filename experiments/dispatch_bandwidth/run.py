@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by SimpleBright_Man 2026
 
-"""Launch one native process per local NPU for concurrent LOCAL/GROUP/CROSS Dispatch."""
+"""Launch one native process per local NPU for concurrent or CROSS-only Dispatch."""
 
 import argparse
 from datetime import datetime, timezone
@@ -49,7 +49,10 @@ def parse_args(argv=None):
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--group-size", type=int, default=4, help="Contiguous rank IDs in one direct-link domain")
     parser.add_argument("--cores", type=int, default=28)
-    parser.add_argument("--workers", type=_csv_integers, default=[2, 5, 21], help="Dedicated LOCAL,GROUP,CROSS cores")
+    parser.add_argument("--traffic", choices=("all", "cross"), default="all")
+    parser.add_argument(
+        "--workers", type=_csv_integers, help="Dedicated LOCAL,GROUP,CROSS cores; CROSS-only defaults to 0,0,cores"
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=1)
@@ -68,18 +71,21 @@ def parse_args(argv=None):
         "--plan", action="store_true", help="Print native commands without writes, ports or NPU queries"
     )
     args = parser.parse_args(argv)
+    if args.workers is None:
+        args.workers = [0, 0, args.cores] if args.traffic == "cross" else [2, 5, 21]
     world = len(args.devices)
     if not 4 <= world <= 16 or len(set(args.devices)) != world or any(device < 0 for device in args.devices):
         parser.error("--devices must contain 4..16 distinct nonnegative ACL device IDs")
     if not 1 < args.group_size < world or world % args.group_size:
         parser.error("--group-size must divide world and leave nonempty GROUP and CROSS classes")
-    if (
-        not 3 <= args.cores <= 32
-        or len(args.workers) != 3
-        or any(count < 1 for count in args.workers)
-        or sum(args.workers) != args.cores
-    ):
-        parser.error("--workers requires three positive counts summing to --cores")
+    minimum_cores = 1 if args.traffic == "cross" else 3
+    if not minimum_cores <= args.cores <= 32 or len(args.workers) != 3 or sum(args.workers) != args.cores:
+        parser.error("--workers must sum to --cores, within the supported core range")
+    if args.traffic == "cross":
+        if args.workers != [0, 0, args.cores]:
+            parser.error("--traffic cross requires --workers 0,0,cores")
+    elif any(count < 1 for count in args.workers):
+        parser.error("--traffic all requires three positive worker counts")
     if (
         not args.bs_values
         or len(set(args.bs_values)) != len(args.bs_values)
@@ -122,6 +128,7 @@ def native_command(args, *, rank, bs, endpoint, directory):
         "buffer-count": args.buffer_count,
         "repeat": args.repeat,
         "scope": args.scope,
+        "traffic": args.traffic,
         "metadata-mode": args.metadata_mode,
         "warmup": args.warmup,
         "iters": args.iters,
@@ -150,14 +157,20 @@ def make_plan(args, directory):
             )
         )
     return dict(
-        mode="concurrent_local_group_cross",
+        mode="cross_only" if args.traffic == "cross" else "concurrent_local_group_cross",
+        traffic_selection=args.traffic,
         metadata_mode=args.metadata_mode,
         world=len(args.devices),
         devices=args.devices,
         workers=dict(zip(report.TRAFFIC, args.workers)),
         output_dir=str(directory),
         cases=cases,
-        note="One kernel concurrently executes all three classes. Each BS starts fresh native processes.",
+        note=(
+            "Only CROSS workers execute in each kernel."
+            if args.traffic == "cross"
+            else "One kernel concurrently executes all three classes."
+        )
+        + " Each BS starts fresh native processes.",
     )
 
 
@@ -246,6 +259,7 @@ def run_case(args, bs, directory):
         experts=args.experts,
         topk=args.topk,
         scope=args.scope,
+        traffic_selection=args.traffic,
         metadata_mode=args.metadata_mode,
         buffer_count=args.buffer_count,
         repeats=args.repeat,
@@ -264,9 +278,12 @@ def run_case(args, bs, directory):
 
 def print_summary(summary):
     config = summary["configuration"]
+    label = "CROSS_ONLY" if config["traffic_selection"] == "cross" else "CONCURRENT"
+    activity = (
+        "Only CROSS workers run." if config["traffic_selection"] == "cross" else "LOCAL/GROUP/CROSS run in one kernel."
+    )
     print(
-        f"[CONCURRENT] BS={config['batch']} scope={config['scope']} metadata_mode={config['metadata_mode']}; "
-        "LOCAL/GROUP/CROSS run in one kernel.",
+        f"[{label}] BS={config['batch']} scope={config['scope']} metadata_mode={config['metadata_mode']}; {activity}",
         flush=True,
     )
     for traffic in report.TRAFFIC:
@@ -312,7 +329,7 @@ def main(argv=None):
     _write_json(directory / "plan.json", plan)
     _resource_snapshot(directory)
     combined = dict(
-        schema_version=2,
+        schema_version=3,
         mode=plan["mode"],
         metadata_mode=args.metadata_mode,
         status="running",

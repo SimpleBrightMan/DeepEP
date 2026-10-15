@@ -52,7 +52,7 @@ def native_report(rank=0, *, repeats=2, iterations=2, clock_offset=0, batch=5, t
         ]
         rounds.append(dict(iteration=iteration, kernel_elapsed_us=12.0, workers=workers))
     return dict(
-        schema_version=2,
+        schema_version=3,
         rank=rank,
         world=4,
         device=rank,
@@ -64,6 +64,7 @@ def native_report(rank=0, *, repeats=2, iterations=2, clock_offset=0, batch=5, t
         experts=32,
         topk=topk,
         scope="all",
+        traffic_selection="all",
         metadata_mode=metadata_mode,
         row_bytes=3712,
         scale_elements=112,
@@ -115,7 +116,7 @@ def test_rank_clock_offsets_never_enter_cross_rank_bandwidth():
 @pytest.mark.parametrize("metadata_mode", ["scalar", "dma", "preload"])
 def test_summary_marks_mode_without_adding_local_metadata_reads_to_payload(metadata_mode, capsys):
     summary = report.summarize_reports([native_report(rank, metadata_mode=metadata_mode) for rank in range(4)])
-    assert summary["schema_version"] == 2
+    assert summary["schema_version"] == 3
     assert summary["configuration"]["metadata_mode"] == metadata_mode
     assert summary["classes"]["cross"]["bytes_per_round_per_card"]["mean"] == 5 * 2 * 3712
     assert summary["classes"]["cross"]["gbps_per_card"]["mean"] == pytest.approx(37120 / 7000)
@@ -167,23 +168,41 @@ def test_zero_traffic_has_no_artificial_bandwidth_observation():
 
 
 @pytest.mark.parametrize("scope", ["all", "first-expert"])
+@pytest.mark.parametrize("selection", ["all", "cross"])
 @pytest.mark.parametrize("world,group_size,experts", [(4, 2, 32), (16, 4, 384)])
 @pytest.mark.parametrize("batch,topk", [(1, 1), (5, 2), (17, 8), (96, 6)])
-def test_residue_counts_match_an_independent_route_enumerator(scope, world, group_size, experts, batch, topk):
+def test_residue_counts_match_an_independent_route_enumerator(
+    scope, selection, world, group_size, experts, batch, topk
+):
     for rank in range(world):
-        raw = dict(rank=rank, world=world, group_size=group_size, experts=experts, batch=batch, topk=topk, scope=scope)
+        raw = dict(
+            rank=rank,
+            world=world,
+            group_size=group_size,
+            experts=experts,
+            batch=batch,
+            topk=topk,
+            scope=scope,
+            traffic_selection=selection,
+        )
         expected = brute_traffic_rows(rank, world, group_size, batch, experts, topk, scope)
+        if selection == "cross":
+            expected.update(local=0, group=0)
         assert report.balanced_traffic_rows(raw) == expected
-        if scope == "all":
+        if scope == "all" and selection == "all":
             assert sum(expected.values()) == batch * topk
 
 
 @pytest.mark.parametrize("batch,first", [(2048, (43, 128, 512)), (4096, (86, 256, 1024)), (8192, (171, 512, 2048))])
 def test_default_ep16_counts_for_full_dispatch_and_first_expert(batch, first):
-    raw = dict(rank=0, world=16, group_size=4, experts=384, batch=batch, topk=8, scope="first-expert")
+    raw = dict(
+        rank=0, world=16, group_size=4, experts=384, batch=batch, topk=8, scope="first-expert", traffic_selection="all"
+    )
     assert report.balanced_traffic_rows(raw) == dict(zip(report.TRAFFIC, first))
     raw["scope"] = "all"
     assert report.balanced_traffic_rows(raw) == dict(local=batch // 2, group=batch * 3 // 2, cross=batch * 6)
+    raw["traffic_selection"] = "cross"
+    assert report.balanced_traffic_rows(raw) == dict(local=0, group=0, cross=batch * 6)
 
 
 @pytest.mark.parametrize(
@@ -457,6 +476,130 @@ def test_launcher_rejects_report_metadata_mode_different_from_request(monkeypatc
 def test_invalid_launch_configuration_is_rejected(arguments):
     with pytest.raises(SystemExit):
         run.parse_args(["--plan", *arguments])
+
+
+def cross_report(rank=0, cores=2, hidden=3712, metadata_mode="dma"):
+    raw = native_report(rank, metadata_mode=metadata_mode)
+    raw.update(
+        traffic_selection="cross",
+        cores=cores,
+        hidden=hidden,
+        row_bytes=((hidden + 255) // 256) * 256 + ((hidden // 32 + 31) // 32) * 32,
+        scale_elements=hidden // 32,
+    )
+    raw["traffic_rows"].update(local=0, group=0)
+    raw["worker_counts"] = dict(local=0, group=0, cross=cores)
+    rows = raw["traffic_rows"]["cross"]
+    raw["validation"]["checked_rows"] = rows
+    allocation = [0] * cores
+    for row in range(rows):
+        allocation[row % cores] += 1
+    for measured in raw["rounds"]:
+        base = measured["iteration"] * 100000
+        measured["workers"] = [
+            dict(
+                group_id=group,
+                traffic="cross",
+                rows=count * raw["repeats"],
+                start_cycle=base + 100 + group * 100 if count else 0,
+                end_cycle=base + 2100 + group * 100 if count else 0,
+            )
+            for group, count in enumerate(allocation)
+        ]
+    return raw
+
+
+@pytest.mark.parametrize("cores", [1, 2, 4, 6, 8, 10, 12, 16, 20, 24, 28, 32])
+@pytest.mark.parametrize("hidden,row_bytes", [(3712, 3968), (4096, 4224), (6144, 6336), (8192, 8448)])
+def test_cross_only_has_exact_payload_and_no_local_or_group_workers(cores, hidden, row_bytes):
+    raws = [cross_report(rank, cores, hidden) for rank in range(4)]
+    summary = report.summarize_reports(raws, expected_world=4, expected_iterations=2)
+    assert summary["mode"] == "cross_only"
+    assert summary["configuration"]["traffic_selection"] == "cross"
+    assert summary["classes"]["cross"]["workers"] == cores
+    assert summary["classes"]["cross"]["bytes_per_round_per_card"]["mean"] == 5 * 2 * row_bytes
+    for traffic in ("local", "group"):
+        assert summary["classes"][traffic]["workers"] == 0
+        assert summary["classes"][traffic]["rank_mean_gbps_per_card"] is None
+        assert summary["classes"][traffic]["bytes_per_round_per_card"]["max"] == 0
+
+
+@pytest.mark.parametrize("fault", ["invalid_selection", "missing_selection", "wrong_workers", "wrong_rows", "old_v2"])
+def test_cross_only_malformed_selection_is_rejected(fault):
+    raw = cross_report()
+    if fault == "invalid_selection":
+        raw["traffic_selection"] = "group"
+    elif fault == "missing_selection":
+        del raw["traffic_selection"]
+    elif fault == "wrong_workers":
+        raw["worker_counts"] = dict(local=1, group=0, cross=1)
+    elif fault == "wrong_rows":
+        raw["traffic_rows"]["local"] = 1
+    else:
+        raw["schema_version"] = 2
+    with pytest.raises(report.ReportError):
+        report.validate_report(raw)
+
+
+@pytest.mark.parametrize("cores", [2, 4, 6, 8, 10, 12, 16, 20, 24, 28])
+def test_cross_only_plan_defaults_to_all_requested_cores_and_passes_native_traffic(tmp_path, cores):
+    args = run.parse_args(["--plan", "--traffic", "cross", "--cores", str(cores)])
+    assert args.workers == [0, 0, cores]
+    plan = run.make_plan(args, tmp_path)
+    assert plan["mode"] == "cross_only"
+    assert plan["traffic_selection"] == "cross"
+    assert plan["workers"] == dict(local=0, group=0, cross=cores)
+    for case in plan["cases"]:
+        for command in case["commands"]:
+            assert command[command.index("--traffic") + 1] == "cross"
+            assert command[command.index("--workers") + 1] == f"0,0,{cores}"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--traffic", "cross", "--cores", "2", "--workers", "1,0,1"],
+        ["--traffic", "cross", "--cores", "0"],
+        ["--traffic", "all", "--cores", "2", "--workers", "0,0,2"],
+        ["--traffic", "all", "--workers", "0,0,28"],
+    ],
+)
+def test_invalid_cross_only_worker_allocation_is_rejected(arguments):
+    with pytest.raises(SystemExit):
+        run.parse_args(["--plan", *arguments])
+
+
+def test_cross_only_launch_rejects_reports_for_concurrent_traffic(monkeypatch, tmp_path):
+    args = run.parse_args(
+        [
+            "--traffic",
+            "cross",
+            "--devices",
+            "0,1,2,3",
+            "--group-size",
+            "2",
+            "--cores",
+            "2",
+            "--experts",
+            "32",
+            "--topk",
+            "2",
+            "--iters",
+            "2",
+            "--repeat",
+            "2",
+        ]
+    )
+
+    class Finished:
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(run, "_endpoint", lambda: "tcp://127.0.0.1:12345")
+    monkeypatch.setattr(run.subprocess, "Popen", lambda *args, **kwargs: Finished())
+    monkeypatch.setattr(run.report, "load_reports", lambda *args: [native_report(rank) for rank in range(4)])
+    with pytest.raises(report.ReportError, match="requested native launch"):
+        run.run_case(args, 5, tmp_path / "cross")
 
 
 def test_cleanup_only_terminates_owned_live_process_objects():
