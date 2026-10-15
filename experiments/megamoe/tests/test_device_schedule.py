@@ -48,3 +48,57 @@ def test_production_pipeline_stage_order(tmp_path):
         methods.append(signature + source[begin:end])
     (tmp_path / "process_wave_methods.inc").write_text("\n".join(methods), encoding="utf-8")
     compile_and_run(Path(__file__).with_name("pipeline_order_host.cpp"), tmp_path)
+
+
+def cpp_body(source, marker):
+    begin = source.index("{", source.index(marker))
+    depth, end = 1, begin + 1
+    while depth:
+        depth += (source[end] == "{") - (source[end] == "}")
+        end += 1
+    return source[begin:end]
+
+
+def test_production_gmm_wave_order_matches_frozen_scheduler(tmp_path):
+    kernel = ROOT / "experiments/megamoe/csrc/kernels/mega_moe"
+    source = (kernel / "mega_moe_wave_a8w4.hpp").read_text(encoding="utf-8")
+    signatures = {
+        "PrepareQuantizedCombinePipeline":
+            "void PrepareQuantizedCombinePipeline(ExpertTokenPosition& dispatchCursor, WaveCombineBufferConfig& buffers)",
+        "RunNextGmm1Slice":
+            "void RunNextGmm1Slice(ExpertWaveRange& wave, uint32_t& usedMGroups, ExpertContext& gmm1ExpertContext, "
+            "GMMAddrInfo& gmm1AddrInfo, uint32_t& startBlockIdx, int32_t& readySequence, uint64_t waveId)",
+        "RunQuantizedCombineGmm1Wave":
+            "void RunQuantizedCombineGmm1Wave(ExpertWaveRange& wave, ExpertTokenPosition& dispatchCursor, "
+            "ExpertContext& gmm1ExpertContext, GMMAddrInfo& gmm1AddrInfo, uint32_t& startBlockIdx, "
+            "int32_t& readySequence, uint64_t waveId)",
+        "RunGmm1Wave":
+            "ExpertWaveRange RunGmm1Wave(ExpertTokenPosition& gmm1Cursor, ExpertContext& gmm1ExpertContext, "
+            "GMMAddrInfo& gmm1AddrInfo, uint32_t& startBlockIdx, int32_t& readySequence, uint64_t waveId, "
+            "ExpertTokenPosition& dispatchCursor)",
+        "RunGmm2CombineForWaveRange":
+            "void RunGmm2CombineForWaveRange(const ExpertWaveRange& wave, ExpertContext& gmm2ExpertContext, "
+            "GMMAddrInfo& gmm2AddrInfo, uint32_t& startBlockIdx, WaveCombineBufferConfig& combineBufferConfig, "
+            "uint32_t& combineRowSequence, int32_t& gmm1TileReadySequence)",
+        "ProcessGmmWaves": "void ProcessGmmWaves(int32_t& gmm1TileReadySequence)",
+    }
+    methods = [signature + cpp_body(source, f"::{name}(") for name, signature in signatures.items()]
+    arch = (kernel / "mega_moe_arch35.hpp").read_text(encoding="utf-8")
+    methods.append(
+        "void RunQuantizedCombineForExpert(const ExpertContext& expertContext, const ExpertSlice& slice, "
+        "GMMAddrInfo& gmmAddrInfo, WaveCombineBufferConfig& combineBufferConfig, "
+        "uint32_t& combineRowSequence, bool isFinalCombine)"
+        + cpp_body(arch, "::RunQuantizedCombineForExpert(")
+    )
+    (tmp_path / "gmm_wave_methods.inc").write_text("\n".join(methods), encoding="utf-8")
+
+    types = (kernel / "common/mega_moe_types.hpp").read_text(encoding="utf-8")
+    utils = (kernel / "common/mega_moe_utils.hpp").read_text(encoding="utf-8")
+    context = "struct ExpertContext" + cpp_body(types, "struct ExpertContext") + ";\n"
+    context += "ExpertContext CreateExpertContext(const MoeStageCommonConfig& context)" + cpp_body(
+        utils, "CreateExpertContext("
+    )
+    context += "\nvoid UpdateExpertContext(ExpertContext& expertContext, uint32_t expertIdx, uint64_t expertTokenCount)"
+    context += cpp_body(utils, "UpdateExpertContext(")
+    (tmp_path / "expert_context_methods.inc").write_text(context, encoding="utf-8")
+    compile_and_run(Path(__file__).with_name("gmm_wave_execution_host.cpp"), tmp_path)

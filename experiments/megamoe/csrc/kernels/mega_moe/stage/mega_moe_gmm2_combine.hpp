@@ -962,14 +962,14 @@ __aicore__ inline void UpdateMoeExpertGmm2GlobalBuffer(const GmmExecutionConfig&
                                                        const MoeSyncWorkspaceLayout& syncLayout,
                                                        const WorkspaceInfo& workspace,
                                                        const ExpertWeightTensorListAddrs& weights,
-                                                       GMMAddrInfo& gmmAddrInfo, const ExpertLoopState& state,
+                                                       GMMAddrInfo& gmmAddrInfo, const ExpertContext& expertContext,
                                                        uint32_t rowOffsetInExpert = 0U)
 {
     constexpr uint32_t weightElementsPerByte = PackedElementTraits<WeightType>::ELEMENTS_PER_BYTE;
     constexpr uint32_t activationOutputElementsPerByte = PackedElementTraits<ActivationOutType>::ELEMENTS_PER_BYTE;
-    uint64_t gmm1OutputDim = static_cast<uint64_t>(Get<N_VALUE>(state.problemShape));
-    uint64_t tokenHiddenDim = static_cast<uint64_t>(Get<K_VALUE>(state.problemShape));
-    uint64_t globalTokenStartIndex = static_cast<uint64_t>(state.globalTokenStartIndex) + rowOffsetInExpert;
+    uint64_t gmm1OutputDim = static_cast<uint64_t>(Get<N_VALUE>(expertContext.problemShape));
+    uint64_t tokenHiddenDim = static_cast<uint64_t>(Get<K_VALUE>(expertContext.problemShape));
+    uint64_t globalTokenStartIndex = static_cast<uint64_t>(expertContext.globalTokenStartIndex) + rowOffsetInExpert;
     uint32_t expertMGroupOffset = rowOffsetInExpert / L1_TILE_M_256;
     uint64_t activationOutputWidth = gmm1OutputDim / ACTIVATION_N_HALF;
     uint64_t activationScaleWidth =
@@ -983,27 +983,27 @@ __aicore__ inline void UpdateMoeExpertGmm2GlobalBuffer(const GmmExecutionConfig&
     gmmAddrInfo.aScaleGlobal =
         workspace.activationQuantScalePtr + globalTokenStartIndex * activationScaleWidth * sizeof(QuantScaleType);
     gmmAddrInfo.bGlobal = GetExpertWeightAddr<WeightType>(
-        weights.weight2, gmmConfig.isPerExpertWeightTensor, state.expertIdx,
-        static_cast<uint64_t>(state.expertIdx) * tokenHiddenDim * activationOutputWidth / weightElementsPerByte);
+        weights.weight2, gmmConfig.isPerExpertWeightTensor, expertContext.expertIdx,
+        static_cast<uint64_t>(expertContext.expertIdx) * tokenHiddenDim * activationOutputWidth / weightElementsPerByte);
     gmmAddrInfo.bScaleGlobal = GetExpertWeightAddr<QuantScaleType>(
-        weights.weightScales2, gmmConfig.isPerExpertWeightTensor, state.expertIdx,
-        static_cast<uint64_t>(state.expertIdx) * tokenHiddenDim * activationScaleWidth);
+        weights.weightScales2, gmmConfig.isPerExpertWeightTensor, expertContext.expertIdx,
+        static_cast<uint64_t>(expertContext.expertIdx) * tokenHiddenDim * activationScaleWidth);
     gmmAddrInfo.activationToGmm2Flag =
         reinterpret_cast<__gm__ int32_t*>(workspace.flagActivationToGmm2Ptr) +
-        static_cast<uint64_t>(state.expertIdx) * syncLayout.activationFlagSlotCountPerExpert +
+        static_cast<uint64_t>(expertContext.expertIdx) * syncLayout.activationFlagSlotCountPerExpert +
         static_cast<uint64_t>(expertMGroupOffset) * INT_CACHELINE;
     gmmAddrInfo.dispatchToGmm1Flag =
         reinterpret_cast<__gm__ int32_t*>(workspace.flagDispatchToGmm1Ptr) +
-        static_cast<uint64_t>(state.expertIdx) * syncLayout.dispatchFlagSlotCountPerExpert +
+        static_cast<uint64_t>(expertContext.expertIdx) * syncLayout.dispatchFlagSlotCountPerExpert +
         static_cast<uint64_t>(expertMGroupOffset) * INT_CACHELINE;
 }
 
 // Combine 只消费当前专家的 GMM2 输出；避免复用完整 GMM2 绑定接口时计算无关的输入、权重和 flag 地址。
 __aicore__ inline void UpdateMoeExpertCombineGlobalBuffer(const WorkspaceInfo& workspace, GMMAddrInfo& gmmAddrInfo,
-                                                          const ExpertLoopState& state)
+                                                          const ExpertContext& expertContext)
 {
-    uint64_t tokenHiddenDim = static_cast<uint64_t>(Get<K_VALUE>(state.problemShape));
-    uint64_t globalTokenStartIndex = static_cast<uint64_t>(state.globalTokenStartIndex);
+    uint64_t tokenHiddenDim = static_cast<uint64_t>(Get<K_VALUE>(expertContext.problemShape));
+    uint64_t globalTokenStartIndex = static_cast<uint64_t>(expertContext.globalTokenStartIndex);
     gmmAddrInfo.gmm2OutGlobal = workspace.gmm2MmadResPtr + globalTokenStartIndex * tokenHiddenDim * sizeof(bfloat16_t);
 }
 
@@ -1139,11 +1139,11 @@ template <uint8_t CombineMode, bool IncludeAiv0 = false>
 __aicore__ inline void RunWaveCombineStage(const MoeStageCommonConfig& common, const AivJobContext& job,
                                            const WaveCombineBufferConfig& bufferConfig, WaveCombineScratch& scratch,
                                            const Params& params, const GMMAddrInfo& gmmAddrInfo,
-                                           const ExpertLoopState& state, uint32_t expertIdx, uint32_t& rowSequence)
+                                           const ExpertContext& expertContext, uint32_t expertIdx, uint32_t& rowSequence)
 {
-    uint32_t currentExpertTokenNum = static_cast<uint32_t>(Get<M_VALUE>(state.problemShape));
+    uint32_t currentExpertTokenNum = static_cast<uint32_t>(Get<M_VALUE>(expertContext.problemShape));
     WorkRange currentCoreTokenRange = GetWaveCombineOwnedRange<IncludeAiv0>(
-        job, currentExpertTokenNum, static_cast<uint64_t>(state.globalTokenStartIndex));
+        job, currentExpertTokenNum, static_cast<uint64_t>(expertContext.globalTokenStartIndex));
     if (currentCoreTokenRange.count != 0U) {
         AscendTimerWaitScope wait(gmmAddrInfo.timer, AscendTimer::AIV_COMBINE_WAIT);
         WaitWaveGmm2Ready(job, params, expertIdx);
@@ -1155,7 +1155,7 @@ __aicore__ inline void RunWaveCombineStage(const MoeStageCommonConfig& common, c
                                      : WAVE_COMBINE_META_INFO_TOKEN_CAPACITY;
         PreloadWaveCombineMetaInfo(
             params, scratch,
-            static_cast<uint64_t>(state.globalTokenStartIndex) + currentCoreTokenRange.start + processedTokenNum,
+            static_cast<uint64_t>(expertContext.globalTokenStartIndex) + currentCoreTokenRange.start + processedTokenNum,
             chunkTokenNum, 0U);
         CombineWaveTokenRange<CombineMode>(common, bufferConfig, scratch, params, gmmAddrInfo.gmm2OutGlobal,
                                            currentCoreTokenRange.start + processedTokenNum, chunkTokenNum, 0U,
@@ -1201,7 +1201,7 @@ __aicore__ inline void NotifyTokenCombineSliceReady(const Params& params, uint32
 // 其他调用保留一次阻塞等待；输出 metadata、发送目的地及 timer 协议不变。
 template <bool InputReadyChecked = false>
 __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, const AivJobContext& job,
-                                            const Params& params, const ExpertLoopState& state, uint32_t rowStart,
+                                            const Params& params, const ExpertContext& expertContext, uint32_t rowStart,
                                             uint32_t rowCount, AscendTimerDevice& timer, WaveCombineScratch& scratch)
 {
     if constexpr (g_coreType == AIC) {
@@ -1210,7 +1210,7 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
     if (GetSubBlockIdx() != 1U || rowCount == 0U) {
         return;
     }
-    uint64_t globalRowStart = static_cast<uint64_t>(state.globalTokenStartIndex) + rowStart;
+    uint64_t globalRowStart = static_cast<uint64_t>(expertContext.globalTokenStartIndex) + rowStart;
     WorkRange owned = GetWaveCombineOwnedRange(job, rowCount, globalRowStart);
     if (owned.count == 0U) {
         return;
@@ -1223,7 +1223,7 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
     GM_ADDR sliceOutput =
         params.workspaceInfo.gmm2MmadResPtr + globalRowStart * common.tokenHiddenDim * sizeof(bfloat16_t);
     uint32_t rowSequence = 0U;
-    timer.SetSlice(state.expertIdx, rowStart, rowCount);
+    timer.SetSlice(expertContext.expertIdx, rowStart, rowCount);
     for (uint32_t done = 0U; done < owned.count;) {
         uint32_t count = owned.count - done;
         count = count < WAVE_COMBINE_META_INFO_TOKEN_CAPACITY ? count : WAVE_COMBINE_META_INFO_TOKEN_CAPACITY;
@@ -1232,7 +1232,7 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
         if constexpr (!InputReadyChecked) {
             if (done == 0U) {
                 AscendTimerWaitScope wait(timer.Enabled() ? &timer : nullptr, AscendTimer::AIV_COMBINE_WAIT);
-                WaitUntilGmFlagAtLeast(GetTokenCombineReadyCounter(params, state.expertIdx, rowStart),
+                WaitUntilGmFlagAtLeast(GetTokenCombineReadyCounter(params, expertContext.expertIdx, rowStart),
                                        static_cast<int32_t>(GetTokenCombineProducerCount(common, job, rowCount)));
             }
         }

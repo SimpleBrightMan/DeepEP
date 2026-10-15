@@ -447,23 +447,23 @@ __aicore__ constexpr inline decltype(auto) Get(T&& value)
     return Get<Second, Rest...>(AscendC::Std::get<First>(AscendC::Std::forward<T>(value)));
 }
 
-__aicore__ inline ExpertLoopState CreateExpertLoopState(const MoeStageCommonConfig& context)
+__aicore__ inline ExpertContext CreateExpertContext(const MoeStageCommonConfig& context)
 {
-    ExpertLoopState state;
-    Get<N_VALUE>(state.problemShape) = context.gmm1OutputDim;
-    Get<K_VALUE>(state.problemShape) = context.tokenHiddenDim;
-    return state;
+    ExpertContext expertContext;
+    Get<N_VALUE>(expertContext.problemShape) = context.gmm1OutputDim;
+    Get<K_VALUE>(expertContext.problemShape) = context.tokenHiddenDim;
+    return expertContext;
 }
 
 // 按专家顺序推进连续 token 行偏移，并用当前专家的 token 数更新 M 维度。
 // 仅支持顺序遍历（包括空专家），不是按任意 expertIdx 查询前缀；不要跳过中间专家。
-__aicore__ inline void UpdateExpertLoopState(ExpertLoopState& state, uint32_t expertIdx, uint64_t expertTokenCount)
+__aicore__ inline void UpdateExpertContext(ExpertContext& expertContext, uint32_t expertIdx, uint64_t expertTokenCount)
 {
-    if (expertIdx != state.expertIdx) {
-        state.globalTokenStartIndex += Get<M_VALUE>(state.problemShape);
+    if (expertIdx != expertContext.expertIdx) {
+        expertContext.globalTokenStartIndex += Get<M_VALUE>(expertContext.problemShape);
     }
-    state.expertIdx = expertIdx;
-    Get<M_VALUE>(state.problemShape) = static_cast<int64_t>(expertTokenCount);
+    expertContext.expertIdx = expertIdx;
+    Get<M_VALUE>(expertContext.problemShape) = static_cast<int64_t>(expertTokenCount);
 }
 
 // 轮询 GM 中的 int32 ready flag，并在两次读取之间加入短暂退避。

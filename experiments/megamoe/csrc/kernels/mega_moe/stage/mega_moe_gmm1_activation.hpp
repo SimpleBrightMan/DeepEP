@@ -1037,7 +1037,7 @@ template <typename ActivationType, typename WeightType, typename ActivationOutTy
 __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
     const GmmExecutionConfig& gmmConfig, const MoeSyncWorkspaceLayout& syncLayout, const WorkspaceInfo& workspace,
     const ExpertWeightTensorListAddrs& weights, BlockEpilogue& epilogueOp, GMMAddrInfo& gmmAddrInfo,
-    const ExpertLoopState& state, uint32_t rowOffsetInExpert = 0U, uint32_t gmm1TilesPerMGroup = 0U)
+    const ExpertContext& expertContext, uint32_t rowOffsetInExpert = 0U, uint32_t gmm1TilesPerMGroup = 0U)
 {
     if constexpr (g_coreType == AIV && !EnableA8W4) {
         if (GetSubBlockIdx() != 0) {
@@ -1047,10 +1047,10 @@ __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
 
     constexpr uint32_t weightElementsPerByte = PackedElementTraits<WeightType>::ELEMENTS_PER_BYTE;
     constexpr uint32_t outputElementsPerByte = PackedElementTraits<ActivationOutType>::ELEMENTS_PER_BYTE;
-    int64_t n = Get<N_VALUE>(state.problemShape);
-    int64_t k = Get<K_VALUE>(state.problemShape);
-    int64_t expertOffset = state.expertIdx;
-    int64_t globalTokenStartIndex = state.globalTokenStartIndex + rowOffsetInExpert;
+    int64_t n = Get<N_VALUE>(expertContext.problemShape);
+    int64_t k = Get<K_VALUE>(expertContext.problemShape);
+    int64_t expertOffset = expertContext.expertIdx;
+    int64_t globalTokenStartIndex = expertContext.globalTokenStartIndex + rowOffsetInExpert;
     uint32_t expertMGroupOffset = rowOffsetInExpert / L1_TILE_M_256;
     int64_t scaleK = Ops::Base::CeilDiv(k, static_cast<int64_t>(MXFP_DIVISOR_SIZE)) * MXFP_MULTI_BASE_SIZE;
 
@@ -1059,7 +1059,7 @@ __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
     }
     if constexpr (TopkWeightsPrefetch) {
         gmmAddrInfo.gmm1TileStatus = reinterpret_cast<__gm__ int32_t*>(workspace.gmm1TileStatusPtr) +
-                                     (static_cast<uint64_t>(state.expertIdx) * syncLayout.gmm1TileStatusCountPerExpert +
+                                     (static_cast<uint64_t>(expertContext.expertIdx) * syncLayout.gmm1TileStatusCountPerExpert +
                                       static_cast<uint64_t>(expertMGroupOffset) * gmm1TilesPerMGroup) *
                                          INT_CACHELINE;
     }
@@ -1071,11 +1071,11 @@ __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
         workspace.dispatchRevDataPtr + globalTokenStartIndex * k / ActivationElementsPerByte * sizeof(ActivationType);
     gmmAddrInfo.aScaleGlobal = workspace.dispatchRevScalePtr + globalTokenStartIndex * scaleK * sizeof(QuantScaleType);
     gmmAddrInfo.bGlobal =
-        GetExpertWeightAddr<ActivationType>(weights.weight1, gmmConfig.isPerExpertWeightTensor, state.expertIdx,
-                                            static_cast<uint64_t>(state.expertIdx) * n * k / weightElementsPerByte);
+        GetExpertWeightAddr<ActivationType>(weights.weight1, gmmConfig.isPerExpertWeightTensor, expertContext.expertIdx,
+                                            static_cast<uint64_t>(expertContext.expertIdx) * n * k / weightElementsPerByte);
     gmmAddrInfo.bScaleGlobal =
-        GetExpertWeightAddr<QuantScaleType>(weights.weightScales1, gmmConfig.isPerExpertWeightTensor, state.expertIdx,
-                                            static_cast<uint64_t>(state.expertIdx) * n * scaleK);
+        GetExpertWeightAddr<QuantScaleType>(weights.weightScales1, gmmConfig.isPerExpertWeightTensor, expertContext.expertIdx,
+                                            static_cast<uint64_t>(expertContext.expertIdx) * n * scaleK);
     if constexpr (g_coreType == AIV) {
         bool runsActivation = true;
         if constexpr (EnableA8W4) {

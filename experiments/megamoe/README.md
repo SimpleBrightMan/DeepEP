@@ -94,16 +94,17 @@ GMM1/GMM2 各自保留跨专家分核游标，GMM2 物理分核方向反转。AI
 
 | 对象 | 含义 | 谁修改 |
 | --- | --- | --- |
-| `ExpertLoopState` | 当前专家编号、专家起始 GM 行、完整专家 M 以及 GMM1 的 N/K 约定 | `PrepareGmmExpertState` 按专家顺序更新；计算函数只读 |
+| `ExpertContext` | 当前专家编号、专家起始 GM 行、完整专家 M 以及 GMM1 的 N/K 约定 | `PrepareGmmExpertContext` 按专家顺序更新；`gmm1ExpertContext/gmm2ExpertContext` 分别保存 |
 | `ExpertSlice` | 本次 `expertIdx / rowStartInExpert / rowCount / globalRowStart` | 规划后保持不变，传给 GMM1/GMM2 |
 | `ExpertTokenPosition` | 下一次待规划的专家、专家内行和本卡紧凑 GM 行 | `TakeNextExpertSliceInWave` 内调用原推进算法更新 |
 | `ExpertWaveRange` | 一整个 Wave 的起止位置与最后非空专家 | GMM1 记录，GMM2 通过 `GetExpertSliceInWave` 重放 |
 
 `globalRowStart = state.globalTokenStartIndex + rowStartInExpert`，是本卡紧凑 GM 行号，
 不是源卡 token ID。切片可以让下一位置进入下一个专家，但本次 slice 和专家状态仍属于旧专家。
-`ExpertLoopState.problemShape.M` 始终是专家总行数；执行时复制形状并设置 `M=slice.rowCount`。
-GMM2 由相同 N/K 约定构造实际计算维度：`N=H`、`K=I`。count 表等待状态只说明元数据可读，
-不代替 Dispatch、激活和 GMM2 的数据 ready flag。
+`ExpertContext.problemShape.M` 始终是专家总行数；执行时复制形状并设置 `M=slice.rowCount`。
+GMM2 由相同 N/K 约定构造实际计算维度：`N=H`、`K=I`。count 表在阶段入口只等待一次，
+不再把 `expertCountTableReady` 放进专家元数据；这不代替 Dispatch、激活和 GMM2 的数据 ready flag。
+`gmm1Cursor` 表示下一待规划位置，`gmm1ExpertContext` 表示当前计算专家，`slice` 表示本次固定范围。
 
 例如 EP64、每卡 BS4096、384 专家、TopK6、H7168/I3072、32 AIC、每 Wave 六个 M-group，
 完全均衡时每个本地专家4096行。W2 的两个 slice 如下：
@@ -115,6 +116,18 @@ GMM2 由相同 N/K 约定构造实际计算维度：`N=H`、`K=I`。count 表等
 
 GMM1 用 `TakeNextExpertSliceInWave` 产生这两个 slice；滞后一 Wave 的 GMM2 用保存的 W2 边界
 恢复同一范围。分核滚动、通信 owner、ready 通知和 timer 范围沿用原协议。
+
+### 计算循环与量化通信兼容路径
+
+`ProcessGmmWaves` 只组织 GMM1/GMM2 Wave 的先后关系。`RunGmm1Wave` 推进一个 Wave，
+`RunNextGmm1Slice` 推进其中一个专家 slice；是否还有任务由游标和 M-group 容量直接判断，
+不再维护 `currentWaveNeedsGmm1/nextWaveNeedsDispatch` 的重复布尔状态。
+是否还有待执行 GMM2 由 GMM1/GMM2 完成的 Wave 数推导，保留 `gmm2LagActive` 表达 BS 调度策略。
+
+量化 Combine 的首 Wave 预取、下一 Wave 搬运/当前 Wave 激活交错、专家级回传分别放在
+`PrepareQuantizedCombinePipeline`、`RunQuantizedCombineGmm1Wave`、`RunQuantizedCombineForExpert`。
+兼容路径仍逐 slice 交错，且跨 Wave 的专家仍等最后一个 slice 才量化回传；末轮 UB 复用和排空协议不变。
+现役非量化 AIV1 继续使用独立优先级调度器，不进入这些兼容操作。
 
 ### 最重要的数据依赖
 
