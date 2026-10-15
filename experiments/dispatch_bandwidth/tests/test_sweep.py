@@ -138,11 +138,29 @@ def test_default_plan_has_forty_exact_cases_without_side_effects(tmp_path, monke
         ["--devices", "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,14"],
         ["--target-gbps", "nan"],
         ["--core-values", "2,2"],
+        ["--core-values", "29"],
+        ["--core-values", "32"],
     ],
 )
 def test_invalid_plan_arguments_are_rejected(argv):
     with pytest.raises(SystemExit):
         sweep.parse_args(argv + ["--plan"])
+
+
+@pytest.mark.parametrize("cores", [29, 32])
+def test_saved_sweep_rejects_active_workers_above_fixed_launch_count(cores):
+    expected = sweep.expected_configuration(sweep.parse_args(["--plan"]))
+    expected["core_values"] = [cores]
+    data = dict(
+        schema_version=1,
+        mode="cross_bandwidth_sweep",
+        status="passed",
+        data_kind="synthetic_test",
+        expected=expected,
+        cases=[],
+    )
+    with pytest.raises(sweep.SweepError, match="Invalid expected core count"):
+        sweep.validate_sweep(data)
 
 
 def test_collection_is_sequential_complete_and_keeps_rank_artifacts(collected):

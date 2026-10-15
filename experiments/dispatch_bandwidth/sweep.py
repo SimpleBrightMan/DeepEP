@@ -74,8 +74,8 @@ def parse_args(argv=None):
         parser.error("The CROSS sweep requires exactly 16 distinct local devices (EP16)")
     if any(hidden < 1024 or hidden > 8192 or hidden % 64 for hidden in args.hidden_values):
         parser.error("Hidden values must be multiples of 64 in [1024,8192]")
-    if any(cores < 1 or cores > 32 for cores in args.core_values):
-        parser.error("Core values must be in [1,32]")
+    if any(cores < 1 or cores > run.CROSS_LAUNCH_GROUPS for cores in args.core_values):
+        parser.error(f"Core values must be in [1,{run.CROSS_LAUNCH_GROUPS}]")
     if not math.isfinite(args.target_gbps) or args.target_gbps <= 0:
         parser.error("--target-gbps must be finite and positive")
     for hidden in args.hidden_values:
@@ -355,7 +355,9 @@ def validate_sweep(data, *, hidden_values=None, core_values=None):
         all(1024 <= hidden <= 8192 and hidden % 64 == 0 for hidden in expected["hidden_values"]),
         "Invalid expected hidden size",
     )
-    _require(all(1 <= cores <= 32 for cores in expected["core_values"]), "Invalid expected core count")
+    _require(
+        all(1 <= cores <= run.CROSS_LAUNCH_GROUPS for cores in expected["core_values"]), "Invalid expected core count"
+    )
     _require(all(device >= 0 for device in expected["devices"]), "Invalid expected device")
     _require(
         expected.get("metadata_mode") in ("scalar", "dma", "preload")

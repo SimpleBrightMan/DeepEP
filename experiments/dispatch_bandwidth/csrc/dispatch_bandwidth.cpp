@@ -236,8 +236,9 @@ private:
 }  // namespace deepep::dispatch_bench
 #endif
 
-// The 28 active lanes occupy AIV1 across the same 28 mixed groups as MegaMoE.
-// AIC/AIV0 are idle, and no all-core barrier depends on their participation.
+// Only AIV1 copies data. The CROSS sweep keeps all 28 mixed launch groups;
+// groups beyond config.cores return before accessing worker/timer buffers.
+// AIC/AIV0 return as well; no all-core barrier depends on their participation.
 template <deepep::dispatch_bench::MetadataMode Mode>
 __schedmode__(1) __global__
     __mix__(1, 2) void dispatch_bandwidth_kernel(GM_ADDR peerBases, GM_ADDR tasks, GM_ADDR metadataInput,

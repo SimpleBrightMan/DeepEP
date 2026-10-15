@@ -509,7 +509,7 @@ def cross_report(rank=0, cores=2, hidden=3712, metadata_mode="dma"):
     return raw
 
 
-@pytest.mark.parametrize("cores", [1, 2, 4, 6, 8, 10, 12, 16, 20, 24, 28, 32])
+@pytest.mark.parametrize("cores", [1, 2, 4, 6, 8, 10, 12, 16, 20, 24, 28])
 @pytest.mark.parametrize("hidden,row_bytes", [(3712, 3968), (4096, 4224), (6144, 6336), (8192, 8448)])
 def test_cross_only_has_exact_payload_and_no_local_or_group_workers(cores, hidden, row_bytes):
     raws = [cross_report(rank, cores, hidden) for rank in range(4)]
@@ -560,6 +560,8 @@ def test_cross_only_plan_defaults_to_all_requested_cores_and_passes_native_traff
     [
         ["--traffic", "cross", "--cores", "2", "--workers", "1,0,1"],
         ["--traffic", "cross", "--cores", "0"],
+        ["--traffic", "cross", "--cores", "29"],
+        ["--traffic", "cross", "--cores", "32"],
         ["--traffic", "all", "--cores", "2", "--workers", "0,0,2"],
         ["--traffic", "all", "--workers", "0,0,28"],
     ],

@@ -21,6 +21,7 @@ else:
     import report
 
 ROOT = Path(__file__).resolve().parents[2]
+CROSS_LAUNCH_GROUPS = 28
 
 
 def _csv_integers(value):
@@ -79,8 +80,9 @@ def parse_args(argv=None):
     if not 1 < args.group_size < world or world % args.group_size:
         parser.error("--group-size must divide world and leave nonempty GROUP and CROSS classes")
     minimum_cores = 1 if args.traffic == "cross" else 3
-    if not minimum_cores <= args.cores <= 32 or len(args.workers) != 3 or sum(args.workers) != args.cores:
-        parser.error("--workers must sum to --cores, within the supported core range")
+    maximum_cores = CROSS_LAUNCH_GROUPS if args.traffic == "cross" else 32
+    if not minimum_cores <= args.cores <= maximum_cores or len(args.workers) != 3 or sum(args.workers) != args.cores:
+        parser.error(f"--workers must sum to --cores, with --cores in [{minimum_cores},{maximum_cores}]")
     if args.traffic == "cross":
         if args.workers != [0, 0, args.cores]:
             parser.error("--traffic cross requires --workers 0,0,cores")

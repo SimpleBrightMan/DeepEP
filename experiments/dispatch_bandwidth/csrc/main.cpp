@@ -32,6 +32,7 @@ namespace {
 
 constexpr uint64_t kChunkBytes = 4ULL * 1024ULL * 1024ULL;
 constexpr double kCyclesPerUs = 1000.0;
+constexpr uint32_t kCrossLaunchGroups = 28U;
 constexpr std::array<const char*, kTrafficKinds> kTrafficNames{"local", "group", "cross"};
 
 struct Options {
@@ -436,6 +437,13 @@ void Run(const Options& options)
     if (plan.total_rows == 0U) {
         throw std::invalid_argument("Selected traffic has no rows; increase --bs or --topk");
     }
+    // Keep the original 28-group launch shape throughout the CROSS sweep.
+    // config.cores still counts active AIV1 workers; the other groups return
+    // before accessing their worker or timer buffers.
+    const uint32_t launch_groups = options.config.cross_only ? kCrossLaunchGroups : options.config.cores;
+    if (options.config.cores > launch_groups) {
+        throw std::invalid_argument("CROSS-only traffic supports at most 28 active workers in its fixed launch");
+    }
     Check(aclInit(nullptr), "aclInit");
     Check(aclrtSetDevice(static_cast<int32_t>(options.device)), "aclrtSetDevice");
     const char* soc = aclrtGetSocName();
@@ -460,8 +468,9 @@ void Run(const Options& options)
     }
     const uint64_t required_ub =
         static_cast<uint64_t>(options.config.ring_slots) * plan.row_bytes + metadata_ub_bytes + 4096U;
-    if (options.config.cores > aic || static_cast<uint64_t>(options.config.cores) * 2U > aiv) {
-        throw std::runtime_error("Requested cores exceed the available AIC/AIV resources; cores will not be reduced");
+    if (launch_groups > aic || static_cast<uint64_t>(launch_groups) * 2U > aiv) {
+        throw std::runtime_error(
+            "Requested launch groups exceed the available AIC/AIV resources; launch will not shrink");
     }
     if (ub_bytes < required_ub || ub_bytes > UINT32_MAX) {
         if (options.metadata_mode == MetadataMode::Preload) {
@@ -471,6 +480,9 @@ void Run(const Options& options)
         }
         throw std::runtime_error("Dispatch row ring and metadata do not fit the platform UB budget");
     }
+    std::cerr << "[rank " << options.rank << "] launch_groups=" << launch_groups
+              << " active_workers=" << options.config.cores << " idle_groups=" << launch_groups - options.config.cores
+              << '\n';
     const uint64_t source_bytes = static_cast<uint64_t>(options.config.batch) * plan.row_bytes;
     aclshmemx_init_attr_t attr{};
     aclshmemx_uniqueid_t unique_id{};
@@ -560,7 +572,7 @@ void Run(const Options& options)
             "aclrtMemset(timer)");
         aclshmem_barrier_all();
         Check(aclrtRecordEvent(start, stream), "aclrtRecordEvent(start)");
-        dispatch_bandwidth_kernel_do(options.config.cores, static_cast<uint32_t>(ub_bytes), stream, peer_table, tasks,
+        dispatch_bandwidth_kernel_do(launch_groups, static_cast<uint32_t>(ub_bytes), stream, peer_table, tasks,
                                      metadata_input, workers, output_tokens, output_scales, output_metadata, timer,
                                      kernel);
         Check(aclrtRecordEvent(end, stream), "aclrtRecordEvent(end)");
@@ -612,6 +624,7 @@ int main(int argc, char** argv)
                          "[--group-size 4 --cores 28 --workers 2,5,21 --buffer-count 6 --repeat 1]\n"
                          "[--traffic all|cross --scope all|first-expert --metadata-mode scalar|dma|preload]\n"
                          "[--workers defaults: all=2,5,21; cross=0,0,cores]\n"
+                         "[cross: fixed 28 launch groups, cores=1..28 active AIV1 workers]\n"
                          "[--warmup 10 --iters 20 --timer]\n";
             return 0;
         }

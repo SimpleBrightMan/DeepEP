@@ -80,8 +80,9 @@ python experiments/dispatch_bandwidth/run.py --workers 2,6,20 --timer
 python experiments/dispatch_bandwidth/run.py --scope first-expert --timer
 ```
 
-`--cores` and the sum of `--workers` must agree; each class needs at least one
-worker. The host rejects a launch exceeding the device's AIC/AIV resources.
+`--cores` and the sum of `--workers` must agree. Under `--traffic all`, each class
+needs at least one worker. The host rejects a launch exceeding the device's
+AIC/AIV resources.
 `--buffer-count` selects 2..6 pipeline slots (default 6). `--warmup`, `--iters`
 and `--repeat` default to 10, 20 and 1. Repeats replay the same input and overwrite
 the same output, increasing cache reuse; interpret them separately from a larger
@@ -256,10 +257,13 @@ correct while moving synchronization away from the Scalar row loop.
 
 The `codex/dispatch-cross-bandwidth-sweep` branch adds `--traffic cross` and an
 automatic 40-case sweep. Every selected rank participates concurrently. Each
-kernel launches exactly N mixed groups and only their N AIV1 lanes perform
-copies; all N workers fetch from the twelve ranks outside their four-card group.
+CROSS kernel launches a fixed 28 mixed groups; N is the active worker count
+selected by `--cores` in [1,28]. Only the first N groups' AIV1 lanes perform
+copies. Unused groups return before reading any buffers, without busy-waiting.
+All N workers fetch from the twelve ranks outside their four-card group.
 LOCAL and GROUP own zero workers and zero output rows. The N values are logical
-communication workers, not a promise of stable physical core placement.
+communication workers, not a promise of stable physical core placement. The host
+requires resources for all 28 launch groups even when N is smaller.
 
 Defaults for the sweep are BS=4096, EP=16, group size=4, E=384, TopK=8, I=1280,
 `metadata-mode=dma`, six data-ring slots, 10 warmups and 20 measured iterations.
