@@ -79,8 +79,11 @@ def native_report(rank=0, *, repeats=2, iterations=2, clock_offset=0, batch=5, t
 
 
 @pytest.mark.parametrize("metadata_mode", ["scalar", "dma", "preload"])
-def test_class_envelope_uses_all_worker_start_and_end_times(metadata_mode):
-    measured = report.rank_measurements(native_report(metadata_mode=metadata_mode))[0]["classes"]["cross"]
+@pytest.mark.parametrize("buffer_count", [1, 2, 3, 4, 5, 6])
+def test_class_envelope_uses_all_worker_start_and_end_times(metadata_mode, buffer_count):
+    raw = native_report(metadata_mode=metadata_mode)
+    raw["buffer_count"] = buffer_count
+    measured = report.rank_measurements(raw)[0]["classes"]["cross"]
     # Two 2us workers with a 3us gap have a 7us class envelope, not 2us or 4us.
     assert measured["envelope_us"] == 7.0
     assert measured["bytes"] == 5 * 2 * 3712
@@ -261,7 +264,15 @@ def test_timer_acl_relative_tolerance_boundary_and_wrong_counter_conversion():
 
 @pytest.mark.parametrize(
     "fault",
-    ["missing_rank", "duplicate_rank", "duplicate_device", "different_config", "mixed_metadata", "partial_rounds"],
+    [
+        "missing_rank",
+        "duplicate_rank",
+        "duplicate_device",
+        "different_config",
+        "mixed_metadata",
+        "mixed_slots",
+        "partial_rounds",
+    ],
 )
 def test_incomplete_or_mismatched_rank_sets_are_rejected(fault):
     raws = [native_report(rank) for rank in range(4)]
@@ -275,6 +286,8 @@ def test_incomplete_or_mismatched_rank_sets_are_rejected(fault):
         raws[3]["batch"] = 19
     elif fault == "mixed_metadata":
         raws[3]["metadata_mode"] = "dma"
+    elif fault == "mixed_slots":
+        raws[3]["buffer_count"] = 1
     else:
         raws[3]["rounds"].pop()
     with pytest.raises(report.ReportError):
@@ -368,7 +381,10 @@ def test_exports_share_one_rank_origin_across_lanes_and_rounds(tmp_path, metadat
 
 
 @pytest.mark.parametrize("metadata_mode", ["scalar", "dma", "preload"])
-def test_plan_uses_no_devices_subprocess_ports_or_output_directory(monkeypatch, tmp_path, capsys, metadata_mode):
+@pytest.mark.parametrize("buffer_count", [1, 2, 3, 4, 5, 6])
+def test_plan_uses_no_devices_subprocess_ports_or_output_directory(
+    monkeypatch, tmp_path, capsys, metadata_mode, buffer_count
+):
     def forbidden(*args, **kwargs):
         pytest.fail("--plan touched an execution-only operation")
 
@@ -397,6 +413,8 @@ def test_plan_uses_no_devices_subprocess_ports_or_output_directory(monkeypatch, 
                 "--timer",
                 "--metadata-mode",
                 metadata_mode,
+                "--buffer-count",
+                str(buffer_count),
             ]
         )
         == 0
@@ -411,6 +429,7 @@ def test_plan_uses_no_devices_subprocess_ports_or_output_directory(monkeypatch, 
     assert command[command.index("--device") + 1] == "3"
     assert command[command.index("--scope") + 1] == "all"
     assert command[command.index("--metadata-mode") + 1] == metadata_mode
+    assert command[command.index("--buffer-count") + 1] == str(buffer_count)
     assert "--timer" in command
 
 
@@ -468,6 +487,7 @@ def test_launcher_rejects_report_metadata_mode_different_from_request(monkeypatc
         ["--devices", "0,0,1,2"],
         ["--repeat", "0"],
         ["--timeout", "nan"],
+        ["--buffer-count", "0"],
         ["--buffer-count", "7"],
         ["--group-size", "3"],
         ["--metadata-mode", "invalid"],

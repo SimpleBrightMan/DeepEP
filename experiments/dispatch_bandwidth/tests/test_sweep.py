@@ -88,7 +88,18 @@ def synthetic_runner(args, batch, directory):
 def collected(tmp_path, monkeypatch):
     monkeypatch.setattr(run, "_resource_snapshot", lambda directory: None)
     args = sweep.parse_args(
-        ["--hidden-values", "3712,8192", "--core-values", "2,12", "--iters", "2", "--output-dir", str(tmp_path)]
+        [
+            "--hidden-values",
+            "3712,8192",
+            "--core-values",
+            "2,12",
+            "--buffer-count",
+            "6",
+            "--iters",
+            "2",
+            "--output-dir",
+            str(tmp_path),
+        ]
     )
     calls = []
 
@@ -100,7 +111,7 @@ def collected(tmp_path, monkeypatch):
     return args, path, calls
 
 
-def test_default_plan_has_forty_exact_cases_without_side_effects(tmp_path, monkeypatch, capsys):
+def test_default_plan_has_sixty_exact_cases_without_side_effects(tmp_path, monkeypatch, capsys):
     def forbidden(*args, **kwargs):
         pytest.fail("A plan must not launch workers, query resources, or import plotting components")
 
@@ -118,17 +129,38 @@ def test_default_plan_has_forty_exact_cases_without_side_effects(tmp_path, monke
     assert sweep.main(["--plan", "--output-dir", str(output)]) == 0
     data = json.loads(capsys.readouterr().out)
     assert not output.exists()
-    assert len(data["cases"]) == data["expected_cases"] == 40
-    assert data["expected"]["devices"] == list(range(16))
-    assert [(case["hidden"], case["cores"]) for case in data["cases"]] == [
-        (hidden, core) for hidden in sweep.DEFAULT_HIDDEN for core in sweep.DEFAULT_CORES
-    ]
-    for case in data["cases"]:
-        command = case["command"]
-        options = run.parse_args(command[3:])
-        assert options.traffic == "cross" and options.workers == [0, 0, case["cores"]]
-        assert options.metadata_mode == "dma" and options.timer
-        assert options.hidden == case["hidden"] and options.bs_values == [4096]
+    assert data["expected_cases"] == 60 and data["buffer_counts"] == [1, 2, 3, 4, 5, 6]
+    assert len(data["slot_sweeps"]) == 6
+    for item in data["slot_sweeps"]:
+        plan = item["plan"]
+        assert len(plan["cases"]) == plan["expected_cases"] == 10
+        assert plan["expected"]["devices"] == list(range(16))
+        assert plan["expected"]["buffer_count"] == item["buffer_count"]
+        assert plan["expected"]["hidden_values"] == [3584]
+        assert [(case["hidden"], case["cores"]) for case in plan["cases"]] == [
+            (3584, core) for core in sweep.DEFAULT_CORES
+        ]
+        for case in plan["cases"]:
+            options = run.parse_args(case["command"][3:])
+            assert options.traffic == "cross" and options.workers == [0, 0, case["cores"]]
+            assert options.metadata_mode == "dma" and options.timer
+            assert options.buffer_count == item["buffer_count"]
+            assert options.hidden == 3584 and options.bs_values == [4096]
+
+
+def test_single_slot_option_preserves_original_plan_shape():
+    args = sweep.parse_args(["--buffer-count", "3", "--plan"])
+    data = sweep.make_scan_plan(args)
+    assert args.buffer_counts == [3] and data["expected"]["buffer_count"] == 3
+    assert data["mode"] == "cross_bandwidth_sweep" and data["expected_cases"] == 10
+
+
+def test_custom_slot_and_hidden_matrices_are_preserved_in_order():
+    args = sweep.parse_args(["--buffer-counts", "6,1,3", "--hidden-values", "3584,4096", "--plan"])
+    data = sweep.make_scan_plan(args)
+    assert data["expected_cases"] == 60
+    assert [item["buffer_count"] for item in data["slot_sweeps"]] == [6, 1, 3]
+    assert all(item["plan"]["expected"]["hidden_values"] == [3584, 4096] for item in data["slot_sweeps"])
 
 
 @pytest.mark.parametrize(
@@ -140,6 +172,10 @@ def test_default_plan_has_forty_exact_cases_without_side_effects(tmp_path, monke
         ["--core-values", "2,2"],
         ["--core-values", "29"],
         ["--core-values", "32"],
+        ["--buffer-count", "0"],
+        ["--buffer-counts", "1,7"],
+        ["--buffer-counts", "2,2"],
+        ["--buffer-count", "2", "--buffer-counts", "3,4"],
     ],
 )
 def test_invalid_plan_arguments_are_rejected(argv):
@@ -299,6 +335,8 @@ def test_main_passes_custom_matrix_to_real_plot_and_exports_nonempty_pngs(collec
                 "2,12",
                 "--iters",
                 "2",
+                "--buffer-count",
+                "6",
                 "--output-dir",
                 str(args.output_dir),
                 "--svg",
@@ -320,7 +358,7 @@ def test_main_passes_custom_matrix_to_real_plot_and_exports_nonempty_pngs(collec
         assert list(axis.lines[1].get_ydata()) == [134, 134]
         assert "SYNTHETIC TEST DATA" in axis.get_title()
         assert "metadata=dma" in axis.get_title() and "EP=16" in axis.get_title()
-        assert "group=4" in axis.get_title()
+        assert "group=4" in axis.get_title() and "slots=6" in axis.get_title()
     assert "record=3968 B" in axes[0].get_title()
 
 
@@ -336,3 +374,63 @@ def test_missing_plotting_components_fail_before_collection(tmp_path, monkeypatc
     monkeypatch.setattr(sweep, "collect_sweep", lambda args: pytest.fail("Must check plotting before measurement"))
     assert sweep.main(["--hidden-values", "3712", "--core-values", "2", "--output-dir", str(tmp_path / "absent")]) == 1
     assert not (tmp_path / "absent").exists()
+
+
+def test_multiple_slots_keep_independent_summaries_csvs_and_six_plots(tmp_path, monkeypatch):
+    pytest.importorskip("matplotlib")
+    monkeypatch.setattr(run, "_resource_snapshot", lambda directory: None)
+    calls = []
+
+    def runner(args, batch, directory):
+        calls.append((args.buffer_count, args.hidden, args.cores))
+        return synthetic_runner(args, batch, directory)
+
+    original_collect = sweep.collect_sweep
+    monkeypatch.setattr(
+        sweep,
+        "collect_sweep",
+        lambda args: original_collect(args, runner=runner, data_kind="synthetic_test"),
+    )
+    assert sweep.main(["--core-values", "2,12", "--iters", "1", "--output-dir", str(tmp_path)]) == 0
+    assert calls == [(slots, 3584, cores) for slots in range(1, 7) for cores in (2, 12)]
+    paths = list(tmp_path.glob("cross_slots_*/slot_sweeps.json"))
+    assert len(paths) == 1
+    index_path = paths[0]
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert index["status"] == "passed" and index["expected_cases"] == 12
+    assert len(index["results"]) == 6
+    for item in index["results"]:
+        assert item["status"] == "passed" and len(item["plots"]) == 1
+        path = index_path.parent / item["sweep_json"]
+        assert path.is_relative_to(index_path.parent / f"slots_{item['buffer_count']}")
+        data = sweep.load_sweep(path)
+        assert data["expected"]["buffer_count"] == item["buffer_count"]
+        assert data["expected"]["hidden_values"] == [3584]
+        plot_sweep.verify_raw_reports(path, data)
+        with path.with_suffix(".csv").open(encoding="utf-8", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        assert len(rows) == 2 and {int(row["buffer_count"]) for row in rows} == {item["buffer_count"]}
+        plot = index_path.parent / item["plots"][0]
+        assert plot.stat().st_size > 1000 and plot.name == "cross_bandwidth_h3584.png"
+
+
+def test_multi_slot_failure_stops_and_indexes_partial_results(tmp_path, monkeypatch):
+    monkeypatch.setattr(run, "_resource_snapshot", lambda directory: None)
+    args = sweep.parse_args(
+        ["--buffer-counts", "2,3,4", "--core-values", "2", "--iters", "1", "--output-dir", str(tmp_path)]
+    )
+    calls = []
+
+    def collect(selected):
+        calls.append(selected.buffer_count)
+        if selected.buffer_count == 3:
+            raise sweep.SweepError("synthetic test failure")
+        return selected.output_dir / "cross_synthetic/sweep.json", []
+
+    monkeypatch.setattr(sweep, "collect_and_plot", lambda selected, plotter: collect(selected))
+    with pytest.raises(sweep.SweepError, match="partial results retained"):
+        sweep.collect_slot_sweeps(args, None)
+    assert calls == [2, 3]
+    index = json.loads(next(tmp_path.glob("cross_slots_*/slot_sweeps.json")).read_text(encoding="utf-8"))
+    assert index["status"] == "failed"
+    assert [(item["buffer_count"], item["status"]) for item in index["results"]] == [(2, "passed"), (3, "failed")]

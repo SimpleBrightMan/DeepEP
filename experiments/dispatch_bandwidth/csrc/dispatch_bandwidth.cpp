@@ -21,7 +21,7 @@ constexpr uint32_t kTaskWords = sizeof(CopyTask) / sizeof(uint32_t);
 constexpr uint32_t kWorkerWords = sizeof(Worker) / sizeof(uint32_t);
 constexpr uint32_t kMetaBytes = kMetaWords * sizeof(uint32_t);
 
-// The six ring slots use the same event IDs and dependencies as MegaMoE's
+// Up to six ring slots use the same event IDs and dependencies as MegaMoE's
 // Fetch/StoreDispatchTokenAndMetaInfo. No event or UB slot survives Run().
 template <MetadataMode Mode>
 class DispatchBandwidthCopy {
@@ -92,12 +92,19 @@ public:
         }
 
         // Keep the ring live across peers and repeats. The next remote read is
-        // submitted before the previous row's local writes, just like Dispatch.
+        // submitted before the previous row's local writes, just like Dispatch,
+        // except when the sole slot must first be released by that write.
         for (uint32_t repeat = 0U; repeat < config_.repeats; ++repeat) {
             for (uint32_t row = 0U; row < worker_.count; ++row) {
                 const uint32_t taskIndex = worker_.begin + row;
                 const CopyTask task = ReadTask(taskIndex);
                 const bool reuse = initializedSlots == config_.ring_slots;
+                if (hasPending && reuse && pendingSlot == nextSlot) {
+                    // With one slot, submit its previous write before Fetch
+                    // can wait for reuse, including the Scalar-mode fence.
+                    Store(pendingSlot, pendingDestination, pendingMetadataIndex);
+                    hasPending = false;
+                }
                 Fetch(nextSlot, taskIndex, task, reuse);
                 if (hasPending) {
                     Store(pendingSlot, pendingDestination, pendingMetadataIndex);

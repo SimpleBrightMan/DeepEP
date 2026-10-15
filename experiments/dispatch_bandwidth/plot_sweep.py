@@ -79,7 +79,7 @@ def plot_sweep(
                 f"CROSS Dispatch bandwidth | H={hidden}  record={row_bytes} B\n"
                 f"BS={expected['batch']}  EP={expected['world']}  group={expected['group_size']}  "
                 f"K={expected['topk']}  E={expected['experts']}  I={expected['intermediate']}  "
-                f"metadata={expected['metadata_mode']}"
+                f"metadata={expected['metadata_mode']}  slots={expected['buffer_count']}"
             )
             if data["data_kind"] == "synthetic_test":
                 title = "SYNTHETIC TEST DATA\n" + title

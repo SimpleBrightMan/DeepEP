@@ -165,7 +165,7 @@ def validate_report(raw, *, expected_iterations=None):
         raise ReportError("Batch/expert capacity exceeds native planner limits")
     if not 1024 <= raw["hidden"] <= 8192 or raw["hidden"] % 64:
         raise ReportError("hidden is outside the native planner limits")
-    if not 256 <= raw["intermediate"] <= 4096 or raw["intermediate"] % 128 or not 2 <= raw["buffer_count"] <= 6:
+    if not 256 <= raw["intermediate"] <= 4096 or raw["intermediate"] % 128 or not 1 <= raw["buffer_count"] <= 6:
         raise ReportError("intermediate/buffer_count are outside the native planner limits")
     if raw["scope"] not in ("all", "first-expert"):
         raise ReportError("Invalid scope")

@@ -105,8 +105,8 @@ def parse_args(argv=None):
         or not 1 <= args.topk <= min(32, args.experts)
     ):
         parser.error("Experts must divide world; top-k must be in [1,min(32,experts)]")
-    if args.warmup < 0 or min(args.iters, args.repeat) < 1 or not 2 <= args.buffer_count <= 6:
-        parser.error("warmup >= 0, iters/repeat >= 1 and buffer-count in [2,6] are required")
+    if args.warmup < 0 or min(args.iters, args.repeat) < 1 or not 1 <= args.buffer_count <= 6:
+        parser.error("warmup >= 0, iters/repeat >= 1 and buffer-count in [1,6] are required")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--timeout must be finite and positive")
     return args

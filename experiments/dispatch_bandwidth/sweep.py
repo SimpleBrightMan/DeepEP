@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by SimpleBright_Man 2026
 
-"""Run a sequential CROSS-only core-count sweep on all selected local NPUs."""
+"""Run sequential CROSS-only core-count sweeps for one or more UB slot counts."""
 
 import argparse
 import csv
@@ -19,8 +19,9 @@ else:
     import report
     import run
 
-DEFAULT_HIDDEN = [3712, 4096, 6144, 8192]
+DEFAULT_HIDDEN = [3584]
 DEFAULT_CORES = [2, 4, 6, 8, 10, 12, 16, 20, 24, 28]
+DEFAULT_BUFFER_COUNTS = [1, 2, 3, 4, 5, 6]
 
 
 class SweepError(ValueError):
@@ -48,7 +49,13 @@ def parse_args(argv=None):
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--metadata-mode", choices=("scalar", "dma", "preload"), default="dma")
-    parser.add_argument("--buffer-count", type=int, default=6)
+    buffers = parser.add_mutually_exclusive_group()
+    buffers.add_argument("--buffer-count", type=int, help="Run only this slot count (1..6)")
+    buffers.add_argument(
+        "--buffer-counts",
+        type=csv_integers,
+        help="Slot counts to scan; default: 1,2,3,4,5,6. Each count gets separate plots.",
+    )
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)
@@ -70,6 +77,13 @@ def parse_args(argv=None):
         "--plan", action="store_true", help="Print all case commands; no writes, NPU or plotting imports"
     )
     args = parser.parse_args(argv)
+    args.buffer_counts = (
+        [args.buffer_count] if args.buffer_count is not None else args.buffer_counts or list(DEFAULT_BUFFER_COUNTS)
+    )
+    if any(count < 1 or count > 6 for count in args.buffer_counts):
+        parser.error("Buffer counts must be in [1,6]")
+    # The measurement/schema helpers operate on one slot count at a time.
+    args.buffer_count = args.buffer_counts[0]
     if len(args.devices) != 16:
         parser.error("The CROSS sweep requires exactly 16 distinct local devices (EP16)")
     if any(hidden < 1024 or hidden > 8192 or hidden % 64 for hidden in args.hidden_values):
@@ -78,10 +92,19 @@ def parse_args(argv=None):
         parser.error(f"Core values must be in [1,{run.CROSS_LAUNCH_GROUPS}]")
     if not math.isfinite(args.target_gbps) or args.target_gbps <= 0:
         parser.error("--target-gbps must be finite and positive")
-    for hidden in args.hidden_values:
-        for cores in args.core_values:
-            case_args(args, hidden, cores)
+    for count in args.buffer_counts:
+        selected = slot_arguments(args, count)
+        for hidden in args.hidden_values:
+            for cores in args.core_values:
+                case_args(selected, hidden, cores)
     return args
+
+
+def slot_arguments(args, buffer_count):
+    selected = argparse.Namespace(**vars(args))
+    selected.buffer_count = buffer_count
+    selected.buffer_counts = [buffer_count]
+    return selected
 
 
 def case_argv(args, hidden, cores):
@@ -176,6 +199,20 @@ def make_plan(args):
         expected_cases=len(cases),
         cases=cases,
         note="Commands are equivalent manual launcher configurations; collection calls run_case directly.",
+    )
+
+
+def make_scan_plan(args):
+    """Preserve the original single-slot plan, or return an index of independent plans."""
+    if len(args.buffer_counts) == 1:
+        return make_plan(args)
+    sweeps = [dict(buffer_count=count, plan=make_plan(slot_arguments(args, count))) for count in args.buffer_counts]
+    return dict(
+        schema_version=1,
+        mode="cross_buffer_count_sweep",
+        buffer_counts=list(args.buffer_counts),
+        expected_cases=sum(item["plan"]["expected_cases"] for item in sweeps),
+        slot_sweeps=sweeps,
     )
 
 
@@ -387,7 +424,7 @@ def validate_sweep(data, *, hidden_values=None, core_values=None):
         and expected["experts"] // expected["world"] <= 128
         and expected["topk"] <= min(32, expected["experts"])
         and expected["batch"] <= 65536
-        and 2 <= expected["buffer_count"] <= 6,
+        and 1 <= expected["buffer_count"] <= 6,
         "Invalid expected native configuration",
     )
     if hidden_values is not None:
@@ -426,6 +463,7 @@ def write_csv(data, path):
         "batch",
         "world",
         "metadata_mode",
+        "buffer_count",
         "mean_gbps_card",
         "rank_min_gbps_card",
         "rank_max_gbps_card",
@@ -459,6 +497,7 @@ def write_csv(data, path):
                     batch=data["expected"]["batch"],
                     world=data["expected"]["world"],
                     metadata_mode=data["expected"]["metadata_mode"],
+                    buffer_count=data["expected"]["buffer_count"],
                     mean_gbps_card=rates["mean"],
                     rank_min_gbps_card=rates["min"],
                     rank_max_gbps_card=rates["max"],
@@ -503,7 +542,8 @@ def collect_sweep(args, *, runner=None, data_kind="measured"):
             target = directory / item["case_dir"]
             target.parent.mkdir(parents=True, exist_ok=True)
             print(
-                f"[SWEEP {len(data['cases']) + 1}/{len(plan['cases'])}] H={item['hidden']} CROSS cores={item['cores']}",
+                f"[SWEEP {len(data['cases']) + 1}/{len(plan['cases'])}] H={item['hidden']} "
+                f"CROSS cores={item['cores']} slots={args.buffer_count}",
                 flush=True,
             )
             summary = runner(case_args(args, item["hidden"], item["cores"]), args.bs, target)
@@ -530,13 +570,76 @@ def collect_sweep(args, *, runner=None, data_kind="measured"):
     return path
 
 
+def collect_and_plot(args, plotter):
+    path = collect_sweep(args)
+    try:
+        outputs = plotter(
+            path,
+            svg=args.svg,
+            target_gbps=args.target_gbps,
+            hidden_values=args.hidden_values,
+            core_values=args.core_values,
+            verify_raw=True,
+        )
+    except Exception as error:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.update(status="failed", error=f"Plotting failed: {error}")
+        _write_json(path, data)
+        write_csv(data, path.with_suffix(".csv"))
+        raise SweepError(f"Plotting failed; measurements retained at {path}: {error}") from error
+    data = load_sweep(path)
+    data["plots"] = [str(output.relative_to(path.parent)) for output in outputs]
+    _write_json(path, data)
+    print(f"[PASSED] {len(data['cases'])} CROSS-only cases; {len(outputs)} plots; {path}", flush=True)
+    return path, outputs
+
+
+def collect_slot_sweeps(args, plotter):
+    """Keep the validated per-slot schema and plots separate, with a small parent index."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SZ_") + uuid.uuid4().hex[:8]
+    directory = args.output_dir.resolve() / ("cross_slots_" + stamp)
+    directory.mkdir(parents=True, exist_ok=False)
+    index_path = directory / "slot_sweeps.json"
+    index = dict(make_scan_plan(args), status="running", run_dir=str(directory), results=[])
+    _write_json(index_path, index)
+    current = None
+    try:
+        for count in args.buffer_counts:
+            selected = slot_arguments(args, count)
+            selected.output_dir = directory / f"slots_{count}"
+            current = dict(buffer_count=count, status="running", output_dir=f"slots_{count}")
+            index["results"].append(current)
+            _write_json(index_path, index)
+            print(f"[SLOTS {len(index['results'])}/{len(args.buffer_counts)}] slots={count}", flush=True)
+            path, outputs = collect_and_plot(selected, plotter)
+            current.update(
+                status="passed",
+                sweep_json=str(path.relative_to(directory)),
+                plots=[str(output.relative_to(directory)) for output in outputs],
+            )
+            _write_json(index_path, index)
+        index["status"] = "passed"
+    except (Exception, KeyboardInterrupt) as error:
+        index.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed", error=str(error))
+        if current is not None:
+            current.update(status=index["status"], error=str(error))
+        _write_json(index_path, index)
+        if isinstance(error, KeyboardInterrupt):
+            raise
+        raise SweepError(f"Slot sweep failed; partial results retained at {index_path}: {error}") from error
+    _write_json(index_path, index)
+    count = sum(len(item["plots"]) for item in index["results"])
+    print(f"[PASSED] {index['expected_cases']} CROSS-only cases; {count} plots; {index_path}", flush=True)
+    return index_path
+
+
 def main(argv=None):
     args = parse_args(argv)
     if args.plan:
-        print(json.dumps(make_plan(args), indent=2))
+        print(json.dumps(make_scan_plan(args), indent=2))
         return 0
     try:
-        # Check before any native launch, not after forty completed cases.
+        # Check before any native launch, rather than after the completed matrix.
         import matplotlib
 
         matplotlib.use("Agg")
@@ -546,26 +649,10 @@ def main(argv=None):
             from .plot_sweep import plot_sweep
         else:
             from plot_sweep import plot_sweep
-        path = collect_sweep(args)
-        try:
-            outputs = plot_sweep(
-                path,
-                svg=args.svg,
-                target_gbps=args.target_gbps,
-                hidden_values=args.hidden_values,
-                core_values=args.core_values,
-                verify_raw=True,
-            )
-        except Exception as error:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            data.update(status="failed", error=f"Plotting failed: {error}")
-            _write_json(path, data)
-            write_csv(data, path.with_suffix(".csv"))
-            raise SweepError(f"Plotting failed; measurements retained at {path}: {error}") from error
-        data = load_sweep(path)
-        data["plots"] = [str(output.relative_to(path.parent)) for output in outputs]
-        _write_json(path, data)
-        print(f"[PASSED] {len(data['cases'])} CROSS-only cases; {len(outputs)} plots; {path}", flush=True)
+        if len(args.buffer_counts) == 1:
+            collect_and_plot(args, plot_sweep)
+        else:
+            collect_slot_sweeps(args, plot_sweep)
         return 0
     except ImportError as error:
         print(

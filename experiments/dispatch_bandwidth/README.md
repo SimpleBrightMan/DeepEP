@@ -83,7 +83,8 @@ python experiments/dispatch_bandwidth/run.py --scope first-expert --timer
 `--cores` and the sum of `--workers` must agree. Under `--traffic all`, each class
 needs at least one worker. The host rejects a launch exceeding the device's
 AIC/AIV resources.
-`--buffer-count` selects 2..6 pipeline slots (default 6). `--warmup`, `--iters`
+`--buffer-count` selects 1..6 pipeline slots (default 6 for a single run).
+`--warmup`, `--iters`
 and `--repeat` default to 10, 20 and 1. Repeats replay the same input and overwrite
 the same output, increasing cache reuse; interpret them separately from a larger
 batch. The intermediate dimension is checked and recorded for model identity,
@@ -256,7 +257,7 @@ correct while moving synchronization away from the Scalar row loop.
 ## CROSS-only core sweep
 
 The `codex/dispatch-cross-bandwidth-sweep` branch adds `--traffic cross` and an
-automatic 40-case sweep. Every selected rank participates concurrently. Each
+automatic slot/core sweep. Every selected rank participates concurrently. Each
 CROSS kernel launches a fixed 28 mixed groups; N is the active worker count
 selected by `--cores` in [1,28]. Only the first N groups' AIV1 lanes perform
 copies. Unused groups return before reading any buffers, without busy-waiting.
@@ -266,23 +267,27 @@ communication workers, not a promise of stable physical core placement. The host
 requires resources for all 28 launch groups even when N is smaller.
 
 Defaults for the sweep are BS=4096, EP=16, group size=4, E=384, TopK=8, I=1280,
-`metadata-mode=dma`, six data-ring slots, 10 warmups and 20 measured iterations.
-The four hidden sizes are **3712, 4096, 6144, 8192**; each is tested with
-**2, 4, 6, 8, 10, 12, 16, 20, 24, 28** CROSS workers. These are forty independent
-all-rank process groups, run sequentially on the same node. Task order and total
-selected rows stay fixed for each H while the worker count changes.
+`metadata-mode=dma`, 10 warmups and 20 measured iterations. The sweep tests
+**1, 2, 3, 4, 5, 6** data-ring slots in order.
+The default hidden size is **3584**, tested with
+**2, 4, 6, 8, 10, 12, 16, 20, 24, 28** CROSS workers. Each slot count therefore
+has ten independent all-rank process groups and one figure. The full default
+scan runs **60 cases and exports 6 PNG figures**, sequentially on the same node.
+Task order and total selected rows stay fixed for each H while the worker count
+and slot count change. Passing `--buffer-count N` runs only that slot count,
+giving ten cases and one figure with the default hidden size. `--hidden-values`
+still accepts a custom comma-separated list; each slot count produces one figure
+per requested hidden size. `--buffer-counts 1,3,6` selects a shorter slot list;
+it is mutually exclusive with the single-value `--buffer-count` option.
 
 | Hidden H | Aligned token storage | Valid scale bytes | Packed GET bytes/row | CROSS rows/card | GET bytes/card |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 3712 | 3840 | 116 | 3968 | 24576 | 97,517,568 |
-| 4096 | 4096 | 128 | 4224 | 24576 | 103,809,024 |
-| 6144 | 6144 | 192 | 6336 | 24576 | 155,713,536 |
-| 8192 | 8192 | 256 | 8448 | 24576 | 207,618,048 |
+| 3584 | 3584 | 112 | 3712 | 24576 | 91,226,112 |
 
-For H=3712, the benchmark keeps the requested hidden dimension 3712; 3840 is
-only its packed source alignment. Output writes contain H valid token bytes,
-H/32 valid scale bytes and 32 metadata bytes. CROSS-only destinations are compact
-and retain the original source rank, token and TopK slot identities.
+The benchmark keeps the requested hidden dimension. Output writes contain H
+valid token bytes, H/32 valid scale bytes and 32 metadata bytes. CROSS-only
+destinations are compact and retain the original source rank, token and TopK slot
+identities.
 
 With CANN loaded and a compatible SHMEM SDK prepared, run from the repository
 root on your allocated 16-card UBX node:
@@ -297,23 +302,27 @@ bash experiments/dispatch_bandwidth/run_cross_sweep.sh
 
 The shell entry point builds the native target, then starts the full sweep and
 plots the results. It checks the plotting dependency before NPU work. It does
-not install dependencies automatically. The run uses a unique results directory
-and retains every case's logs, raw rank reports and timers along with a combined
-JSON and CSV. The program prints the final paths of four PNG figures, one for
-each hidden size. Plotting uses a headless backend and requires no desktop.
+not install dependencies automatically. Each slot count uses a unique results
+directory and retains every case's logs, raw rank reports and timers along with
+its combined JSON and CSV. The default run saves 6 PNG figures, one for each
+slot-count/hidden-size pair. Each figure title includes
+`slots=N`; the axes, curve and rank min/max band retain the same meaning.
+Plotting uses a headless backend and requires no desktop.
 
 The default output layout is:
 
 ```text
-benchmark-runs/dispatch_cross_sweep/cross_<timestamp>_<id>/
-  sweep.json
-  sweep.csv
-  h_3712/cores_2/rank_0.json ... rank_15.json
+benchmark-runs/dispatch_cross_sweep/cross_slots_<timestamp>_<id>/
+  slot_sweeps.json
+  slots_1/cross_<timestamp>_<id>/
+    sweep.json
+    sweep.csv
+    h_3584/cores_2/rank_0.json ... rank_15.json
+    ...
+    plots/cross_bandwidth_h3584.png
+  slots_2/cross_<timestamp>_<id>/...
   ...
-  plots/cross_bandwidth_h3712.png
-  plots/cross_bandwidth_h4096.png
-  plots/cross_bandwidth_h6144.png
-  plots/cross_bandwidth_h8192.png
+  slots_6/cross_<timestamp>_<id>/...
 ```
 
 To redraw from saved results, including a fresh verification of all native
@@ -321,18 +330,20 @@ reports, use the actual path printed by the run:
 
 ```bash
 python experiments/dispatch_bandwidth/plot_sweep.py \
-    /path/to/your-run/sweep.json --verify-raw
+    /path/to/slots_1/your-run/sweep.json --verify-raw
 ```
 
 The one-click sweep always verifies raw reports before plotting. Standalone
 redrawing without `--verify-raw` validates the complete embedded summaries, which
-also permits moving only the combined JSON to a plotting machine. `--svg` adds
-four SVG exports. Shell `--plan` and `--help` skip compilation and SDK checks.
+also permits moving a slot count's combined JSON to a plotting machine. `--svg`
+adds one SVG export per requested hidden size and slot count. Shell `--plan` and
+`--help` skip compilation and SDK checks.
 
 Each figure uses the actual numeric worker counts on the x-axis and mean
 **CROSS read-payload GB/s per card** on the y-axis. Rank min/max indicate variation
-across the sixteen cards; plots share a y-axis range. A target reference, when
-shown, is explicitly distinguished from measured values. The plotter requires a
+across the sixteen cards; figures for a given slot count share a y-axis range.
+A target reference, when shown, is explicitly distinguished from measured values.
+The plotter requires a
 complete, consistent Cartesian grid of successful cases. Missing or failed
 measurements are not filled with zeros or presented as a completed curve.
 
@@ -346,8 +357,20 @@ To inspect one point after building:
 
 ```bash
 python experiments/dispatch_bandwidth/run.py --traffic cross --cores 2 \
-    --hidden 3712 --bs-values 4096 --metadata-mode dma --timer
+    --hidden 3584 --bs-values 4096 --metadata-mode dma --timer
 ```
+
+To scan only slot count 6, producing one hidden-size figure with the defaults:
+
+```bash
+bash experiments/dispatch_bandwidth/run_cross_sweep.sh --buffer-count 6
+```
+
+This single-slot option keeps the original direct output layout:
+`benchmark-runs/dispatch_cross_sweep/cross_<timestamp>_<id>/sweep.json`, with
+`sweep.csv`, rank artifacts and `plots/` in that same run directory. The default
+multi-slot run instead records all slot-run paths in its parent
+`slot_sweeps.json` index.
 
 `--traffic cross` derives `--workers 0,0,N`; explicitly passing different worker
 counts is rejected. In `--traffic all`, the original three positive worker

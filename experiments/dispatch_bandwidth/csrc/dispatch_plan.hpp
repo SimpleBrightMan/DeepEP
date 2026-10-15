@@ -91,7 +91,7 @@ inline void Validate(const Config& config, uint32_t rank)
             "experts must be divisible by world with at most 128 experts per rank");
     Require(config.topk > 0U && config.topk <= 32U && config.topk <= config.experts,
             "topk must be in [1,min(32,experts)]");
-    Require(config.ring_slots >= 2U && config.ring_slots <= 6U, "ring_slots must be in [2,6]");
+    Require(config.ring_slots >= 1U && config.ring_slots <= 6U, "ring_slots must be in [1,6]");
 }
 
 }  // namespace detail

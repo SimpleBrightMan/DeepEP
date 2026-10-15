@@ -208,7 +208,7 @@ void Validation()
         config.experts = 16U;
         config.topk = 17U;
     });
-    for (uint32_t value : {0U, 1U, 7U, UINT32_MAX}) {
+    for (uint32_t value : {0U, 7U, UINT32_MAX}) {
         Invalid([value](Config& config) { config.ring_slots = value; });
     }
     for (uint32_t rank : {16U, UINT32_MAX}) {
@@ -342,7 +342,7 @@ void BoundaryAndVariedShapes()
     tiny.intermediate = 256U;
     tiny.experts = 4U;
     tiny.topk = 1U;
-    tiny.ring_slots = 2U;
+    tiny.ring_slots = 1U;
     for (uint32_t rank = 0U; rank < tiny.world; ++rank) {
         Verify(tiny, rank);
         const Plan plan = BuildPlan(tiny, rank);
@@ -382,7 +382,7 @@ void BoundaryAndVariedShapes()
         config.intermediate = 256U + 128U * (random() % 8U);
         config.experts = config.world * (1U + random() % 11U);
         config.topk = 1U + random() % std::min(32U, config.experts);
-        config.ring_slots = 2U + random() % 5U;
+        config.ring_slots = 1U + random() % 6U;
         config.first_expert = iteration % 2U == 0U;
         const uint32_t rank = random() % config.world;
         Verify(config, rank);
