@@ -5,6 +5,7 @@
 #define MEGA_MOE_PEER_ROWS_H
 
 #include <cstdint>
+#include "mega_moe_wave_schedule.hpp"
 
 // Prefill 独立副本默认启用。改为 0 并重编 kernel 可对照原来的逐 slice 扫描路径。
 // 本开关不影响 host/device 布局、tiling ABI、通信顺序或配额语义。
@@ -198,6 +199,79 @@ __aicore__ inline uint32_t TakePeerRowPrefix(uint32_t count, PeerRowCut& cut)
     }
     return rows;
 }
+
+// 一段真实传输：源位置是该 peer 的 compact route 队列序号，目标位置是本卡紧凑 GM 行号。
+struct PeerTransfer {
+    uint32_t sourceRank;
+    uint32_t sourceOrdinalBegin;
+    uint32_t rowCount;
+    uint32_t destinationRow;
+};
+
+// 只规划 peer 配额和本核交集，不访问 token、不提交 DMA、不发布 ready。
+// 每次只返回一个段；counts 在枚举期间必须保持有效，额外状态不随 BS/EP 增长。
+template <typename PeerCounts>
+class PeerTransferCursor {
+public:
+    __aicore__ inline PeerTransferCursor(const PeerCounts& counts, const PeerRowLimits& limits,
+                                          const ExpertSlice& slice, uint32_t ownedBegin, uint32_t ownedEnd,
+                                          uint32_t peers, uint32_t rank, uint32_t ranksPerNode)
+        : counts_(counts), peers_(peers), rank_(rank), ranksPerNode_(ranksPerNode),
+          expertGlobalRowBegin_(static_cast<uint32_t>(slice.globalRowStart - slice.rowStartInExpert)),
+          ownedBegin_(ownedBegin), ownedEnd_(ownedEnd), destination_(slice.rowStartInExpert)
+    {
+        const uint32_t sliceEnd = slice.rowStartInExpert + slice.rowCount;
+#if MEGAMOE_PREFILL_PEER_FAST_PATH
+        regular_ = CanUseRegularPeerSlice(limits, peers, slice.rowStartInExpert, sliceEnd);
+#endif
+        if (regular_) {
+            regularSlice_ = CreateRegularPeerSlice(peers, slice.rowStartInExpert, sliceEnd);
+            ordinal_ = FindRegularPeerOrdinal(regularSlice_, peers, ownedBegin - slice.rowStartInExpert);
+            destination_ += regularSlice_.Prefix(ordinal_);
+        } else {
+            // 真实 peer 耗尽时保留原 cut 和余数消耗顺序，不能用平均配额替代。
+            beginCut_ = GetPeerRowCut(counts, peers, limits, slice.rowStartInExpert);
+            endCut_ = GetPeerRowCut(counts, peers, limits, sliceEnd);
+        }
+    }
+
+    __aicore__ inline bool Next(PeerTransfer& transfer)
+    {
+        while (ordinal_ < peers_ && destination_ < ownedEnd_) {
+            const uint32_t ordinal = ordinal_++;
+            const uint32_t peer = GetDispatchPeer(ordinal, rank_, peers_, ranksPerNode_);
+            uint32_t sourceBegin, sourceEnd;
+            if (regular_) {
+                sourceBegin = regularSlice_.SourceBegin(ordinal);
+                sourceEnd = regularSlice_.SourceEnd(ordinal);
+            } else {
+                const uint32_t count = counts_.Get(peer);
+                sourceBegin = TakePeerRowPrefix(count, beginCut_);
+                sourceEnd = TakePeerRowPrefix(count, endCut_);
+            }
+            const uint32_t end = destination_ + sourceEnd - sourceBegin;
+            const uint32_t overlapBegin = destination_ > ownedBegin_ ? destination_ : ownedBegin_;
+            const uint32_t overlapEnd = end < ownedEnd_ ? end : ownedEnd_;
+            const uint32_t destinationBegin = destination_;
+            destination_ = end;
+            if (overlapBegin < overlapEnd) {
+                const uint32_t first = sourceBegin + overlapBegin - destinationBegin;
+                transfer = {peer, first, overlapEnd - overlapBegin, expertGlobalRowBegin_ + overlapBegin};
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    const PeerCounts& counts_;
+    uint32_t peers_, rank_, ranksPerNode_, expertGlobalRowBegin_, ownedBegin_, ownedEnd_;
+    uint32_t ordinal_ = 0U;
+    uint32_t destination_;
+    bool regular_ = false;
+    RegularPeerSlice regularSlice_{};
+    PeerRowCut beginCut_{}, endCut_{};
+};
 
 }  // namespace MegaMoeImpl
 

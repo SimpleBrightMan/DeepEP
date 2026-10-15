@@ -129,6 +129,29 @@ GMM1 用 `TakeNextExpertSliceInWave` 产生这两个 slice；滞后一 Wave 的 
 兼容路径仍逐 slice 交错，且跨 Wave 的专家仍等最后一个 slice 才量化回传；末轮 UB 复用和排空协议不变。
 现役非量化 AIV1 继续使用独立优先级调度器，不进入这些兼容操作。
 
+### Dispatch：范围规划与实际搬运分开阅读
+
+先读 [mega_moe_token_dispatch.hpp](csrc/kernels/mega_moe/stage/mega_moe_token_dispatch.hpp)，
+再读 [mega_moe_peer_rows.hpp](csrc/kernels/mega_moe/common/mega_moe_peer_rows.hpp) 的配额算法。
+
+```text
+W4 单专家 slice → DispatchExpertSlice
+通用跨专家范围 → DispatchTokenRange（整个范围只分配一次 owner，再投影到专家）
+                  ↓
+DispatchOwnedExpertSlice → rank 顺序布局 / peer 均衡布局
+                  ↓
+PeerTransfer → AppendPeerRouteSegment → ConsumeRouteBatch → IssuePeerTokenCopies
+                  ↓
+FinishDispatchOwnedRows：消费剩余 batch → DrainDispatchCopyBuffers → PublishGmm1TileReady
+```
+
+`PeerTransfer` 明确记录来源卡、源 compact route 起点、行数、目标 GM 行。
+均衡布局的 `PeerTransferCursor.Next` 只规划这些段，不搬 token、不发布 flag；
+保留规则配额快路径和 peer 耗尽时的余数分配顺序。
+`AppendPeerRouteSegment` 批量读取 compact 索引，`ConsumeRouteBatch` 等索引可读后发起 token 搬运，
+token 环形槽跨 peer 复用。两种布局共享同一个收尾边界：末行写完、相关 MTE 事件回收后才发布 owner 的行贡献。
+没有增加屏障，也没有改成按 peer 发布 ready；默认策略、目标行排列和 GMM1 ready 计数不变。
+
 ### 最重要的数据依赖
 
 | 生产者 → 消费者 | 数据 / 就绪条件 |
@@ -155,8 +178,13 @@ CPU 测试直接编译生产代码中的策略和 Wave 辅助函数，比较旧�
 
 ```bash
 python -m pytest experiments/megamoe/tests/test_device_schedule.py -q
+python -m pytest experiments/megamoe/tests/test_dispatch.py -q
 ```
 
+Dispatch 测试把当前生产规划与重构前的冻结实现逐段对照，覆盖 AIC/AIV、两种布局、
+快路径开关、EP2～128、空/不均衡专家、容量裁剪与单专家直接入口。
+另以 DMA 桩执行实际环形流水及收尾函数，检查 1～6 槽、跨 peer/batch 复用、末行补写、排空后发布 ready。
+这些是 CPU 行为检查，不替代 NPU 编译、真实异步 DMA、精度和性能验证。
 需要 C++17 编译器；可用 `CXX` 指定，没有编译器时测试会明确 skip。
 这不是 NPU 仿真，不能验证 DMA 可见性、死锁或性能。设备验收请在原版与重构版分别重新构建，
 保持同输入、路由、计时方式，至少检查：

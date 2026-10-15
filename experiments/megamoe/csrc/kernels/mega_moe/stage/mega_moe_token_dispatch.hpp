@@ -180,10 +180,10 @@ __aicore__ inline void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
 
 // 环形槽持续跨 peer 使用：先发起下一行读，再写出上一行，避免每个小 peer 段都排空 MTE。
 template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
-__aicore__ inline void CopyTokensAndMetaForDispatch(const TokenDispatchConfig& context, const Params& params,
-                                                    GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
-                                                    int32_t rowDstOffset, int32_t remoteRankIdx, int32_t copyStartIdx,
-                                                    int32_t copyNum, DispatchCopyProgress& progress)
+__aicore__ inline void IssuePeerTokenCopies(const TokenDispatchConfig& context, const Params& params,
+                                           GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
+                                           int32_t rowDstOffset, int32_t remoteRankIdx, int32_t copyStartIdx,
+                                           int32_t copyNum, DispatchCopyProgress& progress)
 {
     const MegaMoeDispatchBufferConfig& bufferConfig = context.bufferConfig;
     int32_t bufferCount = bufferConfig.bufferCount;
@@ -234,7 +234,7 @@ __aicore__ inline void DrainDispatchCopyBuffers(const TokenDispatchConfig& conte
     }
 }
 
-// 发布一个 source-rank 段覆盖到的 GMM1 tile ready 计数。
+// 按本核已经落地的目标行发布 GMM1 M-group ready，多个 owner 的行贡献可原子累加。
 __aicore__ inline void PublishGmm1TileReady(const MoeSyncWorkspaceLayout& syncLayout, const Params& params,
                                             uint32_t localExpertId, int32_t gmm1TileRowCount,
                                             int32_t segmentExpertRowBegin, int32_t segmentExpertRowEnd)
@@ -260,9 +260,9 @@ __aicore__ inline void PublishGmm1TileReady(const MoeSyncWorkspaceLayout& syncLa
 
 // route-index 使用独立的 MTE2_S 事件 6，避免与持续存活的 token 槽 0..5 冲突。
 template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
-__aicore__ inline void FlushDispatchRouteBatch(const TokenDispatchConfig& context, const Params& params,
-                                               GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
-                                               DispatchRouteBatch& batch, DispatchCopyProgress& progress)
+__aicore__ inline void ConsumeRouteBatch(const TokenDispatchConfig& context, const Params& params,
+                                        GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
+                                        DispatchRouteBatch& batch, DispatchCopyProgress& progress)
 {
     if (batch.count == 0U) {
         return;
@@ -270,7 +270,7 @@ __aicore__ inline void FlushDispatchRouteBatch(const TokenDispatchConfig& contex
     SyncFuncStatic<AscendC::HardEvent::MTE2_S, MAX_DISPATCH_BUFFER_COUNT>();
     for (uint32_t i = 0U; i < batch.count; ++i) {
         const auto& segment = batch.segments[i];
-        CopyTokensAndMetaForDispatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+        IssuePeerTokenCopies<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
             context, params, winRankAddr, scratch, segment.dstRow, segment.sourceRank, segment.indexOffset,
             segment.rowCount, progress);
     }
@@ -278,40 +278,55 @@ __aicore__ inline void FlushDispatchRouteBatch(const TokenDispatchConfig& contex
     batch.usedItems = 0U;
 }
 
+// 单个 owner 区间的唯一收尾：消费剩余索引、排空 token/scale/metadata 写出，最后才发布 ready。
+// 不能省略末行补写，也不能把 UB 或事件带入后续 SwiGLU；不增加全核/跨卡屏障。
+template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTileM, bool TopkWeightsPrefetch>
+__aicore__ inline void FinishDispatchOwnedRows(const TokenDispatchConfig& context,
+                                                const MoeSyncWorkspaceLayout& syncLayout, const Params& params,
+                                                GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
+                                                uint32_t expertIdx, const ExpertDispatchCoreRange& completed,
+                                                DispatchRouteBatch& batch, DispatchCopyProgress& progress)
+{
+    ConsumeRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, winRankAddr, scratch,
+                                                                        batch, progress);
+    DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch, progress);
+    PublishGmm1TileReady(syncLayout, params, expertIdx, static_cast<int32_t>(PipelineTileM),
+                         static_cast<int32_t>(completed.localExpertRowBegin),
+                         static_cast<int32_t>(completed.localExpertRowEnd));
+}
+
 /*
  * 保持 Prefill 的 peer 选择、源 ordinal 和目标行不变，只合并多个 peer 的索引读取屏障。
  * 每段 UB 起点按 32B 对齐；容不下完整段时先消费旧 batch，不为填满 UB 切碎小 peer。
  */
 template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
-__aicore__ inline int32_t DispatchRankTokens(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
+__aicore__ inline int32_t AppendPeerRouteSegment(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
                                              const Params& params, GM_ADDR* winRankAddr,
                                              TokenDispatchScratch<ActivationType>& scratch, uint32_t localExpertId,
-                                             int32_t expertGlobalRowBegin, uint32_t remoteRankIdx,
-                                             int32_t destinationRowBegin, int32_t segmentMatchOrdinalBegin,
-                                             int32_t segmentMatchOrdinalEnd, DispatchRouteBatch& batch,
+                                             const PeerTransfer& transfer, DispatchRouteBatch& batch,
                                              DispatchCopyProgress& progress)
 {
     constexpr uint32_t itemsPerBlock = ALIGN_32 / sizeof(int32_t);
     const uint32_t capacity = static_cast<uint32_t>(context.bufferConfig.routeItemsPerBatch);
     int32_t processed = 0;
-    const int32_t rowCount = segmentMatchOrdinalEnd - segmentMatchOrdinalBegin;
+    const int32_t rowCount = static_cast<int32_t>(transfer.rowCount);
     while (processed < rowCount) {
         const uint32_t remaining = static_cast<uint32_t>(rowCount - processed);
         const uint32_t take = remaining < capacity ? remaining : capacity;
         const uint32_t padded = Ops::Base::CeilAlign(take, itemsPerBlock);
         if (batch.count == MAX_DISPATCH_BUFFER_COUNT || batch.usedItems + padded > capacity) {
-            FlushDispatchRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, winRankAddr,
-                                                                                         scratch, batch, progress);
+            ConsumeRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, winRankAddr,
+                                                                                scratch, batch, progress);
         }
         const uint64_t slotOffset =
-            (static_cast<uint64_t>(localExpertId) * common.worldSize + remoteRankIdx) * context.routeIndexAlignSize;
+            (static_cast<uint64_t>(localExpertId) * common.worldSize + transfer.sourceRank) * context.routeIndexAlignSize;
         GlobalTensor<int32_t> remoteRouteIndexGlobal;
         remoteRouteIndexGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(
             params.peermemInfo.maskRecvPtr + slotOffset +
-            static_cast<uint64_t>(segmentMatchOrdinalBegin + processed) * sizeof(int32_t)));
+            static_cast<uint64_t>(transfer.sourceOrdinalBegin + processed) * sizeof(int32_t)));
         DataCopyPad(scratch.validTopkIndexTensor[batch.usedItems], remoteRouteIndexGlobal,
                     {1U, take * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-        batch.segments[batch.count++] = {remoteRankIdx, expertGlobalRowBegin + destinationRowBegin + processed,
+        batch.segments[batch.count++] = {transfer.sourceRank, static_cast<int32_t>(transfer.destinationRow) + processed,
                                          batch.usedItems, static_cast<int32_t>(take)};
         batch.usedItems += padded;
         processed += static_cast<int32_t>(take);
@@ -354,7 +369,6 @@ __aicore__ inline void DispatchOwnedExpertRows(const TokenDispatchConfig& contex
                                                GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
                                                uint32_t localExpertId, const ExpertDispatchCoreRange& coreRange)
 {
-    constexpr int32_t gmm1TileRowCount = static_cast<int32_t>(PipelineTileM);
     uint32_t coreGlobalRowBegin = coreRange.expertGlobalRowBegin + coreRange.localExpertRowBegin;
     uint32_t coreGlobalRowEnd = coreRange.expertGlobalRowBegin + coreRange.localExpertRowEnd;
     // prefix 单调递增，二分找到与本核首行相交的第一个 source rank，避免从 rank 0 线性扫描。
@@ -376,23 +390,18 @@ __aicore__ inline void DispatchOwnedExpertRows(const TokenDispatchConfig& contex
             coreGlobalRowBegin > rankGlobalRowBegin ? coreGlobalRowBegin : rankGlobalRowBegin;
         uint32_t overlapGlobalRowEnd = coreGlobalRowEnd < rankGlobalRowEnd ? coreGlobalRowEnd : rankGlobalRowEnd;
         if (overlapGlobalRowBegin < overlapGlobalRowEnd) {
-            int32_t rankDispatchedRowCount = DispatchRankTokens<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
-                context, common, params, winRankAddr, scratch, localExpertId,
-                static_cast<int32_t>(coreRange.expertGlobalRowBegin), sourceRankIdx,
-                static_cast<int32_t>(overlapGlobalRowBegin - coreRange.expertGlobalRowBegin),
-                static_cast<int32_t>(overlapGlobalRowBegin - rankGlobalRowBegin),
-                static_cast<int32_t>(overlapGlobalRowEnd - rankGlobalRowBegin), batch, progress);
+            const PeerTransfer transfer{sourceRankIdx, overlapGlobalRowBegin - rankGlobalRowBegin,
+                                         overlapGlobalRowEnd - overlapGlobalRowBegin, overlapGlobalRowBegin};
+            int32_t rankDispatchedRowCount = AppendPeerRouteSegment<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+                context, common, params, winRankAddr, scratch, localExpertId, transfer, batch, progress);
             dispatchedRowCount += rankDispatchedRowCount;
         }
         ++sourceRankIdx;
     }
-    FlushDispatchRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, winRankAddr, scratch,
-                                                                                 batch, progress);
-    DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch, progress);
-    // 所有 source-rank 子段完成后统一发布本核贡献；GMM1 按 tile 累计到完整行数后即可启动。
-    PublishGmm1TileReady(syncLayout, params, localExpertId, gmm1TileRowCount,
-                         static_cast<int32_t>(coreRange.localExpertRowBegin),
-                         static_cast<int32_t>(coreRange.localExpertRowBegin) + dispatchedRowCount);
+    const ExpertDispatchCoreRange completed{coreRange.expertGlobalRowBegin, coreRange.localExpertRowBegin,
+                                            coreRange.localExpertRowBegin + static_cast<uint32_t>(dispatchedRowCount)};
+    FinishDispatchOwnedRows<ActivationType, QuantScaleType, PipelineTileM, TopkWeightsPrefetch>(
+        context, syncLayout, params, winRankAddr, scratch, localExpertId, completed, batch, progress);
 }
 
 // 原 prefix 仍表示 [expert][source rank] 的真实路由数量，只改变 Dispatch 的目标行排列。
@@ -414,7 +423,7 @@ __aicore__ inline void DispatchPeerBalancedRows(const TokenDispatchConfig& conte
                                                 const MoeSyncWorkspaceLayout& syncLayout, const Params& params,
                                                 GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
                                                 uint32_t expertIdx, const ExpertDispatchCoreRange& coreRange,
-                                                uint32_t sliceBegin, uint32_t sliceEnd)
+                                                const ExpertSlice& slice)
 {
     DispatchRouteBatch batch{};
     DispatchCopyProgress progress{};
@@ -422,64 +431,70 @@ __aicore__ inline void DispatchPeerBalancedRows(const TokenDispatchConfig& conte
 #if MEGAMOE_PREFILL_PEER_FAST_PATH
     const PeerRowLimits& limits =
         GetCachedPeerRowLimits(scratch.peerRowLimitsCache, counts, expertIdx, common.worldSize);
-    bool regular = CanUseRegularPeerSlice(limits, common.worldSize, sliceBegin, sliceEnd);
 #else
-    PeerRowLimits limits = GetPeerRowLimits(counts, common.worldSize);
-    bool regular = false;
+    const PeerRowLimits limits = GetPeerRowLimits(counts, common.worldSize);
 #endif
-    PeerRowCut beginCut{}, endCut{};
-    RegularPeerSlice regularSlice{};
-    uint32_t firstOrdinal = 0U;
-    if (regular) {
-        regularSlice = CreateRegularPeerSlice(common.worldSize, sliceBegin, sliceEnd);
-        firstOrdinal =
-            FindRegularPeerOrdinal(regularSlice, common.worldSize, coreRange.localExpertRowBegin - sliceBegin);
+    PeerTransferCursor<DispatchPeerCounts> peers(counts, limits, slice, coreRange.localExpertRowBegin,
+                                                 coreRange.localExpertRowEnd, common.worldSize, common.rankId,
+                                                 context.ranksPerNode);
+    PeerTransfer transfer{};
+    while (peers.Next(transfer)) {
+        AppendPeerRouteSegment<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+            context, common, params, winRankAddr, scratch, expertIdx, transfer, batch, progress);
+    }
+    FinishDispatchOwnedRows<ActivationType, QuantScaleType, PipelineTileM, TopkWeightsPrefetch>(
+        context, syncLayout, params, winRankAddr, scratch, expertIdx, coreRange, batch, progress);
+}
+
+// 两种真实行布局共享执行边界；本核 owner 范围和整个 slice 分开，避免把配额算成本核局部配额。
+template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTileM, bool TopkWeightsPrefetch,
+          bool PeerBalanced>
+__aicore__ inline void DispatchOwnedExpertSlice(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
+                                                 const MoeSyncWorkspaceLayout& syncLayout, const Params& params,
+                                                 GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
+                                                 const ExpertSlice& slice, const ExpertDispatchCoreRange& owned)
+{
+    if constexpr (PeerBalanced) {
+        DispatchPeerBalancedRows<ActivationType, QuantScaleType, PipelineTileM, TopkWeightsPrefetch>(
+            context, common, syncLayout, params, winRankAddr, scratch, slice.expertIdx, owned, slice);
     } else {
-        // 真实 peer 已耗尽：保留原配额算法及余数消耗顺序，不能套用均匀配额假设。
-        beginCut = GetPeerRowCut(counts, common.worldSize, limits, sliceBegin);
-        endCut = GetPeerRowCut(counts, common.worldSize, limits, sliceEnd);
+        DispatchOwnedExpertRows<ActivationType, QuantScaleType, PipelineTileM, TopkWeightsPrefetch>(
+            context, common, syncLayout, params, winRankAddr, scratch, slice.expertIdx, owned);
     }
-    uint32_t destination = sliceBegin + (regular ? regularSlice.Prefix(firstOrdinal) : 0U);
-    for (uint32_t ordinal = firstOrdinal; ordinal < common.worldSize; ++ordinal) {
-        uint32_t peer = GetDispatchPeer(ordinal, common.rankId, common.worldSize, context.ranksPerNode);
-        uint32_t sourceBegin, sourceEnd;
-        if (regular) {
-            // 直接恢复本 peer 的源区间，不再读取无关 peer 的 count 或从 ordinal=0 扫描。
-            sourceBegin = regularSlice.SourceBegin(ordinal);
-            sourceEnd = regularSlice.SourceEnd(ordinal);
-        } else {
-            uint32_t count = counts.Get(peer);
-            sourceBegin = TakePeerRowPrefix(count, beginCut);
-            sourceEnd = TakePeerRowPrefix(count, endCut);
-        }
-        uint32_t destinationEnd = destination + sourceEnd - sourceBegin;
-        uint32_t overlapBegin =
-            destination > coreRange.localExpertRowBegin ? destination : coreRange.localExpertRowBegin;
-        uint32_t overlapEnd =
-            destinationEnd < coreRange.localExpertRowEnd ? destinationEnd : coreRange.localExpertRowEnd;
-        if (overlapBegin < overlapEnd) {
-            uint32_t first = sourceBegin + overlapBegin - destination;
-            DispatchRankTokens<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
-                context, common, params, winRankAddr, scratch, expertIdx,
-                static_cast<int32_t>(coreRange.expertGlobalRowBegin), peer, static_cast<int32_t>(overlapBegin),
-                static_cast<int32_t>(first), static_cast<int32_t>(first + overlapEnd - overlapBegin), batch, progress);
-        }
-        destination = destinationEnd;
-        if (destination >= coreRange.localExpertRowEnd) {
-            break;
-        }
+}
+
+// W4 主路径：调用方已经切出单专家 slice，直接分配 owner，不再遍历专家或重新从 prefix 还原边界。
+template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTileM, bool TopkWeightsPrefetch,
+          bool PeerBalanced = false>
+__aicore__ inline void DispatchExpertSlice(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
+                                            const BlockJobContext& blockJob, const MoeSyncWorkspaceLayout& syncLayout,
+                                            const Params& params, GM_ADDR* winRankAddr,
+                                            TokenDispatchScratch<ActivationType>& scratch, const ExpertSlice& slice)
+{
+    if constexpr (g_coreType == AIC) {
+        return;
     }
-    FlushDispatchRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, winRankAddr, scratch,
-                                                                                 batch, progress);
-    DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch, progress);
-    // 每个 owner 仍独占连续目标行；本核所有 peer 段落地后按目标行发布一次贡献。
-    PublishGmm1TileReady(syncLayout, params, expertIdx, static_cast<int32_t>(PipelineTileM),
-                         static_cast<int32_t>(coreRange.localExpertRowBegin),
-                         static_cast<int32_t>(coreRange.localExpertRowEnd));
+    if (GetSubBlockIdx() != 1U || blockJob.totalJobs == 0U || slice.globalRowStart >= context.maxOutputSize) {
+        return;
+    }
+    // 与通用范围入口使用同一容量裁剪和 owner 轮转，不能按未裁剪行数分核。
+    const uint64_t available = context.maxOutputSize - slice.globalRowStart;
+    ExpertSlice clipped = slice;
+    clipped.rowCount = static_cast<uint32_t>(slice.rowCount < available ? slice.rowCount : available);
+    const WorkRange rows = GetRotatedBalancedTokenRange(clipped.rowCount, blockJob.jobIndex, blockJob.totalJobs,
+                                                        static_cast<uint32_t>(clipped.globalRowStart));
+    if (rows.count == 0U) {
+        return;
+    }
+    const ExpertDispatchCoreRange owned{
+        static_cast<uint32_t>(clipped.globalRowStart - clipped.rowStartInExpert),
+        clipped.rowStartInExpert + rows.start, clipped.rowStartInExpert + rows.start + rows.count};
+    DispatchOwnedExpertSlice<ActivationType, QuantScaleType, PipelineTileM, TopkWeightsPrefetch, PeerBalanced>(
+        context, common, syncLayout, params, winRankAddr, scratch, clipped, owned);
 }
 
 /*
- * Dispatch 唯一执行入口：搬运调用方给定的左闭右开专家 token 范围，并发布 GMM1 tile ready。
+ * 跨专家范围入口：保留整个范围的一次分核，再投影到各专家；不可先逐专家重新分核。
  * 调用方负责提前规划范围、推进 WAVE/专家位置以及在必要时恢复 prefix；本函数只做范围裁剪、AIV1 分工、
  * 专家/source-rank 拆段和数据发送。共享底层搬运与同步，仅 W4 非量化 token 路径选择 peer 均衡落位。
  */
@@ -541,19 +556,14 @@ __aicore__ inline void DispatchTokenRange(const TokenDispatchConfig& context, co
             // 将本核的全局连续区间投影为当前专家内的局部 row 区间。
             ExpertDispatchCoreRange expertRange{expertGlobalRowBegin, overlapGlobalRowBegin - expertGlobalRowBegin,
                                                 overlapGlobalRowEnd - expertGlobalRowBegin};
-            if constexpr (PeerBalanced) {
-                uint32_t sliceBegin =
-                    dispatchGlobalRowBegin > expertGlobalRowBegin ? dispatchGlobalRowBegin - expertGlobalRowBegin : 0U;
-                uint32_t sliceEnd = dispatchGlobalRowEnd < expertGlobalRowEnd
-                                        ? dispatchGlobalRowEnd - expertGlobalRowBegin
-                                        : expertGlobalRowEnd - expertGlobalRowBegin;
-                DispatchPeerBalancedRows<ActivationType, QuantScaleType, PipelineTileM, TopkWeightsPrefetch>(
-                    context, common, syncLayout, params, winRankAddr, scratch, expertIdx, expertRange, sliceBegin,
-                    sliceEnd);
-            } else {
-                DispatchOwnedExpertRows<ActivationType, QuantScaleType, PipelineTileM, TopkWeightsPrefetch>(
-                    context, common, syncLayout, params, winRankAddr, scratch, expertIdx, expertRange);
-            }
+            const uint32_t sliceBegin =
+                dispatchGlobalRowBegin > expertGlobalRowBegin ? dispatchGlobalRowBegin - expertGlobalRowBegin : 0U;
+            const uint32_t sliceEnd = dispatchGlobalRowEnd < expertGlobalRowEnd
+                                          ? dispatchGlobalRowEnd - expertGlobalRowBegin
+                                          : expertGlobalRowEnd - expertGlobalRowBegin;
+            const ExpertSlice slice{expertIdx, sliceBegin, sliceEnd - sliceBegin, expertGlobalRowBegin + sliceBegin};
+            DispatchOwnedExpertSlice<ActivationType, QuantScaleType, PipelineTileM, TopkWeightsPrefetch, PeerBalanced>(
+                context, common, syncLayout, params, winRankAddr, scratch, slice, expertRange);
         }
     }
 }
@@ -689,7 +699,7 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
 }
 
 /*
- * W4 的 Activation/SwiGLU 会覆盖 AIV1 UB 0 开始的 prefix 表。调用方在执行 DispatchTokenRange 前，
+ * W4 的 Activation/SwiGLU 会覆盖 AIV1 UB 0 开始的 prefix 表。调用方在执行 Dispatch 前，
  * 从当前物理 block 的 GM 备份恢复“首专家前缀 + 本次范围覆盖的专家前缀”。
  */
 template <typename ActivationType>
