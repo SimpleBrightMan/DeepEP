@@ -14,6 +14,7 @@ from deep_ep_experimental.megamoe.reference import (
     fp8_decode,
     fp8_encode,
     local_reference,
+    make_weights,
     quantize_input,
     unpack_weight,
 )
@@ -52,6 +53,59 @@ def test_fp4_nibble_and_scale_order():
     np.testing.assert_array_equal(result[:32:2], FP4)
     np.testing.assert_array_equal(result[1:32:2], FP4[::-1])
     np.testing.assert_array_equal(result[32:], result[:32] * 2)
+
+
+def test_fp8_weight_codes_and_scale_order():
+    codes = np.tile(np.array([0x38, 0xB8], dtype=np.uint8), (1, 2, 32))
+    scales = np.array([[[[127, 128]], [[126, 129]]]], dtype=np.uint8)
+    values = unpack_weight((codes, scales), weight_kind="fp8")
+    expected = np.tile(np.array([1, -1], dtype=np.float32), 32)
+    np.testing.assert_array_equal(values[0, 0, :32], expected[:32])
+    np.testing.assert_array_equal(values[0, 0, 32:], expected[32:] * 2)
+    np.testing.assert_array_equal(values[0, 1, :32], expected[:32] / 2)
+    np.testing.assert_array_equal(values[0, 1, 32:], expected[32:] * 4)
+
+
+@pytest.mark.parametrize("weight_kind", ["fp4", "fp8"])
+def test_weight_generator_is_reproducible_and_matches_dense_shapes(weight_kind):
+    first = make_weights(2, 128, 64, 13, weight_kind=weight_kind)
+    repeat = make_weights(2, 128, 64, 13, weight_kind=weight_kind)
+    for (codes, scales), (other_codes, other_scales), (n, k) in zip(first, repeat, ((128, 128), (128, 64))):
+        assert codes.shape == (2, n, k // 2 if weight_kind == "fp4" else k)
+        assert scales.shape == (2, n, k // 64, 2)
+        np.testing.assert_array_equal(codes, other_codes)
+        np.testing.assert_array_equal(scales, other_scales)
+        dense = unpack_weight((codes, scales), weight_kind=weight_kind)
+        assert dense.shape == (2, n, k) and np.isfinite(dense).all()
+        assert (dense < 0).any() and (dense > 0).any() and np.unique(scales).size > 1
+
+
+def test_default_fp4_generator_preserves_original_rng_sequence():
+    rng = np.random.default_rng(13)
+    expected = []
+    for n, k in ((128, 128), (128, 64)):
+        packed = rng.integers(0, 256, (2, n, k // 2), dtype=np.uint8)
+        exponent = int(np.floor(-0.5 * np.log2(k))) - 2
+        scales = rng.integers(127 + exponent - 1, 127 + exponent + 2, (2, n, k // 64, 2), dtype=np.uint8)
+        expected.append((packed, scales))
+    for actual_pair, expected_pair in zip(make_weights(2, 128, 64, 13), expected):
+        for actual, original in zip(actual_pair, expected_pair):
+            np.testing.assert_array_equal(actual, original)
+
+
+def test_unsupported_weight_modes_fail_early():
+    from deep_ep_experimental.megamoe.benchmark import validate_weight_mode
+
+    config = dict(model=dict(num_shared_experts=0))
+    validate_weight_mode(config, "fp8")
+    with pytest.raises(ValueError, match="--timer"):
+        validate_weight_mode(config, "fp8", timer=True)
+    config["model"]["num_shared_experts"] = 1
+    with pytest.raises(ValueError, match="shared experts"):
+        validate_weight_mode(config, "fp8")
+    validate_weight_mode(config, "fp4", timer=True)
+    with pytest.raises(ValueError, match="fp4 or fp8"):
+        make_weights(1, 64, 64, 0, weight_kind="int8")
 
 
 def test_local_moe_decomposition_and_empty_expert():

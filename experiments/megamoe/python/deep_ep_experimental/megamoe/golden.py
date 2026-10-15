@@ -24,10 +24,11 @@ def token_indices(bs, check_tokens):
     return np.arange(bs) if check_tokens == 0 else np.unique(np.linspace(0, bs - 1, min(bs, check_tokens)).astype(int))
 
 
-def contract(config, world, bs, input_kind, routing, check_tokens):
+def contract(config, world, bs, input_kind, routing, check_tokens, *, weight_kind="fp4"):
     from . import reference
-    from .benchmark import inputs
+    from .benchmark import inputs, validate_weight_mode
 
+    validate_weight_mode(config, weight_kind)
     if world <= 0 or config["model"]["num_experts"] % world:
         raise ValueError("Global experts must divide positive EP size")
     if input_kind not in ("bf16", "fp8") or routing not in ("balanced", "random", "skewed"):
@@ -36,13 +37,14 @@ def contract(config, world, bs, input_kind, routing, check_tokens):
     # 权重/输入或参考算法变化自动失效；编译参数、性能轮数不影响 Golden。
     source = inspect.getsource(reference) + inspect.getsource(inputs) + Path(__file__).read_text(encoding="utf-8")
     return dict(
-        version=1,
+        version=2,
         reference_sha256=hashlib.sha256(source.encode()).hexdigest(),
         model=config["model"],
         seed=config["seed"],
         world=world,
         bs=bs,
         input=input_kind,
+        weights=weight_kind,
         routing=routing,
         check_tokens=check_tokens,
         numerical_contract="ascend_post_gmm2_route_weight_v1",
@@ -152,7 +154,13 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
             if not needed:
                 continue
             # 必须保留原始 RNG 的整组生成顺序；单专家重新播种会改变待测权重。
-            raw = make_weights(local, model["hidden"], model["intermediate_hidden"], config["seed"] + owner)
+            raw = make_weights(
+                local,
+                model["hidden"],
+                model["intermediate_hidden"],
+                config["seed"] + owner,
+                weight_kind=spec["weights"],
+            )
             for expert in needed:
                 token, slot = np.where(ids == owner * local + expert)
                 pair = tuple((data[expert], scale[expert]) for data, scale in raw)
@@ -165,7 +173,7 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
 
     def forward(job):
         token, route_weight, pair = job
-        w1, w2 = map(unpack_weight, pair)
+        w1, w2 = (unpack_weight(value, weight_kind=spec["weights"]) for value in pair)
         result = np.empty((len(token), model["hidden"]), dtype=np.float32)
         for start in range(0, len(token), chunk_tokens):
             stop = start + chunk_tokens
@@ -209,12 +217,13 @@ def prepare(
     directory,
     *,
     input_kind="bf16",
+    weight_kind="fp4",
     routing="balanced",
     check_tokens=0,
     workers=DEFAULT_WORKERS,
     chunk_tokens=256,
 ):
-    spec = contract(config, world, bs, input_kind, routing, check_tokens)
+    spec = contract(config, world, bs, input_kind, routing, check_tokens, weight_kind=weight_kind)
     missing = []
     for rank in ranks:
         if cache_path(directory, spec, rank).exists():
@@ -271,6 +280,7 @@ def main():
     parser.add_argument("--ranks", required=True, help="Source ranks on this host, e.g. 0-7")
     parser.add_argument("--golden-dir", type=Path, default=Path("benchmark-golden"))
     parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
+    parser.add_argument("--weights", choices=("fp4", "fp8"), default="fp4", help="Must match the benchmark weight type")
     parser.add_argument("--routing", choices=("balanced", "random", "skewed"), default="balanced")
     parser.add_argument("--check-tokens", type=int, default=0)
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
@@ -298,6 +308,7 @@ def main():
             ranks,
             args.golden_dir,
             input_kind=args.input,
+            weight_kind=args.weights,
             routing=args.routing,
             check_tokens=args.check_tokens,
             workers=args.workers,

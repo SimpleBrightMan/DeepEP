@@ -38,7 +38,7 @@ def config():
     )
 
 
-def naive(config, world, source, bs, routing, check_tokens):
+def naive(config, world, source, bs, routing, check_tokens, weight_kind="fp4"):
     """Old per-source/per-owner oracle, with no cached/batched Golden implementation."""
     model = config["model"]
     local = model["num_experts"] // world
@@ -51,8 +51,11 @@ def naive(config, world, source, bs, routing, check_tokens):
     x = dequantize_input(*quantize_input(x[selected]))
     result = np.zeros_like(x)
     for owner in range(world):
-        raw = make_weights(local, model["hidden"], model["intermediate_hidden"], config["seed"] + owner)
-        result += local_reference(x, ids[selected], weights[selected], *map(unpack_weight, raw), owner * local)
+        raw = make_weights(
+            local, model["hidden"], model["intermediate_hidden"], config["seed"] + owner, weight_kind=weight_kind
+        )
+        decoded = (unpack_weight(pair, weight_kind=weight_kind) for pair in raw)
+        result += local_reference(x, ids[selected], weights[selected], *decoded, owner * local)
     if model["num_shared_experts"]:
         raw = make_weights(
             model["num_shared_experts"], model["hidden"], model["intermediate_hidden"], config["seed"] + 100000
@@ -64,14 +67,14 @@ def naive(config, world, source, bs, routing, check_tokens):
 
 @pytest.mark.parametrize("routing", ["balanced", "random", "skewed"])
 @pytest.mark.parametrize("check_tokens", [0, 3])
-@pytest.mark.parametrize("shared", [0, 1])
-def test_parallel_chunked_matches_old_oracle(config, routing, check_tokens, shared):
+@pytest.mark.parametrize("weight_kind,shared", [("fp4", 0), ("fp4", 1), ("fp8", 0)])
+def test_parallel_chunked_matches_old_oracle(config, routing, check_tokens, weight_kind, shared):
     config["model"]["num_shared_experts"] = shared
-    spec = golden.contract(config, 2, 7, "fp8", routing, check_tokens)
+    spec = golden.contract(config, 2, 7, "fp8", routing, check_tokens, weight_kind=weight_kind)
     serial = golden.generate(config, spec, [0, 1], workers=1, chunk_tokens=256)
     parallel = golden.generate(config, spec, [0, 1], workers=3, chunk_tokens=2)
     for rank in (0, 1):
-        expected = naive(config, 2, rank, 7, routing, check_tokens)
+        expected = naive(config, 2, rank, 7, routing, check_tokens, weight_kind)
         for a, b, c in zip(serial[rank], parallel[rank], expected):
             np.testing.assert_array_equal(a, b)
             np.testing.assert_allclose(a, c, atol=1e-8)
@@ -115,6 +118,21 @@ def test_partial_cache_only_computes_missing_ranks(config, tmp_path, monkeypatch
     np.testing.assert_array_equal(golden.load(tmp_path, spec, 1)[0], naive(config, 2, 1, 7, "balanced", 0)[0])
 
 
+def test_weight_type_has_distinct_golden_cache_and_rejects_shared_fp8(config, tmp_path):
+    with pytest.raises(ValueError, match="shared experts"):
+        golden.prepare(config, 2, 7, [0], tmp_path, weight_kind="fp8")
+    assert not list(tmp_path.iterdir())
+    config["model"]["num_shared_experts"] = 0
+    fp4 = golden.prepare(config, 2, 7, [0], tmp_path)
+    fp8 = golden.contract(config, 2, 7, "bf16", "balanced", 0, weight_kind="fp8")
+    assert fp4["weights"] == "fp4" and fp8["weights"] == "fp8"
+    assert golden.cache_path(tmp_path, fp4, 0) != golden.cache_path(tmp_path, fp8, 0)
+    with pytest.raises(FileNotFoundError, match="Golden missing"):
+        golden.load(tmp_path, fp8, 0)
+    golden.prepare(config, 2, 7, [0], tmp_path, weight_kind="fp8")
+    assert not np.array_equal(golden.load(tmp_path, fp4, 0)[0], golden.load(tmp_path, fp8, 0)[0])
+
+
 def test_routing_source_change_invalidates_cached_golden(config, tmp_path, monkeypatch):
     spec = golden.prepare(config, 2, 7, [0], tmp_path)
     original = golden.inspect.getsource
@@ -149,8 +167,11 @@ def test_legacy_mixed_error_boundaries():
     assert not golden.compare(np.zeros(2), np.zeros(1))["passed"]
 
 
-def test_accuracy_uses_only_compact_control_report(config, tmp_path):
-    spec = golden.prepare(config, 2, 7, [0], tmp_path, input_kind="fp8")
+@pytest.mark.parametrize("weight_kind", ["fp4", "fp8"])
+def test_accuracy_uses_only_compact_control_report(config, tmp_path, weight_kind):
+    if weight_kind == "fp8":
+        config["model"]["num_shared_experts"] = 0
+    spec = golden.prepare(config, 2, 7, [0], tmp_path, input_kind="fp8", weight_kind=weight_kind)
     output, counts, _ = golden.load(tmp_path, spec, 0)
 
     class Tensor:
@@ -187,6 +208,7 @@ def test_accuracy_uses_only_compact_control_report(config, tmp_path):
             group=Group(),
             golden_dir=tmp_path,
             input_kind="fp8",
+            weight_kind=weight_kind,
         )[0]
 
     assert check(output, counts, 7 + 2 * counts)["passed"]
@@ -209,7 +231,10 @@ def test_incomplete_atomic_save_is_not_published(config, tmp_path, monkeypatch):
     assert not list(tmp_path.rglob("*.tmp"))
 
 
-def test_cpu_only_cli_cache_is_readable_by_benchmark(config, tmp_path):
+@pytest.mark.parametrize("weight_kind", ["fp4", "fp8"])
+def test_cpu_only_cli_cache_is_readable_by_benchmark(config, tmp_path, weight_kind):
+    if weight_kind == "fp8":
+        config["model"]["num_shared_experts"] = 0
     case = tmp_path / "case.json"
     case.write_text(json.dumps(config), encoding="utf-8")
     root = Path(__file__).resolve().parents[3]
@@ -239,11 +264,41 @@ def test_cpu_only_cli_cache_is_readable_by_benchmark(config, tmp_path):
         "--chunk-tokens",
         "2",
     ]
+    if weight_kind == "fp8":
+        command += ["--weights", "fp8"]
     for marker in ("saved", "reuse"):
         result = subprocess.run(
             command, capture_output=True, text=True, timeout=60, env=dict(os.environ, OMP_NUM_THREADS="1")
         )
         assert result.returncode == 0, result.stderr
         assert marker in result.stdout
-    spec = golden.contract(config, 2, 7, "fp8", "balanced", 0)
-    np.testing.assert_array_equal(golden.load(tmp_path / "cache", spec, 0)[0], naive(config, 2, 0, 7, "balanced", 0)[0])
+    spec = golden.contract(config, 2, 7, "fp8", "balanced", 0, weight_kind=weight_kind)
+    np.testing.assert_array_equal(
+        golden.load(tmp_path / "cache", spec, 0)[0], naive(config, 2, 0, 7, "balanced", 0, weight_kind)[0]
+    )
+
+
+@pytest.mark.parametrize("unsupported", ["shared", "timer"])
+def test_benchmark_rejects_unsupported_fp8_before_torch_import(config, tmp_path, monkeypatch, unsupported):
+    import builtins
+    from deep_ep_experimental.megamoe import benchmark
+
+    config["model"]["num_shared_experts"] = int(unsupported == "shared")
+    path = tmp_path / "case.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    argv = ["benchmark", "--config", str(path), "--weights", "fp8", "--output-dir", str(tmp_path / "output")]
+    if unsupported == "timer":
+        argv += ["--timer"]
+    monkeypatch.setattr(sys, "argv", argv)
+    original_import = builtins.__import__
+
+    def checked_import(name, *args, **kwargs):
+        if name in ("torch", "torch_npu"):
+            pytest.fail("unsupported A8W8 configuration reached device import")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", checked_import)
+    with pytest.raises(SystemExit) as error:
+        benchmark.main()
+    assert error.value.code == 2
+    assert not (tmp_path / "output").exists()

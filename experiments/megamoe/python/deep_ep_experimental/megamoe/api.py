@@ -60,6 +60,20 @@ def _check_fp4_weight_format(weight, name):
         )
 
 
+def _check_fp8_nd_format(tensor, name):
+    import torch_npu
+
+    actual = torch_npu.get_npu_format(tensor)
+    # CPU -> NPU copies of 4-D scale tensors use base NCHW (0). Like ND (2),
+    # it preserves contiguous row-major storage; NZ does not.
+    if actual not in (0, 2):
+        raise ValueError(
+            f"{name}: A8W8 weights and scales require base ND/NCHW format 2 or 0, "
+            f"got format={actual}, dtype={tensor.dtype}, shape={tuple(tensor.shape)}; "
+            "convert to ND before calling transform_weights_for_mega_moe"
+        )
+
+
 class SymmBuffer:
     """Collective resource owner. All ranks construct/call/destroy in the same order.
 
@@ -338,6 +352,9 @@ def transform_weights_for_mega_moe(
             weight = weight.view(torch.uint8)  # 重解释 FP4 的位模式，不能做数值类型转换。
         if weight.dtype not in {torch.uint8, torch.float8_e4m3fn}:
             raise TypeError("Weights must be packed FP4 int8/uint8 or FP8 E4M3")
+        if weight.dtype == torch.float8_e4m3fn:
+            _check_fp8_nd_format(weight, name)
+            _check_fp8_nd_format(scale, name + " scales")
         k = weight.shape[-1] * (2 if weight.dtype == torch.uint8 else 1)
         expected = (*weight.shape[:2], k // 64, 2)
         if k % 64:
@@ -484,6 +501,14 @@ def _run(
         ):
             if weight is not None:
                 _check_fp4_weight_format(weight, name)
+    else:
+        for name, tensor in (
+            ("l1_weights", w1),
+            ("l2_weights", w2),
+            ("l1_weights scales", s1),
+            ("l2_weights scales", s2),
+        ):
+            _check_fp8_nd_format(tensor, name)
     if cumulative_stats is not None:
         stats = cumulative_stats
         if (

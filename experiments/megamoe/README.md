@@ -32,7 +32,7 @@ def fp8_fp4_mega_moe(
 | `x` | 可选 BF16 `[B,H]`，覆盖 buffer 中的 FP8 输入；内部量化为 FP8，**不是 BF16 GEMM** |
 | `sym_buffer.topk_idx` | int32 `[B,K]`，全局专家 ID，同 token 不重复且不能为 -1 |
 | `sym_buffer.topk_weights` | FP32 `[B,K]` 路由权重；BF16/FP8 输入均从 buffer 读取路由 |
-| `l1_weights / l2_weights` | 两对 `(weight, scale)`，当前测试使用 FP4 E2M1 权重 + E8M0 scale |
+| `l1_weights / l2_weights` | 两对 `(weight, scale)`，支持 FP4 E2M1 或 FP8 E4M3 权重 + E8M0 scale |
 | `shared_l1_weights / shared_l2_weights` | 共享专家的两对权重，必须同时传入，数量与 buffer 的 S 一致；默认不使用 |
 | `cumulative_local_expert_recv_stats` | 可选 int32 `[L]`，在原值上累加专家接收 token 数 |
 | `timer` | 可选 `buffer.allocate_timer()`；仅在单独诊断调用中传入 |
@@ -50,6 +50,12 @@ FP8 输入仍需打包到通信区，因此流水中的 `AIV_QUANT` 此时表示
 调用 `w1, w2 = transform_weights_for_mega_moe(raw_w1, raw_w2)` 得到 Ascend NZ 权重。FP4 routed GMM1 一次准备两套 weight/scale：实际 B≤256 使用 `[gate128, up128]` 融合布局，B>256 使用 `[gate | up]` 配对布局。转换不进入计时区间，但额外保留一份 GMM1 权重和 scale；GMM2 不复制。
 请完整保留返回的 `w1`，不要解包后重组、原地修改或自行搬运其张量；权重更新或设备变化时从原始 ND 重新转换。共享专家将首维 L 换成 S，并传入 `shared=True`，使用 planar 权重布局。
 不能直接传入已经做过 CUDA 专用重排的权重。
+
+A8W8 使用原始 ND 布局的 FP8 E4M3 权重：GMM1 为 `[L,2I,H]`，GMM2 为 `[L,H,I]`；
+E8M0 scale 形状与上表相同，每32个 K 元素共用一个 scale。
+`transform_weights_for_mega_moe` 保留 FP8 权重的 ND 布局，不进行 FP4 NZ 转换。
+A8W8 的权重和 scale 使用连续行优先存储，接受基础 ND format 2 和 NCHW format 0（四维 scale 的默认格式）。
+Python 与 native 入口会拒绝 NZ，避免按 ND 读取 NZ 存储产生静默精度错误。
 
 buffer 的构造参数如下，模型参数含义与测试 JSON 相同：
 
@@ -75,7 +81,9 @@ buffer = SymmBuffer(
 约束：EP=2～128，E 可整除 EP 且每卡最多 128 个路由专家；S=0～8；B=1～65536；
 H=1024～8192 且为64的倍数，I=256～4096 且为128的倍数，1≤K≤min(32,E)。
 各 rank 必须同序、同 B 调用；仅推理，不支持反向、空/不等长 B 或图捕获。
-`mma_type="fp8xfp8"` 是保留入口，不支持共享专家/timer；**下文 benchmark 固定测试 W4A8，不提供权重 dtype 开关**。
+`mma_type="fp8xfp8"` 选择 A8W8，不支持共享专家和 timer。
+包内 `benchmark` / `golden` 通过 `--weights fp4|fp8` 选择权重，默认 `fp4`；
+多机 `scripts/batch_launch.py` 仍固定测试 W4A8。
 
 兼容入口 `mega_moe(x, ids, weights, w1, w2, buffer, ...)` 返回 `(y, per_call_counts)`。
 接口签名参照 DeepGEMM `78b6900`。本实现使用 int32 路由 ID、E8M0 输入 scale，
@@ -201,6 +209,35 @@ python experiments/megamoe/scripts/batch_launch.py --hosts-file "$HOSTS_FILE" --
 # EP128：将 HOSTS_FILE 改为包含16个节点的配置。
 python experiments/megamoe/scripts/batch_launch.py --hosts-file "$HOSTS_FILE" --ep-size 128
 ```
+
+### A8W8 单机精度与性能验证
+
+安装启用 MegaMoE 的 wheel 后，直接运行包内入口。以下使用两张空闲 NPU、`smoke` 模型（S=0），
+覆盖 BF16 / 预量化 FP8 输入及小、大 B；输入类型与权重类型分别由 `--input`、`--weights` 指定。
+CPU Golden 和 benchmark 的配置、EP、B、输入类型、权重类型及路由必须一致；缓存按这些字段区分。
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=4,5
+export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:26733
+# SHMEM 的 lib 目录须已按构建输出加入 LD_LIBRARY_PATH。
+python -m deep_ep_experimental.megamoe.golden \
+  --config smoke --ep-size 2 --ranks 0-1 --bs-values 1,17,96,257,512 \
+  --weights fp8 --input fp8 --routing random --golden-dir benchmark-golden
+torchrun --standalone --nproc-per-node=2 -m deep_ep_experimental.megamoe.benchmark \
+  --config smoke --bs-values 1,17,96,257,512 --mode accuracy \
+  --weights fp8 --input fp8 --routing random --golden-dir benchmark-golden \
+  --output-dir benchmark-runs/a8w8-smoke-fp8
+
+# BF16 输入：先以 --input bf16 生成对应 Golden，再以相同参数运行 accuracy。
+# 性能模式不需要 Golden；每次运行使用新的输出目录。
+torchrun --standalone --nproc-per-node=2 -m deep_ep_experimental.megamoe.benchmark \
+  --config smoke --bs-values 96,512 --mode perf --weights fp8 --input bf16 \
+  --output-dir benchmark-runs/a8w8-smoke-perf
+```
+
+A8W8 测试要求 `num_shared_experts=0`，不能传 `--timer`；不支持的组合会在设备初始化前报错。
+精度沿用 W4A8 的 CPU mixed-error 阈值，不放宽 A8W8 误差标准。
+`manifest.json` 记录 `weights`，报告中的专家计数与重复累计统计同样参与精度判定。
 
 ### 模型和共享专家配置
 

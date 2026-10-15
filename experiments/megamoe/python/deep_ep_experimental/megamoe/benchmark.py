@@ -40,6 +40,16 @@ def load_config(name, bs_values=None):
     return config
 
 
+def validate_weight_mode(config, weight_kind, *, timer=False):
+    """Reject unsupported A8W8 combinations before importing Torch or allocating devices."""
+    if weight_kind not in ("fp4", "fp8"):
+        raise ValueError("Weights must be fp4 or fp8")
+    if weight_kind == "fp8" and config["model"]["num_shared_experts"]:
+        raise ValueError("A8W8 (--weights fp8) does not support shared experts; set num_shared_experts=0")
+    if weight_kind == "fp8" and timer:
+        raise ValueError("A8W8 (--weights fp8) does not support --timer")
+
+
 def inputs(config, rank, bs, routing="balanced", *, world):
     import numpy as np
     from .reference import bf16
@@ -85,12 +95,13 @@ def accuracy(
     group,
     golden_dir,
     input_kind,
+    weight_kind="fp4",
 ):
     import numpy as np
     from .golden import cache_path, compare, contract, load
     from .reference import error_metrics
 
-    spec = contract(config, world, bs, input_kind, routing, check_tokens)
+    spec = contract(config, world, bs, input_kind, routing, check_tokens, weight_kind=weight_kind)
     expected, expected_local, selected = load(golden_dir, spec, rank)
     actual = output.float().cpu().numpy()[selected]
     report = compare(actual, expected)
@@ -119,6 +130,7 @@ def main():
     parser.add_argument("--bs-values", help="Only model config override, e.g. 96,4096")
     parser.add_argument("--mode", choices=("accuracy", "perf"), default="accuracy")
     parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
+    parser.add_argument("--weights", choices=("fp4", "fp8"), default="fp4", help="FP4 W4A8 or FP8 W8A8 weights")
     parser.add_argument(
         "--routing",
         choices=("balanced", "random", "skewed"),
@@ -137,6 +149,10 @@ def main():
     config = load_config(args.config, args.bs_values)
     if args.check_tokens < 0 or not 0 < args.relative_rmse < 1:
         parser.error("Invalid accuracy sample count or tolerance")
+    try:
+        validate_weight_mode(config, args.weights, timer=args.timer)
+    except ValueError as error:
+        parser.error(str(error))
     import torch
     import torch_npu  # noqa: F401 - Registers NPU dtype/device/stream support.
     from .api import StoreGroup
@@ -154,6 +170,7 @@ def main():
 
 
 def run(args, config, group):
+    validate_weight_mode(config, args.weights, timer=args.timer)
     import torch
     from .api import SymmBuffer, fp8_fp4_mega_moe, transform_weights_for_mega_moe
     from .reference import make_weights, quantize_input
@@ -168,6 +185,7 @@ def run(args, config, group):
             config,
             args.mode,
             args.input,
+            args.weights,
             args.routing,
             args.timer,
             args.timer_ranks,
@@ -186,7 +204,11 @@ def run(args, config, group):
         error = None
         try:
             for bs in config["bs_values"]:
-                load(args.golden_dir, contract(config, world, bs, args.input, args.routing, args.check_tokens), rank)
+                load(
+                    args.golden_dir,
+                    contract(config, world, bs, args.input, args.routing, args.check_tokens, weight_kind=args.weights),
+                    rank,
+                )
         except Exception as failure:
             error = f"rank={rank} Golden validation: {failure}"
         collective_check(group, "accuracy Golden cache", error)
@@ -203,6 +225,7 @@ def run(args, config, group):
     manifest = dict(
         config=config,
         input=args.input,
+        weights=args.weights,
         mode=args.mode,
         routing=args.routing,
         ep_size=world,
@@ -222,17 +245,25 @@ def run(args, config, group):
         group,
         num_max_tokens_per_rank=max(config["bs_values"]),
         ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
+        mma_type="fp8xfp4" if args.weights == "fp4" else "fp8xfp8",
         **model,
     )
 
     def device_pair(pair):
         data, scale = pair
-        return (torch.from_numpy(data).npu(), torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
+        weight = torch.from_numpy(data).npu()
+        if args.weights == "fp8":
+            weight = weight.view(torch.float8_e4m3fn)
+        return weight, torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu)
 
     if args.timer and not buffer.timer_enabled:
         raise RuntimeError("Timer requires a W4A8 wheel built with DEEPEP_MEGAMOE_TIMER=ON")
     raw = make_weights(
-        model["num_experts"] // world, model["hidden"], model["intermediate_hidden"], config["seed"] + rank
+        model["num_experts"] // world,
+        model["hidden"],
+        model["intermediate_hidden"],
+        config["seed"] + rank,
+        weight_kind=args.weights,
     )
     prepared = transform_weights_for_mega_moe(*map(device_pair, raw))
     shared_raw, shared_kwargs = None, {}
@@ -322,6 +353,7 @@ def run(args, config, group):
                 group=group,
                 golden_dir=args.golden_dir,
                 input_kind=args.input,
+                weight_kind=args.weights,
             )
             (case / "accuracy.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
             if not all(item["passed"] for item in reports):

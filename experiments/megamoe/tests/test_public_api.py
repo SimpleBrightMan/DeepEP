@@ -354,12 +354,50 @@ def test_routed_transform_rejects_incomplete_gate_up_pair(backend):
         api.transform_weights_for_mega_moe(pair, pair)
 
 
-def test_fp8_weights_remain_nd_without_fp4_format_cast(backend):
+@pytest.mark.parametrize("base_format", [0, 2])
+def test_fp8_weights_remain_nd_without_fp4_format_cast(backend, base_format):
     pair = (Tensor(np.zeros((1, 128, 128)), "float8_e4m3fn"), Tensor(np.full((1, 128, 2, 2), 127), "float8_e8m0fnu"))
+    pair[0].npu_format = pair[1].npu_format = base_format
     for weight, scale in api.transform_weights_for_mega_moe(pair, pair):
         assert weight is pair[0]
         np.testing.assert_array_equal(scale.data, pair[1].data)
     assert not any(isinstance(event, tuple) and event[0] == "format_cast" for event in backend.events)
+
+
+@pytest.mark.parametrize("pair_index", [0, 1])
+@pytest.mark.parametrize("tensor_index", [0, 1])
+@pytest.mark.parametrize("npu_format", [29, 50])
+def test_fp8_transform_rejects_non_nd_weights_and_scales(backend, pair_index, tensor_index, npu_format):
+    pairs = tuple(
+        (Tensor(np.zeros((1, 128, 128)), "float8_e4m3fn"), Tensor(np.full((1, 128, 2, 2), 127), "float8_e8m0fnu"))
+        for _ in range(2)
+    )
+    pairs[pair_index][tensor_index].npu_format = npu_format
+    name = f"l{pair_index + 1}_weights" + (" scales" if tensor_index else "")
+    with pytest.raises(ValueError, match=rf"{name}: A8W8.*base ND/NCHW format 2 or 0.*got format={npu_format}"):
+        api.transform_weights_for_mega_moe(*pairs)
+
+
+@pytest.mark.parametrize("tensor_index", [None, 0, 1, 2, 3])
+@pytest.mark.parametrize("base_format", [0, 2])
+def test_fp8_launch_checks_nd_even_without_transform(backend, tensor_index, base_format):
+    b = backend.buffer
+    b.mma_type = "fp8xfp8"
+    pairs = (
+        (Tensor(np.zeros((2, 512, 1024)), "float8_e4m3fn"), Tensor(np.full((2, 512, 16, 2), 127), "float8_e8m0fnu")),
+        (Tensor(np.zeros((2, 1024, 256)), "float8_e4m3fn"), Tensor(np.full((2, 1024, 4, 2), 127), "float8_e8m0fnu")),
+    )
+    tensors = (*pairs[0], *pairs[1])
+    for tensor in tensors:
+        tensor.npu_format = base_format
+    if tensor_index is not None:
+        tensors[tensor_index].npu_format = 29
+        with pytest.raises(ValueError, match="A8W8.*base ND/NCHW format 2 or 0.*got format=29"):
+            api.fp8_fp4_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), *pairs, b)
+        assert not any(isinstance(event, tuple) and event[0] == "launch" for event in backend.events)
+    else:
+        api.fp8_fp4_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), *pairs, b)
+        assert any(isinstance(event, tuple) and event[0] == "launch" for event in backend.events)
 
 
 @pytest.mark.parametrize("weight_format", [29, 50])

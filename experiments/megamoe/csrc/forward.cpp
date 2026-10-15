@@ -7,11 +7,13 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <utility>
 
 #include <acl/acl.h>
 #include "shmem.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
+#include "torch_npu/csrc/core/npu/NPUFormat.h"
 #include "tiling/platform/platform_ascendc.h"
 
 #include "check.hpp"
@@ -376,6 +378,18 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     TORCH_CHECK(weight2.scalar_type() == weight1.scalar_type(), "weight1 and weight2 must use the same dtype");
     TORCH_CHECK(is_a8w4 || weight1.scalar_type() == c10::ScalarType::Float8_e4m3fn,
                 "weight1/weight2 must be packed E2M1 uint8 (A8W4) or FP8 E4M3 (A8W8)");
+    if (!is_a8w4) {
+        // The FP8 kernel uses row-major strides. Base NCHW (CPU copies of
+        // 4-D scales) and ND preserve them; contiguous NZ storage does not.
+        for (const auto& item :
+             {std::make_pair("weight1", &weight1), std::make_pair("weight2", &weight2),
+              std::make_pair("weight_scales1", &weight_scales1), std::make_pair("weight_scales2", &weight_scales2)}) {
+            const auto format = at_npu::native::get_npu_format(*item.second);
+            TORCH_CHECK(format == ACL_FORMAT_ND || format == ACL_FORMAT_NCHW, item.first,
+                        ": A8W8 weights and scales require base ND/NCHW format 2 or 0, got format=", format,
+                        ", dtype=", item.second->scalar_type(), ", shape=", item.second->sizes());
+        }
+    }
     TORCH_CHECK(weight_scales1.scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
                     weight_scales2.scalar_type() == c10::ScalarType::Float8_e8m0fnu,
                 "weight scales must be FP8 E8M0 tensors");
