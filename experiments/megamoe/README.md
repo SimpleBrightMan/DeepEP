@@ -43,7 +43,7 @@ python experiments/megamoe/scripts/batch_launch.py --ep-size 8 --bs-values 32,96
 | 4 | [mega_moe_arch35.hpp](csrc/kernels/mega_moe/mega_moe_arch35.hpp)：`ProcessWave` | 输入、专家计算、输出的公共阶段怎样连接？ |
 | 5 | [mega_moe_shared_policy.hpp](csrc/kernels/mega_moe/common/mega_moe_shared_policy.hpp)：`SelectInputPreparationMode` | 为什么选这个输入协议？不要把策略当成 ready flag。 |
 | 6 | [mega_moe_wave_a8w4.hpp](csrc/kernels/mega_moe/mega_moe_wave_a8w4.hpp)：`ProcessMoeExpertStages`、`ProcessGmmWaves`、`ProcessAiv1PriorityStages` | AIC/AIV0 与 AIV1 分别怎样推进？ |
-| 7 | [mega_moe_wave_schedule.hpp](csrc/kernels/mega_moe/common/mega_moe_wave_schedule.hpp)：`AdvanceExpertTokenPositionInWave` | 一个专家怎样切成 slice，再装入 Wave？ |
+| 7 | [mega_moe_wave_schedule.hpp](csrc/kernels/mega_moe/common/mega_moe_wave_schedule.hpp)：`ExpertSlice`、`TakeNextExpertSliceInWave`、`GetExpertSliceInWave` | 怎样固定本次 slice、推进下一位置，再由 GMM2 重放同一范围？ |
 | 8 | [mega_moe_gmm1_activation.hpp](csrc/kernels/mega_moe/stage/mega_moe_gmm1_activation.hpp)：`WaitForGmm1InputReady`、`RunGmm1A8W4` | Dispatch、Prologue、MMAD、SwiGLU 的数据依赖是什么？ |
 | 9 | [block_prologue_a8w4.hpp](csrc/kernels/mega_moe/catlass_gmm/block_prologue_a8w4.hpp) 与 [mega_moe_gmm2_combine.hpp](csrc/kernels/mega_moe/stage/mega_moe_gmm2_combine.hpp) | 如何用分块生产/消费和完成计数保护数据？ |
 
@@ -87,6 +87,34 @@ Slice 不跨专家，Wave 可包含多个 slice。`ExpertWaveRange` 将起点、
 BS<4096 时计算顺序为 `G1(W0), G2(W0), G1(W1), G2(W1)...`；BS≥4096 时为
 `G1(W0), G1(W1), G2(W0), G1(W2), G2(W1)...`，末尾补齐最后一个 GMM2。
 GMM1/GMM2 各自保留跨专家分核游标，GMM2 物理分核方向反转。AIV1 的进度不由这些调用顺序代替。
+
+### 专家状态、当前 slice、下一位置
+
+计算调用将完整专家元数据与本次行范围分开：
+
+| 对象 | 含义 | 谁修改 |
+| --- | --- | --- |
+| `ExpertLoopState` | 当前专家编号、专家起始 GM 行、完整专家 M 以及 GMM1 的 N/K 约定 | `PrepareGmmExpertState` 按专家顺序更新；计算函数只读 |
+| `ExpertSlice` | 本次 `expertIdx / rowStartInExpert / rowCount / globalRowStart` | 规划后保持不变，传给 GMM1/GMM2 |
+| `ExpertTokenPosition` | 下一次待规划的专家、专家内行和本卡紧凑 GM 行 | `TakeNextExpertSliceInWave` 内调用原推进算法更新 |
+| `ExpertWaveRange` | 一整个 Wave 的起止位置与最后非空专家 | GMM1 记录，GMM2 通过 `GetExpertSliceInWave` 重放 |
+
+`globalRowStart = state.globalTokenStartIndex + rowStartInExpert`，是本卡紧凑 GM 行号，
+不是源卡 token ID。切片可以让下一位置进入下一个专家，但本次 slice 和专家状态仍属于旧专家。
+`ExpertLoopState.problemShape.M` 始终是专家总行数；执行时复制形状并设置 `M=slice.rowCount`。
+GMM2 由相同 N/K 约定构造实际计算维度：`N=H`、`K=I`。count 表等待状态只说明元数据可读，
+不代替 Dispatch、激活和 GMM2 的数据 ready flag。
+
+例如 EP64、每卡 BS4096、384 专家、TopK6、H7168/I3072、32 AIC、每 Wave 六个 M-group，
+完全均衡时每个本地专家4096行。W2 的两个 slice 如下：
+
+| slice | `expertIdx` | `rowStartInExpert` | `rowCount` | `globalRowStart` | 规划后的下一位置（专家/专家内行/GM行） |
+| --- | --- | --- | --- | --- | --- |
+| E0 尾段 | 0 | 3072 | 1024 | 3072 | 1 / 0 / 4096 |
+| E1 首段 | 1 | 0 | 512 | 4096 | 1 / 512 / 4608 |
+
+GMM1 用 `TakeNextExpertSliceInWave` 产生这两个 slice；滞后一 Wave 的 GMM2 用保存的 W2 边界
+恢复同一范围。分核滚动、通信 owner、ready 通知和 timer 范围沿用原协议。
 
 ### 最重要的数据依赖
 

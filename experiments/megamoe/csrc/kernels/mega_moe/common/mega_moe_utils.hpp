@@ -456,6 +456,7 @@ __aicore__ inline ExpertLoopState CreateExpertLoopState(const MoeStageCommonConf
 }
 
 // 按专家顺序推进连续 token 行偏移，并用当前专家的 token 数更新 M 维度。
+// 仅支持顺序遍历（包括空专家），不是按任意 expertIdx 查询前缀；不要跳过中间专家。
 __aicore__ inline void UpdateExpertLoopState(ExpertLoopState& state, uint32_t expertIdx, uint64_t expertTokenCount)
 {
     if (expertIdx != state.expertIdx) {

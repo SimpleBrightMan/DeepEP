@@ -33,6 +33,8 @@ using ProblemShape = AscendC::Shape<int64_t, int64_t, int64_t, int64_t>;
 
 // GMM1/GMM2 逐专家遍历的公共状态。expertIdx 标识当前专家，globalTokenStartIndex 表示该专家
 // 在本卡 MoE 专家紧凑 token 序列中的起始索引。
+// problemShape 始终保留完整专家 M 和 GMM1 的 N/K 约定；GMM2 在执行配置中转换 N/K。
+// 计算函数只读此状态，当前行范围用 ExpertSlice 表达；GMM1/GMM2 分别持有自己的状态。
 struct ExpertLoopState {
     ProblemShape problemShape;
     int64_t globalTokenStartIndex = 0;

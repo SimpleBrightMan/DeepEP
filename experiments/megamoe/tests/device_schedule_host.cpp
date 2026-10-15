@@ -56,12 +56,17 @@ static uint32_t CheckWaves(const std::vector<uint32_t>& counts, uint32_t target)
     while (current.expertIdx < counts.size()) {
         uint32_t used = 0, oldUsed = 0;
         ExpertWaveRange wave{current, current, static_cast<uint32_t>(counts.size())};
+        std::vector<ExpertSlice> slices;
         while (HasWaveCapacity(current, counts.size(), used, target)) {
             const auto before = current;
             const uint32_t count = counts[current.expertIdx];
-            const uint32_t rows = AdvanceExpertTokenPositionInWave<256>(count, target, used, current);
+            const auto slice = TakeNextExpertSliceInWave<256>(count, target, used, current);
+            const uint32_t rows = slice.rowCount;
             const uint32_t oldRows = LegacyAdvance(count, target, oldUsed, legacy);
             assert(rows == oldRows && used == oldUsed && used <= target);
+            assert(slice.expertIdx == before.expertIdx);
+            assert(slice.rowStartInExpert == before.tokenIndexInExpert);
+            assert(slice.globalRowStart == before.globalTokenIndex);
             assert(current.expertIdx == legacy.expertIdx);
             assert(current.tokenIndexInExpert == legacy.tokenIndexInExpert);
             assert(current.globalTokenIndex == legacy.globalTokenIndex);
@@ -70,6 +75,7 @@ static uint32_t CheckWaves(const std::vector<uint32_t>& counts, uint32_t target)
                 assert(rows <= count - before.tokenIndexInExpert);
                 wave.lastActiveExpert = before.expertIdx;
                 consumed += rows;
+                slices.push_back(slice);
             }
             wave.end = current;
         }
@@ -77,6 +83,24 @@ static uint32_t CheckWaves(const std::vector<uint32_t>& counts, uint32_t target)
             ++nonemptyWaves;
             assert(wave.lastActiveExpert < counts.size());
             assert(wave.end.globalTokenIndex > wave.begin.globalTokenIndex);
+            // GMM2 必须重放 GMM1 的同一批 slice，包括跨专家、空专家、尾块和 >32-bit GM 行号。
+            uint64_t expertStart = uint64_t{1} << 33;
+            for (uint32_t e = 0; e < wave.begin.expertIdx; ++e) expertStart += counts[e];
+            const uint32_t endExpert = wave.end.expertIdx + (wave.end.tokenIndexInExpert != 0U);
+            uint32_t replayed = 0;
+            for (uint32_t e = wave.begin.expertIdx; e < endExpert; ++e) {
+                const auto replay = GetExpertSliceInWave(wave, e, counts[e], expertStart);
+                if (replay.rowCount != 0U) {
+                    assert(replayed < slices.size());
+                    const auto& original = slices[replayed++];
+                    assert(replay.expertIdx == original.expertIdx);
+                    assert(replay.rowStartInExpert == original.rowStartInExpert);
+                    assert(replay.rowCount == original.rowCount);
+                    assert(replay.globalRowStart == original.globalRowStart);
+                }
+                expertStart += counts[e];
+            }
+            assert(replayed == slices.size());
         }
     }
     uint64_t expected = 0;
@@ -86,9 +110,28 @@ static uint32_t CheckWaves(const std::vector<uint32_t>& counts, uint32_t target)
     return nonemptyWaves;
 }
 
+static void CheckEp64PrefillSlices()
+{
+    // EP64/BS4096、384 专家、TopK6 完全均衡：本卡六专家各4096行，W2 跨 E0/E1。
+    ExpertTokenPosition position{0U, 3072U, 3072U};
+    uint32_t used = 0;
+    const auto tail = TakeNextExpertSliceInWave<256>(4096U, 6U, used, position);
+    assert(tail.expertIdx == 0U && tail.rowStartInExpert == 3072U);
+    assert(tail.rowCount == 1024U && tail.globalRowStart == 3072U);
+    assert(position.expertIdx == 1U && position.tokenIndexInExpert == 0U);
+    assert(position.globalTokenIndex == 4096U && used == 4U);
+
+    const auto head = TakeNextExpertSliceInWave<256>(4096U, 6U, used, position);
+    assert(head.expertIdx == 1U && head.rowStartInExpert == 0U);
+    assert(head.rowCount == 512U && head.globalRowStart == 4096U);
+    assert(position.expertIdx == 1U && position.tokenIndexInExpert == 512U);
+    assert(position.globalTokenIndex == 4608U && used == 6U);
+}
+
 int main()
 {
     CheckPolicy();
+    CheckEp64PrefillSlices();
     assert(CheckWaves(std::vector<uint32_t>(6, 96), 3) == 2);
     assert(CheckWaves(std::vector<uint32_t>(6, 4096), 6) == 16);
     assert(CheckWaves({0, 0, 0}, 3) == 0);

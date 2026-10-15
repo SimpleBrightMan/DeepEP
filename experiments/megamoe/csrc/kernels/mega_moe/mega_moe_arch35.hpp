@@ -97,9 +97,8 @@ protected:
     __aicore__ inline void ProcessInputRouteHandshake();
     __aicore__ inline void ProcessOutputStage();
     template <bool SourceGmm1Fused>
-    __aicore__ inline void RunGmm2CombineForExpert(ExpertLoopState& state, GMMAddrInfo& gmmAddrInfo,
-                                                   uint32_t& startBlockIdx, uint32_t tokenStartIndexInExpert,
-                                                   uint32_t sliceTokenCount,
+    __aicore__ inline void RunGmm2CombineForExpert(const ExpertLoopState& state, const ExpertSlice& slice,
+                                                   GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx,
                                                    WaveCombineBufferConfig& combineBufferConfig,
                                                    uint32_t& combineRowSequence, int32_t& pairwiseTileSequence,
                                                    bool isFinalCombine, bool reverseBlocks = false,
@@ -714,19 +713,19 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm2
 template <TemplateMegaMoeTypeClass>
 template <bool SourceGmm1Fused>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert(
-    ExpertLoopState& state, GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx, uint32_t tokenStartIndexInExpert,
-    uint32_t sliceTokenCount, WaveCombineBufferConfig& combineBufferConfig, uint32_t& combineRowSequence,
+    const ExpertLoopState& state, const ExpertSlice& slice, GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx,
+    WaveCombineBufferConfig& combineBufferConfig, uint32_t& combineRowSequence,
     int32_t& pairwiseTileSequence, bool isFinalCombine, bool reverseBlocks, void* gmm2WaveContext)
 {
     constexpr bool tokenCombine = ENABLE_A8W4 && CombineQuantMode == COMBINE_NO_QUANT;
     constexpr bool pairwiseCombine = !tokenCombine && CombineQuantMode == COMBINE_NO_QUANT;
     uint32_t expertTokenCount = static_cast<uint32_t>(Get<M_VALUE>(state.problemShape));
     uint32_t gmm2NTileCount = Ops::Base::CeilDiv(commonConfig_.tokenHiddenDim, static_cast<uint32_t>(L1_TILE_N));
-    uint32_t problemTileCount = GetMGroupCountForRows(sliceTokenCount, GMM1_TILE_M) * gmm2NTileCount;
+    uint32_t problemTileCount = GetMGroupCountForRows(slice.rowCount, GMM1_TILE_M) * gmm2NTileCount;
     if (!HandleWaveProblemWithoutWork(problemTileCount, gmmExecutionConfig_.blockJob, startBlockIdx, reverseBlocks)) {
         UpdateMoeExpertGmm2GlobalBuffer<Weight1Type, ActivationQuantOutType, QuantScaleOutType>(
             gmmExecutionConfig_, syncWorkspaceLayout_, params_.workspaceInfo, moeWeightTensorListAddrs_, gmmAddrInfo,
-            state, tokenStartIndexInExpert);
+            state, slice.rowStartInExpert);
         if constexpr (pairwiseCombine) {
             // 非量化 Combine 按 GMM2 tile 配对消费，需要为每个 AIC 配置独立完成标记。
             gmmAddrInfo.gmmToEpilogueFlag =
@@ -735,12 +734,12 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
         }
         gmmAddrInfo.timer = timer_.Enabled() ? &timer_ : nullptr;
         ProblemShape sliceProblemShape = state.problemShape;
-        Get<M_VALUE>(sliceProblemShape) = sliceTokenCount;
+        Get<M_VALUE>(sliceProblemShape) = slice.rowCount;
         int32_t* gmm2TileSequence = nullptr;
         if constexpr (pairwiseCombine) {
             gmm2TileSequence = &pairwiseTileSequence;
         }
-        timer_.SetSlice(state.expertIdx, tokenStartIndexInExpert, sliceTokenCount);
+        timer_.SetSlice(state.expertIdx, slice.rowStartInExpert, slice.rowCount);
         // TokenCombine逐tile记录ISSUE；独立slice在出口排空，wave上下文由调用者统一收尾。
         if constexpr (g_coreType == AIC && CombineQuantMode != COMBINE_NO_QUANT) {
             timer_.StartSpan(AscendTimer::AIC_GMM2);
@@ -753,7 +752,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
         RunGmm2A8W4<ActivationQuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType, GMM1_TILE_M,
                     TopkWeightsPrefetch, false, false, true, pairwiseCombine, tokenCombine, SourceGmm1Fused>(
             sliceProblemShape, gmmAddrInfo, startBlockIdx, gmmExecutionConfig_.blockJob, expertTokenCount,
-            tokenStartIndexInExpert, &params_, gmm2TileSequence, reverseBlocks, gmm2WaveContext);
+            slice.rowStartInExpert, &params_, gmm2TileSequence, reverseBlocks, gmm2WaveContext);
         if constexpr (g_coreType == AIC && CombineQuantMode != COMBINE_NO_QUANT) {
             timer_.EndSpan(AscendTimer::AIC_GMM2);
         }
@@ -769,7 +768,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
             // 无wave上下文时，RunGmm2A8W4内的局部对象已析构并完成FIX_S。
             // wave 上下文仍有在途 FIX；由调用者在 End 后统一发布，不能提前通知消费者。
             if (gmm2WaveContext == nullptr) {
-                NotifyTokenCombineSliceReady(params_, state.expertIdx, tokenStartIndexInExpert);
+                NotifyTokenCombineSliceReady(params_, state.expertIdx, slice.rowStartInExpert);
             }
         }
     }
@@ -778,7 +777,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
         // 发送行归属与 GEMM2 tile 分核独立：无配对计算 tile 的 AIV1 仍可能有行要发。
         // AIC 通知已在上方完成，这里的通用发送入口对 AIC 直接返回。
         if (!computeReplay_) {
-            RunTokenCombineSlice(commonConfig_, waveCombineJob_, params_, state, tokenStartIndexInExpert, sliceTokenCount,
+            RunTokenCombineSlice(commonConfig_, waveCombineJob_, params_, state, slice.rowStartInExpert, slice.rowCount,
                                  timer_, waveCombineScratch_);
         }
         return;
@@ -790,7 +789,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
     }
 
     // 量化 Combine 保持原 W4 语义：跨 WAVE 的专家必须等最后一个 slice 完成后再消费。
-    if (tokenStartIndexInExpert + sliceTokenCount < expertTokenCount) {
+    if (slice.rowStartInExpert + slice.rowCount < expertTokenCount) {
         return;
     }
 
@@ -834,7 +833,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
     }
 }
 
-// 从 workspace 读取 token 数并准备 GMM 专家状态；GMM1 可按需先等待 token count ready。
+// 按专家顺序读取完整专家元数据，不移动 token 游标，也不把 M 改为当前 slice 的行数。
+// GMM1 首次读取前等待完整 count 表发布；这不代表 token 特征已到达，特征由 M-group flag 保护。
 template <TemplateMegaMoeTypeClass>
 template <bool WaitForTokenCountReady>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::PrepareGmmExpertState(ExpertLoopState& state,
