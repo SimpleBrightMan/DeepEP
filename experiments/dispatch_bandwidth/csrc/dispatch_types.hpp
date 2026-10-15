@@ -13,6 +13,8 @@ constexpr uint32_t kMetaWords = 8U;
 
 enum class Traffic : uint32_t { Local = 0U, Group = 1U, Cross = 2U };
 
+enum class MetadataMode : uint32_t { Scalar = 0U, Dma = 1U, Preload = 2U };
+
 struct CopyTask {
     uint32_t peer;
     uint32_t token;
@@ -43,11 +45,12 @@ struct KernelConfig {
     uint32_t row_bytes;
     uint32_t ring_slots;
     uint32_t repeats;
+    uint32_t metadata_mode;
 };
 
 static_assert(sizeof(CopyTask) == 16U);
 static_assert(sizeof(Worker) == 16U);
 static_assert(sizeof(TimerRecord) == 32U);
-static_assert(sizeof(KernelConfig) == 32U);
+static_assert(sizeof(KernelConfig) == 36U);
 
 }  // namespace deepep::dispatch_bench

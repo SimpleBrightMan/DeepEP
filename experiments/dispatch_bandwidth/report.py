@@ -20,6 +20,7 @@ COMMON_FIELDS = (
     "experts",
     "topk",
     "scope",
+    "metadata_mode",
     "row_bytes",
     "scale_elements",
     "buffer_count",
@@ -125,7 +126,7 @@ def validate_report(raw, *, expected_iterations=None):
     missing = required - set(raw)
     if missing:
         raise ReportError("Missing report field(s): " + ", ".join(sorted(missing)))
-    if type(raw["schema_version"]) is not int or raw["schema_version"] != 1:
+    if type(raw["schema_version"]) is not int or raw["schema_version"] != 2:
         raise ReportError("Unsupported schema_version")
     for name in (
         "world",
@@ -163,6 +164,8 @@ def validate_report(raw, *, expected_iterations=None):
         raise ReportError("intermediate/buffer_count are outside the native planner limits")
     if raw["scope"] not in ("all", "first-expert"):
         raise ReportError("Invalid scope")
+    if raw["metadata_mode"] not in ("scalar", "dma", "preload"):
+        raise ReportError("Invalid metadata_mode: expected scalar, dma or preload")
     scale_elements = (raw["hidden"] + 31) // 32
     row_bytes = (raw["hidden"] + 255) // 256 * 256 + (scale_elements + 31) // 32 * 32
     if raw["scale_elements"] != scale_elements or raw["row_bytes"] != row_bytes:
@@ -332,7 +335,7 @@ def summarize_reports(reports, *, expected_world=None, expected_iterations=None)
             kernel_window_gbps_per_card=distribution([value["kernel_window_gbps"] for value in values]),
         )
     return dict(
-        schema_version=1,
+        schema_version=2,
         mode="concurrent_local_group_cross",
         configuration={name: first[name] for name in COMMON_FIELDS},
         metric="rank_local_class_payload_gbps",
@@ -388,6 +391,7 @@ def export_timers(raw, directory):
             (
                 "rank",
                 "device",
+                "metadata_mode",
                 "iteration",
                 "group_id",
                 "traffic",
@@ -407,6 +411,7 @@ def export_timers(raw, directory):
                     (
                         raw["rank"],
                         raw["device"],
+                        raw["metadata_mode"],
                         measured["iteration"],
                         worker["group_id"],
                         worker["traffic"],
@@ -431,6 +436,7 @@ def export_timers(raw, directory):
                             args=dict(
                                 rank=raw["rank"],
                                 device=raw["device"],
+                                metadata_mode=raw["metadata_mode"],
                                 rows=worker["rows"],
                                 bytes=worker["rows"] * raw["row_bytes"],
                                 time_origin="rank_first_measured_start",
@@ -438,5 +444,8 @@ def export_timers(raw, directory):
                         )
                     )
     output = directory / f"rank_{raw['rank']}_trace.json"
-    output.write_text(json.dumps(dict(traceEvents=trace, displayTimeUnit="us"), indent=2), encoding="utf-8")
+    output.write_text(
+        json.dumps(dict(traceEvents=trace, displayTimeUnit="us", metadata_mode=raw["metadata_mode"]), indent=2),
+        encoding="utf-8",
+    )
     return path, output

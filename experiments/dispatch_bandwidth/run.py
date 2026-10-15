@@ -55,6 +55,7 @@ def parse_args(argv=None):
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--buffer-count", type=int, default=6)
     parser.add_argument("--scope", choices=("all", "first-expert"), default="all")
+    parser.add_argument("--metadata-mode", choices=("scalar", "dma", "preload"), default="dma")
     parser.add_argument("--timer", action="store_true", help="Export per-rank worker CSV and Chrome trace JSON")
     parser.add_argument("--timeout", type=float, default=600, help="Maximum seconds for each fresh BS process group")
     parser.add_argument(
@@ -121,6 +122,7 @@ def native_command(args, *, rank, bs, endpoint, directory):
         "buffer-count": args.buffer_count,
         "repeat": args.repeat,
         "scope": args.scope,
+        "metadata-mode": args.metadata_mode,
         "warmup": args.warmup,
         "iters": args.iters,
     }
@@ -149,6 +151,7 @@ def make_plan(args, directory):
         )
     return dict(
         mode="concurrent_local_group_cross",
+        metadata_mode=args.metadata_mode,
         world=len(args.devices),
         devices=args.devices,
         workers=dict(zip(report.TRAFFIC, args.workers)),
@@ -205,7 +208,10 @@ def run_case(args, bs, directory):
         native_command(args, rank=rank, bs=bs, endpoint=endpoint, directory=directory)
         for rank in range(len(args.devices))
     ]
-    _write_json(directory / "launch.json", dict(batch=bs, endpoint=endpoint, commands=commands))
+    _write_json(
+        directory / "launch.json",
+        dict(batch=bs, metadata_mode=args.metadata_mode, endpoint=endpoint, commands=commands),
+    )
     processes, logs = [], []
     started = time.monotonic()
     try:
@@ -240,6 +246,7 @@ def run_case(args, bs, directory):
         experts=args.experts,
         topk=args.topk,
         scope=args.scope,
+        metadata_mode=args.metadata_mode,
         buffer_count=args.buffer_count,
         repeats=args.repeat,
         worker_counts=dict(zip(report.TRAFFIC, args.workers)),
@@ -258,7 +265,9 @@ def run_case(args, bs, directory):
 def print_summary(summary):
     config = summary["configuration"]
     print(
-        f"[CONCURRENT] BS={config['batch']} scope={config['scope']}; LOCAL/GROUP/CROSS run in one kernel.", flush=True
+        f"[CONCURRENT] BS={config['batch']} scope={config['scope']} metadata_mode={config['metadata_mode']}; "
+        "LOCAL/GROUP/CROSS run in one kernel.",
+        flush=True,
     )
     for traffic in report.TRAFFIC:
         value = summary["classes"][traffic]
@@ -303,8 +312,9 @@ def main(argv=None):
     _write_json(directory / "plan.json", plan)
     _resource_snapshot(directory)
     combined = dict(
-        schema_version=1,
+        schema_version=2,
         mode=plan["mode"],
+        metadata_mode=args.metadata_mode,
         status="running",
         run_dir=str(directory),
         requested_ranks=len(args.devices) * len(args.bs_values),

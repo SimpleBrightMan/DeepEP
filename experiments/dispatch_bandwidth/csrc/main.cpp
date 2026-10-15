@@ -41,6 +41,7 @@ struct Options {
     uint32_t warmup = 10U;
     uint32_t iterations = 20U;
     uint32_t repeats = 1U;
+    MetadataMode metadata_mode = MetadataMode::Dma;
     std::string endpoint;
     std::filesystem::path output;
     bool timer_requested = false;
@@ -52,6 +53,19 @@ struct Round {
     double envelope_us;
     std::vector<TimerRecord> records;
 };
+
+const char* MetadataModeName(MetadataMode mode)
+{
+    switch (mode) {
+        case MetadataMode::Scalar:
+            return "scalar";
+        case MetadataMode::Dma:
+            return "dma";
+        case MetadataMode::Preload:
+            return "preload";
+    }
+    throw std::invalid_argument("Invalid metadata mode");
+}
 
 void Check(int result, const char* operation)
 {
@@ -149,6 +163,13 @@ Options ParseOptions(int argc, char** argv)
             options.warmup = ParseUint(value, name);
         } else if (name == "--iters") {
             options.iterations = ParseUint(value, name);
+        } else if (name == "--metadata-mode") {
+            if (value != "scalar" && value != "dma" && value != "preload") {
+                throw std::invalid_argument("--metadata-mode must be scalar, dma, or preload");
+            }
+            options.metadata_mode = value == "scalar" ? MetadataMode::Scalar
+                                    : value == "dma"  ? MetadataMode::Dma
+                                                      : MetadataMode::Preload;
         } else if (name == "--scope") {
             if (value != "all" && value != "first-expert") {
                 throw std::invalid_argument("--scope must be all or first-expert");
@@ -223,6 +244,28 @@ void InitializeSource(uint8_t* source, const Options& options, const Plan& plan)
         }
         CopyToDevice(source + static_cast<uint64_t>(begin) * plan.row_bytes, input.data(),
                      static_cast<uint64_t>(rows) * plan.row_bytes);
+        begin += rows;
+    }
+}
+
+void InitializeMetadata(uint8_t* metadata_input, const Plan& plan)
+{
+    constexpr uint32_t record_bytes = kMetaWords * sizeof(uint32_t);
+    constexpr uint32_t rows_per_chunk = static_cast<uint32_t>(kChunkBytes / record_bytes);
+    // Keep a bounded host staging buffer; the table is indexed by task order,
+    // independently of each task's final output destination.
+    std::vector<uint32_t> input(static_cast<std::size_t>(rows_per_chunk) * kMetaWords, 0U);
+    for (uint32_t begin = 0U; begin < plan.total_rows;) {
+        const uint32_t rows = std::min(rows_per_chunk, plan.total_rows - begin);
+        for (uint32_t row = 0U; row < rows; ++row) {
+            const CopyTask& task = plan.tasks[static_cast<std::size_t>(begin) + row];
+            const std::size_t offset = static_cast<std::size_t>(row) * kMetaWords;
+            input[offset] = task.peer;
+            input[offset + 1U] = task.token;
+            input[offset + 2U] = task.topk_slot;
+        }
+        CopyToDevice(metadata_input + static_cast<uint64_t>(begin) * record_bytes, input.data(),
+                     static_cast<uint64_t>(rows) * record_bytes);
         begin += rows;
     }
 }
@@ -323,13 +366,14 @@ double ValidateTimers(const Options& options, const Plan& plan, const std::vecto
 std::string Report(const Options& options, const Plan& plan, const std::vector<Round>& rounds)
 {
     std::ostringstream json;
-    json << std::setprecision(17) << "{\n\"schema_version\":1,\"rank\":" << options.rank
+    json << std::setprecision(17) << "{\n\"schema_version\":2,\"rank\":" << options.rank
          << ",\"world\":" << options.config.world << ",\"device\":" << options.device
          << ",\"cores\":" << options.config.cores << ",\"group_size\":" << options.config.group_size
          << ",\"batch\":" << options.config.batch << ",\"hidden\":" << options.config.hidden
          << ",\"intermediate\":" << options.config.intermediate << ",\"experts\":" << options.config.experts
          << ",\"topk\":" << options.config.topk << ",\"scope\":\""
-         << (options.config.first_expert ? "first-expert" : "all") << "\",\"row_bytes\":" << plan.row_bytes
+         << (options.config.first_expert ? "first-expert" : "all") << "\",\"metadata_mode\":\""
+         << MetadataModeName(options.metadata_mode) << "\",\"row_bytes\":" << plan.row_bytes
          << ",\"scale_elements\":" << plan.scale_elements << ",\"buffer_count\":" << options.config.ring_slots
          << ",\"repeats\":" << options.repeats
          << ",\"cycles_per_us\":1000.0,\"timer_requested\":" << (options.timer_requested ? "true" : "false")
@@ -394,11 +438,25 @@ void Run(const Options& options)
     platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub_bytes);
     const uint32_t aic = platform->GetCoreNumAic();
     const uint32_t aiv = platform->GetCoreNumAiv();
-    const uint64_t required_ub = static_cast<uint64_t>(options.config.ring_slots) * (plan.row_bytes + 32U) + 4096U;
+    uint64_t metadata_ub_bytes = static_cast<uint64_t>(options.config.ring_slots) * kMetaWords * sizeof(uint32_t);
+    if (options.metadata_mode == MetadataMode::Preload) {
+        uint32_t max_worker_rows = 1U;
+        for (const Worker& worker : plan.workers) {
+            max_worker_rows = std::max(max_worker_rows, worker.count);
+        }
+        metadata_ub_bytes = static_cast<uint64_t>(max_worker_rows) * kMetaWords * sizeof(uint32_t);
+    }
+    const uint64_t required_ub =
+        static_cast<uint64_t>(options.config.ring_slots) * plan.row_bytes + metadata_ub_bytes + 4096U;
     if (options.config.cores > aic || static_cast<uint64_t>(options.config.cores) * 2U > aiv) {
         throw std::runtime_error("Requested cores exceed the available AIC/AIV resources; cores will not be reduced");
     }
     if (ub_bytes < required_ub || ub_bytes > UINT32_MAX) {
+        if (options.metadata_mode == MetadataMode::Preload) {
+            throw std::runtime_error(
+                "Preloaded worker metadata and Dispatch row ring exceed the platform UB budget; "
+                "use --metadata-mode dma or reduce the workload");
+        }
         throw std::runtime_error("Dispatch row ring and metadata do not fit the platform UB budget");
     }
     const uint64_t source_bytes = static_cast<uint64_t>(options.config.batch) * plan.row_bytes;
@@ -439,6 +497,11 @@ void Run(const Options& options)
     const uint64_t token_bytes = static_cast<uint64_t>(plan.total_rows) * options.config.hidden;
     const uint64_t scale_bytes = static_cast<uint64_t>(plan.total_rows) * plan.scale_elements;
     const uint64_t metadata_bytes = static_cast<uint64_t>(plan.total_rows) * kMetaWords * sizeof(uint32_t);
+    uint8_t* metadata_input = nullptr;
+    if (options.metadata_mode != MetadataMode::Scalar) {
+        metadata_input = Allocate(metadata_bytes, allocations);
+        InitializeMetadata(metadata_input, plan);
+    }
     uint8_t* output_tokens = Allocate(token_bytes, allocations);
     uint8_t* output_scales = Allocate(scale_bytes, allocations);
     uint8_t* output_metadata = Allocate(metadata_bytes, allocations);
@@ -451,14 +514,22 @@ void Run(const Options& options)
     Check(aclrtCreateStream(&stream), "aclrtCreateStream");
     Check(aclrtCreateEvent(&start), "aclrtCreateEvent(start)");
     Check(aclrtCreateEvent(&end), "aclrtCreateEvent(end)");
-    KernelConfig kernel{options.rank,        options.config.world, options.config.cores,      options.config.hidden,
-                        plan.scale_elements, plan.row_bytes,       options.config.ring_slots, options.repeats};
+    KernelConfig kernel{options.rank,
+                        options.config.world,
+                        options.config.cores,
+                        options.config.hidden,
+                        plan.scale_elements,
+                        plan.row_bytes,
+                        options.config.ring_slots,
+                        options.repeats,
+                        static_cast<uint32_t>(options.metadata_mode)};
     std::vector<Round> rounds;
     rounds.reserve(options.iterations);
     const uint32_t total_rounds = options.warmup + options.iterations;
     std::cerr << "[rank " << options.rank << "] source_stride=" << plan.row_bytes << " rows=" << plan.total_rows
               << " workers=" << options.config.worker_counts[0] << ',' << options.config.worker_counts[1] << ','
-              << options.config.worker_counts[2] << " AIC/AIV=" << aic << '/' << aiv << '\n';
+              << options.config.worker_counts[2] << " metadata_mode=" << MetadataModeName(options.metadata_mode)
+              << " AIC/AIV=" << aic << '/' << aiv << '\n';
     for (uint32_t iteration = 0U; iteration < total_rounds; ++iteration) {
         // These resets and the collective are deliberately outside ACL timing.
         // Every measured round must produce its own output, not inherit warmup data.
@@ -477,7 +548,8 @@ void Run(const Options& options)
         aclshmem_barrier_all();
         Check(aclrtRecordEvent(start, stream), "aclrtRecordEvent(start)");
         dispatch_bandwidth_kernel_do(options.config.cores, static_cast<uint32_t>(ub_bytes), stream, peer_table, tasks,
-                                     workers, output_tokens, output_scales, output_metadata, timer, kernel);
+                                     metadata_input, workers, output_tokens, output_scales, output_metadata, timer,
+                                     kernel);
         Check(aclrtRecordEvent(end, stream), "aclrtRecordEvent(end)");
         Check(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream");
         if (iteration >= options.warmup) {
@@ -525,7 +597,8 @@ int main(int argc, char** argv)
             std::cout << "Dispatch MTE benchmark: --rank R --device D --endpoint tcp://IP:PORT --output FILE\n"
                          "[--world 16 --bs 4096 --hidden 3584 --intermediate 1280 --experts 384 --topk 8]\n"
                          "[--group-size 4 --cores 28 --workers 2,5,21 --buffer-count 6 --repeat 1]\n"
-                         "[--scope all|first-expert --warmup 10 --iters 20 --timer]\n";
+                         "[--scope all|first-expert --metadata-mode scalar|dma|preload]\n"
+                         "[--warmup 10 --iters 20 --timer]\n";
             return 0;
         }
         deepep::dispatch_bench::Run(options);

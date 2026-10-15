@@ -154,3 +154,99 @@ python -m pytest -q experiments/dispatch_bandwidth/tests
 The planner test needs a C++17 host compiler. These checks validate routes,
 per-class counts, worker partitioning, report completeness and timing arithmetic;
 they do not require NPUs.
+
+## Metadata pipeline comparison
+
+`--metadata-mode scalar|dma|preload` selects three implementations of the same
+Dispatch workload. The default is `dma`, removing per-row Scalar synchronization;
+select `scalar` explicitly to reproduce the original benchmark.
+Native reports use schema version 2 and include `metadata_mode`; aggregation
+rejects mixed modes. Timer CSV and trace files also identify the mode.
+
+```bash
+for mode in scalar dma preload; do
+    python experiments/dispatch_bandwidth/run.py \
+        --metadata-mode "$mode" --bs-values 2048,4096,8192 --timer
+done
+```
+
+These runs keep rank selection, task order, per-row remote reads, three output
+arrays, worker allocation and the communication bandwidth formula identical.
+Both new modes still write all 32 metadata bytes per output row and run the same
+full final-output validation. Neither prepopulates the output metadata.
+
+| Mode | Metadata preparation inside the kernel | Per-row Scalar synchronization |
+| --- | --- | --- |
+| `scalar` | Three Scalar `SetValue` stores into the reused UB slot | `S_MTE3` and, when reusing a slot, `MTE3_S` |
+| `dma` | One local 32B GM-to-UB DMA per row, alongside the unchanged remote GET | None |
+| `preload` | One contiguous local GM-to-UB DMA for the worker's whole metadata table | None |
+
+The host creates the read-only input metadata table in task order:
+`[source_rank, source_token, topk_slot, 0, 0, 0, 0, 0]`. Like the existing task
+plan, host table construction and H2D initialization are outside kernel timing.
+The DMA that stages this table into UB is **inside both the device timer and ACL
+event timing**. It is local bookkeeping traffic and does not enter the remote
+read-payload bandwidth numerator. `dma` adds 32 local input bytes per row, about
+0.862% of the 3712-byte remote read, and one MTE2 descriptor per row. `preload`
+reads those bytes once per kernel; `--repeat` reuses the same read-only UB table.
+The three output writes still occur on every repeat in every mode.
+
+The `dma` slot protocol is:
+
+```text
+MTE2: wait MTE3_MTE2(slot) when reusing the slot
+      read remote token+scale into rowUB[slot]
+      read local metadata into metaUB[slot]
+      set MTE2_MTE3(slot)
+MTE3: wait MTE2_MTE3(slot)
+      write token, scale, metadata to the three output arrays
+      set MTE3_MTE2(slot)
+```
+
+The MTE3-to-MTE2 event protects both UB regions from being overwritten before
+their previous writes have finished. No Scalar instruction writes those regions
+in the loop, so there is no corresponding per-row Scalar reuse dependency.
+`preload` uses the same data-slot protocol, but its metadata UB table is immutable:
+the initial preload precedes the first remote read on MTE2, and the first
+MTE2-to-MTE3 event makes both available to MTE3. Each pending output keeps its own
+metadata row index, including across repeat boundaries.
+
+The final MTE3-to-Scalar completion wait remains in both DMA modes, after all
+pending output writes have been submitted. It is needed to read the end timestamp
+and safely reuse UB for the timer record. Removing Scalar synchronization from
+the row loop does not remove the requirement to finish all output before ending
+the measurement. Data-slot MTE3-to-MTE2 reuse events also remain necessary.
+
+`preload` needs `max_worker_rows * 32` metadata UB bytes plus the data ring and
+headroom. With the default worker split, metadata requirements are:
+
+| BS | Maximum rows per worker | Maximum metadata UB bytes |
+| --- | ---: | ---: |
+| 2048 | 615 | 19,680 |
+| 4096 | 1229 | 39,328 |
+| 8192 | 2458 | 78,656 |
+
+The host checks the actual platform UB budget. It rejects an oversized `preload`
+configuration explicitly; use `dma` for bounded ring storage instead. There is
+no silent mode fallback. The new modes remove one dependency, but do not promise
+that hardware queues remain full or that bandwidth reaches 134 GB/s: queue
+capacity, Scalar task loads, remote service time and physical-link utilization
+can still limit throughput. Compare both class envelopes and whole-kernel ACL
+time, and inspect per-worker timers for tails.
+
+### Applying the result to MegaMoE
+
+This comparison changes only the standalone benchmark. Dynamic routing in the
+production operator must generate metadata on the device; a host-generated
+table is not a replacement for that work. If the comparison shows a gain, the
+next production candidate is to generate metadata in route-index batches or
+with Vector instructions into independent buffers, then let MTE3 consume it.
+Metadata should still be published before the corresponding GMM tile-ready
+notification, and the full operator time must include its preparation.
+
+The three routing fields do not depend on the GET payload. When production
+`TopkWeightsPrefetch` is enabled, however, metadata word 3 contains weight bits
+extracted from the returned packed row. That path has an additional data
+dependency and cannot simply reuse the benchmark's precomputed zeros. A device
+batch implementation must keep this weight dependency and the consumers' layout
+correct while moving synchronization away from the Scalar row loop.

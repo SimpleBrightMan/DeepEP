@@ -28,7 +28,7 @@ def brute_traffic_rows(rank, world, group_size, batch, experts, topk, scope):
     return rows
 
 
-def native_report(rank=0, *, repeats=2, iterations=2, clock_offset=0, batch=5, topk=2):
+def native_report(rank=0, *, repeats=2, iterations=2, clock_offset=0, batch=5, topk=2, metadata_mode="scalar"):
     traffic_rows = brute_traffic_rows(rank, 4, 2, batch, 32, topk, "all")
     specs = [("local", 0, 100, 1100), ("group", 0, 300, 2300), ("cross", 0, 1000, 3000), ("cross", 1, 6000, 8000)]
     # Tiny fixture: independently distribute rows cyclically rather than calling the reporter's planner.
@@ -52,7 +52,7 @@ def native_report(rank=0, *, repeats=2, iterations=2, clock_offset=0, batch=5, t
         ]
         rounds.append(dict(iteration=iteration, kernel_elapsed_us=12.0, workers=workers))
     return dict(
-        schema_version=1,
+        schema_version=2,
         rank=rank,
         world=4,
         device=rank,
@@ -64,6 +64,7 @@ def native_report(rank=0, *, repeats=2, iterations=2, clock_offset=0, batch=5, t
         experts=32,
         topk=topk,
         scope="all",
+        metadata_mode=metadata_mode,
         row_bytes=3712,
         scale_elements=112,
         buffer_count=6,
@@ -76,8 +77,9 @@ def native_report(rank=0, *, repeats=2, iterations=2, clock_offset=0, batch=5, t
     )
 
 
-def test_class_envelope_uses_all_worker_start_and_end_times():
-    measured = report.rank_measurements(native_report())[0]["classes"]["cross"]
+@pytest.mark.parametrize("metadata_mode", ["scalar", "dma", "preload"])
+def test_class_envelope_uses_all_worker_start_and_end_times(metadata_mode):
+    measured = report.rank_measurements(native_report(metadata_mode=metadata_mode))[0]["classes"]["cross"]
     # Two 2us workers with a 3us gap have a 7us class envelope, not 2us or 4us.
     assert measured["envelope_us"] == 7.0
     assert measured["bytes"] == 5 * 2 * 3712
@@ -85,13 +87,14 @@ def test_class_envelope_uses_all_worker_start_and_end_times():
     assert measured["kernel_window_gbps"] == pytest.approx(5 * 2 * 3712 / 12000)
 
 
-def test_padding_and_repeats_are_in_the_payload_numerator():
-    first = report.rank_measurements(native_report(repeats=2))[0]["classes"]["cross"]
-    second = report.rank_measurements(native_report(repeats=3))[0]["classes"]["cross"]
+@pytest.mark.parametrize("metadata_mode", ["scalar", "dma", "preload"])
+def test_padding_and_repeats_are_in_the_payload_numerator(metadata_mode):
+    first = report.rank_measurements(native_report(repeats=2, metadata_mode=metadata_mode))[0]["classes"]["cross"]
+    second = report.rank_measurements(native_report(repeats=3, metadata_mode=metadata_mode))[0]["classes"]["cross"]
     assert first["rows"] == 10
     assert first["bytes"] != 10 * (3584 + 112)  # Scale storage is padded to 128 bytes.
     assert second["gbps"] == pytest.approx(first["gbps"] * 1.5)
-    malformed = native_report()
+    malformed = native_report(metadata_mode=metadata_mode)
     malformed["row_bytes"] = 3584 + 112
     with pytest.raises(report.ReportError, match="padded"):
         report.validate_report(malformed)
@@ -107,6 +110,30 @@ def test_rank_clock_offsets_never_enter_cross_rank_bandwidth():
     assert cross["envelope_us_per_card"]["mean"] == 7.0
     assert summary["successful_ranks"] == 4
     assert summary["successful_rank_rounds"] == 8
+
+
+@pytest.mark.parametrize("metadata_mode", ["scalar", "dma", "preload"])
+def test_summary_marks_mode_without_adding_local_metadata_reads_to_payload(metadata_mode, capsys):
+    summary = report.summarize_reports([native_report(rank, metadata_mode=metadata_mode) for rank in range(4)])
+    assert summary["schema_version"] == 2
+    assert summary["configuration"]["metadata_mode"] == metadata_mode
+    assert summary["classes"]["cross"]["bytes_per_round_per_card"]["mean"] == 5 * 2 * 3712
+    assert summary["classes"]["cross"]["gbps_per_card"]["mean"] == pytest.approx(37120 / 7000)
+    run.print_summary(summary)
+    assert f"metadata_mode={metadata_mode}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("metadata_mode", ["invalid", "DMA", "", None, 0, True, [], {}])
+def test_invalid_metadata_mode_is_rejected(metadata_mode):
+    with pytest.raises(report.ReportError, match="metadata_mode"):
+        report.validate_report(native_report(metadata_mode=metadata_mode))
+
+
+def test_metadata_mode_is_required():
+    raw = native_report()
+    del raw["metadata_mode"]
+    with pytest.raises(report.ReportError, match="Missing report field.*metadata_mode"):
+        report.validate_report(raw)
 
 
 def test_rounds_keep_rank_min_mean_max_and_percentiles():
@@ -214,7 +241,8 @@ def test_timer_acl_relative_tolerance_boundary_and_wrong_counter_conversion():
 
 
 @pytest.mark.parametrize(
-    "fault", ["missing_rank", "duplicate_rank", "duplicate_device", "different_config", "partial_rounds"]
+    "fault",
+    ["missing_rank", "duplicate_rank", "duplicate_device", "different_config", "mixed_metadata", "partial_rounds"],
 )
 def test_incomplete_or_mismatched_rank_sets_are_rejected(fault):
     raws = [native_report(rank) for rank in range(4)]
@@ -226,6 +254,8 @@ def test_incomplete_or_mismatched_rank_sets_are_rejected(fault):
         raws[3]["device"] = 0
     elif fault == "different_config":
         raws[3]["batch"] = 19
+    elif fault == "mixed_metadata":
+        raws[3]["metadata_mode"] = "dma"
     else:
         raws[3]["rounds"].pop()
     with pytest.raises(report.ReportError):
@@ -237,6 +267,7 @@ def test_incomplete_or_mismatched_rank_sets_are_rejected(fault):
     [
         "missing_field",
         "invalid_schema",
+        "old_schema",
         "failed_validation",
         "unchecked_rows",
         "missing_core",
@@ -256,6 +287,8 @@ def test_malformed_native_records_fail_closed(fault):
         del raw["row_bytes"]
     elif fault == "invalid_schema":
         raw["schema_version"] = True
+    elif fault == "old_schema":
+        raw["schema_version"] = 1
     elif fault == "failed_validation":
         raw["validation"]["passed"] = False
     elif fault == "unchecked_rows":
@@ -294,10 +327,14 @@ def test_load_reports_rejects_missing_bad_json_and_rank_identity(tmp_path):
         report.load_reports(tmp_path, 4)
 
 
-def test_exports_share_one_rank_origin_across_lanes_and_rounds(tmp_path):
-    raw = native_report(clock_offset=2**61)
+@pytest.mark.parametrize("metadata_mode", ["scalar", "dma", "preload"])
+def test_exports_share_one_rank_origin_across_lanes_and_rounds(tmp_path, metadata_mode):
+    raw = native_report(clock_offset=2**61, metadata_mode=metadata_mode)
     csv_path, trace_path = report.export_timers(raw, tmp_path)
-    trace = json.loads(trace_path.read_text(encoding="utf-8"))["traceEvents"]
+    exported = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert exported["metadata_mode"] == metadata_mode
+    trace = exported["traceEvents"]
+    assert all(event["args"]["metadata_mode"] == metadata_mode for event in trace)
     assert min(event["ts"] for event in trace) == 0
     cross = next(event for event in trace if event["name"] == "round_0_CROSS" and event["tid"] == "AIV1_group_3")
     assert cross["ts"] == 5.9
@@ -307,10 +344,12 @@ def test_exports_share_one_rank_origin_across_lanes_and_rounds(tmp_path):
     with csv_path.open(encoding="utf-8", newline="") as stream:
         records = list(csv.DictReader(stream))
     assert len(records) == 8
+    assert {record["metadata_mode"] for record in records} == {metadata_mode}
     assert int(records[0]["start_cycle"]) == 2**61 + 100
 
 
-def test_plan_uses_no_devices_subprocess_ports_or_output_directory(monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize("metadata_mode", ["scalar", "dma", "preload"])
+def test_plan_uses_no_devices_subprocess_ports_or_output_directory(monkeypatch, tmp_path, capsys, metadata_mode):
     def forbidden(*args, **kwargs):
         pytest.fail("--plan touched an execution-only operation")
 
@@ -337,6 +376,8 @@ def test_plan_uses_no_devices_subprocess_ports_or_output_directory(monkeypatch, 
                 "--bs-values",
                 "2048,4096,8192",
                 "--timer",
+                "--metadata-mode",
+                metadata_mode,
             ]
         )
         == 0
@@ -344,12 +385,60 @@ def test_plan_uses_no_devices_subprocess_ports_or_output_directory(monkeypatch, 
     plan = json.loads(capsys.readouterr().out)
     assert not output.exists()
     assert plan["mode"] == "concurrent_local_group_cross"
+    assert plan["metadata_mode"] == metadata_mode
     assert len(plan["cases"]) == 3
     command = plan["cases"][0]["commands"][3]
     assert command[command.index("--rank") + 1] == "3"
     assert command[command.index("--device") + 1] == "3"
     assert command[command.index("--scope") + 1] == "all"
+    assert command[command.index("--metadata-mode") + 1] == metadata_mode
     assert "--timer" in command
+
+
+def test_metadata_mode_defaults_to_dma_in_plan_and_native_commands(tmp_path):
+    args = run.parse_args(["--plan"])
+    assert args.metadata_mode == "dma"
+    plan = run.make_plan(args, tmp_path / "not-created")
+    assert plan["metadata_mode"] == "dma"
+    for case in plan["cases"]:
+        for command in case["commands"]:
+            assert command[command.index("--metadata-mode") + 1] == "dma"
+    assert not (tmp_path / "not-created").exists()
+
+
+def test_launcher_rejects_report_metadata_mode_different_from_request(monkeypatch, tmp_path):
+    args = run.parse_args(
+        [
+            "--devices",
+            "0,1,2,3",
+            "--group-size",
+            "2",
+            "--cores",
+            "4",
+            "--workers",
+            "1,1,2",
+            "--experts",
+            "32",
+            "--topk",
+            "2",
+            "--iters",
+            "2",
+            "--repeat",
+            "2",
+            "--metadata-mode",
+            "dma",
+        ]
+    )
+
+    class Finished:
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(run, "_endpoint", lambda: "tcp://127.0.0.1:12345")
+    monkeypatch.setattr(run.subprocess, "Popen", lambda *args, **kwargs: Finished())
+    monkeypatch.setattr(run.report, "load_reports", lambda *args: [native_report(rank) for rank in range(4)])
+    with pytest.raises(report.ReportError, match="does not match the requested native launch"):
+        run.run_case(args, 5, tmp_path / "case")
 
 
 @pytest.mark.parametrize(
@@ -362,6 +451,7 @@ def test_plan_uses_no_devices_subprocess_ports_or_output_directory(monkeypatch, 
         ["--timeout", "nan"],
         ["--buffer-count", "7"],
         ["--group-size", "3"],
+        ["--metadata-mode", "invalid"],
     ],
 )
 def test_invalid_launch_configuration_is_rejected(arguments):
