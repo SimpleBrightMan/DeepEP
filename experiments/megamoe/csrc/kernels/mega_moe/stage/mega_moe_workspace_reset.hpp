@@ -35,11 +35,7 @@ __aicore__ inline void ResetSyncStatus(const AivJobContext& job, const Params& p
     ResetWorkspaceRegion<1>(job, params.workspaceInfo.flagActivationToGmm2Ptr,
                             static_cast<int32_t>(params.workspaceInfo.flagResetElementCount), resetBatchElementCount,
                             resetTensor);
-    if constexpr (TopkWeightsPrefetch) {
-        ResetWorkspaceRegion<1>(job, params.workspaceInfo.gmm1TileStatusPtr,
-                                static_cast<int32_t>(params.workspaceInfo.gmm1TileStatusElementCount),
-                                resetBatchElementCount, resetTensor);
-    }
+
 }
 #endif
 

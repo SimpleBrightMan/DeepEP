@@ -53,16 +53,14 @@ struct BlockMmadSelector<true, C> {
 };
 
 // 汇总 GMM1/GMM2 在不同量化路径下共用的类型、shape 和 layout 配置。
-template <bool IsA8W4, uint8_t CombineQuantMode, typename ElementA, typename ElementB, typename ElementC,
-          typename ElementMxScaleA, typename ElementMxScaleB, bool IsWeightNZ = false, bool TopkWeightsPrefetch = false,
-          bool IsShared = false, bool IsLayered = false, bool IsGmm1Interleaved = false, bool IsWaveFlagGrained = false,
-          bool FuseGateUp = false>
+template <bool IsA8W4, typename ElementA, typename ElementB, typename ElementC, typename ElementMxScaleA,
+          typename ElementMxScaleB, bool IsWeightNZ = false, bool IsShared = false, bool IsGmm1Interleaved = false,
+          bool IsWaveFlagGrained = false, bool FuseGateUp = false>
 struct Config {
-    static_assert(!FuseGateUp || (IsA8W4 && !IsShared && !IsLayered && !IsGmm1Interleaved),
+    static_assert(!FuseGateUp || (IsA8W4 && !IsShared && !IsGmm1Interleaved),
                   "Fused gate/up is restricted to routed local W4A8");
     static constexpr bool IS_SHARED = IsShared;
     static constexpr bool IS_WEIGHT_NZ = IsWeightNZ;
-    static constexpr bool TOPK_WEIGHTS_PREFETCH = TopkWeightsPrefetch;
     using ElementAType = ElementA;
     using ElementBType = ElementB;
     using ElementCType = ElementC;
@@ -151,8 +149,8 @@ struct Config {
         config.blockNum = blockJob.totalJobs;
         config.blockIdx = blockJob.jobIndex;
         config.scaleK = CeilDiv(config.k, MXFP_DIVISOR_SIZE) * MXFP_MULTI_BASE_SIZE;
-        config.activationTileM = TopkWeightsPrefetch ? L1_TILE_M_128 : gmm1TileM;
-        config.sharedPolicy = SelectSharedExpertPolicy(IsA8W4 && !IsLayered, IsShared ? 1U : 0U, config.m);
+        config.activationTileM = gmm1TileM;
+        config.sharedPolicy = SelectSharedExpertPolicy(IsA8W4, IsShared ? 1U : 0U, config.m);
         config.blockMmadTiling = SelectBlockMmadTilingConfig(config.m, config.k, config.tileM);
     }
 

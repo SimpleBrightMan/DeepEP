@@ -68,33 +68,18 @@ def test_production_gmm_wave_order_matches_frozen_scheduler(tmp_path):
     kernel = ROOT / "experiments/megamoe/csrc/kernels/mega_moe"
     source = (kernel / "mega_moe_wave_a8w4.hpp").read_text(encoding="utf-8")
     signatures = {
-        "PrepareQuantizedCombinePipeline":
-            "void PrepareQuantizedCombinePipeline(ExpertTokenPosition& dispatchCursor, WaveCombineBufferConfig& buffers)",
         "RunNextGmm1Slice":
             "void RunNextGmm1Slice(ExpertWaveRange& wave, uint32_t& usedMGroups, ExpertContext& gmm1ExpertContext, "
             "GMMAddrInfo& gmm1AddrInfo, uint32_t& startBlockIdx, int32_t& readySequence, uint64_t waveId)",
-        "RunQuantizedCombineGmm1Wave":
-            "void RunQuantizedCombineGmm1Wave(ExpertWaveRange& wave, ExpertTokenPosition& dispatchCursor, "
-            "ExpertContext& gmm1ExpertContext, GMMAddrInfo& gmm1AddrInfo, uint32_t& startBlockIdx, "
-            "int32_t& readySequence, uint64_t waveId)",
         "RunGmm1Wave":
             "ExpertWaveRange RunGmm1Wave(ExpertTokenPosition& gmm1Cursor, ExpertContext& gmm1ExpertContext, "
-            "GMMAddrInfo& gmm1AddrInfo, uint32_t& startBlockIdx, int32_t& readySequence, uint64_t waveId, "
-            "ExpertTokenPosition& dispatchCursor)",
+            "GMMAddrInfo& gmm1AddrInfo, uint32_t& startBlockIdx, int32_t& readySequence, uint64_t waveId)",
         "RunGmm2CombineForWaveRange":
             "void RunGmm2CombineForWaveRange(const ExpertWaveRange& wave, ExpertContext& gmm2ExpertContext, "
-            "GMMAddrInfo& gmm2AddrInfo, uint32_t& startBlockIdx, WaveCombineBufferConfig& combineBufferConfig, "
-            "uint32_t& combineRowSequence, int32_t& gmm1TileReadySequence)",
+            "GMMAddrInfo& gmm2AddrInfo, uint32_t& startBlockIdx)",
         "ProcessGmmWaves": "void ProcessGmmWaves(int32_t& gmm1TileReadySequence)",
     }
     methods = [signature + cpp_body(source, f"::{name}(") for name, signature in signatures.items()]
-    arch = (kernel / "mega_moe_arch35.hpp").read_text(encoding="utf-8")
-    methods.append(
-        "void RunQuantizedCombineForExpert(const ExpertContext& expertContext, const ExpertSlice& slice, "
-        "GMMAddrInfo& gmmAddrInfo, WaveCombineBufferConfig& combineBufferConfig, "
-        "uint32_t& combineRowSequence, bool isFinalCombine)"
-        + cpp_body(arch, "::RunQuantizedCombineForExpert(")
-    )
     (tmp_path / "gmm_wave_methods.inc").write_text("\n".join(methods), encoding="utf-8")
 
     types = (kernel / "common/mega_moe_types.hpp").read_text(encoding="utf-8")

@@ -210,10 +210,7 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
         LocalTensor<uint16_t>(TPosition::VECCALC, ubOffsets.reciprocalScaleOffsetBytes, ubOffsets.scaleElementCapacity);
 
     // weight UB: 放在 VECIN 区之后的安全区域，仅 mode=1 分配
-    if constexpr (TopkWeightsPrefetch) {
-        weightUb_ = LocalTensor<float>(TPosition::VECCALC, ubOffsets.topkWeightOffsetBytes,
-                                       ubOffsets.topkWeightElementCapacity);
-    }
+
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
@@ -299,9 +296,7 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
     gatedActivationContext.gate = firstSrc;
     gatedActivationContext.up = secondSrc;
     gatedActivationContext.output = gluResAddr;
-    if constexpr (TopkWeightsPrefetch) {
-        gatedActivationContext.topkWeights = (__ubuf__ float*)weightUb_.GetPhyAddr();
-    } else {
+    {
         gatedActivationContext.topkWeights = nullptr;
     }
     gatedActivationContext.gateTail = gateTail;

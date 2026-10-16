@@ -144,7 +144,7 @@ public:
     {
         uint32_t kSize = tla::get<0>(params.layoutPrologueB.originShape());
         const auto kPlan =
-            MegaMoeImpl::GmmKernel::MakeA8W4KPlan(actualBlockShape.m(), actualBlockShape.n(), allowDynamicB);
+            MegaMoeImpl::GmmKernel::MakeA8W4KPlan(actualBlockShape.m());
         const uint32_t kL1Size = kPlan.kb;
         const uint32_t kGmLoop = CeilDiv(kSize, kL1Size);
 

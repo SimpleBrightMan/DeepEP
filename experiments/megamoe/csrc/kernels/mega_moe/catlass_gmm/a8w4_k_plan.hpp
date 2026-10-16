@@ -23,10 +23,8 @@ struct A8W4KPlan {
     uint32_t kb;
     uint32_t bColumns;
 };
-__aicore__ constexpr inline A8W4KPlan MakeA8W4KPlan(uint32_t m, uint32_t n, bool allowDynamicB)
+__aicore__ constexpr inline A8W4KPlan MakeA8W4KPlan(uint32_t m)
 {
-    (void)allowDynamicB;
-    (void)n;
     // 每个B槽最多64KiB，不能把K512*N256误当成一槽。
     // AIC/AIV0都使用此计划，确保K外层、N半块内层的生产消费顺序一致。
     if (m <= 128U) {

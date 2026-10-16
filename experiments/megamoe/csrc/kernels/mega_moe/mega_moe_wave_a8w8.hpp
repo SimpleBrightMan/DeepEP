@@ -32,8 +32,8 @@
 #include "stage/mega_moe_workspace_reset.hpp"
 #include "stage/mega_moe_shared_expert_input.hpp"
 #include "stage/mega_moe_token_dispatch.hpp"
-#include "stage/mega_moe_gmm1_activation.hpp"
-#include "stage/mega_moe_gmm2_combine.hpp"
+#include "stage/mega_moe_gmm1_a8w8.hpp"
+#include "stage/mega_moe_gmm2_a8w8.hpp"
 #include "stage/mega_moe_unpermute.hpp"
 #include "mc2_common/quantize_functions.hpp"
 
@@ -42,11 +42,9 @@ namespace MegaMoeImpl {
 using namespace AscendC;
 
 // 预留：XType OutputType TopkWeightsType Weight1Type
-#define TemplateMegaMoeA8W8WaveTypeClass                                                                    \
-    typename XType, typename OutputType, typename TopkWeightsType, typename Weight1Type, int32_t QuantMode, \
-        int32_t CombineQuantMode, bool TopkWeightsPrefetch, bool IsGmm1Interleaved
-#define TemplateMegaMoeA8W8WaveTypeFunc \
-    XType, OutputType, TopkWeightsType, Weight1Type, QuantMode, CombineQuantMode, TopkWeightsPrefetch, IsGmm1Interleaved
+#define TemplateMegaMoeA8W8WaveTypeClass \
+    typename XType, typename OutputType, typename TopkWeightsType, typename Weight1Type, int32_t QuantMode
+#define TemplateMegaMoeA8W8WaveTypeFunc XType, OutputType, TopkWeightsType, Weight1Type, QuantMode
 
 template <TemplateMegaMoeA8W8WaveTypeClass>
 class MegaMoeA8W8Wave {
@@ -85,7 +83,7 @@ private:
     __aicore__ inline void InitTokenUnpermuteConfig();
     __aicore__ inline void DispatchBuffInit();
     __aicore__ inline void SendAndQuantBuffInit();
-    __aicore__ inline CombineBufferConfig InitCombineBuffers();
+
     __aicore__ inline void ProcessSharedExpertGmm1();
     __aicore__ inline void ProcessMoeExpertStages();
     __aicore__ inline void ProcessSharedExpertGmm2();
@@ -98,16 +96,12 @@ private:
                                                           GmmRuntimeState& runtimeState);
     __aicore__ inline void AdvanceStartBlockIdxForSkippedGmm1(const ExpertTokenPosition& waveBeginPosition,
                                                               const ExpertTokenPosition& waveEndPosition);
-    __aicore__ inline void ProcessGmm2Wave(ExpertTokenPosition& gmm2Cursor,
-                                           const ExpertTokenPosition& waveEndPosition, ExpertContext& gmm2ExpertContext,
-                                           GMMAddrInfo& gmm2AddrInfo, GmmRuntimeState& runtimeState,
-                                           int32_t& gmm2TileSequence, uint32_t allCoreCombineExpertIndex,
+    __aicore__ inline void ProcessGmm2Wave(ExpertTokenPosition& gmm2Cursor, const ExpertTokenPosition& waveEndPosition,
+                                           ExpertContext& gmm2ExpertContext, GMMAddrInfo& gmm2AddrInfo,
+                                           GmmRuntimeState& runtimeState, int32_t& gmm2TileSequence,
+                                           uint32_t allCoreCombineExpertIndex,
                                            ExpertContext& allCoreCombineExpertContext);
-    __aicore__ inline void ProcessCombineExperts(uint32_t expertBegin, uint32_t expertEnd,
-                                                 ExpertContext& combineState, GMMAddrInfo& combineAddrInfo,
-                                                 const CombineBufferConfig& bufferConfig,
-                                                 uint32_t allCoreCombineExpertIndex,
-                                                 const ExpertContext& allCoreCombineExpertContext);
+
     __aicore__ inline UnpermuteBufferConfig InitTokenUnpermuteBuffers();
 
     __gm__ Mc2MoeContext* mc2Context_{nullptr};
@@ -146,7 +140,7 @@ private:
     uint32_t sharedExpertNum_ = 0;
     uint32_t moeExpertPerRank_ = 0;
 
-    static constexpr bool GMM1_INTERLEAVED = IsGmm1Interleaved;
+    static constexpr bool GMM1_INTERLEAVED = false;
 
     /*
      * AIV1 上 Dispatch 与 Combine 分阶段复用 UB，进入 Combine 前 Dispatch 的动态 ring 已经排空：
@@ -169,10 +163,10 @@ private:
     TokenUnpermuteScratch tokenUnpermuteScratch_;
 
     static constexpr uint32_t GMM1_TILE_M = L1_TILE_M_256;
-    static constexpr uint32_t EPILOGUE_TILE_M = TopkWeightsPrefetch ? L1_TILE_M_128 : L1_TILE_M_256;
+    static constexpr uint32_t EPILOGUE_TILE_M = L1_TILE_M_256;
 
-    using BlockEpilogue = BlockEpilogueActivationMxQuant<ActivationType, bfloat16_t, EPILOGUE_TILE_M, L1_TILE_N,
-                                                         TopkWeightsPrefetch, GMM1_INTERLEAVED>;
+    using BlockEpilogue =
+        BlockEpilogueActivationMxQuant<ActivationType, bfloat16_t, EPILOGUE_TILE_M, L1_TILE_N, false, GMM1_INTERLEAVED>;
     using SharedBlockEpilogue =
         BlockEpilogueActivationMxQuant<ActivationType, bfloat16_t, L1_TILE_M_256, L1_TILE_N, false, GMM1_INTERLEAVED>;
     BlockEpilogue epilogueOp_;
@@ -185,7 +179,7 @@ template <TemplateMegaMoeA8W8WaveTypeClass>
 __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::InitInputPrepareConfigs()
 {
     aivJob_ = {.jobIndex = aivCoreIdx_, .totalJobs = blockAivNum_};
-    quantProcessConfig_ = CreateQuantProcessConfig<ActivationType, QuantScaleOutType, TopkWeightsPrefetch,
+    quantProcessConfig_ = CreateQuantProcessConfig<ActivationType, QuantScaleOutType, false,
                                                    PackedElementTraits<ActivationType>::ELEMENTS_PER_BYTE>(k_, params_);
     sendMaskConfig_ = CreateSendMaskConfig(params_, aivCoreIdx_);
 }
@@ -199,8 +193,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::InitGmm
                            .isPerExpertWeightTensor = params_.tilingData->isPerExpertWeightTensor};
     countWorkspace_ = {.blockIdx = blockIdx_, .blockNum = params_.tilingData->aicNum};
     syncWorkspaceLayout_ = {.dispatchFlagSlotCountPerExpert = dispatchFlagSlotsPerExpert,
-                            .activationFlagSlotCountPerExpert = dispatchFlagSlotsPerExpert,
-                            .gmm1TileStatusCountPerExpert = params_.tilingData->maxTilesPerExpert};
+                            .activationFlagSlotCountPerExpert = dispatchFlagSlotsPerExpert};
     waveCombineJob_ = {.jobIndex = blockIdx_, .totalJobs = blockNum_};
 }
 
@@ -208,9 +201,7 @@ template <TemplateMegaMoeA8W8WaveTypeClass>
 __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::InitTokenUnpermuteConfig()
 {
     uint32_t quantTokenSizeBytes = 0U;
-    if constexpr (CombineQuantMode != COMBINE_NO_QUANT && g_coreType == AIV) {
-        quantTokenSizeBytes = CreateQuantTokenBufferConfig(k_).quantTokenSizeBytes;
-    }
+
     tokenUnpermuteConfig_ = {.job = {.jobIndex = aivCoreIdx_, .totalJobs = blockAivNum_},
                              .quantTokenSizeBytes = quantTokenSizeBytes,
                              .fullTokenChunkJobCount = params_.tilingData->unpermuteFullTokenChunkCoreCount,
@@ -218,9 +209,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::InitTok
                              .tailTokenChunkConfig = params_.tilingData->unpermuteConfigForTailTokenChunk};
 }
 
-// ========================
 // Init：初始化成员并计算地址偏移
-// ========================
 template <TemplateMegaMoeA8W8WaveTypeClass>
 __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Init(
     GM_ADDR context, GM_ADDR x, GM_ADDR topkIds, GM_ADDR topkWeights, GM_ADDR weight1, GM_ADDR weight2,
@@ -293,9 +282,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Init(
 #endif
 }
 
-// =================================================================================================
 // DispatchBuffInit：申请公共 SendCount 和 Token Dispatch 函数使用的 buffer。
-// =================================================================================================
 template <TemplateMegaMoeA8W8WaveTypeClass>
 __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::DispatchBuffInit()
 {
@@ -352,17 +339,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Dispatc
         LocalTensor<int32_t>(TPosition::VECCALC, metaInfoTensorAddr, metaInfoReserveSize / sizeof(int32_t));
 }
 
-template <TemplateMegaMoeA8W8WaveTypeClass>
-__aicore__ inline typename MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::CombineBufferConfig
-MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::InitCombineBuffers()
-{
-    return InitWaveCombineBuffers<CombineQuantMode, false, WAVE_COMBINE_STEADY_ROW_BUFFER_COUNT>(commonConfig_,
-                                                                                                 waveCombineScratch_);
-}
-
-// ======================================================================================
 // SendAndQuantBuffInit：申请公共 mask、workspace reset 和 token quant 函数使用的 buffer。
-// ======================================================================================
 template <TemplateMegaMoeA8W8WaveTypeClass>
 __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::SendAndQuantBuffInit()
 {
@@ -455,9 +432,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::SendAnd
     resetBatchElementCount_ = resetBatchElementCount;
 }
 
-// ===============================================================
 // 可选共享专家流程：依次执行共享专家 GMM1 与 SwiGLU，并在结束后重置 GMM 调度状态。
-// ===============================================================
 template <TemplateMegaMoeA8W8WaveTypeClass>
 __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::ProcessSharedExpertGmm1()
 {
@@ -510,21 +485,18 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         UpdateSharedExpertGmm2GlobalBuffer<ActivationType, Weight1Type, QuantScaleOutType, GMM1_TILE_M>(
             commonConfig_, gmmExecutionConfig_, params_.workspaceInfo, sharedWeightTensorListAddrs_, gmmAddrInfo,
             sharedExpertIdx);
-        RunGmm2ByMode<COMBINE_NO_QUANT, QuantOutType, ActivationType, Weight1Type, QuantScaleOutType, false, false,
-                      GMM1_TILE_M, TopkWeightsPrefetch, true, GMM1_INTERLEAVED, true>(
+        RunGmm2A8W8<QuantOutType, QuantScaleOutType, GMM1_TILE_M, true, GMM1_INTERLEAVED, true>(
             gmmExecutionConfig_, gmmAddrInfo, problemShape, runtimeState, nullptr, true);
     }
 }
 
-// ===============================================================
 // Wave 模板主流程。
-// ===============================================================
 // 在 wave 模板内构造 Unpermute 使用的 UB 视图，并返回当前 AIV 对应的 buffer 配置。
 template <TemplateMegaMoeA8W8WaveTypeClass>
 __aicore__ inline typename MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::UnpermuteBufferConfig
 MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::InitTokenUnpermuteBuffers()
 {
-    return CreateTokenUnpermuteBuffers<TopkWeightsType, CombineQuantMode>(
+    return CreateTokenUnpermuteBuffers<TopkWeightsType, COMBINE_NO_QUANT>(
         tokenUnpermuteConfig_, commonConfig_.tokenHiddenDim, tokenUnpermuteScratch_);
 }
 
@@ -551,7 +523,7 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTyp
         plannedDispatchPosition = nextDispatchRange.end;
         dispatchRange.end = nextDispatchRange.end;
     }
-    DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch>(
+    DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, false>(
         tokenDispatchConfig_, commonConfig_, gmmExecutionConfig_.blockJob, syncWorkspaceLayout_, params_,
         g_winRankAddr_, tokenDispatchScratch_, dispatchRange);
     // 整 WAVE 的数据和 ready flag 发布完成后，再提交 Dispatch 进度。
@@ -601,9 +573,8 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTyp
     uint32_t processedMGroupCount = 0U;
     while (gmm1Cursor.expertIdx < moeExpertPerRank_ && processedMGroupCount < mGroupsPerWave_) {
         if (gmm1Cursor.tokenIndexInExpert == 0U) {
-            uint32_t expertTokenCount =
-                GetExpertTokenCountFromWorkspace(params_.workspaceInfo.expertRevTokenNumsPtr, countWorkspace_,
-                                                 moeExpertPerRank_, gmm1Cursor.expertIdx);
+            uint32_t expertTokenCount = GetExpertTokenCountFromWorkspace(
+                params_.workspaceInfo.expertRevTokenNumsPtr, countWorkspace_, moeExpertPerRank_, gmm1Cursor.expertIdx);
             UpdateExpertContext(gmm1ExpertContext, gmm1Cursor.expertIdx, expertTokenCount);
         }
 
@@ -615,8 +586,8 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTyp
         }
 
         uint32_t remainingMGroupCount = mGroupsPerWave_ - processedMGroupCount;
-        uint32_t waveEndTokenIndexInExpert = GetWaveEndRowOffsetInExpert(
-            expertRowCount, gmm1Cursor.tokenIndexInExpert, remainingMGroupCount, GMM1_TILE_M);
+        uint32_t waveEndTokenIndexInExpert = GetWaveEndRowOffsetInExpert(expertRowCount, gmm1Cursor.tokenIndexInExpert,
+                                                                         remainingMGroupCount, GMM1_TILE_M);
         uint32_t waveRowCount = waveEndTokenIndexInExpert - gmm1Cursor.tokenIndexInExpert;
         uint32_t problemMGroupCount = GetMGroupCountForRows(waveRowCount, GMM1_TILE_M);
         bool skipGmm1Problem = false;
@@ -638,8 +609,7 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTyp
         ProblemShape gmm1WaveProblemShape = gmm1ExpertContext.problemShape;
         Get<M_VALUE>(gmm1WaveProblemShape) = waveEndTokenIndexInExpert - gmm1Cursor.tokenIndexInExpert;
         UpdateMoeExpertGmm1GlobalBuffer<ActivationType, Weight1Type, ActivationType, QuantScaleOutType,
-                                        PackedElementTraits<QuantOutType>::ELEMENTS_PER_BYTE, false,
-                                        TopkWeightsPrefetch>(
+                                        PackedElementTraits<QuantOutType>::ELEMENTS_PER_BYTE, false>(
             gmmExecutionConfig_, syncWorkspaceLayout_, params_.workspaceInfo, moeWeightTensorListAddrs_, epilogueOp_,
             gmm1AddrInfo, gmm1ExpertContext, gmm1Cursor.tokenIndexInExpert, gmm1TilesPerMGroup_);
         /*
@@ -650,10 +620,9 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTyp
             gmm1Cursor.tokenIndexInExpert == 0U && static_cast<uint64_t>(waveEndTokenIndexInExpert) == expertRowCount;
         uint32_t waveTokenStartIndex =
             static_cast<uint32_t>(gmm1ExpertContext.globalTokenStartIndex) + gmm1Cursor.tokenIndexInExpert;
-        RunGmm1GenericByWeightFormat<QuantOutType, ActivationType, QuantScaleOutType, GMM1_TILE_M, EPILOGUE_TILE_M,
-                                     TopkWeightsPrefetch, GMM1_INTERLEAVED, true>(
-            gmmExecutionConfig_, params_, epilogueOp_, gmm1AddrInfo, gmm1WaveProblemShape, waveTokenStartIndex,
-            runtimeState, gmm1Cursor.expertIdx, nullptr, isWholeExpert);
+        RunGmm1A8W8<QuantOutType, ActivationType, QuantScaleOutType, GMM1_TILE_M, EPILOGUE_TILE_M, GMM1_INTERLEAVED,
+                    true>(gmmExecutionConfig_, params_, epilogueOp_, gmm1AddrInfo, gmm1WaveProblemShape,
+                          waveTokenStartIndex, runtimeState, gmm1Cursor.expertIdx, nullptr, isWholeExpert);
 
         processedMGroupCount += problemMGroupCount;
         gmm1Cursor.tokenIndexInExpert = waveEndTokenIndexInExpert;
@@ -672,17 +641,10 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
     GMMAddrInfo& gmm2AddrInfo, GmmRuntimeState& runtimeState, int32_t& gmm2TileSequence,
     uint32_t allCoreCombineExpertIndex, ExpertContext& allCoreCombineExpertContext)
 {
-    if constexpr (CombineQuantMode != COMBINE_NO_QUANT && g_coreType == AIV) {
-        if (GetSubBlockIdx() == 1U) {
-            return;
-        }
-    }
-
     while (!IsSameExpertTokenPosition(gmm2Cursor, waveEndPosition) && gmm2Cursor.expertIdx < moeExpertPerRank_) {
         if (gmm2Cursor.tokenIndexInExpert == 0U) {
-            uint32_t expertTokenCount =
-                GetExpertTokenCountFromWorkspace(params_.workspaceInfo.expertRevTokenNumsPtr, countWorkspace_,
-                                                 moeExpertPerRank_, gmm2Cursor.expertIdx);
+            uint32_t expertTokenCount = GetExpertTokenCountFromWorkspace(
+                params_.workspaceInfo.expertRevTokenNumsPtr, countWorkspace_, moeExpertPerRank_, gmm2Cursor.expertIdx);
             UpdateExpertContext(gmm2ExpertContext, gmm2Cursor.expertIdx, expertTokenCount);
         }
 
@@ -709,9 +671,6 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
             gmm2Cursor.tokenIndexInExpert = waveEndTokenIndexInExpert;
             gmm2Cursor.globalTokenIndex += waveRowCount;
             if (gmm2Cursor.tokenIndexInExpert >= expertRowCount) {
-                if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {
-                    NotifyWaveGmm2Ready(waveCombineJob_, params_, gmm2Cursor.expertIdx);
-                }
                 ++gmm2Cursor.expertIdx;
                 gmm2Cursor.tokenIndexInExpert = 0U;
             }
@@ -723,7 +682,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         UpdateMoeExpertGmm2GlobalBuffer<Weight1Type, ActivationType, QuantScaleOutType>(
             gmmExecutionConfig_, syncWorkspaceLayout_, params_.workspaceInfo, moeWeightTensorListAddrs_, gmm2AddrInfo,
             gmm2ExpertContext, gmm2Cursor.tokenIndexInExpert);
-        if constexpr (CombineQuantMode == COMBINE_NO_QUANT) {
+        {
             gmm2AddrInfo.gmmToEpilogueFlag =
                 reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagGmmToEpiloguePtr) +
                 static_cast<uint64_t>(gmmExecutionConfig_.blockJob.jobIndex) * INT_CACHELINE;
@@ -732,81 +691,20 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         bool isWholeExpert =
             gmm2Cursor.tokenIndexInExpert == 0U && static_cast<uint64_t>(waveEndTokenIndexInExpert) == expertRowCount;
         int32_t* tileSequence = nullptr;
-        if constexpr (CombineQuantMode == COMBINE_NO_QUANT) {
+        {
             tileSequence = &gmm2TileSequence;
         }
-        RunGmm2ByMode<COMBINE_NO_QUANT, QuantOutType, ActivationType, Weight1Type, QuantScaleOutType, false, false,
-                      GMM1_TILE_M, TopkWeightsPrefetch, false, GMM1_INTERLEAVED, true,
-                      CombineQuantMode == COMBINE_NO_QUANT>(gmmExecutionConfig_, gmm2AddrInfo, gmm2WaveProblemShape,
-                                                            runtimeState, nullptr, isWholeExpert,
-                                                            gmm2Cursor.tokenIndexInExpert, &params_, tileSequence);
+        RunGmm2A8W8<QuantOutType, QuantScaleOutType, GMM1_TILE_M, false, GMM1_INTERLEAVED, true, true>(
+            gmmExecutionConfig_, gmm2AddrInfo, gmm2WaveProblemShape, runtimeState, nullptr, isWholeExpert,
+            gmm2Cursor.tokenIndexInExpert, &params_, tileSequence);
 
         gmm2Cursor.tokenIndexInExpert = waveEndTokenIndexInExpert;
         gmm2Cursor.globalTokenIndex += waveRowCount;
         if (gmm2Cursor.tokenIndexInExpert >= expertRowCount) {
-            if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {
-                if constexpr (g_coreType == AIV) {
-                    if (GetSubBlockIdx() == 0U && gmm2Cursor.expertIdx == allCoreCombineExpertIndex) {
-                        allCoreCombineExpertContext = gmm2ExpertContext;
-                    }
-                }
-                NotifyWaveGmm2Ready(waveCombineJob_, params_, gmm2Cursor.expertIdx);
-            }
             ++gmm2Cursor.expertIdx;
             gmm2Cursor.tokenIndexInExpert = 0U;
         }
     }
-}
-
-// 量化 Combine 保持原有专家粒度：只消费当前 WAVE 已完整完成的专家，最后一个非空专家由全部 AIV 处理。
-template <TemplateMegaMoeA8W8WaveTypeClass>
-__aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::ProcessCombineExperts(
-    uint32_t expertBegin, uint32_t expertEnd, ExpertContext& combineState, GMMAddrInfo& combineAddrInfo,
-    const CombineBufferConfig& bufferConfig, uint32_t allCoreCombineExpertIndex,
-    const ExpertContext& allCoreCombineExpertContext)
-{
-    if constexpr (g_coreType == AIC) {
-        return;
-    }
-    if (GetSubBlockIdx() == 0U) {
-        if (allCoreCombineExpertIndex < expertBegin || allCoreCombineExpertIndex >= expertEnd) {
-            return;
-        }
-        CombineBufferConfig activeBufferConfig =
-            PrepareFinalWaveCombineBuffers<CombineQuantMode>(commonConfig_, bufferConfig, waveCombineScratch_);
-        UpdateMoeExpertCombineGlobalBuffer(params_.workspaceInfo, combineAddrInfo, allCoreCombineExpertContext);
-        uint32_t rowSequence = 0U;
-        RunWaveCombineStage<CombineQuantMode, true>(commonConfig_, waveCombineJob_, activeBufferConfig,
-                                                    waveCombineScratch_, params_, combineAddrInfo,
-                                                    allCoreCombineExpertContext, allCoreCombineExpertIndex, rowSequence);
-        DrainCombineRowBuffers(rowSequence, activeBufferConfig.rowBufferCount);
-        return;
-    }
-
-    CombineBufferConfig activeBufferConfig = bufferConfig;
-    uint32_t rowSequence = 0U;
-    for (uint32_t expertIdx = expertBegin; expertIdx < expertEnd; ++expertIdx) {
-        uint32_t expertTokenCount = GetExpertTokenCountFromWorkspace(params_.workspaceInfo.expertRevTokenNumsPtr,
-                                                                     countWorkspace_, moeExpertPerRank_, expertIdx);
-        UpdateExpertContext(combineState, expertIdx, expertTokenCount);
-        if (expertTokenCount == 0U) {
-            continue;
-        }
-        bool useAllAivCores = expertIdx == allCoreCombineExpertIndex;
-        UpdateMoeExpertCombineGlobalBuffer(params_.workspaceInfo, combineAddrInfo, combineState);
-        if (useAllAivCores) {
-            activeBufferConfig =
-                PrepareFinalWaveCombineBuffers<CombineQuantMode>(commonConfig_, bufferConfig, waveCombineScratch_);
-            RunWaveCombineStage<CombineQuantMode, true>(commonConfig_, waveCombineJob_, activeBufferConfig,
-                                                        waveCombineScratch_, params_, combineAddrInfo, combineState,
-                                                        combineState.expertIdx, rowSequence);
-        } else {
-            RunWaveCombineStage<CombineQuantMode>(commonConfig_, waveCombineJob_, activeBufferConfig,
-                                                  waveCombineScratch_, params_, combineAddrInfo, combineState,
-                                                  combineState.expertIdx, rowSequence);
-        }
-    }
-    DrainCombineRowBuffers(rowSequence, activeBufferConfig.rowBufferCount);
 }
 
 /*
@@ -825,9 +723,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.expertRevTokenNumsPtr));
     DispatchBuffInit();
     CombineBufferConfig combineBufferConfig{};
-    if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {
-        combineBufferConfig = InitCombineBuffers();
-    }
+
     PrepareMoeExpertTokenCountTable(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
     if constexpr (g_coreType == AIC) {
         // count 表是阶段级依赖；AIV0 在下方进入其逐专家准备前等待，AIV1 是表的生产者。
@@ -858,19 +754,6 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         if (GetSubBlockIdx() == 0U) {
             WaitForMoeExpertTokenCountReady(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr, countWorkspace_, 0U);
         }
-        if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {
-            for (uint32_t expertEnd = moeExpertPerRank_; expertEnd > 0U; --expertEnd) {
-                uint32_t expertIdx = expertEnd - 1U;
-                uint64_t countOffset =
-                    GetExpertCountWorkspaceOffset(countWorkspace_, moeExpertPerRank_, expertIdx, true);
-                __gm__ int32_t* expertTokenCountAddr =
-                    reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.expertRevTokenNumsPtr) + countOffset;
-                if (AscendC::ReadGmByPassDCache(expertTokenCountAddr) != 0) {
-                    allCoreCombineExpertIndex = expertIdx;
-                    break;
-                }
-            }
-        }
     }
 
     while (waveBeginPosition.expertIdx < moeExpertPerRank_) {
@@ -886,7 +769,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
                 } else {
                     hasPreparedWave = false;
                 }
-                if constexpr (CombineQuantMode == COMBINE_NO_QUANT) {
+                {
                     AdvanceStartBlockIdxForSkippedGmm1(waveBeginPosition, waveEndPosition);
                 }
             }
@@ -898,12 +781,6 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         ProcessGmm2Wave(gmm2Cursor, waveEndPosition, gmm2ExpertContext, gmm2AddrInfo, gmm2RuntimeState,
                         gmm2TileSequence, allCoreCombineExpertIndex, allCoreCombineExpertContext);
         UpdateGmmLoopCount(gmmLoopCount_, LoopCountIndex::GMM2, ++gmm2Count);
-        if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {
-            uint32_t combineEndExpertIndex = waveEndPosition.expertIdx;
-            ProcessCombineExperts(combineBeginExpertIndex, combineEndExpertIndex, combineExpertContext, combineAddrInfo,
-                                  combineBufferConfig, allCoreCombineExpertIndex, allCoreCombineExpertContext);
-            combineBeginExpertIndex = combineEndExpertIndex;
-        }
 
         const bool hasNextWave = waveEndPosition.expertIdx < moeExpertPerRank_;
         const bool fixedRoleResonance =
@@ -915,7 +792,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         waveBeginPosition = waveEndPosition;
     }
 
-    if constexpr (!TopkWeightsPrefetch) {
+    {
         EndSync<GMM1_INTERLEAVED>(vecSetSyncCom, gmm1PingPongIdx_);
     }
     gmm1PingPongIdx_ = 0;
@@ -958,11 +835,11 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
 
     // 阶段 1：AIV 完成本卡输入量化、路由 mask 推送和 flag 清零。
     exceptionDump_.UpdateStage(MegaMoeImpl::Stage::INPUT_PREPARE);
-    QuantizeLocalTokens<QuantMode, QuantOutType, ActivationType, TopkWeightsType, TopkWeightsPrefetch>(
+    QuantizeLocalTokens<QuantMode, QuantOutType, ActivationType, TopkWeightsType, false>(
         aivJob_, commonConfig_, params_, quantProcessConfig_, quantProcessScratch_);
     GatherAndSendExpertCompactRoutes(aivJob_, commonConfig_, params_, g_winRankAddr_, sendMaskConfig_,
                                      sendMaskScratch_);
-    ResetSyncStatus<TopkWeightsPrefetch>(aivJob_, params_, resetBatchElementCount_, resetTensor_);
+    ResetSyncStatus<false>(aivJob_, params_, resetBatchElementCount_, resetTensor_);
     if (sharedExpertNum_ > 0) {
         // 可选：为共享专家拆分连续布局的输入数据与 scale。
         PrepareSharedExpertInput<ActivationType, QuantScaleOutType, 1U>(
@@ -982,7 +859,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         CrossRankSyncInWorldSize(params_.peermemInfo.rankSyncInWorldPtr, rankId_, worldSize_, aivJob_);
         exceptionDump_.UpdateStage(MegaMoeImpl::Stage::UNPERMUTE);
         UnpermuteBufferConfig unpermuteBufferConfig = InitTokenUnpermuteBuffers();
-        UnpermuteTokens<CombineQuantMode, TopkWeightsType, TopkWeightsPrefetch, GMM1_TILE_M>(
+        UnpermuteTokens<COMBINE_NO_QUANT, TopkWeightsType, false, GMM1_TILE_M>(
             tokenUnpermuteConfig_, commonConfig_, params_, tokenUnpermuteScratch_, unpermuteBufferConfig);
     }
     // 恢复入口时保存的溢出模式。

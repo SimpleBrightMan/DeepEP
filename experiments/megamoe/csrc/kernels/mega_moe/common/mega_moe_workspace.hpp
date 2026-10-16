@@ -22,7 +22,6 @@ constexpr int64_t SIZE_BF_16 = 2U;
 struct WorkspaceInfo {
     GM_ADDR dispatchRevDataPtr;
     GM_ADDR dispatchRevScalePtr;
-    GM_ADDR dispatchRevWeightsPtr{nullptr};
     GM_ADDR activationQuantDataPtr;
     GM_ADDR activationQuantScalePtr;
     GM_ADDR expertRevTokenNumsPtr;
@@ -42,14 +41,7 @@ struct WorkspaceInfo {
     GM_ADDR sharedExpertInputScalePtr{nullptr};
     GM_ADDR sharedExpertActivationDataPtr{nullptr};
     GM_ADDR sharedExpertActivationScalePtr{nullptr};
-    GM_ADDR gmm1TileStatusPtr{nullptr};  // GMM1 tile 就绪状态位区（仅 prefetch 软同步分配）
     GM_ADDR sharedExpertGmm2TileCounterPtr{nullptr};
-
-    GM_ADDR maskSlotPtr{nullptr};        // urma发送mask临时GM
-    GM_ADDR dispatchL1CommPtr{nullptr};  // dispatch L1 communication workspace
-    GM_ADDR dispatchCursorPtr{nullptr};  // dispatch cnt for each expert
-    GM_ADDR dispatchDonePtr{nullptr};    // dispatch done
-    GM_ADDR dispatchL2CommPtr{nullptr};  // dispatch l2 communication workspace
 
     // 连续 flag 通知区（自 flagActivationToGmm2Ptr 起）的 int32 元素总数。
     // 在分配处顺手记账，保证 ResetSyncStatus 的清零范围与分配范围恒同源。
@@ -58,8 +50,6 @@ struct WorkspaceInfo {
     GM_ADDR flagSharedActivationDonePtr{nullptr};
     GM_ADDR flagSharedGmm1DonePtr{nullptr};
     int64_t flagResetElementCount{0};
-    // prefetch 软同步 GMM1 tile 状态区的 int32 元素总数（未分配时为 0）。
-    int64_t gmm1TileStatusElementCount{0};
 
     int64_t workspaceSize;
     HOST_DEVICE WorkspaceInfo() = default;
@@ -82,14 +72,6 @@ private:
         workspaceSize +=
             Ops::Base::CeilAlign(SIZE_INT_8 * tilingData->maxOutputSize * dispatchScaleElementsPerToken, ALIGN_512);
 
-        if (tilingData->topkWeightsPrefetch == 1 && tilingData->topoType == TOPO_TYPE_URMA) {
-            dispatchRevWeightsPtr = base + workspaceSize;
-            uint32_t weightAlignBytes = Ops::Base::CeilAlign(static_cast<uint32_t>(tilingData->topK * sizeof(float)),
-                                                             static_cast<uint32_t>(ALIGN_32));
-            workspaceSize += Ops::Base::CeilAlign(
-                static_cast<int64_t>(tilingData->maxOutputSize) * static_cast<int64_t>(weightAlignBytes), ALIGN_512);
-        }
-
         activationQuantDataPtr = base + workspaceSize;
         workspaceSize += Ops::Base::CeilAlign(
             SIZE_INT_8 * tilingData->maxOutputSize * tilingData->hiddenDim / ACTIVATION_N_HALF, ALIGN_512);
@@ -100,27 +82,22 @@ private:
             ALIGN_512);
 
         expertRevTokenNumsPtr = base + workspaceSize;
-        int64_t expertMajorPaddedCountBytes =
-            static_cast<int64_t>(tilingData->moeExpertPerRank) * ALIGN_32 * tilingData->aicNum;
         int64_t blockMajorCountStride = static_cast<int64_t>(
             Ops::Base::CeilAlign(tilingData->moeExpertPerRank, static_cast<uint32_t>(INT_CACHELINE)));
         int64_t blockMajorCountBytes =
             blockMajorCountStride * static_cast<int64_t>(sizeof(int32_t)) * tilingData->aicNum;
-        int64_t expertCountWorkspaceBytes =
-            tilingData->topoType == TOPO_TYPE_MTE ? blockMajorCountBytes : expertMajorPaddedCountBytes;
-        workspaceSize += Ops::Base::CeilAlign(expertCountWorkspaceBytes, ALIGN_512);
+        workspaceSize += Ops::Base::CeilAlign(blockMajorCountBytes, ALIGN_512);
 
         metaInfoPtr = base + workspaceSize;
         workspaceSize += Ops::Base::CeilAlign(tilingData->maxOutputSize * ALIGN_32, ALIGN_512);
 
         // 以下三组 flag 仅由 MoE 专家使用；共享专家路径不使用这些 flag。
-        const bool useMteWaveCombine = tilingData->topoType == TOPO_TYPE_MTE;
+        constexpr bool useMteWaveCombine = true;
         int64_t maxWavesPerExpert =
             Ops::Base::CeilDiv(static_cast<int64_t>(tilingData->maxOutputSize), static_cast<int64_t>(L1_TILE_M_256));
         int64_t waveFlagSlotsPerExpert = maxWavesPerExpert * static_cast<int64_t>(INT_CACHELINE);
-        // MTE GMM2 按 256-token M group 消费 activation；URMA 只使用每个专家的首槽。
-        int64_t activationFlagSlotsPerExpert =
-            tilingData->topoType == TOPO_TYPE_MTE ? waveFlagSlotsPerExpert : static_cast<int64_t>(INT_CACHELINE);
+        // Dispatch 与 GMM2 输入都按 256-token M-group 发布。
+        int64_t activationFlagSlotsPerExpert = waveFlagSlotsPerExpert;
         int64_t moeExpertCount = static_cast<int64_t>(tilingData->moeExpertPerRank);
 
         // 所有 Scalar 通知都放在同一段连续 workspace 中。每个逻辑槽独占一个 64B cache line，
@@ -138,30 +115,18 @@ private:
         // 每个 AIC 的就绪序列与前面的 flag 连续存放，使 ResetFlagList 能用同一次 MTE reset 清理；
         // 每个序列独占一个 64B cache line。
         // W4 GMM1 activation 始终使用该序号；采用 tile Combine 的非量化路径也复用它。
-        bool isW4Mode = tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 ||
-                        tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
-                        tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ;
-        if (isW4Mode || (tilingData->topoType == TOPO_TYPE_MTE && tilingData->combineQuantMode == COMBINE_NO_QUANT)) {
+        {
             flagGmmToEpiloguePtr = base + workspaceSize;
             workspaceSize += static_cast<int64_t>(tilingData->aicNum) * INT_CACHELINE * SIZE_INT_32;
         }
 
-        if (tilingData->topoType == TOPO_TYPE_MTE && (tilingData->combineQuantMode != COMBINE_NO_QUANT ||
-                                                      tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4)) {
+        if (tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4) {
             // A8W4 非量化 Combine：每个 slice 按首 M-group 独占一个 64B 计数槽。
             // 用最大 M-group 数预留地址，避免跨 wave 复用槽而让快核提前放行旧 slice。
-            // 本区仍位于连续 flag reset 范围内，每次算子调用统一清零；量化路径布局不变。
+            // 本区位于连续 flag reset 范围内，每次算子调用统一清零。
             gmm2ReadyPtr = base + workspaceSize;
-            int64_t readySlotsPerExpert = tilingData->combineQuantMode == COMBINE_NO_QUANT
-                                              ? waveFlagSlotsPerExpert
-                                              : static_cast<int64_t>(tilingData->aicNum) * INT_CACHELINE;
+            int64_t readySlotsPerExpert = waveFlagSlotsPerExpert;
             workspaceSize += SIZE_INT_32 * moeExpertCount * readySlotsPerExpert;
-        }
-
-        if (tilingData->topoType == TOPO_TYPE_URMA) {
-            gmm2CombineSyncCounterPtr = base + workspaceSize;
-            workspaceSize += static_cast<int64_t>(tilingData->combineSyncSlotCountPerExpert) * moeExpertCount *
-                             INT_CACHELINE * SIZE_INT_32;
         }
 
         // Shared expert GMM2 tile counter: tile 级 flag counter, 每 shared expert 一组 slot。
@@ -189,18 +154,12 @@ private:
         }
         flagResetElementCount = (workspaceSize - flagRegionBeginOffset) / SIZE_INT_32;
 
-        // A8W4 / Combine 量化路径的条件 workspace 分配。
-        // 以下条件分配与 mega_moe.h 编译期守卫 (ENABLE_A8W4 / ENABLE_A4W4 / CombineQuantMode) 一致，
-        // 由 TilingKey 保证同步。
-        // W4 Wave-ahead Dispatch 与 layered A8W4 都会跨 Activation 保留 cumsum；Activation 会覆盖对应 UB，
+        // W4 Dispatch 跨激活保留 cumsum；Activation 会覆盖对应 UB，
         // 因此需要逐物理 block 的 GM 备份。A8W8 的 cumsum 常驻 AIV1 UB 并按 wave 连续推进，不需要该备份。
         cumsumInfoPtr = nullptr;
         gmm1MmadResPtr = nullptr;
         gmm2MmadResPtr = nullptr;
-        bool activationOverwritesDispatchCumsum =
-            tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 ||
-            (tilingData->topoType == TOPO_TYPE_MTE && (tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
-                                                       tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ));
+        bool activationOverwritesDispatchCumsum = tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4;
         if (activationOverwritesDispatchCumsum) {
             // cumsumInfo：逐核备份 cumsum 状态，每核 moeExpertPerRank × epWorldSize 个 int32。
             cumsumInfoPtr = base + workspaceSize;
@@ -209,18 +168,14 @@ private:
                                                   ALIGN_32) *
                              tilingData->aicNum;
         }
-        if (tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 || tilingData->topkWeightsPrefetch == 1) {
+        if (tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4) {
             // gmm1MmadRes：GMM1 matmul 输出，布局为 maxOutputSize × hiddenDim 个 BF16。
             gmm1MmadResPtr = base + workspaceSize;
             workspaceSize += SIZE_BF_16 * tilingData->maxOutputSize * tilingData->hiddenDim;
         }
         // gmm2MmadRes：GMM2 matmul 输出，布局为 maxOutputSize × h 个 BF16；
-        // A8W4 GMM1、A4W4 混合路径、A4W4_NZ 和 Combine 量化路径需要该区域。
-        if (tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 ||
-            tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4 ||
-            tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A4W4_NZ ||
-            tilingData->combineQuantMode != COMBINE_NO_QUANT || tilingData->topoType == TOPO_TYPE_URMA ||
-            useMteWaveCombine) {
+        // 保持原 MTE 布局：W4/A8W8 都预留整段结果容量，不引入新的 ring 复用协议。
+        {
             if (useMteWaveCombine) {
                 workspaceSize = Ops::Base::CeilAlign(workspaceSize, static_cast<int64_t>(ALIGN_512));
             }
@@ -233,48 +188,6 @@ private:
                                       static_cast<int64_t>(tilingData->h);
             workspaceSize += useMteWaveCombine ? Ops::Base::CeilAlign(gmm2OutputBytes, static_cast<int64_t>(ALIGN_512))
                                                : gmm2OutputBytes;
-        }
-
-        // GMM1 tile 状态位区（仅 prefetch 路径分配，用于 AIC→AIV 软同步）。
-        // 每个 tile 状态和末尾 allDone 状态都独占一条 64B cache line。
-        gmm1TileStatusPtr = nullptr;
-        if (tilingData->topkWeightsPrefetch == 1) {
-            gmm1TileStatusPtr = base + workspaceSize;
-            int64_t statusSlots =
-                static_cast<int64_t>(tilingData->moeExpertPerRank) * tilingData->maxTilesPerExpert + 1;
-            gmm1TileStatusElementCount = statusSlots * INT_CACHELINE;
-            int64_t statusBytes = SIZE_INT_32 * statusSlots * INT_CACHELINE;
-            workspaceSize += Ops::Base::CeilAlign(statusBytes, ALIGN_512);
-        }
-        if (tilingData->topoType == TOPO_TYPE_URMA) {
-            maskSlotPtr = base + workspaceSize;
-            int64_t sendTotalNum = static_cast<int64_t>(tilingData->bs) * tilingData->topK;
-            int64_t compareCount = Ops::Base::CeilAlign(sendTotalNum * (int64_t)sizeof(int32_t), (int64_t)ALIGN_256) /
-                                   (int64_t)sizeof(int32_t);
-            int64_t maskAlignSize = Ops::Base::CeilAlign(compareCount / 8, (int64_t)ALIGN_32);
-            int64_t maskSlotSize = maskAlignSize + (int64_t)ALIGN_32;  // mask + 32B count
-
-            workspaceSize += Ops::Base::CeilAlign(
-                (int64_t)tilingData->moeExpertPerRank * tilingData->epWorldSize * maskSlotSize, (int64_t)ALIGN_512);
-
-            dispatchL1CommPtr = base + workspaceSize;
-            int64_t serverWorkspaceBytes =
-                static_cast<int64_t>(ALIGN_32) + static_cast<int64_t>(tilingData->bs) * ALIGN_32;
-            workspaceSize += Ops::Base::CeilAlign(static_cast<int64_t>(serverNum) * serverWorkspaceBytes,
-                                                  static_cast<int64_t>(ALIGN_512));
-
-            dispatchCursorPtr = base + workspaceSize;
-            workspaceSize +=
-                Ops::Base::CeilAlign(static_cast<int64_t>(serverNum * SIZE_INT_32), static_cast<int64_t>(ALIGN_512));
-
-            dispatchDonePtr = base + workspaceSize;
-            workspaceSize += Ops::Base::CeilAlign(static_cast<int64_t>(tilingData->aicNum * SIZE_INT_32),
-                                                  static_cast<int64_t>(ALIGN_512));
-
-            dispatchL2CommPtr = base + workspaceSize;
-            int64_t flagSnapshotBytes = static_cast<int64_t>(tilingData->bs) * static_cast<int64_t>(sizeof(uint64_t));
-            int64_t dispatchL2ScratchBytes = Ops::Base::CeilAlign(flagSnapshotBytes, static_cast<int64_t>(ALIGN_512));
-            workspaceSize += static_cast<int64_t>(tilingData->aicNum) * dispatchL2ScratchBytes;
         }
 
         // 共享专家 workspace buffer。

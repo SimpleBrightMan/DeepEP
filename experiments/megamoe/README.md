@@ -5,6 +5,11 @@ Modified by Joyce_An 2026
 
 # MegaMoE Prefill Beta
 
+工程设计、文件/函数职责及同步维护约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。当前仅保留
+MTE + 非量化 Combine；W4A8 与 A8W8 都继续支持。URMA、量化 Combine、top-k weight prefetch
+的不可达执行分支已清理，A8W8 MX 计算独立在 `stage/mega_moe_gmm{1,2}_a8w8.hpp`。
+下方 10-16 整合数据属于 `18ada75b1` 及其受测设备代码，不能作为本次后续清理的验收结果。
+
 ## main：计算优化与完整 EP8 验收
 
 main 已合入 GMM2 完成边界/wave 流水复用、GMM1 FIX 异步完成通知及 wave 流水复用。
@@ -162,17 +167,16 @@ GMM2 由相同 N/K 约定构造实际计算维度：`N=H`、`K=I`。count 表在
 GMM1 用 `TakeNextExpertSliceInWave` 产生这两个 slice；滞后一 Wave 的 GMM2 用保存的 W2 边界
 恢复同一范围。分核滚动、通信 owner、ready 通知和 timer 范围沿用原协议。
 
-### 计算循环与量化通信兼容路径
+### 计算循环与支持边界
 
 `ProcessGmmWaves` 只组织 GMM1/GMM2 Wave 的先后关系。`RunGmm1Wave` 推进一个 Wave，
 `RunNextGmm1Slice` 推进其中一个专家 slice；是否还有任务由游标和 M-group 容量直接判断，
 不再维护 `currentWaveNeedsGmm1/nextWaveNeedsDispatch` 的重复布尔状态。
 是否还有待执行 GMM2 由 GMM1/GMM2 完成的 Wave 数推导，保留 `gmm2LagActive` 表达 BS 调度策略。
 
-量化 Combine 的首 Wave 预取、下一 Wave 搬运/当前 Wave 激活交错、专家级回传分别放在
-`PrepareQuantizedCombinePipeline`、`RunQuantizedCombineGmm1Wave`、`RunQuantizedCombineForExpert`。
-兼容路径仍逐 slice 交错，且跨 Wave 的专家仍等最后一个 slice 才量化回传；末轮 UB 复用和排空协议不变。
-现役非量化 AIV1 继续使用独立优先级调度器，不进入这些兼容操作。
+量化 Combine 的首 Wave 预取、交错激活和专家级量化回传入口已删除。
+W4A8 的 AIV1 始终使用独立优先级调度器；输入量化与 SwiGLU 后的 MX 量化不受影响。
+A8W8 的独立实现继续保留，不把它作为 W4 运行时开关。
 
 ### Dispatch：范围规划与实际搬运分开阅读
 

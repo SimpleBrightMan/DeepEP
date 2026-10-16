@@ -3,13 +3,14 @@ from pathlib import Path
 import os
 import shutil
 import subprocess
+import shlex
 
 
 def test_actual_reused_activation_address(tmp_path):
     compiler = os.environ.get('CXX') or shutil.which('g++')
     assert compiler, 'C++ compiler required for actual address-transform test'
     header = Path(__file__).parents[1] / 'csrc/kernels/mega_moe/catlass_gmm/mega_moe_grouped_matmul.hpp'
-    text = header.read_text()
+    text = header.read_text(encoding='utf-8')
     begin = text.index('constexpr uint64_t ReusedActivationReadAddress(')
     end = text.index('\n}', begin) + 2
     source = '''#include <cstdint>
@@ -31,5 +32,6 @@ int main() {
     cpp = tmp_path / 'cache.cpp'
     cpp.write_text(source)
     exe = tmp_path / ('cache.exe' if os.name == 'nt' else 'cache')
-    subprocess.run([compiler, '-std=c++17', str(cpp), '-o', str(exe)], check=True)
+    command = shlex.split(compiler) if os.environ.get('CXX') else [compiler]
+    subprocess.run([*command, '-std=c++17', str(cpp), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)

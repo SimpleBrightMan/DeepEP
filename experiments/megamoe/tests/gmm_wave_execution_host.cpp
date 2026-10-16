@@ -167,23 +167,23 @@ struct WaveHarness {
     }
     template <bool SourceFused>
     void RunGmm2CombineForExpert(const ExpertContext& context, const ExpertSlice& slice, GMMAddrInfo&,
-                                uint32_t& start, WaveCombineBufferConfig&, uint32_t& rowSequence,
-                                int32_t&, bool final, bool reverse, void* = nullptr) {
-        assert(reverse);
+                                uint32_t& start, PipelineStub&) {
+        const bool final = false;
         assert(context.expertIdx == slice.expertIdx);
         assert(context.globalTokenStartIndex + slice.rowStartInExpert == slice.globalRowStart);
         const auto before = start;
         start = (start + Ops::Base::CeilDiv(slice.rowCount, 256U) * 28) % 32;
-        if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {
-            if (slice.rowStartInExpert + slice.rowCount == static_cast<uint32_t>(context.problemShape[0])) {
-                rowSequence += context.problemShape[0];
-            }
-        }
         events.push_back({2, slice.expertIdx, slice.rowStartInExpert, slice.rowCount, slice.globalRowStart,
                           static_cast<uint64_t>(timer_.wave), before, start, final});
     }
 
 #include "gmm_wave_methods.inc"
+    // Frozen scheduler retains its old signature; only its non-quantized path remains supported.
+    void RunGmm2CombineForWaveRange(const ExpertWaveRange& wave, ExpertContext& context, GMMAddrInfo& addr,
+                                  uint32_t& start, WaveCombineBufferConfig&, uint32_t&, int32_t&) {
+        RunGmm2CombineForWaveRange(wave, context, addr, start);
+    }
+
 
     void LegacyQuantizedCombineForExpert(const ExpertContext& expertContext, const ExpertSlice& slice,
                                          GMMAddrInfo& gmmAddrInfo, WaveCombineBufferConfig& combineBufferConfig,
@@ -354,37 +354,9 @@ static void Check(const std::vector<uint32_t>& counts, uint32_t bs, uint32_t gro
 static void CheckRoles(const std::vector<uint32_t>& counts, uint32_t bs, uint32_t groups) {
     Check<AIC, 0>(counts, bs, groups);
     Check<AIV, 0>(counts, bs, groups);
-    Check<AIC, 1>(counts, bs, groups);
-    Check<AIV, 1>(counts, bs, groups);
-    Check<AIV, 1>(counts, bs, groups, 1);
     Check<AIC, 0, true>(counts, bs, groups);
-    Check<AIV, 1, true>(counts, bs, groups, 1);
-}
-template <int Core> static void CheckQuantizedCombine(uint32_t sub) {
-    for (uint32_t shared : {0U, 1U}) {
-        for (bool final : {false, true}) {
-            for (uint32_t end : {1536U, 4096U}) {
-                WaveHarness<Core, 1> current({4096}, 4096, 6, sub), legacy({4096}, 4096, 6, sub);
-                current.sharedExpertNum_ = legacy.sharedExpertNum_ = shared;
-                ExpertContext context = CreateExpertContext(current.commonConfig_);
-                UpdateExpertContext(context, 0, 4096);
-                const ExpertSlice slice{0, 0, end, 0};
-                GMMAddrInfo addr;
-                WaveCombineBufferConfig buffers{2}, oldBuffers{2};
-                uint32_t sequence = 0, oldSequence = 0;
-                current.RunQuantizedCombineForExpert(context, slice, addr, buffers, sequence, final);
-                legacy.LegacyQuantizedCombineForExpert(context, slice, addr, oldBuffers, oldSequence, final);
-                assert(current.events == legacy.events);
-                assert(sequence == oldSequence && buffers.rowBufferCount == oldBuffers.rowBufferCount);
-                if (end < 4096) assert(current.events.empty());
-            }
-        }
-    }
 }
 int main() {
-    CheckQuantizedCombine<AIC>(0);
-    CheckQuantizedCombine<AIV>(0);
-    CheckQuantizedCombine<AIV>(1);
     for (uint32_t bs : {96U, 4095U, 4096U, 8192U}) {
         CheckRoles(std::vector<uint32_t>(6, 4096), bs, 6);
         CheckRoles({0, 0, 0}, bs, 6);

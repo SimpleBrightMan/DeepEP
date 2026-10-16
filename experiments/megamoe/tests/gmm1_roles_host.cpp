@@ -48,7 +48,7 @@ int main() {
         CatlassGmm1<Config> kernel;
         events.clear();
         for (unsigned slice = 0; slice < 2; ++slice) {
-            RunGmm1ComputeTiles<false, false>(kernel, scheduler, addr, config, 0, 4, sequence, 0);
+            RunGmm1ComputeTiles<false>(kernel, scheduler, addr, config, 0, 4, sequence, 0);
         }
         assert(kernel.begins == (async ? 1U : 2U));
         assert(kernel.ends == (async ? 0U : 2U));

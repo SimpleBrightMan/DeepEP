@@ -33,8 +33,7 @@ __schedmode__(1) __global__
     util_set_ffts_config(ffts_addr);
     constexpr int32_t kDispatchE4M3 = 4;
     if constexpr (IsA8W4) {
-        MegaMoeImpl::MegaMoeA8W4Wave<bfloat16_t, bfloat16_t, float, fp4x2_e2m1_t, kDispatchE4M3,
-                                     MegaMoeImpl::COMBINE_NO_QUANT, false, FuseGateUp>
+        MegaMoeImpl::MegaMoeA8W4Wave<bfloat16_t, bfloat16_t, float, fp4x2_e2m1_t, kDispatchE4M3, FuseGateUp>
             op;
         op.Init(context, x, topk_ids, topk_weights, weight1, weight2, nullptr, weight_scales1, weight_scales2, x_scales,
                 shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
@@ -42,8 +41,7 @@ __schedmode__(1) __global__
         op.SetComputeReplay(compute_replay);
         op.Process();
     } else {
-        MegaMoeImpl::MegaMoeA8W8Wave<bfloat16_t, bfloat16_t, float, fp8_e4m3fn_t, kDispatchE4M3,
-                                     MegaMoeImpl::COMBINE_NO_QUANT, false, false>
+        MegaMoeImpl::MegaMoeA8W8Wave<bfloat16_t, bfloat16_t, float, fp8_e4m3fn_t, kDispatchE4M3>
             op;
         op.Init(context, x, topk_ids, topk_weights, weight1, weight2, nullptr, weight_scales1, weight_scales2, x_scales,
                 shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,

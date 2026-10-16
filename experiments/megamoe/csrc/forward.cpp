@@ -122,49 +122,20 @@ MegaMoeSendMaskBufferConfig SendMaskConfig(const MegaMoeTilingData& t, uint32_t 
     return c;
 }
 
-uint64_t HostFlagElements(const MegaMoeTilingData& t)
-{
-    const uint64_t waves = CeilDiv<uint64_t>(t.maxOutputSize, 256U);
-    const uint64_t wave_slots = waves * MegaMoeImpl::INT_CACHELINE;
-    uint64_t count = static_cast<uint64_t>(t.moeExpertPerRank) *
-                     (wave_slots + wave_slots + static_cast<uint64_t>(MegaMoeImpl::INT_CACHELINE) * t.aicNum);
-    const bool is_w4 = t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 ||
-                       t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A4W4 ||
-                       t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A4W4_NZ;
-    if (is_w4 || (t.topoType == MegaMoeImpl::TOPO_TYPE_MTE && t.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT)) {
-        // Pairwise GMM2/combine publishes one sequence per AIC.
-        count += static_cast<uint64_t>(t.aicNum) * MegaMoeImpl::INT_CACHELINE;
-    }
-    if (t.topoType == MegaMoeImpl::TOPO_TYPE_MTE && (t.combineQuantMode != MegaMoeImpl::COMBINE_NO_QUANT ||
-                                                     t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4)) {
-        // Match WorkspaceInfo: the atomic A8W4 path owns one counter per M-group,
-        // while quantized Combine retains one ready slot per AIC.
-        const uint64_t ready_slots_per_expert = t.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT
-                                                    ? wave_slots
-                                                    : static_cast<uint64_t>(t.aicNum) * MegaMoeImpl::INT_CACHELINE;
-        count += static_cast<uint64_t>(t.moeExpertPerRank) * ready_slots_per_expert;
-    }
-    if (t.sharedExpertNum > 0U) {
-        count += CeilDiv<uint64_t>(t.bs, 256U) * t.sharedExpertNum * MegaMoeImpl::INT_CACHELINE;
-        if (t.topoType == MegaMoeImpl::TOPO_TYPE_MTE && t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4) {
-            count += 4ULL * t.aicNum * MegaMoeImpl::INT_CACHELINE;
-        }
-    }
-    return count;
-}
-
 void SetSendMaskConfigs(MegaMoeTilingData& t, uint32_t ub)
 {
-    const uint32_t reset_per_core =
-        static_cast<uint32_t>(CeilDiv(HostFlagElements(t), static_cast<uint64_t>(t.blockAivNum)));
+    // UB Reset 预算直接读取真实布局；新增同步区只需修改 WorkspaceInfo。
+    const MegaMoeImpl::WorkspaceInfo layout(nullptr, &t);
+    const uint32_t reset_per_core = static_cast<uint32_t>(
+        CeilDiv(static_cast<uint64_t>(layout.flagResetElementCount), static_cast<uint64_t>(t.blockAivNum)));
     const uint32_t reset_count = std::min(reset_per_core, static_cast<uint32_t>(DISPATCH_RESET_BATCH));
     const uint32_t reset_bytes = AlignUp(reset_count, uint32_t{MegaMoeImpl::INT32_PER_256B}) * 4U;
     const uint32_t quant_out = AlignUp(t.h, 256U) + AlignUp(CeilDiv(t.h, 32U), 32U);
     const uint32_t quant_in = AlignUp(t.h, 128U) * 2U;
     const auto inputMode = MegaMoeImpl::SelectInputPreparationMode(
         t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4, t.sharedExpertNum, t.bs);
-    const uint32_t route_cores = inputMode == MegaMoeImpl::InputPreparationMode::Aiv1RouteOverlap ?
-                                    t.aicNum : t.blockAivNum;
+    const uint32_t route_cores =
+        inputMode == MegaMoeImpl::InputPreparationMode::Aiv1RouteOverlap ? t.aicNum : t.blockAivNum;
     const uint32_t max_experts = MegaMoeImpl::CalcSendMaskExpertCapacity(&t, route_cores);
     const uint32_t accumulator = AlignUp(max_experts * 4U, 32U);
     const uint32_t fixed = reset_bytes + 2048U + 2U * quant_out + 2U * quant_in + accumulator;
@@ -341,8 +312,9 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     context.epRankId = static_cast<uint32_t>(rank);
     context.rankSizePerServer = static_cast<uint32_t>(world);
     for (int64_t peer = 0; peer < world; ++peer) {
-        void* address = local_rank >= 0 ? reinterpret_cast<void*>(symmetric_address) :
-            aclshmem_ptr(reinterpret_cast<void*>(symmetric_address), static_cast<int32_t>(peer));
+        void* address = local_rank >= 0
+                            ? reinterpret_cast<void*>(symmetric_address)
+                            : aclshmem_ptr(reinterpret_cast<void*>(symmetric_address), static_cast<int32_t>(peer));
         TORCH_CHECK(address != nullptr, "rank=", rank, " prepare: cannot resolve peer=", peer);
         context.epHcclBuffer_[peer] = reinterpret_cast<uint64_t>(address);
     }
@@ -461,8 +433,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     torch::Tensor y = out.has_value() ? *out : torch::empty(x.sizes(), x.options().dtype(torch::kBFloat16));
     CheckTensor(y, 2, "out");
     TORCH_CHECK(y.scalar_type() == torch::kBFloat16 && y.sizes() == x.sizes(), "out must be BF16 [BS, H]");
-    torch::Tensor expert_tokens = compute_replay_ ? replay_counts_ :
-        torch::empty({experts}, x.options().dtype(torch::kInt32));
+    torch::Tensor expert_tokens =
+        compute_replay_ ? replay_counts_ : torch::empty({experts}, x.options().dtype(torch::kInt32));
 
     const auto stream = c10_npu::getCurrentNPUStream();
     auto ptr = [](const torch::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
@@ -499,8 +471,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
 
 void Plan::enable_compute_replay()
 {
-    TORCH_CHECK(tiling_.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 &&
-                    tiling_.sharedExpertNum == 0, "Compute replay requires W4A8 with no shared experts");
+    TORCH_CHECK(tiling_.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 && tiling_.sharedExpertNum == 0,
+                "Compute replay requires W4A8 with no shared experts");
     TORCH_CHECK(replay_counts_.defined(), "Compute replay requires a complete priming forward first");
     // 完整 forward 留下 Dispatch 输入和专家计数；切换前保证设备已完成，不能重放半成品。
     TORCH_CHECK(aclrtSynchronizeDevice() == ACL_SUCCESS, "Compute replay priming synchronization failed");
@@ -514,12 +486,12 @@ void Plan::prepare_local_compute(torch::Tensor data, torch::Tensor scales, torch
     CheckTensor(scales, 2, "local dispatched scales");
     TORCH_CHECK(data.device() == workspace_.device() && scales.device() == workspace_.device(),
                 "Local input must be on the Plan device");
-    TORCH_CHECK(data.element_size() == 1 && scales.element_size() == 1 &&
-                data.size(1) == tiling_.h && scales.size(0) == data.size(0) &&
-                scales.size(1) == tiling_.h / 32 && data.size(0) <= tiling_.maxOutputSize,
+    TORCH_CHECK(data.element_size() == 1 && scales.element_size() == 1 && data.size(1) == tiling_.h &&
+                    scales.size(0) == data.size(0) && scales.size(1) == tiling_.h / 32 &&
+                    data.size(0) <= tiling_.maxOutputSize,
                 "Local input must be packed E4M3 [rows,H] and E8M0 [rows,H/32] within workspace capacity");
-    TORCH_CHECK(counts.device().is_cpu() && counts.scalar_type() == torch::kInt32 &&
-                counts.dim() == 1 && counts.is_contiguous() && counts.numel() == tiling_.moeExpertPerRank,
+    TORCH_CHECK(counts.device().is_cpu() && counts.scalar_type() == torch::kInt32 && counts.dim() == 1 &&
+                    counts.is_contiguous() && counts.numel() == tiling_.moeExpertPerRank,
                 "Local counts must be contiguous CPU int32 [local_experts]");
     int64_t rows = 0;
     for (int64_t e = 0; e < counts.numel(); ++e) {
@@ -531,8 +503,10 @@ void Plan::prepare_local_compute(torch::Tensor data, torch::Tensor scales, torch
     TORCH_CHECK(aclrtSynchronizeDevice() == ACL_SUCCESS, "Local input preparation synchronization failed");
     auto* base = static_cast<uint8_t*>(workspace_.data_ptr());
     const MegaMoeImpl::WorkspaceInfo info(base, &tiling_);
-    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(info.dispatchRevDataPtr, data.nbytes(), data.data_ptr(), data.nbytes(), ACL_MEMCPY_DEVICE_TO_DEVICE));
-    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(info.dispatchRevScalePtr, scales.nbytes(), scales.data_ptr(), scales.nbytes(), ACL_MEMCPY_DEVICE_TO_DEVICE));
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(info.dispatchRevDataPtr, data.nbytes(), data.data_ptr(), data.nbytes(),
+                                        ACL_MEMCPY_DEVICE_TO_DEVICE));
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(info.dispatchRevScalePtr, scales.nbytes(), scales.data_ptr(), scales.nbytes(),
+                                        ACL_MEMCPY_DEVICE_TO_DEVICE));
     // MTE count表按AIC block-major布局，每个计算核有相同的完整专家计数。
     const int64_t stride = AlignUp<int64_t>(counts.numel(), MegaMoeImpl::INT_CACHELINE);
     std::vector<int32_t> block_counts(platform_.aic * stride, 0);
@@ -540,7 +514,8 @@ void Plan::prepare_local_compute(torch::Tensor data, torch::Tensor scales, torch
         std::copy_n(counts.data_ptr<int32_t>(), counts.numel(), block_counts.data() + block * stride);
     }
     const size_t bytes = block_counts.size() * sizeof(int32_t);
-    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(info.expertRevTokenNumsPtr, bytes, block_counts.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE));
+    ASCEND_DEEPEP_CHECK_ACL(
+        aclrtMemcpy(info.expertRevTokenNumsPtr, bytes, block_counts.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE));
     // BF16 0xffff为NaN；未被GMM2完整覆盖的输出必须让smoke失败，不能误读旧显存。
     const size_t output_bytes = rows * static_cast<int64_t>(tiling_.h) * sizeof(uint16_t);
     ASCEND_DEEPEP_CHECK_ACL(aclrtMemset(info.gmm2MmadResPtr, output_bytes, 0xff, output_bytes));
@@ -552,10 +527,12 @@ void Plan::prepare_local_compute(torch::Tensor data, torch::Tensor scales, torch
 torch::Tensor Plan::local_compute_output()
 {
     TORCH_CHECK(local_buffer_.defined() && compute_replay_, "Local compute not prepared");
-    auto result = torch::empty({local_rows_, static_cast<int64_t>(tiling_.h)}, workspace_.options().dtype(torch::kBFloat16));
+    auto result =
+        torch::empty({local_rows_, static_cast<int64_t>(tiling_.h)}, workspace_.options().dtype(torch::kBFloat16));
     TORCH_CHECK(aclrtSynchronizeDevice() == ACL_SUCCESS, "Local compute output synchronization failed");
     const MegaMoeImpl::WorkspaceInfo info(static_cast<uint8_t*>(workspace_.data_ptr()), &tiling_);
-    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(result.data_ptr(), result.nbytes(), info.gmm2MmadResPtr, result.nbytes(), ACL_MEMCPY_DEVICE_TO_DEVICE));
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(result.data_ptr(), result.nbytes(), info.gmm2MmadResPtr, result.nbytes(),
+                                        ACL_MEMCPY_DEVICE_TO_DEVICE));
     return result;
 }
 
@@ -567,8 +544,7 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
                 "Invalid buffer shape");
     // The buffer outlives BS/weight-mode changes. Reserve the decode rail/count
     // layout as well; prefill continues to bind its original device offsets.
-    const MegaMoeImpl::PeermemSizeParams params{
-        tokens, topk, hidden, experts, world, 2, 1, false, false, MegaMoeImpl::TOPO_TYPE_MTE, true};
+    const MegaMoeImpl::PeermemSizeParams params{tokens, topk, hidden, experts, world, 2, 1, true};
     return AlignUp<int64_t>(MegaMoeImpl::EXCEPTION_DUMP_REGION_SIZE + MegaMoeImpl::CalcPeermemLeastSize(params),
                             2LL << 20);
 }

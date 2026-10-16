@@ -386,7 +386,7 @@ public:
             AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CEventList[l0CListId]);
         }
 
-        const auto kPlan = MegaMoeImpl::GmmKernel::MakeA8W4KPlan(mBlockActual, nBlockActual, allowDynamicB);
+        const auto kPlan = MegaMoeImpl::GmmKernel::MakeA8W4KPlan(mBlockActual);
         const uint32_t ka = kPlan.ka;
         const uint32_t kb = kPlan.kb;
         const uint32_t kL1Loop = CeilDiv(kBlockActual, kb);

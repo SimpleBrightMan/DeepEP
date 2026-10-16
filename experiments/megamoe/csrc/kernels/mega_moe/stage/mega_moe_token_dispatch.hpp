@@ -132,9 +132,7 @@ __aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
     scratch.metaInfoTensor[bufferIdx * INT32_PER_256B].SetValue(TOKEN_ID, tokenIndex);
     scratch.metaInfoTensor[bufferIdx * INT32_PER_256B].SetValue(
         TOPK_INDEX, topkIndex % static_cast<int32_t>(params.tilingData->topK));
-    if constexpr (TopkWeightsPrefetch) {
-        SetFlag<AscendC::HardEvent::MTE2_S>(eventId);
-    } else {
+    {
         SetFlag<AscendC::HardEvent::S_MTE3>(eventId);
     }
 }
@@ -158,15 +156,7 @@ __aicore__ inline void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
     LocalTensor<ActivationType> tokenScaleBuffer = GetDispatchCopyBuffer(context, scratch, bufferIdx);
     LocalTensor<QuantScaleType> scaleBuffer =
         tokenScaleBuffer[context.quantTokenAlignBytes].template ReinterpretCast<QuantScaleType>();
-    if constexpr (TopkWeightsPrefetch) {
-        WaitFlag<AscendC::HardEvent::MTE2_S>(eventId);
-        uint32_t weightOffsetInUb = context.quantTokenAlignBytes + context.quantScaleAlignBytes;
-        LocalTensor<int32_t> weightBitsTensor = tokenScaleBuffer[weightOffsetInUb].template ReinterpretCast<int32_t>();
-        int32_t topkSlot = scratch.metaInfoTensor[bufferIdx * INT32_PER_256B].GetValue(TOPK_INDEX);
-        int32_t weightBits = weightBitsTensor.GetValue(static_cast<uint32_t>(topkSlot));
-        scratch.metaInfoTensor[bufferIdx * INT32_PER_256B].SetValue(WEIGHT_INDEX, weightBits);
-        SetFlag<AscendC::HardEvent::S_MTE3>(eventId);
-    }
+
     DataCopyPad(tokenRevGlobalTensor[copyIdx * scratch.revTokenElemCnt], tokenScaleBuffer,
                 {1, static_cast<uint16_t>(scratch.revTokenElemCnt * sizeof(ActivationType)), 0U, 0U, 0U});
     DataCopyPad(scaleRevGlobalTensor[copyIdx * scratch.revScaleElemCnt], scaleBuffer,

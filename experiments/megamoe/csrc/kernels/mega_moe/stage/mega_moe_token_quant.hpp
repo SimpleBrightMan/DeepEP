@@ -32,11 +32,7 @@ __aicore__ inline QuantProcessConfig CreateQuantProcessConfig(uint32_t tokenHidd
     uint32_t quantScaleAlignBytes = Ops::Base::CeilAlign(
         quantScaleNumAlignPerToken * static_cast<uint32_t>(sizeof(QuantScaleOutType)), static_cast<uint32_t>(ALIGN_32));
     uint32_t quantTokenScaleAlignBytes = quantTokenAlignBytes + quantScaleAlignBytes;
-    if constexpr (TopkWeightsPrefetch) {
-        uint32_t weightAlignBytes = Ops::Base::CeilAlign(static_cast<uint32_t>(params.tilingData->topK * sizeof(float)),
-                                                         static_cast<uint32_t>(ALIGN_32));
-        quantTokenScaleAlignBytes += weightAlignBytes;
-    }
+
     return {quantTokenAlignBytes, quantScaleAlignBytes, quantTokenScaleAlignBytes, quantScaleNumAlignPerToken};
 }
 
@@ -58,33 +54,7 @@ __aicore__ inline void LoadTopkWeightsToUb(const Params& params, const QuantProc
                                            const LocalTensor<ActivationType>& xOutTensor, int32_t tokenIndex,
                                            TEventID event)
 {
-    if constexpr (TopkWeightsPrefetch) {
-        GlobalTensor<TopkWeightsType> weightGm;
-        weightGm.SetGlobalBuffer(reinterpret_cast<__gm__ TopkWeightsType*>(
-            params.probsGmAddr +
-            static_cast<uint64_t>(tokenIndex) * params.tilingData->topK * sizeof(TopkWeightsType)));
-        uint32_t weightOffsetInUb = config.quantTokenAlignBytes + config.quantScaleAlignBytes;
-        if constexpr (Std::IsSame<TopkWeightsType, bfloat16_t>::value) {
-            LocalTensor<TopkWeightsType> weightBf16Tmp =
-                scratch.mxTempTensor.template ReinterpretCast<TopkWeightsType>();
-            DataCopyPad(weightBf16Tmp, weightGm,
-                        {1U, static_cast<uint32_t>(params.tilingData->topK * sizeof(TopkWeightsType)), 0U, 0U, 0U},
-                        {false, 0U, 0U, 0U});
-            SetFlag<AscendC::HardEvent::MTE2_V>(event);
-            WaitFlag<AscendC::HardEvent::MTE2_V>(event);
-            LocalTensor<float> weightFp32Ub = xOutTensor[weightOffsetInUb].template ReinterpretCast<float>();
-            Cast(weightFp32Ub, weightBf16Tmp, AscendC::RoundMode::CAST_NONE, params.tilingData->topK);
-            PipeBarrier<PIPE_V>();
-        } else {
-            LocalTensor<TopkWeightsType> weightUb =
-                xOutTensor[weightOffsetInUb].template ReinterpretCast<TopkWeightsType>();
-            DataCopyPad(weightUb, weightGm,
-                        {1U, static_cast<uint32_t>(params.tilingData->topK * sizeof(TopkWeightsType)), 0U, 0U, 0U},
-                        {false, 0U, 0U, 0U});
-            SetFlag<AscendC::HardEvent::MTE2_V>(event);
-            WaitFlag<AscendC::HardEvent::MTE2_V>(event);
-        }
-    }
+
 }
 
 // 原型：MegaMoe::QuantProcessInRank。量化一个逻辑 AIV 任务负责的本卡 token。
@@ -180,7 +150,7 @@ __aicore__ inline void QuantizeLocalTokens(const AivJobContext& job, const MoeSt
                     xCopyInPadParams);
         LoadTopkWeightsToUb<TopkWeightsType, ActivationType, TopkWeightsPrefetch>(params, config, scratch, xOutTensor,
                                                                                   tokenRange.start + index, event);
-        if constexpr (!TopkWeightsPrefetch) {
+        {
             SetFlag<AscendC::HardEvent::MTE2_V>(event);
             WaitFlag<AscendC::HardEvent::MTE2_V>(event);
         }

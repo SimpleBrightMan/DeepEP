@@ -18,9 +18,6 @@
 #include "mega_moe_constants.hpp"
 #include "mega_moe_workspace.hpp"
 #include "mega_moe_wave_schedule.hpp"
-#if defined(ENABLE_MEGA_MOE_LAYERED_KERNEL)
-#include "adv_api/hcomm/hcomm.h"
-#endif
 #include "../mc2_common/mc2_moe_context.hpp"
 
 class AscendTimerDevice;
@@ -62,21 +59,12 @@ struct GMMAddrInfo {
     __gm__ int32_t* dispatchToGmm1Flag;
     __gm__ int32_t* gmm2CombineSyncCounter;
     __gm__ int32_t* gmmToEpilogueFlag;
-    __gm__ int32_t* gmm1TileStatus;
     __gm__ int32_t* sharedExpertGmm2TileCounter;
     // 仅 Wave 调试采集设置；其他调用保持空指针。
     AscendTimerDevice* timer = nullptr;
     // 仅非量化、非prefetch的routed Wave启用；GM计数此时表示issued而非completed。
     bool gmm1AsyncCompletion = false;
 };
-
-#if defined(ENABLE_MEGA_MOE_LAYERED_KERNEL)
-struct CombineCommParams {
-    uint32_t rankId;
-    Hcomm<COMM_PROTOCOL_UBC_CTP>* hcomm;
-    __gm__ Mc2MoeContext* mc2Context;
-};
-#endif
 
 // 保存 TensorList 入口地址，供按 expert 布局解析当前专家权重。
 struct ExpertWeightTensorListAddrs {
@@ -104,9 +92,6 @@ struct Params {
     WorkspaceInfo workspaceInfo;
     PeermemInfo peermemInfo;
     MegaMoeTilingData* tilingData;
-#if defined(ENABLE_MEGA_MOE_LAYERED_KERNEL)
-    CombineCommParams combineCommParams;
-#endif
 };
 
 enum class AddrUpdateMode : int32_t { GMM1, GMM2 };
@@ -154,7 +139,6 @@ struct GmmExecutionConfig {
 struct MoeSyncWorkspaceLayout {
     int32_t dispatchFlagSlotCountPerExpert;
     int32_t activationFlagSlotCountPerExpert;
-    uint32_t gmm1TileStatusCountPerExpert;
 };
 
 struct GroupSyncSlotLayout {

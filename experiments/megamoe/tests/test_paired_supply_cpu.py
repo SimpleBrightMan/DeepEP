@@ -30,9 +30,7 @@ int main() {
   static_assert(B::ScaleBBase + B::ScaleStages*B::ScaleBytes == 512*1024);
   for (unsigned m : {1,4,12,32,64,127,128,129,256})
     for (unsigned n : {64,128,192,256}) {
-      auto p = MakeA8W4KPlan(m,n,true);
-      auto q = MakeA8W4KPlan(m,n,false);
-      assert(p.ka==q.ka && p.kb==q.kb && p.bColumns==q.bColumns);
+      auto p = MakeA8W4KPlan(m);
       assert(((m+15)/16*16)*p.ka <= B::ABytes);
       assert(p.kb*p.bColumns <= B::BBytes);
       assert(p.ka==p.kb && 2048%p.kb==0);

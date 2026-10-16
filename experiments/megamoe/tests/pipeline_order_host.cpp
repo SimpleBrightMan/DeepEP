@@ -7,6 +7,7 @@
 using namespace MegaMoeImpl;
 enum { AIC, AIV, PIPE_ALL, OVERFLOW_MODE_CTRL };
 namespace MegaMoeImpl {
+constexpr int COMBINE_NO_QUANT = 0;
 enum class Stage { INPUT_PREPARE, SHARED_EXPERT_GMM1, CROSS_RANK_SYNC_INPUT,
                    SHARED_EXPERT_GMM2, CROSS_RANK_SYNC_OUTPUT, UNPERMUTE, COMPLETE };
 }

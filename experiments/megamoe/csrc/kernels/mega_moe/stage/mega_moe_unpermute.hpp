@@ -76,20 +76,11 @@ __aicore__ inline void LoadMoeExpertInput(const TokenUnpermuteConfig& context, c
                                           LocalTensor<bfloat16_t>& dataInBf16, LocalTensor<float>& dataInFp32)
 {
     WaitFlag<HardEvent::V_MTE2>(event);
-    if constexpr (CombineMode == COMBINE_NO_QUANT) {
+    {
         DataCopy(dataInBf16, expandedX[expertInputIndex * common.tokenHiddenDim], common.tokenHiddenDim);
         SetFlag<HardEvent::MTE2_V>(event);
         WaitFlag<HardEvent::MTE2_V>(event);
         Cast(dataInFp32, dataInBf16, RoundMode::CAST_NONE, common.tokenHiddenDim);
-    } else {
-        uint32_t quantTokenElementCount = context.quantTokenSizeBytes / sizeof(bfloat16_t);
-        DataCopy(dataInBf16, expandedX[expertInputIndex * quantTokenElementCount], quantTokenElementCount);
-        SetFlag<HardEvent::MTE2_V>(event);
-        WaitFlag<HardEvent::MTE2_V>(event);
-        uint32_t nScale = Ops::Base::CeilDiv(common.tokenHiddenDim, static_cast<uint32_t>(MXFP_SCALE_GROUP_NUM));
-        using Fp8Type = typename std::conditional<CombineMode == MXFP8_E4M3_COMM_QUANT, fp8_e4m3fn_t, fp8_e5m2_t>::type;
-        Mxfp8::DeQuantMxFp8<Fp8Type, bfloat16_t>(dataInBf16, dataInFp32, scratch.bf16ScaleTensor,
-                                                 scratch.fp32ScaleTensor, nScale, common.tokenHiddenDim);
     }
 }
 
@@ -116,14 +107,12 @@ __aicore__ inline void AccumulateMoeExpertsForToken(const TokenUnpermuteConfig& 
         WaitFlag<HardEvent::S_V>(event);
         PipeBarrier<PIPE_V>();
         if (expertIdx == 0) {
-            if constexpr (TopkWeightsPrefetch) {
-                DataCopy(scratch.dataResFp32Tensor, dataInFp32, common.tokenHiddenDim);
-            } else {
+            {
                 float expertScale = scratch.topKWeightsTensor.GetValue(localIdx * common.topK + expertIdx);
                 Muls(scratch.dataResFp32Tensor, dataInFp32, expertScale, common.tokenHiddenDim);
             }
         } else {
-            if constexpr (!TopkWeightsPrefetch) {
+            {
                 float expertScale = scratch.topKWeightsTensor.GetValue(localIdx * common.topK + expertIdx);
                 Muls(dataInFp32, dataInFp32, expertScale, common.tokenHiddenDim);
                 PipeBarrier<PIPE_V>();
@@ -186,7 +175,7 @@ __aicore__ inline void ProcessTokenUnpermuteBatch(
     const GlobalTensor<bfloat16_t>& expandedX, GlobalTensor<bfloat16_t>& output, int32_t jobOffset,
     int32_t batchTokenOffset, int32_t batchTokenCount, TEventID outputBufferEvent)
 {
-    if constexpr (!TopkWeightsPrefetch) {
+    {
         LoadTokenUnpermuteWeights<TopkWeightsType>(common, params, scratch, jobOffset, batchTokenOffset,
                                                    batchTokenCount);
     }
@@ -234,15 +223,6 @@ __aicore__ inline MegaMoeUnpermuteBufferConfig CreateTokenUnpermuteBuffers(const
 
     uint32_t bf16ScaleBufAlign = 0U;
     uint32_t fp32ScaleBufAlign = 0U;
-    if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {
-        uint32_t scaleNum = Ops::Base::CeilDiv(tokenHiddenDim, static_cast<uint32_t>(ALIGN_32));
-        bf16ScaleBufAlign = Ops::Base::CeilAlign(
-            scaleNum * static_cast<uint32_t>(sizeof(bfloat16_t)) * static_cast<uint32_t>(DEQUANT_BF16_SCALE_EXPANSION),
-            static_cast<uint32_t>(ALIGN_32));
-        fp32ScaleBufAlign = Ops::Base::CeilAlign(
-            scaleNum * static_cast<uint32_t>(sizeof(float)) * static_cast<uint32_t>(DEQUANT_FP32_SCALE_EXPANSION),
-            static_cast<uint32_t>(ALIGN_32));
-    }
 
     uint32_t bf16SlotBytes = bufferConfig.bf16SlotElementCount * sizeof(bfloat16_t);
     uint32_t fp32SlotBytes = bufferConfig.fp32SlotElementCount * sizeof(float);
@@ -264,12 +244,7 @@ __aicore__ inline MegaMoeUnpermuteBufferConfig CreateTokenUnpermuteBuffers(const
             TPosition::VECCALC, tempAddr, bufferConfig.topKWeightsConversionBufferBytes / sizeof(bfloat16_t));
         tempAddr += bufferConfig.topKWeightsConversionBufferBytes;
     }
-    if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {
-        scratch.bf16ScaleTensor =
-            LocalTensor<bfloat16_t>(TPosition::VECCALC, tempAddr, bf16ScaleBufAlign / sizeof(bfloat16_t));
-        tempAddr += bf16ScaleBufAlign;
-        scratch.fp32ScaleTensor = LocalTensor<float>(TPosition::VECCALC, tempAddr, fp32ScaleBufAlign / sizeof(float));
-    }
+
     return bufferConfig;
 }
 
