@@ -29,6 +29,9 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091  # 使用当前机器的空�
 # 只打印计划，不访问设备、不写输出。
 python3 experiments/megamoe/scripts/hierarchical_bench.py --plan
 
+# 检查当前 Python 的分层模块和原生接口，不初始化 NPU、不启动 rank。
+python3 experiments/megamoe/scripts/hierarchical_bench.py --check-install
+
 # 默认 H3584、I1280、E384、K8、S0、EP16、balanced，BS2048/4096/8192。
 python3 experiments/megamoe/scripts/hierarchical_bench.py
 ```
@@ -36,6 +39,8 @@ python3 experiments/megamoe/scripts/hierarchical_bench.py
 已有 timer-enabled wheel 也可以使用；这个原型测试不传 per-core timer 指针。
 切换分支后必须重新构建安装完整 wheel，不能复用另一个分支的扩展。
 一键入口会清除扫描分支的两个通信核配比变量，每个 BS 单独启动一个 torchrun。
+启动前在与 worker 相同的环境检查安装，并固定 worker 使用启动脚本的 Python，防止遗留 `PYTHON_EXEC` 切到另一环境。
+安装信息保存在 `installation.json`；`PYTHONPATH` 保留，以兼容 CANN Python 依赖。
 读取 `npu-smi info` 并保存快照，不会抢占或杀掉已有作业；16 张可见卡应全部分配给本次任务。
 
 ```bash
@@ -56,6 +61,24 @@ python3 experiments/megamoe/scripts/hierarchical_bench.py --bs-values 2048 --inp
 H 为 `[1024,8192]` 中 256 的倍数，I 为 `[256,4096]` 中 128 的倍数；
 E 能被 16 整除且每卡专家数不超过 128，K≤min(32,E)。不支持 Decode。
 因此 H=3712 目前不支持，默认 H=3584 支持。
+
+### 找不到 hierarchy_benchmark 模块
+
+该入口必须安装到运行 Python 的 `site-packages`；只编译 `.so` 或加载旧 wheel 不足以运行。
+本分支的 wheel 包含 `hierarchy.py` 和 `hierarchy_benchmark.py`。
+新版构建脚本会在安装后检查新入口及原生 `Plan.configure_hierarchy` / `hierarchy_buffer_size`。
+
+若执行过 `build.sh` 仍报错，先用 `--check-install` 查看实际 Python、包路径与错误，
+再核对 `PYTHON`、`PYTHONPATH` 和本次安装的 wheel。可以显式统一解释器：
+
+```bash
+PY=$(python3 -c 'import sys; print(sys.executable)')
+PYTHON="$PY" bash experiments/megamoe/scripts/build.sh
+"$PY" experiments/megamoe/scripts/hierarchical_bench.py --check-install
+```
+
+如果已有包含这两个新模块的正确 wheel，只需用该 Python 重新安装这个 wheel，无需重新编译。
+不要只把仓库源码加入 `PYTHONPATH` 来绕过错误，否则可能把新 Python 接口与旧 native 扩展混用。
 
 ## 当前的数据流
 

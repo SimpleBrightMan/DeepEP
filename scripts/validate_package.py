@@ -72,6 +72,8 @@ def inspect_wheel(path):
             required = {
                 "deep_ep_experimental/megamoe/api.py",
                 "deep_ep_experimental/megamoe/benchmark.py",
+                "deep_ep_experimental/megamoe/hierarchy.py",
+                "deep_ep_experimental/megamoe/hierarchy_benchmark.py",
                 "deep_ep_experimental/megamoe/configs/smoke.json",
                 "deep_ep_experimental/megamoe/libmegamoe_kernel.so",
             }

@@ -91,12 +91,22 @@ def build(root=ROOT, *, rebuild_shmem=False):
     wheels = list(wheel_dir.glob("ascend_deepep-*.whl"))
     if len(wheels) != 1:
         raise RuntimeError(f"Expected exactly one ascend-deepep wheel in {wheel_dir}, found {len(wheels)}")
-    run([sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", str(wheels[0])])
+    from validate_package import inspect_wheel
+
+    inspect_wheel(wheels[0])
+    # Run outside the checkout so local egg-info cannot shadow the installed distribution.
+    run([sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", str(wheels[0])], cwd=wheel_dir)
     probe = "from deep_ep._native import require_native; require_native('build smoke')"
     if beta == "ON":
         probe += "; import torch, torch_npu; import deep_ep_experimental.megamoe._C"
     # -I 不从源码目录/PYTHONPATH 导入；这里只加载扩展，不分配 NPU 或启动通信。
     run([sys.executable, "-I", "-c", probe], cwd=wheel_dir)
+    if beta == "ON":
+        # Verify the actual Python runner and hierarchy-specific native methods too.
+        run(
+            [sys.executable, "-I", str(root / "experiments/megamoe/scripts/hierarchical_bench.py"), "--check-install"],
+            cwd=wheel_dir,
+        )
     print(f"[BUILD] Installed: {wheels[0]}", flush=True)
     print("[BUILD] Before running tests in your shell (bash cannot export to its parent):")
     print(f'export LD_LIBRARY_PATH={shlex.quote(str(Path(env["SHMEM_ROOT"]) / "lib"))}:"${{LD_LIBRARY_PATH:-}}"')

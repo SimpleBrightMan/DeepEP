@@ -53,7 +53,15 @@ def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
         "test.dist-info/licenses/deepseek-deepep.LICENSE": b"fixture",
     }
     if payload:
-        for name in ("api.py", "benchmark.py", "configs/smoke.json", "libmegamoe_kernel.so", "_C.fake.so"):
+        for name in (
+            "api.py",
+            "benchmark.py",
+            "hierarchy.py",
+            "hierarchy_benchmark.py",
+            "configs/smoke.json",
+            "libmegamoe_kernel.so",
+            "_C.fake.so",
+        ):
             entries["deep_ep_experimental/megamoe/" + name] = b"fixture"
         entries["test.dist-info/licenses/cann.LICENSE"] = b"fixture"
     if ep_gmm_fused:
@@ -80,6 +88,18 @@ def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
 def test_wheel_expected_payload(tmp_path, enabled, payload):
     validate = load(ROOT / "scripts/validate_package.py")
     assert validate.inspect_wheel(wheel(tmp_path, enabled, payload))["megamoe"]["enabled"] == enabled
+
+
+def test_wheel_rejects_missing_hierarchy_runner(tmp_path):
+    validate = load(ROOT / "scripts/validate_package.py")
+    complete = wheel(tmp_path, True, True)
+    incomplete = tmp_path / "incomplete.whl"
+    with zipfile.ZipFile(complete) as source, zipfile.ZipFile(incomplete, "w") as target:
+        for name in source.namelist():
+            if not name.endswith("/hierarchy_benchmark.py"):
+                target.writestr(name, source.read(name))
+    with pytest.raises(RuntimeError, match="Incomplete MegaMoE"):
+        validate.inspect_wheel(incomplete)
 
 
 @pytest.mark.parametrize("megamoe,ep_gmm_fused", [(False, False), (False, True), (True, False), (True, True)])
@@ -136,6 +156,10 @@ def test_component_switches_preserve_python_packages(tmp_path):
                 if present:
                     original = ROOT / "experiments" / component / "python" / prefix / module
                     assert archive.read(prefix + module) == original.read_bytes()
+                    if component == "megamoe":
+                        for entry in ("hierarchy.py", "hierarchy_benchmark.py"):
+                            expected = ROOT / "experiments/megamoe/python" / prefix / entry
+                            assert archive.read(prefix + entry) == expected.read_bytes()
 
 
 @pytest.mark.parametrize("enabled,payload", [(False, True), (True, False)])

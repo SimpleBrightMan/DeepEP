@@ -13,11 +13,33 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import uuid
 
 ROOT = Path(__file__).resolve().parents[3]
 STAGES = ("dispatch_cross", "dispatch_intra", "combine_intra", "combine_cross")
 CORE_ENV = ("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES")
+INSTALL_PROBE = """
+import importlib, json, os, sys
+report = {"python": sys.executable, "pythonpath": os.environ.get("PYTHONPATH"), "modules": {}}
+try:
+    for name in ("deep_ep", "deep_ep_experimental.megamoe",
+                 "deep_ep_experimental.megamoe.hierarchy_benchmark"):
+        module = importlib.import_module(name)
+        report["modules"][name] = module.__file__
+    import torch, torch_npu
+    core = importlib.import_module("deep_ep._C")
+    native = importlib.import_module("deep_ep_experimental.megamoe._C")
+    report["modules"]["deep_ep._C"] = core.__file__
+    report["modules"]["deep_ep_experimental.megamoe._C"] = native.__file__
+    if not hasattr(native, "hierarchy_buffer_size") or not hasattr(native.Plan, "configure_hierarchy"):
+        raise RuntimeError("Installed native extension lacks hierarchical-dedup support")
+    report["passed"] = True
+except Exception as error:
+    report.update(passed=False, error=f"{type(error).__name__}: {error}")
+print(json.dumps(report), flush=True)
+sys.exit(0 if report["passed"] else 1)
+"""
 
 
 def parse_args(argv=None):
@@ -37,6 +59,7 @@ def parse_args(argv=None):
     parser.add_argument("--timeout", type=int, default=3600, help="Seconds per BS process group")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--plan", action="store_true", help="Print commands without device access or files")
+    parser.add_argument("--check-install", action="store_true", help="Check Python/native imports without using NPU")
     args = parser.parse_args(argv)
     try:
         args.bs_values = [int(value) for value in args.bs_values.split(",")]
@@ -110,6 +133,7 @@ def plan(args):
         commands=[command(args, bs) for bs in args.bs_values],
         timeout_seconds_per_bs=args.timeout,
         inherited_variables_cleared=list(CORE_ENV),
+        worker_python=sys.executable,
         notes=[
             "One fresh torchrun per BS, comparing original direct schedule and hierarchy in each case.",
             "Prototype uses multiple kernels, stream synchronization and host SHMEM stage barriers.",
@@ -126,12 +150,39 @@ def environment(base=None):
     for key in CORE_ENV:
         result.pop(key, None)
     result.setdefault("OMP_NUM_THREADS", "1")
+    # torchrun otherwise honors an inherited PYTHON_EXEC from another environment.
+    result["PYTHON_EXEC"] = sys.executable
     return result
+
+
+def check_installation(cwd):
+    """Use the same executable, cwd and environment as workers; no NPU allocation."""
+    result = subprocess.run(
+        [sys.executable, "-c", INSTALL_PROBE],
+        cwd=cwd,
+        env=environment(),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    print(f"[INSTALL_CHECK] worker Python: {sys.executable}", flush=True)
+    if result.stdout.strip():
+        print(result.stdout.strip(), flush=True)
+    if result.returncode:
+        raise RuntimeError(
+            "Hierarchy package/native installation check failed before starting any ranks. "
+            f"Use this same Python ({sys.executable}) to build/install and run this branch; "
+            "inspect the module paths above and PYTHON/PYTHONPATH overrides. "
+            "Run PYTHON=<that-python> bash experiments/megamoe/scripts/build.sh.\n" + result.stderr.strip()
+        )
+    return result.stdout.strip()
 
 
 def execute(argv, cwd, logfile, timeout):
     with logfile.open("w", encoding="utf-8") as stream:
-        stream.write(json.dumps(dict(argv=argv, cleared_environment=list(CORE_ENV))) + "\n")
+        stream.write(
+            json.dumps(dict(argv=argv, worker_python=sys.executable, cleared_environment=list(CORE_ENV))) + "\n"
+        )
         stream.flush()
         process = subprocess.Popen(
             argv, cwd=cwd, env=environment(), stdout=stream, stderr=subprocess.STDOUT, start_new_session=True
@@ -288,10 +339,16 @@ def main(argv=None):
     if args.plan:
         print(json.dumps(launch_plan, indent=2))
         return
+    if args.check_install:
+        with tempfile.TemporaryDirectory(prefix="megamoe-install-check-") as directory:
+            check_installation(directory)
+        return
     if os.name != "posix":
         raise RuntimeError("Run on Linux with 16 allocated UBX devices; --plan requires no device")
     args.output_dir.mkdir(parents=True, exist_ok=False)
     (args.output_dir / "plan.json").write_text(json.dumps(launch_plan, indent=2) + "\n", encoding="utf-8")
+    check = check_installation(args.output_dir)
+    (args.output_dir / "installation.json").write_text(check + "\n", encoding="utf-8")
     snapshot = subprocess.run(["npu-smi", "info"], text=True, capture_output=True, check=True)
     (args.output_dir / "npu_smi.txt").write_text(snapshot.stdout + snapshot.stderr, encoding="utf-8")
     print(

@@ -3,6 +3,9 @@
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -105,10 +108,59 @@ def test_command_forwards_full_model_and_accuracy_configuration(tmp_path):
 def test_does_not_inherit_other_branch_core_configuration():
     original = {name: "12" for name in launcher.CORE_ENV}
     original["SHMEM_ROOT"] = "/sdk"
+    original["PYTHON_EXEC"] = "/old/python"
+    original["PYTHONPATH"] = "/cann/site-packages"
     cleaned = launcher.environment(original)
     assert all(name not in cleaned for name in launcher.CORE_ENV)
     assert cleaned["SHMEM_ROOT"] == "/sdk" and cleaned["OMP_NUM_THREADS"] == "1"
     assert all(name in original for name in launcher.CORE_ENV)
+    assert cleaned["PYTHON_EXEC"] == sys.executable
+    assert cleaned["PYTHONPATH"] == original["PYTHONPATH"]
+
+
+def test_install_check_matches_worker_environment_and_reports_missing_module(tmp_path, monkeypatch, capsys):
+    def run(argv, **kwargs):
+        assert argv[:2] == [sys.executable, "-c"]
+        assert kwargs["cwd"] == tmp_path and kwargs["env"] == launcher.environment()
+        assert "hierarchy_benchmark" in argv[2] and "configure_hierarchy" in argv[2]
+        return SimpleNamespace(returncode=1, stdout='{"passed":false,"error":"missing hierarchy_benchmark"}', stderr="")
+
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="before starting any ranks"):
+        launcher.check_installation(tmp_path)
+    assert "missing hierarchy_benchmark" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("missing", ["runner", "native", None])
+def test_install_probe_checks_actual_imports_without_npu_calls(tmp_path, missing):
+    modules = {
+        "deep_ep/__init__.py": "",
+        "deep_ep/_C.py": "",
+        "deep_ep_experimental/__init__.py": "",
+        "deep_ep_experimental/megamoe/__init__.py": "",
+        "torch.py": "",
+        "torch_npu.py": "",
+        "deep_ep_experimental/megamoe/hierarchy_benchmark.py": "",
+        "deep_ep_experimental/megamoe/_C.py": (
+            "class Plan:\n    configure_hierarchy = None\nhierarchy_buffer_size = None\n"
+            if missing != "native"
+            else "class Plan: pass\n"
+        ),
+    }
+    if missing == "runner":
+        modules.pop("deep_ep_experimental/megamoe/hierarchy_benchmark.py")
+    for relative, source in modules.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+    result = subprocess.run(
+        [sys.executable, "-c", launcher.INSTALL_PROBE], cwd=tmp_path, capture_output=True, text=True
+    )
+    report = json.loads(result.stdout)
+    assert report["passed"] is (missing is None)
+    assert result.returncode == (0 if missing is None else 1)
+    if missing:
+        assert "hierarchy" in report["error"] or "hierarchical" in report["error"]
 
 
 def make_case(tmp_path):
