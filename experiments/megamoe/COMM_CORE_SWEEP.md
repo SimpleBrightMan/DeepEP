@@ -7,10 +7,11 @@
 固定 H=3584、I=1280、E=384、K=8、S=0、EP16、BS=2048/4096/8192，沿用仓库 rank-first balanced 路由。
 全部 28 个物理核心保持启动。连续四个 rank 为一组，INTRA 包含本卡搬运。
 
-## 构建和首次时间验收
+## 构建和运行
 
 激活匹配的 Python/Torch 环境并 source CANN，设置完整 SHMEM SDK 的 `SHMEM_ROOT`。
 此次包含新设备 kernel 与 Python API，必须重新构建安装，不能复用旧二进制。
+审计计数已改为每核独占 128B 缓存行，timer buffer 布局随之更新；Python 包和设备库必须一起更新。
 
 ```bash
 git fetch origin
@@ -24,17 +25,31 @@ export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 export LD_LIBRARY_PATH="${SHMEM_ROOT:-$PWD/third-party/shmem/install/shmem}/lib:$ASCEND_HOME_PATH/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-# 不访问设备、不创建文件，只查看计划。
-python3 experiments/megamoe/scripts/comm_core_sweep.py --plan --run-full-reference
+# 仅运行通信模拟，保留 timer 原始文件；不做数据/逐 token 核对或完整算子时间对比。
+python3 experiments/megamoe/scripts/comm_core_sweep.py \
+  --mode baseline --bs-values 2048,4096,8192 \
+  --no-validation --keep-raw-timers
+```
 
-# 每个 BS 跑一次完整 MegaMoE，再跑独立通信模拟并比较每个核。
+`--mode baseline` 清除继承的 Dispatch / Combine 分核变量，使用原任务分配。
+不加 `--run-full-reference` 时只运行通信模拟，适合后续快速实验。
+`--no-validation` 跳过 CPU Golden、数据 snapshot、逐 token audit 和任务一致性核对，仍采集 timer-off kernel 耗时和普通 timer。
+带宽分子来自普通 timer 中实际记录的行数，分母为全部 28 个 AIV1 的通信累计时间均值；Dispatch、Combine 分开计算。
+报告标记 `validation=skipped`，保留每 Wave/每核时间和行数，不生成逐 token 审计 CSV。
+需要流水图时，可对结果内 `bs_<BS>/baseline/bs_<BS>/timer/` 运行 `python3 -m deep_ep_experimental.megamoe.timer /实际timer目录 --ranks 0-15`。
+
+## 可选的解耦验收
+
+下面命令在每个 BS 先跑本分支完整 MegaMoE，再跑通信模拟，最后比较每核时间；它不是只跑 main 原算子。
+两者均使用原 Dispatch/Combine 任务分配，完整版本还执行 GMM1、SwiGLU 和 GMM2。
+
+```bash
 python3 experiments/megamoe/scripts/comm_core_sweep.py \
   --mode baseline --bs-values 2048,4096,8192 \
   --run-full-reference --timing-rtol 0.10 --require-timing-match
 ```
 
-`--mode baseline` 清除继承的 Dispatch / Combine 分核变量，使用原任务分配。
-不加 `--run-full-reference` 时只运行通信模拟，适合后续快速实验。
+验收与 `--no-validation` 互斥；无需每轮性能实验都执行验收。
 
 `--timing-rtol 0.10` 表示 10% 相对容差，可增加 `--timing-atol-us`。
 对每个 rank、每个核、每种通信分别检验：
@@ -87,7 +102,7 @@ python3 experiments/megamoe/scripts/comm_core_sweep.py \
 
 ## 数据与计时验收
 
-每个通信 case 包含 timer-off 性能采样、普通 timer 批量调用（仅最后一次带 timer）、独立 audit kernel。
+未设置 `--no-validation` 时，每个通信 case 包含 timer-off 性能采样、普通 timer 批量调用（仅最后一次带 timer）、独立 audit kernel。
 audit 记录逐 token 实际任务，详细标量日志开销不进入带宽。
 
 FP8 输入字节和 scale 由源 rank/token/lane 确定，身份位覆盖全部 8192 个 token。
@@ -154,7 +169,7 @@ payload 分子不含 metadata、控制标记与本地暂存，不做 RX+TX 翻�
 - `bs_*/full_megamoe_comparison.json`：显式对照的每核时间匹配结果。
 
 默认不保存庞大 raw timer；需要流水图时加 `--keep-raw-timers`，再使用 timer CLI。
-普通 timer 为 346,092,304 B/卡，释放后申请 audit 648,082,192 B/卡。
+普通 timer 为 346,104,064 B/卡，释放后申请 audit 648,093,952 B/卡；`--no-validation` 不申请 audit。
 16 rank 同时解析 audit 的原始 D2H 数据约 10.37 GB 主机内存，另需任务对象和 snapshot 内存。
 TCPStore 仅交换紧凑报告，详细数据保存在各 rank 文件。
 数据与任务检查失败立即停止，时间偏差是否强制退出由 `--require-timing-match` 控制。

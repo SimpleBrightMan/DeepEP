@@ -101,6 +101,21 @@ def test_missing_duplicate_audit_and_wrong_timer_budget_rejected():
         comm_report.rank_report(events, transfers=transfers, **spec)
 
 
+def test_missing_core_audit_reports_counts_without_guessing_cause():
+    _, spec, events, transfers, _ = report_capture()
+    lost = [record for record in transfers if record["core"] == 0]
+    remaining = [record for record in transfers if record["core"] != 0]
+    with pytest.raises(ValueError, match="fidelity mismatch") as failure:
+        comm_report.rank_report(events, transfers=remaining, **spec)
+    message = str(failure.value)
+    counts = Counter(record["operation"] for record in lost)
+    assert f"missing_count={len(lost)} unexpected_count=0" in message
+    assert f"DISPATCH/c0:{counts['DISPATCH']}" in message
+    assert f"COMBINE/c0:{counts['COMBINE']}" in message
+    assert "unexpected_by_operation_core=[]" in message
+    assert "missing=[(Transfer(" in message
+
+
 def test_wrong_measured_wave_core_assignment_and_overlap_rejected():
     _, spec, events, transfers, _ = report_capture()
     wrong = deepcopy(events)
@@ -124,6 +139,15 @@ def test_audit_instrumented_timing_cannot_contaminate_bandwidth():
 def test_native_memset_enabled_flag_is_nonzero_not_only_integer_one():
     _, _, audit, plan = capture()
     audit.values[p.COMM_AUDIT_ENABLE_OFFSET] = 0x0101010101010101
+    assert len(comm_report.read_transfers(audit, 0)) == len(plan["transfers"])
+
+
+def test_audit_count_padding_is_not_interpreted_as_other_cores():
+    _, _, audit, plan = capture()
+    for hardware_core in range(p.N_CORE_COUNT):
+        offset = p.COMM_AUDIT_COUNT_OFFSET + hardware_core * p.COMM_AUDIT_COUNT_STRIDE
+        for padding in range(1, p.COMM_AUDIT_COUNT_STRIDE):
+            audit.values[offset + padding] = p.COMM_AUDIT_MAX_RECORDS_PER_CORE + 1
     assert len(comm_report.read_transfers(audit, 0)) == len(plan["transfers"])
 
 
@@ -168,7 +192,7 @@ def test_inactive_workers_are_zero_but_denominator_is_always_28(tmp_path):
 
 def test_trace_overflow_and_legacy_only_timing_are_rejected():
     spec, measured, audit, _ = capture()
-    audit.values[p.COMM_AUDIT_COUNT_OFFSET + 2] = p.COMM_AUDIT_MAX_RECORDS_PER_CORE + 1
+    audit.values[p.COMM_AUDIT_COUNT_OFFSET + 2 * p.COMM_AUDIT_COUNT_STRIDE] = p.COMM_AUDIT_MAX_RECORDS_PER_CORE + 1
     with pytest.raises(ValueError, match="overflow"):
         comm_report.read_transfers(audit, 0)
     with pytest.raises(ValueError, match="separate actual-transfer audit"):

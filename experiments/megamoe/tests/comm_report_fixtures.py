@@ -42,12 +42,13 @@ def capture(bs=16, rank=0, dispatch_intra=0, combine_intra=0, hidden=3584, inter
     for transfer in plan["transfers"]:
         grouped[(transfer.operation, transfer.wave, transfer.core, transfer.expert)].append(transfer)
         hardware_core = transfer.core * 3 + 2
-        index = audit.values.get(p.COMM_AUDIT_COUNT_OFFSET + hardware_core, 0)
+        count_offset = p.COMM_AUDIT_COUNT_OFFSET + hardware_core * p.COMM_AUDIT_COUNT_STRIDE
+        index = audit.values.get(count_offset, 0)
         offset = p.COMM_AUDIT_RECORD_OFFSET + (hardware_core * p.COMM_AUDIT_MAX_RECORDS_PER_CORE + index) * 3
         audit.values[offset] = transfer.wave
         audit.values[offset + 1] = ((transfer.operation == "COMBINE") << 56) | (transfer.expert << 32) | transfer.row
         audit.values[offset + 2] = (transfer.source_rank << 48) | (transfer.topk_slot << 32) | transfer.source_token
-        audit.values[p.COMM_AUDIT_COUNT_OFFSET + hardware_core] = index + 1
+        audit.values[count_offset] = index + 1
     slices = {(s["wave"], s["expert"]): s for s in plan["slices"]}
     for sequence, ((operation, wave, core, expert), transfers) in enumerate(sorted(grouped.items())):
         hardware_core = core * 3 + 2

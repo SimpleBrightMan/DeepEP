@@ -134,6 +134,9 @@ def parse_args(argv=None):
     parser.add_argument("--config", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--no-timer-raw", action="store_true")
+    parser.add_argument(
+        "--no-validation", action="store_true", help="Measure communication only; skip payload checks and task audit"
+    )
     args = parser.parse_args(argv)
     config = load_config(args.config)
     model = config["model"]
@@ -148,14 +151,14 @@ def run(args, config, group):
     import numpy as np
     import torch
     from .api import SymmBuffer, communication_forward
-    from .comm_report import rank_report, read_events, read_transfers, summarize, write_rank_detail
+    from .comm_report import rank_report, read_events, read_transfers, summarize, timer_rank_report, write_rank_detail
     from .timer.breakdown import compact_events, rank_breakdown, write_breakdown
     from .validation import collective_check
 
     rank, world = group.rank(), group.size()
     if world != 16 or int(os.environ["LOCAL_WORLD_SIZE"]) != 16:
         raise ValueError("Communication simulator requires one EP16 machine")
-    collective_check(group, "communication-only configuration", None, (config, args.no_timer_raw))
+    collective_check(group, "communication-only configuration", None, (config, args.no_timer_raw, args.no_validation))
     rank_dir = args.output_dir / f"rank_{rank}"
     error = None
     try:
@@ -170,6 +173,7 @@ def run(args, config, group):
         mode="perf",
         routing="balanced",
         workload="communication_only",
+        validation="skipped" if args.no_validation else "strict",
         ep_size=world,
         rank=rank,
         local_rank=int(os.environ["LOCAL_RANK"]),
@@ -205,7 +209,7 @@ def run(args, config, group):
         buffer.prepare_communication(bs, combine_payload=payload)
         torch.npu.synchronize()
         del payload, data, scales
-        expected = expected_output(config, rank, bs)
+        expected = None if args.no_validation else expected_output(config, rank, bs)
         result = torch.empty((bs, model["hidden"]), device="npu", dtype=torch.bfloat16)
         counts = None
 
@@ -228,7 +232,7 @@ def run(args, config, group):
             metric="communication_only_kernel_duration_us", workload="communication_only", alignment=alignment
         )
         (case / "profiling.json").write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
-        uninstrumented = result.float().cpu().numpy()
+        uninstrumented = None if args.no_validation else result.float().cpu().numpy()
 
         def validate(label, expected, uninstrumented):
             snapshot = buffer.communication_snapshot(rows)
@@ -245,7 +249,8 @@ def run(args, config, group):
             if not all(item["passed"] for item in reports):
                 raise AssertionError(f"Communication payload verification failed: {case / label}")
 
-        validate("payload_accuracy.json", expected, uninstrumented)
+        if not args.no_validation:
+            validate("payload_accuracy.json", expected, uninstrumented)
         timer_dir = args.output_dir / f"bs_{bs}" / "timer"
         timer_dir.mkdir(parents=True, exist_ok=True)
         timer = buffer.allocate_timer()
@@ -257,7 +262,8 @@ def run(args, config, group):
         group.barrier(f"communication timer batch BS={bs}")
         enqueue_batch(call, torch, prefix, alignment, config["iters"], timer)
         torch.npu.synchronize()
-        validate("timer_accuracy.json", expected, uninstrumented)
+        if not args.no_validation:
+            validate("timer_accuracy.json", expected, uninstrumented)
         raw = timer.cpu().numpy().astype("<i8", copy=False).reshape(-1)
         events = read_events(raw, rank)
         breakdown = rank_breakdown(compact_events(raw, rank), rank)
@@ -268,40 +274,46 @@ def run(args, config, group):
         if rank == 0:
             write_breakdown(breakdowns, timer_dir, f"communication only BS={bs}")
 
-        # Audit writes occur in a separate invocation; they never enter measured bandwidth.
-        audit = buffer.allocate_timer(audit=True)
-        torch.npu.synchronize()
-        group.barrier(f"communication task audit BS={bs}")
-        call(audit)
-        torch.npu.synchronize()
-        validate("communication_audit_accuracy.json", expected, uninstrumented)
-        raw = audit.cpu().numpy().astype("<i8", copy=False).reshape(-1)
-        transfers = read_transfers(raw, rank)
-        if not args.no_timer_raw:
-            raw.tofile(timer_dir / f"rank_{rank}_communication_audit.bin")
-        del raw, audit
-        report = rank_report(
-            events,
-            rank,
-            bs,
-            model["hidden"],
-            model["num_topk"],
-            int(os.environ.get("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "0")),
-            int(os.environ.get("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES", "0")),
-            experts=model["num_experts"],
-            intermediate=model["intermediate_hidden"],
-            ranks_per_node=16,
-            transfers=transfers,
-        )
+        if args.no_validation:
+            report = timer_rank_report(events, rank, model["hidden"])
+        else:
+            # Audit writes occur in a separate invocation; they never enter measured bandwidth.
+            audit = buffer.allocate_timer(audit=True)
+            torch.npu.synchronize()
+            group.barrier(f"communication task audit BS={bs}")
+            call(audit)
+            torch.npu.synchronize()
+            validate("communication_audit_accuracy.json", expected, uninstrumented)
+            raw = audit.cpu().numpy().astype("<i8", copy=False).reshape(-1)
+            transfers = read_transfers(raw, rank)
+            if not args.no_timer_raw:
+                raw.tofile(timer_dir / f"rank_{rank}_communication_audit.bin")
+            del raw, audit
+            report = rank_report(
+                events,
+                rank,
+                bs,
+                model["hidden"],
+                model["num_topk"],
+                int(os.environ.get("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "0")),
+                int(os.environ.get("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES", "0")),
+                experts=model["num_experts"],
+                intermediate=model["intermediate_hidden"],
+                ranks_per_node=16,
+                transfers=transfers,
+            )
         report = write_rank_detail(report, timer_dir)
-        reports = group.all_gather(report, f"communication strict wave/core report BS={bs}")
+        reports = group.all_gather(report, f"communication bandwidth report BS={bs}")
         if rank == 0:
-            summary = summarize(reports)
+            summary = summarize(reports, require_validation=not args.no_validation)
             summary["workload"] = "communication_only"
             (timer_dir / "communication.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+            validation_status = (
+                "validation skipped" if args.no_validation else "Dispatch/Combine payload and wave/core audit passed"
+            )
             print(
                 f"[COMM_ONLY] BS={bs} kernel rank-max-mean={profile['rank_max_mean_us']:.3f}us; "
-                "Dispatch/Combine payload and wave/core audit passed; no GMM executed",
+                f"{validation_status}; no GMM executed",
                 flush=True,
             )
         del prefix, expected, uninstrumented

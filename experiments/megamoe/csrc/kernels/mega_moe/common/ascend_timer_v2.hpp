@@ -71,14 +71,23 @@ static constexpr int WAVE_ID_TOTAL_SIZE = WAVE_ID_PER_CORE_ALIGN * N_CORE_COUNT;
 // The normal timing buffer contains only controls/counts, not the large audit
 // log. Native launch derives this flag from the validated allocation size.
 static constexpr int COMM_AUDIT_ENABLE_OFFSET = WAVE_ID_OFFSET + WAVE_ID_TOTAL_SIZE;
-static constexpr int COMM_M_GROUPS_PER_WAVE_OFFSET = COMM_AUDIT_ENABLE_OFFSET + 1;
-static constexpr int COMM_AUDIT_COUNT_OFFSET = COMM_AUDIT_ENABLE_OFFSET + 2;
-static constexpr int TOTAL_BUFFER_SIZE = COMM_AUDIT_COUNT_OFFSET + N_CORE_COUNT;
+// Scalar GM stores write back whole cache lines. Controls and counters with
+// different writers must not share a line, even when their int64 slots differ.
+// ENABLE is host-owned, the wave budget belongs to AIV1 core 0, and each
+// hardware core owns one count line (including idle AIC/AIV0 zero counts).
+static constexpr int COMM_CACHE_LINE_WORDS = 16;
+static constexpr int COMM_M_GROUPS_PER_WAVE_OFFSET = COMM_AUDIT_ENABLE_OFFSET + COMM_CACHE_LINE_WORDS;
+static constexpr int COMM_AUDIT_COUNT_OFFSET = COMM_M_GROUPS_PER_WAVE_OFFSET + COMM_CACHE_LINE_WORDS;
+static constexpr int COMM_AUDIT_COUNT_STRIDE = COMM_CACHE_LINE_WORDS;
+static constexpr int TOTAL_BUFFER_SIZE = COMM_AUDIT_COUNT_OFFSET + N_CORE_COUNT * COMM_AUDIT_COUNT_STRIDE;
 static constexpr int COMM_AUDIT_RECORD_OFFSET = TOTAL_BUFFER_SIZE;
 static constexpr int COMM_AUDIT_MAX_RECORDS_PER_CORE = 131072;
 static constexpr int COMM_AUDIT_RECORD_WORDS = 3;
 static constexpr int COMM_AUDIT_BUFFER_SIZE =
     COMM_AUDIT_RECORD_OFFSET + N_CORE_COUNT * COMM_AUDIT_MAX_RECORDS_PER_CORE * COMM_AUDIT_RECORD_WORDS;
+static_assert(COMM_AUDIT_ENABLE_OFFSET % COMM_CACHE_LINE_WORDS == 0);
+static_assert(COMM_AUDIT_RECORD_OFFSET % COMM_CACHE_LINE_WORDS == 0);
+static_assert(COMM_AUDIT_MAX_RECORDS_PER_CORE * COMM_AUDIT_RECORD_WORDS % COMM_CACHE_LINE_WORDS == 0);
 
 }  // namespace AscendTimer
 

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from deep_ep_experimental.megamoe import output_check
+from deep_ep_experimental.megamoe import comm_report, output_check
 
 ROOT = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location(
@@ -52,6 +52,30 @@ def test_full_reference_is_explicit_and_included_in_launch_plan():
         sweep.parse_args(["--require-timing-match"])
     with pytest.raises(SystemExit):
         sweep.parse_args(["--run-full-reference", "--full-reference-dir", "old"])
+
+
+@pytest.mark.parametrize(
+    "extra", [["--run-full-reference"], ["--full-reference-dir", "old"], ["--require-timing-match"]]
+)
+def test_performance_only_rejects_full_reference_and_timing_requirements(extra):
+    with pytest.raises(SystemExit):
+        sweep.parse_args(["--no-validation", *extra])
+
+
+def test_performance_only_plan_and_child_command(tmp_path, capsys):
+    target = tmp_path / "performance"
+    sweep.main(["--plan", "--no-validation", "--output-dir", str(target)])
+    planned = json.loads(capsys.readouterr().out)
+    assert not target.exists()
+    assert planned["validation"] == "skipped"
+    assert planned["total_case_launches"] == 3
+    assert planned["full_reference"] is None
+    assert "validation skipped" in planned["stages"][0]
+    assert not any("checks Dispatch bytes" in note for note in planned["notes"])
+    args = sweep.parse_args(["--no-validation"])
+    command = sweep.command(args, tmp_path / "config", target, None, target)
+    assert "--no-validation" in command
+    assert "deep_ep_experimental.megamoe.comm_benchmark" in command
 
 
 @pytest.mark.parametrize("different", ["intermediate_hidden", "alignment", "rank", "split"])
@@ -160,7 +184,8 @@ def test_staged_search_retains_first_stage_winner_outside_combine_candidates(tmp
     monkeypatch.setattr(sweep, "write_summary", lambda path, plan, records, chosen: selections.extend(chosen))
     durations = {None: 200, (2, 12): 90, (4, 12): 100, (2, 2): 150, (2, 4): 130}
 
-    def read(output, bs, pair):
+    def read(output, bs, pair, *, validate=True):
+        assert validate
         return dict(pair=list(pair) if pair else None, passed=True, comm_kernel_rank_max_mean_us=durations[pair])
 
     monkeypatch.setattr(sweep, "read_case", read)
@@ -193,7 +218,8 @@ def test_dispatch_only_keeps_combine_fixed_through_scan_and_confirmation(tmp_pat
     monkeypatch.setattr(sweep, "write_summary", lambda path, plan, records, chosen: selections.extend(chosen))
     durations = {None: 200, (10, 7): 120, (12, 7): 110, (16, 7): 130, (20, 7): 125}
 
-    def read(output, bs, pair):
+    def read(output, bs, pair, *, validate=True):
+        assert validate
         return dict(pair=list(pair) if pair else None, passed=True, comm_kernel_rank_max_mean_us=durations[pair])
 
     monkeypatch.setattr(sweep, "read_case", read)
@@ -237,7 +263,7 @@ def test_default_baseline_runs_each_bs_once_without_selection(tmp_path, monkeypa
     monkeypatch.setattr(sweep, "execute", lambda argv, **kwargs: launches.append((argv, kwargs["environment"])))
     monkeypatch.setattr(sweep, "print_case", results.append)
     monkeypatch.setattr(sweep, "write_summary", lambda path, plan, records, chosen: selections.extend(chosen))
-    monkeypatch.setattr(sweep, "read_case", lambda output, bs, pair: dict(bs=bs, pair=pair, passed=True))
+    monkeypatch.setattr(sweep, "read_case", lambda output, bs, pair, **kwargs: dict(bs=bs, pair=pair, passed=True))
     sweep.main(["--output-dir", str(tmp_path / "run"), "--case-gap-seconds", "0"])
     assert [item["bs"] for item in results] == [2048, 4096, 8192]
     assert all(item["pair"] is None and item["stage"] == "baseline" for item in results)
@@ -285,8 +311,7 @@ def test_execute_waits_and_records_exit_without_masking_child_failure(tmp_path, 
     assert records[-1]["event"] == "torchrun_exit" and records[-1]["returncode"] == status
 
 
-@pytest.mark.parametrize("pair", [None, (12, 0), (12, 12)])
-def test_case_reader_accepts_complete_data_and_rejects_incomplete_ranks(tmp_path, pair):
+def write_case_fixture(tmp_path, pair, *, validate=True):
     bs = 2048
     for rank in range(16):
         directory = tmp_path / f"rank_{rank}"
@@ -305,6 +330,8 @@ def test_case_reader_accepts_complete_data_and_rejects_incomplete_ranks(tmp_path
             config=dict(bs_values=[bs]),
             build={"test": True},
         )
+        if not validate:
+            manifest["validation"] = "skipped"
         (directory / "manifest.json").write_text(json.dumps(manifest))
     rank0 = tmp_path / "rank_0" / f"bs_{bs}"
     rank0.mkdir()
@@ -315,9 +342,10 @@ def test_case_reader_accepts_complete_data_and_rejects_incomplete_ranks(tmp_path
     )
     (rank0 / "profiling.json").write_text(json.dumps(profile))
     checks = [dict(rank=rank, passed=True) for rank in range(16)]
-    (rank0 / "payload_accuracy.json").write_text(json.dumps(checks))
-    (rank0 / "timer_accuracy.json").write_text(json.dumps(checks))
-    (rank0 / "communication_audit_accuracy.json").write_text(json.dumps(checks))
+    if validate:
+        (rank0 / "payload_accuracy.json").write_text(json.dumps(checks))
+        (rank0 / "timer_accuracy.json").write_text(json.dumps(checks))
+        (rank0 / "communication_audit_accuracy.json").write_text(json.dumps(checks))
     timer = tmp_path / f"bs_{bs}" / "timer"
     timer.mkdir(parents=True)
     communication = dict(
@@ -328,7 +356,18 @@ def test_case_reader_accepts_complete_data_and_rejects_incomplete_ranks(tmp_path
             for operation in ("DISPATCH", "COMBINE")
         },
     )
+    if not validate:
+        communication["validation"] = dict(strict_wave_core=False, status="skipped")
+        for record in communication["ranks"]:
+            record["validation"] = dict(strict_wave_core=False, status="skipped", accounting="timer_row_counts")
     (timer / "communication.json").write_text(json.dumps(communication))
+    return rank0, timer, communication, checks
+
+
+@pytest.mark.parametrize("pair", [None, (12, 0), (12, 12)])
+def test_case_reader_accepts_complete_data_and_rejects_incomplete_ranks(tmp_path, pair):
+    bs = 2048
+    rank0, timer, communication, checks = write_case_fixture(tmp_path, pair)
     report = sweep.read_case(tmp_path, bs, pair)
     assert report["comm_kernel_rank_max_mean_us"] == 116.0
     assert report["comm_kernel_rank_min_mean_us"] == 101.0
@@ -344,6 +383,100 @@ def test_case_reader_accepts_complete_data_and_rejects_incomplete_ranks(tmp_path
     (timer / "communication.json").write_text(json.dumps(communication))
     with pytest.raises(ValueError, match="per-wave/core"):
         sweep.read_case(tmp_path, bs, pair)
+
+
+def test_performance_only_reader_never_requires_accuracy_files_or_audit(tmp_path, capsys):
+    rank0, timer, communication, checks = write_case_fixture(tmp_path, None, validate=False)
+    assert not list(rank0.glob("*accuracy.json"))
+    report = sweep.read_case(tmp_path, 2048, None, validate=False)
+    assert report["validation"] == "skipped"
+    assert report["comm_kernel_rank_max_mean_us"] == 116.0
+    sweep.print_case(report)
+    output = capsys.readouterr().out
+    assert "validation skipped" in output
+    assert "passed" not in output
+    assert "JSON/CSV" not in output
+    assert "[BW] DISPATCH" in output and "[BW] COMBINE" in output
+    # A performance-only read must not silently accept a partially strict report.
+    communication["ranks"][4]["validation"]["strict_wave_core"] = True
+    (timer / "communication.json").write_text(json.dumps(communication))
+    with pytest.raises(ValueError, match="validation-skipped"):
+        sweep.read_case(tmp_path, 2048, None, validate=False)
+
+
+def test_performance_reader_accepts_real_timer_accounting_summary(tmp_path):
+    _, timer, _, _ = write_case_fixture(tmp_path, None, validate=False)
+    records = []
+    for rank in range(16):
+        events = [
+            dict(
+                rank=rank,
+                core=core,
+                wave=wave,
+                family=f"AIV_{operation}_COMM",
+                row_count=80 + rank + core,
+                start_cycle=1000 + wave * 100000,
+                end_cycle=5000 + wave * 100000 + core * 100,
+                audit_enabled=False,
+            )
+            for operation in ("DISPATCH", "COMBINE")
+            for wave in range(2)
+            for core in range(28)
+        ]
+        measured = comm_report.timer_rank_report(events, rank, 3584)
+        records.append(comm_report.write_rank_detail(measured, timer))
+    actual = comm_report.summarize(records, require_validation=False)
+    (timer / "communication.json").write_text(json.dumps(actual))
+    loaded = sweep.read_case(tmp_path, 2048, None, validate=False)
+    assert loaded["communication"]["operations"] == actual["operations"]
+    assert loaded["validation"] == "skipped"
+    assert loaded["communication"]["ranks"][0]["detail_files"].keys() == {"json"}
+
+
+@pytest.mark.parametrize("validate", [False, True])
+def test_case_reader_rejects_validation_mode_mismatch(tmp_path, validate):
+    write_case_fixture(tmp_path, None, validate=not validate)
+    with pytest.raises(ValueError, match="manifest"):
+        sweep.read_case(tmp_path, 2048, None, validate=validate)
+
+
+@pytest.mark.parametrize("corruption", ["rank", "profile", "bandwidth", "schema"])
+def test_performance_only_still_rejects_incomplete_or_invalid_measurements(tmp_path, corruption):
+    rank0, timer, communication, checks = write_case_fixture(tmp_path, None, validate=False)
+    if corruption == "rank":
+        communication["ranks"].pop()
+    elif corruption == "profile":
+        path = rank0 / "profiling.json"
+        profile = json.loads(path.read_text())
+        profile["per_rank_rounds_us"][2] = []
+        path.write_text(json.dumps(profile))
+    elif corruption == "bandwidth":
+        communication["operations"]["DISPATCH"]["gbps_per_card_mean"] = 0.0
+    else:
+        communication["schema_version"] = 1
+    (timer / "communication.json").write_text(json.dumps(communication))
+    with pytest.raises(ValueError):
+        sweep.read_case(tmp_path, 2048, None, validate=False)
+
+
+def test_performance_only_runs_all_bs_without_reference_or_validation(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sweep, "os", SimpleNamespace(name="posix", environ={}))
+    monkeypatch.setattr(sweep.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="", stderr=""))
+    launches, reads = [], []
+    monkeypatch.setattr(sweep, "execute", lambda argv, **kwargs: launches.append(argv))
+    monkeypatch.setattr(sweep, "print_case", lambda item: None)
+    monkeypatch.setattr(sweep, "write_summary", lambda *a: None)
+
+    def read(output, bs, pair, *, validate=True):
+        reads.append((bs, pair, validate))
+        return dict(bs=bs, pair=pair, passed=True, validation="skipped")
+
+    monkeypatch.setattr(sweep, "read_case", read)
+    sweep.main(["--no-validation", "--output-dir", str(tmp_path / "run"), "--case-gap-seconds", "0"])
+    assert reads == [(2048, None, False), (4096, None, False), (8192, None, False)]
+    assert len(launches) == 3 and all("--no-validation" in command for command in launches)
+    assert all("deep_ep_experimental.megamoe.benchmark" not in command for command in launches)
+    assert "COMPLETED_VALIDATION_SKIPPED" in capsys.readouterr().out
 
 
 def test_output_reference_is_full_finite_exact_and_signature_bound(tmp_path):

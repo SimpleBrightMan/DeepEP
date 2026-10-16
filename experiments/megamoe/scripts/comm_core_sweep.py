@@ -79,6 +79,11 @@ def parse_args(argv=None):
     parser.add_argument("--alignment-rows", type=int, default=100000)
     parser.add_argument("--alignment-cols", type=int, default=30000)
     parser.add_argument("--alignment-repeats", type=int, default=20)
+    parser.add_argument(
+        "--no-validation",
+        action="store_true",
+        help="Performance only: skip payload/task audits and report bandwidth from timer row counts",
+    )
     references = parser.add_mutually_exclusive_group()
     references.add_argument(
         "--run-full-reference",
@@ -125,6 +130,8 @@ def parse_args(argv=None):
         parser.error("case-gap-seconds must be finite and in [0,60]")
     if any(not 0 <= value < float("inf") for value in (args.timing_rtol, args.timing_atol_us)):
         parser.error("Comparison tolerances must be finite and nonnegative")
+    if args.no_validation and (args.run_full_reference or args.full_reference_dir or args.require_timing_match):
+        parser.error("--no-validation cannot be combined with a full reference or timing comparison")
     if args.require_timing_match and not (args.run_full_reference or args.full_reference_dir):
         parser.error("--require-timing-match requires a full MegaMoE reference")
     if args.output_dir is None:
@@ -147,9 +154,10 @@ def configuration(args, bs):
 
 
 def plan(args):
+    validation_stage = "validation skipped" if args.no_validation else "independent payload and wave/core validation"
     if args.mode == "baseline":
         candidates = 0
-        stages = ["communication-only original schedule + independent payload and wave/core validation"]
+        stages = [f"communication-only original schedule + {validation_stage}"]
     elif args.mode == "dispatch":
         candidates = len(args.dispatch_cores)
         sweep_stage = "Dispatch sweep with Combine fixed; no Combine sweep"
@@ -163,7 +171,7 @@ def plan(args):
         sweep_stage = "Dispatch sweep with Combine fixed, then Combine sweep with best Dispatch"
     if args.mode != "baseline":
         stages = [
-            "communication-only original schedule baseline + independent payload and wave/core validation",
+            f"communication-only original schedule baseline + {validation_stage}",
             sweep_stage,
             "fresh-process confirmation of selected pair",
         ]
@@ -171,6 +179,7 @@ def plan(args):
     return dict(
         schema_version=3,
         workload="communication_only",
+        validation="skipped" if args.no_validation else "strict",
         mode=args.mode,
         ep_size=16,
         physical_aiv1_workers=28,
@@ -197,11 +206,15 @@ def plan(args):
         model=configuration(args, args.bs_values[0])["model"],
         output_dir=str(args.output_dir),
         notes=[
-            "Every case checks Dispatch bytes/scales/metadata and Combine output against independent synthetic payload expectations.",
+            "Payload/output checks and transfer audits are skipped; bytes are accounted from measured timer row counts."
+            if args.no_validation
+            else "Every case checks Dispatch bytes/scales/metadata and Combine output against independent synthetic payload expectations.",
             "No weights, GMM1, SwiGLU or GMM2 run in communication-only cases; synthetic GMM2 rows are prepared once before timing.",
             "Dispatch and Combine keep production slot policies (Prefill Combine has two slots).",
             "Combine=0 means original Combine ownership; Dispatch experiments can leave Combine unchanged.",
-            "Baseline and candidates validate each wave/core against the production wave/task oracle; workload equality alone does not prove matching time.",
+            "Timer structure and complete rank/profile reports are still checked; no task or full-operator timing comparison runs."
+            if args.no_validation
+            else "Baseline and candidates validate each wave/core against the production wave/task oracle; workload equality alone does not prove matching time.",
             "Staged search can miss interactions; fullgrid only finds the best sampled pair in this run.",
             "Timer pass is separate from timer-off communication-only kernel profiling; no plots are generated.",
             "Each launched case owns a new SHMEM runtime; fresh ports avoid cross-case bootstrap reuse.",
@@ -286,6 +299,8 @@ def command(args, config_path, output, pair, baseline, *, full_reference=False):
             "0-15",
             "--comm-report",
         ]
+    elif args.no_validation:
+        result.append("--no-validation")
     if not args.keep_raw_timers:
         result.append("--no-timer-raw")
     return result
@@ -320,7 +335,7 @@ def execute(argv, *, cwd, environment, logfile, timeout):
         raise RuntimeError(f"Case exited with status {code}; inspect {logfile}")
 
 
-def read_case(output, bs, pair):
+def read_case(output, bs, pair, *, validate=True):
     expected_environment = {ENV_DISPATCH: str(pair[0]) if pair else None, ENV_COMBINE: str(pair[1]) if pair else None}
     builds = []
     for rank in range(16):
@@ -334,6 +349,7 @@ def read_case(output, bs, pair):
             or manifest.get("workload") != "communication_only"
             or manifest["comm_core_split"] != expected_environment
             or manifest["config"]["bs_values"] != [bs]
+            or manifest.get("validation", "strict") != ("strict" if validate else "skipped")
         ):
             raise ValueError("Benchmark manifest does not match the requested case")
         builds.append(manifest["build"])
@@ -341,9 +357,10 @@ def read_case(output, bs, pair):
         raise ValueError("Ranks loaded different installed builds")
     rank0 = output / "rank_0" / f"bs_{bs}"
     profile = json.loads((rank0 / "profiling.json").read_text(encoding="utf-8"))
-    comparisons = json.loads((rank0 / "payload_accuracy.json").read_text(encoding="utf-8"))
-    if sorted(r["rank"] for r in comparisons) != list(range(16)) or not all(r["passed"] for r in comparisons):
-        raise ValueError("Missing or failed independent communication payload verification ranks")
+    if validate:
+        comparisons = json.loads((rank0 / "payload_accuracy.json").read_text(encoding="utf-8"))
+        if sorted(r["rank"] for r in comparisons) != list(range(16)) or not all(r["passed"] for r in comparisons):
+            raise ValueError("Missing or failed independent communication payload verification ranks")
     per_rank = profile["per_rank_rounds_us"]
     if (
         profile["timer_pass"]
@@ -361,6 +378,7 @@ def read_case(output, bs, pair):
         pair=list(pair) if pair else None,
         output_dir=str(output),
         passed=True,
+        validation="strict" if validate else "skipped",
         comm_kernel_rank_max_mean_us=slowest,
         comm_kernel_rank_min_mean_us=statistics.mean(min(values) for values in zip(*per_rank)),
         comm_kernel_all_ranks_mean_us=statistics.mean(v for row in per_rank for v in row),
@@ -373,10 +391,21 @@ def read_case(output, bs, pair):
     )
     if sorted(r["rank"] for r in report["communication"]["ranks"]) != list(range(16)):
         raise ValueError("Missing communication ranks")
-    if report["communication"].get("schema_version") != 2 or not all(
-        r.get("validation", {}).get("strict_wave_core") is True for r in report["communication"]["ranks"]
+    if report["communication"].get("schema_version") != 2:
+        raise ValueError("Expected communication report schema version 2")
+    validation = report["communication"].get("validation")
+    if validate:
+        if (validation is not None and validation != dict(strict_wave_core=True, status="passed")) or not all(
+            r.get("validation", {}).get("strict_wave_core") is True for r in report["communication"]["ranks"]
+        ):
+            raise ValueError("Missing strict per-wave/core communication validation")
+    elif validation != dict(strict_wave_core=False, status="skipped") or not all(
+        r.get("validation", {}).get("strict_wave_core") is False
+        and r.get("validation", {}).get("status") == "skipped"
+        and r.get("validation", {}).get("accounting") == "timer_row_counts"
+        for r in report["communication"]["ranks"]
     ):
-        raise ValueError("Missing strict per-wave/core communication validation")
+        raise ValueError("Expected explicit validation-skipped timer-row accounting for every rank")
     if set(report["communication"].get("operations", {})) != {"DISPATCH", "COMBINE"}:
         raise ValueError("Expected separate Dispatch and Combine mean-core-time bandwidth reports")
     for value in report["communication"]["operations"].values():
@@ -385,12 +414,17 @@ def read_case(output, bs, pair):
             for key in ("gbps_per_card_mean", "gbps_per_card_min", "gbps_per_card_max")
         ):
             raise ValueError("Nonfinite/nonpositive communication bandwidth")
-    timer_comparison = json.loads((rank0 / "timer_accuracy.json").read_text(encoding="utf-8"))
-    if sorted(r["rank"] for r in timer_comparison) != list(range(16)) or not all(r["passed"] for r in timer_comparison):
-        raise ValueError("Missing/failed timer-on/off validation")
-    audit_comparison = json.loads((rank0 / "communication_audit_accuracy.json").read_text(encoding="utf-8"))
-    if sorted(r["rank"] for r in audit_comparison) != list(range(16)) or not all(r["passed"] for r in audit_comparison):
-        raise ValueError("Missing/failed communication audit output validation")
+    if validate:
+        timer_comparison = json.loads((rank0 / "timer_accuracy.json").read_text(encoding="utf-8"))
+        if sorted(r["rank"] for r in timer_comparison) != list(range(16)) or not all(
+            r["passed"] for r in timer_comparison
+        ):
+            raise ValueError("Missing/failed timer-on/off validation")
+        audit_comparison = json.loads((rank0 / "communication_audit_accuracy.json").read_text(encoding="utf-8"))
+        if sorted(r["rank"] for r in audit_comparison) != list(range(16)) or not all(
+            r["passed"] for r in audit_comparison
+        ):
+            raise ValueError("Missing/failed communication audit output validation")
     return report
 
 
@@ -511,9 +545,12 @@ def print_case(item):
         return f"{cores}/{28 - cores}" if cores else "original"
 
     label = f"D={schedule(pair[0])} C={schedule(pair[1])}" if pair else "original schedule"
+    validation = (
+        "validation skipped" if item.get("validation") == "skipped" else "independent payload verification passed"
+    )
     print(
         f"[CASE] BS={item['bs']} {label} COMM-KERNEL rank-max-mean={item['comm_kernel_rank_max_mean_us']:.3f}us "
-        f"rank-min-mean={item['comm_kernel_rank_min_mean_us']:.3f}us (timer off; independent payload verification passed)",
+        f"rank-min-mean={item['comm_kernel_rank_min_mean_us']:.3f}us (timer off; {validation})",
         flush=True,
     )
     if item["communication"]:
@@ -525,7 +562,13 @@ def print_case(item):
                 flush=True,
             )
         detail_index = Path(item["output_dir"]) / f"bs_{item['bs']}" / "timer" / "communication.json"
-        print(f"[WAVE_CORE] strict per-wave/core validation passed; rank JSON/CSV paths in: {detail_index}", flush=True)
+        task_status = (
+            "validation skipped; timer row-count accounting"
+            if item.get("validation") == "skipped"
+            else "strict per-wave/core validation passed"
+        )
+        detail_format = "JSON" if item.get("validation") == "skipped" else "JSON/CSV"
+        print(f"[WAVE_CORE] {task_status}; rank {detail_format} paths in: {detail_index}", flush=True)
 
 
 def main(argv=None):
@@ -595,7 +638,7 @@ def main(argv=None):
                 timeout=args.timeout,
             )
             launched = True
-            item = dict(read_case(output, bs, pair), stage=stage)
+            item = dict(read_case(output, bs, pair, validate=not args.no_validation), stage=stage)
             records.append(item)
             if pair is not None:
                 cached[pair] = item
@@ -649,7 +692,13 @@ def main(argv=None):
             flush=True,
         )
     timing_mismatch = any(item.get("full_megamoe_comparison", {}).get("timing_match") is False for item in records)
-    status = "COMPLETED_TIMING_MISMATCH" if timing_mismatch else "PAYLOAD_AND_TASKS_PASSED"
+    status = (
+        "COMPLETED_VALIDATION_SKIPPED"
+        if args.no_validation
+        else "COMPLETED_TIMING_MISMATCH"
+        if timing_mismatch
+        else "PAYLOAD_AND_TASKS_PASSED"
+    )
     print(f"[{status}] {len(records)} communication case launches; {args.output_dir / 'summary.json'}", flush=True)
 
 

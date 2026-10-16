@@ -70,7 +70,7 @@ def read_transfers(raw, rank):
         raise ValueError("Expected a task-audit buffer with audit enabled")
     records = []
     for hardware_core in range(p.N_CORE_COUNT):
-        count = int(raw[p.COMM_AUDIT_COUNT_OFFSET + hardware_core])
+        count = int(raw[p.COMM_AUDIT_COUNT_OFFSET + hardware_core * p.COMM_AUDIT_COUNT_STRIDE])
         if not 0 <= count <= p.COMM_AUDIT_MAX_RECORDS_PER_CORE:
             raise ValueError(f"rank={rank} core={hardware_core}: communication audit overflow/invalid count")
         if count and (hardware_core % 3 != 2 or hardware_core // 3 >= WORKERS):
@@ -167,8 +167,19 @@ def rank_report(
     expected = oracle["transfers"]
     missing, unexpected = Counter(expected) - Counter(actual), Counter(actual) - Counter(expected)
     if missing or unexpected:
+
+        def counts_by_core(difference):
+            counts = Counter()
+            for record, count in difference.items():
+                counts[(record.operation, record.core)] += count
+            return ",".join(f"{operation}/c{core}:{count}" for (operation, core), count in sorted(counts.items()))
+
         raise ValueError(
             f"rank={rank}: wave/core/token fidelity mismatch; "
+            f"expected={len(expected)} actual={len(actual)} "
+            f"missing_count={sum(missing.values())} unexpected_count={sum(unexpected.values())}; "
+            f"missing_by_operation_core=[{counts_by_core(missing)}]; "
+            f"unexpected_by_operation_core=[{counts_by_core(unexpected)}]; "
             f"missing={list(missing.items())[:3]}, unexpected={list(unexpected.items())[:3]}"
         )
     expected_counts = Counter((r.operation, r.wave, r.core, r.expert) for r in expected)
@@ -298,6 +309,58 @@ def rank_report(
     )
 
 
+def timer_rank_report(events, rank, hidden):
+    """Account timer-recorded rows without an audit, oracle, or payload check."""
+    groups = defaultdict(list)
+    for event in events:
+        if event.get("rank") != rank or event.get("family") not in FAMILIES:
+            raise ValueError("Unexpected communication timer family/rank")
+        if event.get("audit_enabled") is not False:
+            raise ValueError("Bandwidth must use timer-only spans, not the task-audit call")
+        core, wave = event["core"], event["wave"]
+        if not 0 <= core < WORKERS or wave < 0 or event["row_count"] <= 0:
+            raise ValueError("Invalid communication timer core/wave/row count")
+        if not event["end_cycle"] > event["start_cycle"] > 0:
+            raise ValueError("Incomplete communication timer interval")
+        groups[(event["family"].split("_")[1], wave, core)].append(event)
+
+    wave_ids = sorted({wave for _, wave, _ in groups})
+    waves, operations = [], {}
+    for operation in OPERATIONS:
+        row_bytes = payload_bytes(hidden, operation)
+        operation_waves = []
+        for wave in wave_ids:
+            cores, selected = [], []
+            for core in range(WORKERS):
+                items = groups[(operation, wave, core)]
+                rows = sum(item["row_count"] for item in items)
+                elapsed = sum((item["end_cycle"] - item["start_cycle"]) / p.CYCLE_TO_US for item in items)
+                cores.append(dict(core=core, rows=rows, bytes=rows * row_bytes, duration_us=elapsed, spans=len(items)))
+                selected.extend(items)
+            rows = sum(core["rows"] for core in cores)
+            measured = _measure(rows * row_bytes, rows, [core["duration_us"] for core in cores])
+            envelope = (
+                (max(e["end_cycle"] for e in selected) - min(e["start_cycle"] for e in selected)) / p.CYCLE_TO_US
+                if selected
+                else 0.0
+            )
+            operation_waves.append(dict(operation=operation, wave=wave, **measured, envelope_us=envelope, cores=cores))
+        rows = sum(wave["rows"] for wave in operation_waves)
+        operations[operation] = _measure(rows * row_bytes, rows, [wave["sum_core_us"] for wave in operation_waves])
+        waves.extend(operation_waves)
+    return dict(
+        rank=rank,
+        operations=operations,
+        waves=waves,
+        validation=dict(
+            strict_wave_core=False,
+            status="skipped",
+            accounting="timer_row_counts",
+            wave_count=len(wave_ids),
+        ),
+    )
+
+
 def write_rank_detail(report, directory):
     """Persist full detail locally; return a small, JSON-safe StoreGroup payload."""
     directory = Path(directory)
@@ -306,20 +369,23 @@ def write_rank_detail(report, directory):
     json_path, csv_path = directory / f"{stem}.json", directory / f"{stem}.csv"
     visible = {key: value for key, value in report.items() if not key.startswith("_")}
     json_path.write_text(json.dumps(visible, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["rank", *wave_oracle.Transfer._fields])
-        for row in sorted(report["_transfers"]):
-            writer.writerow([report["rank"], *row])
+    detail_files = dict(json=str(json_path))
+    if "_transfers" in report:
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["rank", *wave_oracle.Transfer._fields])
+            for row in sorted(report["_transfers"]):
+                writer.writerow([report["rank"], *row])
+        detail_files["csv"] = str(csv_path)
     return dict(
         rank=report["rank"],
         operations=report["operations"],
         validation=report["validation"],
-        detail_files=dict(json=str(json_path), csv=str(csv_path)),
+        detail_files=detail_files,
     )
 
 
-def summarize(records):
+def summarize(records, *, require_validation=True):
     if sorted(r["rank"] for r in records) != list(range(16)):
         raise ValueError("Need exactly all 16 rank reports")
     operations = {}
@@ -330,8 +396,11 @@ def summarize(records):
         operations[operation] = dict(
             gbps_per_card_mean=statistics.mean(values), gbps_per_card_min=min(values), gbps_per_card_max=max(values)
         )
-    if any(not r["validation"]["strict_wave_core"] for r in records):
+    validated = all(r["validation"]["strict_wave_core"] for r in records)
+    if require_validation and not validated:
         raise ValueError("All ranks must pass strict actual-transfer fidelity validation")
+    if not require_validation and not validated and any(r["validation"].get("status") != "skipped" for r in records):
+        raise ValueError("Performance-only reports must explicitly mark validation skipped")
     return dict(
         schema_version=2,
         metric="one_way_payload_bytes_over_mean_28_core_summed_span_time",
@@ -342,12 +411,17 @@ def summarize(records):
             "Per-wave bandwidth uses the same formula. Envelopes are diagnostic only, never the denominator.",
             "Dispatch counts padded FP8+scale GET payload; Combine counts BF16 PUT payload, without RX+TX doubling.",
             "Payload excludes route indices, metadata, flags and other control traffic.",
-            "Exact copy identities come from a separate audit call; bandwidth uses a timer-only call.",
+            (
+                "Exact copy identities come from a separate audit call; bandwidth uses a timer-only call."
+                if validated
+                else "Payload row counts come from timer metadata; payload, task identity, and full-operator comparisons were skipped."
+            ),
             "Dispatch spans include prefix reload and ownership planning; Combine includes ownership arithmetic and the successful readiness probe.",
             "Combine producer waits and failed readiness probes are excluded. Empty communication tasks record zero time.",
             "These are mean-core-time effective rates, not wall-clock link throughput or E2E rates.",
             "Operator latency is measured separately with both timer and task audit disabled.",
         ],
         operations=operations,
+        validation=dict(strict_wave_core=validated, status="passed" if validated else "skipped"),
         ranks=records,
     )

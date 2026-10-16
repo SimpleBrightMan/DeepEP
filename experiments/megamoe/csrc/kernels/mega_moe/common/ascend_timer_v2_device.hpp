@@ -298,7 +298,7 @@ public:
             int32_t index = AscendTimer::N_TIMING_COUNTER + coreId_ * AscendTimer::DYNAMIC_ITER_PER_CORE_ALIGN + typeId;
             WriteValue(index, dynamicCounts_[typeId]);
         }
-        WriteValue(AscendTimer::COMM_AUDIT_COUNT_OFFSET + coreId_, auditCount_);
+        WriteValue(AscendTimer::COMM_AUDIT_COUNT_OFFSET + coreId_ * AscendTimer::COMM_AUDIT_COUNT_STRIDE, auditCount_);
     }
 
 private:
