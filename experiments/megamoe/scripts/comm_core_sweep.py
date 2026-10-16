@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026, SimpleBright_Man
 
-"""EP16 production W4A8 Dispatch/Combine core-ratio sweep; no plots."""
+"""EP16 production W4A8 Dispatch core-ratio sweep with fixed Combine; no plots."""
 
 import argparse
 import csv
@@ -39,11 +39,22 @@ def integers(text, maximum, label):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bs-values", default="2048,4096,8192")
-    parser.add_argument("--intra-cores", default=DEFAULT_CORES, help="Both stage candidate lists; CROSS=28-INTRA")
+    parser.add_argument(
+        "--intra-cores",
+        default=DEFAULT_CORES,
+        help="Dispatch candidates; both stages only in staged/fullgrid mode; CROSS=28-INTRA",
+    )
     parser.add_argument("--dispatch-intra-cores", help="Override Dispatch candidate list")
-    parser.add_argument("--combine-intra-cores", help="Override Combine candidate list")
-    parser.add_argument("--initial-combine-intra", type=int, default=12)
-    parser.add_argument("--mode", choices=("staged", "fullgrid"), default="staged")
+    parser.add_argument("--combine-intra-cores", help="Combine candidates for explicit staged/fullgrid mode")
+    parser.add_argument(
+        "--combine-intra",
+        "--initial-combine-intra",
+        dest="initial_combine_intra",
+        type=int,
+        default=12,
+        help="Fixed Combine INTRA cores (initial value in staged mode)",
+    )
+    parser.add_argument("--mode", choices=("dispatch", "staged", "fullgrid"), default="dispatch")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
@@ -72,11 +83,17 @@ def parse_args(argv=None):
     try:
         args.bs_values = integers(args.bs_values, 65536, "BS")
         args.dispatch_cores = integers(args.dispatch_intra_cores or args.intra_cores, 27, "Dispatch cores")
-        args.combine_cores = integers(args.combine_intra_cores or args.intra_cores, 27, "Combine cores")
+        args.combine_cores = (
+            [args.initial_combine_intra]
+            if args.mode == "dispatch"
+            else integers(args.combine_intra_cores or args.intra_cores, 27, "Combine cores")
+        )
     except argparse.ArgumentTypeError as error:
         parser.error(str(error))
     if not 1 <= args.initial_combine_intra <= 27 or args.warmup < 0 or args.seed < 0:
         parser.error("Invalid initial cohort, warmup or seed")
+    if args.mode == "dispatch" and args.combine_intra_cores is not None:
+        parser.error("Dispatch-only mode fixes Combine; use --combine-intra, or explicitly select staged/fullgrid")
     if min(args.iters, args.timeout, args.alignment_rows, args.alignment_cols, args.alignment_repeats) < 1:
         parser.error("Iterations, timeout and alignment dimensions/repeats must be positive")
     if not math.isfinite(args.case_gap_seconds) or not 0 <= args.case_gap_seconds <= 60:
@@ -103,13 +120,17 @@ def configuration(args, bs):
 
 
 def plan(args):
-    candidates = (
-        len(args.dispatch_cores) * len(args.combine_cores)
-        if args.mode == "fullgrid"
-        else (
+    if args.mode == "dispatch":
+        candidates = len(args.dispatch_cores)
+        sweep_stage = "Dispatch sweep with Combine fixed; no Combine sweep"
+    elif args.mode == "fullgrid":
+        candidates = len(args.dispatch_cores) * len(args.combine_cores)
+        sweep_stage = "all Dispatch x Combine candidate pairs"
+    else:
+        candidates = (
             len(args.dispatch_cores) + len(args.combine_cores) - int(args.initial_combine_intra in args.combine_cores)
         )
-    )
+        sweep_stage = "Dispatch sweep with Combine fixed, then Combine sweep with best Dispatch"
     return dict(
         schema_version=1,
         mode=args.mode,
@@ -118,6 +139,7 @@ def plan(args):
         bs_values=args.bs_values,
         dispatch_intra_candidates=args.dispatch_cores,
         combine_intra_candidates=args.combine_cores,
+        combine_fixed=args.mode == "dispatch",
         initial_combine_intra=args.initial_combine_intra,
         shmem_port_policy=args.shmem_port_policy,
         case_gap_seconds=args.case_gap_seconds,
@@ -126,9 +148,7 @@ def plan(args):
         selection="minimum timer-off mean(per-round maximum rank kernel duration)",
         stages=[
             "unchanged-schedule baseline + full-output save",
-            "Dispatch sweep with Combine fixed, then Combine sweep with best Dispatch"
-            if args.mode == "staged"
-            else "all Dispatch x Combine candidate pairs",
+            sweep_stage,
             "fresh-process confirmation of selected pair",
         ],
         global_optimum_guaranteed=False,
@@ -454,7 +474,10 @@ def main(argv=None):
             return item
 
         original = run_case(None, "baseline")
-        if args.mode == "fullgrid":
+        if args.mode == "dispatch":
+            for n in args.dispatch_cores:
+                run_case((n, args.initial_combine_intra), "dispatch")
+        elif args.mode == "fullgrid":
             for pair in itertools.product(args.dispatch_cores, args.combine_cores):
                 run_case(pair, "grid")
         else:

@@ -26,13 +26,15 @@ def test_plan_does_not_touch_devices_or_create_output(tmp_path, capsys):
     sweep.main(["--plan", "--output-dir", str(target), "--intra-cores", "2,4,6", "--bs-values", "2048"])
     planned = json.loads(capsys.readouterr().out)
     assert not target.exists()
-    assert planned["total_case_launches"] == 8  # baseline + 3D + 3C + confirmation
+    assert planned["total_case_launches"] == 5  # baseline + 3D + confirmation
+    assert planned["mode"] == "dispatch" and planned["combine_fixed"]
+    assert planned["combine_intra_candidates"] == [12]
     assert planned["model"]["num_topk"] == 8
     assert not planned["global_optimum_guaranteed"]
 
 
 def test_staged_cached_case_and_grid_counts():
-    args = sweep.parse_args(["--intra-cores", "7,12,21", "--bs-values", "4096"])
+    args = sweep.parse_args(["--mode", "staged", "--intra-cores", "7,12,21", "--bs-values", "4096"])
     assert sweep.plan(args)["case_launches_per_bs"] == 7
     args.mode = "fullgrid"
     assert sweep.plan(args)["case_launches_per_bs"] == 11
@@ -48,6 +50,8 @@ def test_staged_cached_case_and_grid_counts():
         ("--bs-values", "0"),
         ("--comparison-atol", "nan"),
         ("--initial-combine-intra", "28"),
+        ("--combine-intra", "0"),
+        ("--combine-intra-cores", "10,12"),
         ("--case-gap-seconds", "-1"),
         ("--case-gap-seconds", "nan"),
         ("--case-gap-seconds", "61"),
@@ -96,11 +100,54 @@ def test_staged_search_retains_first_stage_winner_outside_combine_candidates(tmp
         return dict(pair=list(pair) if pair else None, passed=True, operator_rank_max_mean_us=durations[pair])
 
     monkeypatch.setattr(sweep, "read_case", read)
-    sweep.main(["--output-dir", str(tmp_path / "run"), "--bs-values", "2048", "--intra-cores", "2,4"])
+    sweep.main(
+        ["--mode", "staged", "--output-dir", str(tmp_path / "run"), "--bs-values", "2048", "--intra-cores", "2,4"]
+    )
     assert selections[-1]["pair"] == [2, 12]
     assert selections[-1]["confirmation_us"] == 90
     assert len(launches) == 6 and gaps == [2.0] * 5
     assert len({env["DEEPEP_SHMEM_ENDPOINT"] for env in launches}) == len(launches)
+
+
+def test_dispatch_only_keeps_combine_fixed_through_scan_and_confirmation(tmp_path, monkeypatch):
+    monkeypatch.setattr(sweep, "os", SimpleNamespace(name="posix", environ={}))
+    monkeypatch.setattr(sweep.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="", stderr=""))
+    launches, results, selections = [], [], []
+    monkeypatch.setattr(sweep, "execute", lambda *a, **k: launches.append(k["environment"]))
+    monkeypatch.setattr(sweep, "print_case", lambda item: results.append(item))
+    monkeypatch.setattr(sweep, "write_summary", lambda path, plan, records, chosen: selections.extend(chosen))
+    durations = {None: 200, (10, 7): 120, (12, 7): 110, (16, 7): 130, (20, 7): 125}
+
+    def read(output, bs, pair):
+        return dict(pair=list(pair) if pair else None, passed=True, operator_rank_max_mean_us=durations[pair])
+
+    monkeypatch.setattr(sweep, "read_case", read)
+    sweep.main(
+        [
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--bs-values",
+            "2048",
+            "--intra-cores",
+            "10,12,16,20",
+            "--combine-intra",
+            "7",
+            "--case-gap-seconds",
+            "0",
+        ]
+    )
+    assert [item["stage"] for item in results] == ["baseline"] + ["dispatch"] * 4 + ["confirm"]
+    assert [item["pair"] for item in results] == [None, [10, 7], [12, 7], [16, 7], [20, 7], [12, 7]]
+    assert all(env[sweep.ENV_COMBINE] == "7" for env in launches[1:])
+    assert selections[-1]["pair"] == [12, 7]
+
+
+def test_dispatch_only_plan_counts_and_legacy_fixed_combine_alias():
+    args = sweep.parse_args(["--intra-cores", "10,12,16,20"])
+    plan = sweep.plan(args)
+    assert plan["case_launches_per_bs"] == 6 and plan["total_case_launches"] == 18
+    args = sweep.parse_args(["--initial-combine-intra", "8"])
+    assert args.combine_cores == [8] and args.initial_combine_intra == 8
 
 
 def test_fresh_endpoint_preserves_host_and_skips_previous_ports(monkeypatch):

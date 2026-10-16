@@ -1,6 +1,7 @@
 # MegaMoE EP16 通信核心配比扫描
 
-本分支在生产 W4A8 MegaMoE 中分别设置 Dispatch 和 Combine 的本组/跨组 AIV1 配比。
+本分支默认只遍历生产 W4A8 MegaMoE 的 Dispatch 本组/跨组 AIV1 配比，
+Combine 固定 INTRA=12、CROSS=16；`--combine-intra` 可设置固定值。
 不是独立通信微基准：量化、路由、GMM1、SwiGLU、GMM2、Combine 和 Unpermute 均执行，
 GMM 与激活计算仍使用全部 28 个物理核心。连续四个 rank 为一组，共四组；本组 INTRA 包含本卡搬运。
 
@@ -25,7 +26,7 @@ export LD_LIBRARY_PATH="${SHMEM_ROOT:-$PWD/third-party/shmem/install/shmem}/lib:
 # 只预览，不访问设备、不创建输出目录。
 python3 experiments/megamoe/scripts/comm_core_sweep.py --plan
 
-# 一键扫描默认三组 BS，同时检查全量输出，最终生成 summary.json/summary.csv。
+# 只遍历 Dispatch，Combine 固定 12/16；检查全量输出并生成 summary.json/summary.csv。
 python3 experiments/megamoe/scripts/comm_core_sweep.py
 ```
 
@@ -52,13 +53,17 @@ python3 experiments/megamoe/scripts/comm_core_sweep.py
 python3 experiments/megamoe/scripts/comm_core_sweep.py \
   --bs-values 2048 --intra-cores 7,8,12 --warmup 5 --iters 20
 
-# 分别指定两个阶段的候选；Dispatch 扫描期间先固定 Combine INTRA=12。
+# 固定 Combine 12/16，只遍历指定 Dispatch 核数。
 python3 experiments/megamoe/scripts/comm_core_sweep.py \
+  --bs-values 2048,4096,8192 --intra-cores 10,12,16,20 --combine-intra 12
+
+# 全部 1..27 个 Dispatch 配比，Combine 仍固定。
+python3 experiments/megamoe/scripts/comm_core_sweep.py --intra-cores "$(seq -s, 1 27)"
+
+# 以后需要单独恢复两阶段扫描时，显式选择 staged。
+python3 experiments/megamoe/scripts/comm_core_sweep.py --mode staged \
   --dispatch-intra-cores 6,7,8,10,12 \
   --combine-intra-cores 6,7,8,10,12,16 --initial-combine-intra 12
-
-# 全部 1..27 配比：分阶段，默认不会展开 27×27。
-python3 experiments/megamoe/scripts/comm_core_sweep.py --intra-cores "$(seq -s, 1 27)"
 
 # 需要研究两者交互时才使用 fullgrid；下例是 4×4，共 16 个候选/BS。
 python3 experiments/megamoe/scripts/comm_core_sweep.py --mode fullgrid --intra-cores 6,7,8,12
@@ -68,11 +73,14 @@ python3 experiments/megamoe/scripts/comm_core_sweep.py --mode fullgrid --intra-c
 
 1. 不设置配比环境变量，执行原始生产调度作为 baseline，保存全量输出和专家计数。
 2. 固定 Combine 的 INTRA=12，扫描 Dispatch 候选，按算子整体耗时选择 Dispatch 配比。
-3. 固定上一步的 Dispatch 最优值，扫描 Combine 候选；已经执行的相同配比复用结果。
-4. 从两个阶段全部已测候选选择最优配比，使用新进程复测，报告相对 baseline 的总耗时加速比。
+3. 选出的 Dispatch 配比在同一固定 Combine 配比下使用新进程复测，报告相对 baseline 的总耗时加速比。
 
-默认每个 BS 23 次启动，三个 BS 共 69 次；包括 baseline 和最优组合复测。
-分阶段搜索可能错过 Dispatch/Combine 的交互最优点。`fullgrid` 遍历给定候选的笛卡尔积，
+默认每个 BS 13 次启动，三个 BS 共 39 次；包括 baseline 和最优组合复测。
+使用 `--intra-cores 10,12,16,20` 时每 BS 6 次，三个 BS 共 18 次。
+默认 `--mode dispatch` 不进入 Combine 扫描阶段。完整算子仍执行 Combine，继续打印四类带宽，
+其余 rank 的进度差异仍可能影响 Combine 和整算子耗时，需结合 Dispatch 带宽及重复运行判断结果。
+`--mode staged` 恢复先 Dispatch 后 Combine 的旧搜索，可能错过两者交互最优点。
+`--mode fullgrid` 遍历给定候选的笛卡尔积，
 也只能选出本次采样中最优的一组，不能消除温度、运行噪声等影响。
 
 ## 配比如何生效

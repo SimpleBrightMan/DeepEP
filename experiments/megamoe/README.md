@@ -5,8 +5,8 @@ Modified by Joyce_An 2026
 
 # MegaMoE Prefill Beta
 
-本分支新增单机 EP16、28 核的生产算子通信核心配比扫描，详见
-[Dispatch/Combine 配比扫描](COMM_CORE_SWEEP.md)。默认不设置配比环境变量时保留原调度。
+本分支新增单机 EP16、28 核的生产算子通信核心配比扫描，默认仅遍历 Dispatch，Combine 固定 12/16，详见
+[通信配比扫描](COMM_CORE_SWEEP.md)。直接调用算子且不设置配比环境变量时保留原调度。
 
 公开入口：`deep_ep_experimental.megamoe`。W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度。
 构建和多机测试入口位于本目录的 `scripts/`；机器地址及环境配置由使用者提供。
