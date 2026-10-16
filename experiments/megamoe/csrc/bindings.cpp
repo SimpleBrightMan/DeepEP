@@ -21,6 +21,7 @@ PYBIND11_MODULE(_C, module)
         .def_property_readonly("workspace_bytes", &Plan::workspace_bytes);
     module.def("ffts_config", [] { return shmemx_get_ffts_config(); });
     module.attr("timer_numel") = AscendTimer::TOTAL_BUFFER_SIZE;
+    module.attr("timer_audit_numel") = AscendTimer::COMM_AUDIT_BUFFER_SIZE;
 #ifdef DEEPEP_MEGAMOE_TIMER
     module.attr("timer_enabled") = true;
 #else

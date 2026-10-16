@@ -43,6 +43,8 @@ enum DynamicTimingType {
     AIV_DISPATCH_CROSS,
     AIV_COMBINE_INTRA,
     AIV_COMBINE_CROSS,
+    AIV_DISPATCH_COMM,
+    AIV_COMBINE_COMM,
     DYNAMIC_TYPE_COUNT_ENUM
 };
 
@@ -66,7 +68,17 @@ static constexpr int NO_WAVE = -1;
 static constexpr int WAVE_ID_OFFSET = TASK_METADATA_OFFSET + TASK_METADATA_SIZE;
 static constexpr int WAVE_ID_PER_CORE_ALIGN = (N_TIMING_ITEM_PER_CORE + 15) / 16 * 16;
 static constexpr int WAVE_ID_TOTAL_SIZE = WAVE_ID_PER_CORE_ALIGN * N_CORE_COUNT;
-static constexpr int TOTAL_BUFFER_SIZE = WAVE_ID_OFFSET + WAVE_ID_TOTAL_SIZE;
+// The normal timing buffer contains only controls/counts, not the large audit
+// log. Native launch derives this flag from the validated allocation size.
+static constexpr int COMM_AUDIT_ENABLE_OFFSET = WAVE_ID_OFFSET + WAVE_ID_TOTAL_SIZE;
+static constexpr int COMM_M_GROUPS_PER_WAVE_OFFSET = COMM_AUDIT_ENABLE_OFFSET + 1;
+static constexpr int COMM_AUDIT_COUNT_OFFSET = COMM_AUDIT_ENABLE_OFFSET + 2;
+static constexpr int TOTAL_BUFFER_SIZE = COMM_AUDIT_COUNT_OFFSET + N_CORE_COUNT;
+static constexpr int COMM_AUDIT_RECORD_OFFSET = TOTAL_BUFFER_SIZE;
+static constexpr int COMM_AUDIT_MAX_RECORDS_PER_CORE = 131072;
+static constexpr int COMM_AUDIT_RECORD_WORDS = 3;
+static constexpr int COMM_AUDIT_BUFFER_SIZE =
+    COMM_AUDIT_RECORD_OFFSET + N_CORE_COUNT * COMM_AUDIT_MAX_RECORDS_PER_CORE * COMM_AUDIT_RECORD_WORDS;
 
 }  // namespace AscendTimer
 

@@ -140,7 +140,9 @@ def main():
     parser.add_argument("--comparison-rtol", type=float, default=0.0)
     parser.add_argument("--comparison-atol", type=float, default=0.0)
     parser.add_argument(
-        "--comm-report", action="store_true", help="Export split Dispatch/Combine per-wave payload bandwidth"
+        "--comm-report",
+        action="store_true",
+        help="Validate per-wave communication tasks and report Dispatch/Combine bandwidth",
     )
     parser.add_argument(
         "--no-timer-raw", action="store_true", help="Keep compact reports instead of large raw timer buffers"
@@ -153,6 +155,8 @@ def main():
         parser.error("--comm-report requires --timer --timer-ranks 0-15")
     if args.no_timer_raw and not args.comm_report:
         parser.error("--no-timer-raw requires --comm-report")
+    if args.comm_report and (args.routing != "balanced" or config["model"]["num_shared_experts"] != 0):
+        parser.error("--comm-report requires balanced routing and no shared experts")
     if (args.save_output_reference or args.reference_output_dir) and args.routing != "balanced":
         parser.error("Output regression currently requires balanced routing")
     import torch
@@ -376,7 +380,9 @@ def run(args, config, group):
                 )
         if args.timer:
             uninstrumented = (
-                result.float().cpu().numpy() if args.mode == "accuracy" or args.reference_output_dir else None
+                result.float().cpu().numpy()
+                if args.mode == "accuracy" or args.reference_output_dir or args.comm_report
+                else None
             )
             timer, error = None, None
             try:
@@ -399,7 +405,7 @@ def run(args, config, group):
                 instrumented = result.float().cpu().numpy()
                 metrics = error_metrics(instrumented, uninstrumented)
                 metrics["passed"] = bool(metrics["finite"] and metrics["relative_rmse"] <= args.relative_rmse)
-                if args.reference_output_dir:
+                if args.reference_output_dir or args.comm_report:
                     metrics["output_equal"] = bool(
                         np.allclose(
                             instrumented,
@@ -415,46 +421,103 @@ def run(args, config, group):
                 if any(not item["passed"] for item in comparisons):
                     raise AssertionError(f"BS={bs}: timer-on/off output mismatch")
             timer_dir = args.output_dir / f"bs_{bs}" / "timer"
-            breakdown = None
-            if timer is not None:
-                from .timer.breakdown import compact_events, rank_breakdown
+            breakdown, error = None, None
+            try:
+                if timer is not None:
+                    from .timer.breakdown import compact_events, rank_breakdown
 
-                timer_dir.mkdir(parents=True, exist_ok=True)
-                raw_timer = timer.cpu().numpy().astype("<i8", copy=False).reshape(-1)
-                if not args.no_timer_raw:
-                    raw_timer.tofile(timer_dir / f"rank_{rank}_npu_time.bin")
-                breakdown = rank_breakdown(compact_events(raw_timer, rank), rank)
-                if args.comm_report:
-                    from .comm_report import read_events, rank_report
+                    timer_dir.mkdir(parents=True, exist_ok=True)
+                    raw_timer = timer.cpu().numpy().astype("<i8", copy=False).reshape(-1)
+                    if not args.no_timer_raw:
+                        raw_timer.tofile(timer_dir / f"rank_{rank}_npu_time.bin")
+                    breakdown = rank_breakdown(compact_events(raw_timer, rank), rank)
+                    if args.comm_report:
+                        from .comm_report import read_events
 
+                        communication_events = read_events(raw_timer, rank)
+                    del raw_timer
+                    print(
+                        f"[TIMER] rank={rank} BS={bs} {'compact report' if args.no_timer_raw else 'raw saved'}",
+                        flush=True,
+                    )
+            except Exception as failure:
+                error = f"rank={rank} BS={bs}: {failure}"
+            collective_check(group, f"timer decode BS={bs}", error)
+            records = group.all_gather(breakdown, f"timer breakdown BS={bs}")
+            error = None
+            try:
+                if rank == 0:
+                    from .timer.breakdown import write_breakdown
+
+                    timer_dir.mkdir(parents=True, exist_ok=True)
+                    write_breakdown([r for r in records if r is not None], timer_dir, f"BS={bs}")
+            except Exception as failure:
+                error = str(failure)
+            collective_check(group, f"timer breakdown write BS={bs}", error)
+            del timer
+            if args.comm_report:
+                from .comm_report import rank_report, read_transfers, summarize, write_rank_detail
+
+                # Audit actual transfer identities in a separate invocation. Detailed
+                # scalar trace writes must never contribute to the bandwidth sample.
+                audit_timer, error = None, None
+                try:
+                    audit_timer = buffer.allocate_timer(audit=True)
+                except Exception as failure:
+                    error = str(failure)
+                collective_check(group, f"communication audit allocation BS={bs}", error)
+                torch.npu.synchronize()
+                group.barrier(f"communication audit BS={bs}")
+                call(audit_timer)
+                torch.npu.synchronize()
+                audit_output = result.float().cpu().numpy()
+                audit_equal = bool(
+                    np.allclose(
+                        audit_output,
+                        uninstrumented,
+                        rtol=args.comparison_rtol,
+                        atol=args.comparison_atol,
+                        equal_nan=False,
+                    )
+                )
+                audit_comparisons = group.all_gather(
+                    dict(rank=rank, passed=audit_equal), f"communication audit output BS={bs}"
+                )
+                (case / "communication_audit_accuracy.json").write_text(
+                    json.dumps(audit_comparisons, indent=2) + "\n", encoding="utf-8"
+                )
+                if not all(item["passed"] for item in audit_comparisons):
+                    raise AssertionError(f"BS={bs}: communication audit output mismatch")
+                communication, error = None, None
+                try:
+                    raw_audit = audit_timer.cpu().numpy().astype("<i8", copy=False).reshape(-1)
+                    transfers = read_transfers(raw_audit, rank)
+                    if not args.no_timer_raw:
+                        raw_audit.tofile(timer_dir / f"rank_{rank}_communication_audit.bin")
+                    del raw_audit
                     communication = rank_report(
-                        read_events(raw_timer, rank),
+                        communication_events,
                         rank,
                         bs,
                         model["hidden"],
                         model["num_topk"],
-                        int(os.environ["DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES"]),
-                        int(os.environ["DEEPEP_MEGAMOE_COMBINE_INTRA_CORES"]),
+                        int(os.environ.get("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "0")),
+                        int(os.environ.get("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES", "0")),
+                        experts=model["num_experts"],
+                        intermediate=model["intermediate_hidden"],
+                        ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
+                        transfers=transfers,
                     )
-                del raw_timer
-                print(
-                    f"[TIMER] rank={rank} BS={bs} {'compact report' if args.no_timer_raw else 'raw saved'}", flush=True
-                )
-            records = group.all_gather(breakdown, f"timer breakdown BS={bs}")
-            if rank == 0:
-                from .timer.breakdown import write_breakdown
-
-                timer_dir.mkdir(parents=True, exist_ok=True)
-                write_breakdown([r for r in records if r is not None], timer_dir, f"BS={bs}")
-            if args.comm_report:
-                from .comm_report import summarize
-
+                    communication = write_rank_detail(communication, timer_dir)
+                except Exception as failure:
+                    error = f"rank={rank} BS={bs}: {failure}"
+                del audit_timer
+                collective_check(group, f"per-wave communication validation BS={bs}", error)
                 communication_records = group.all_gather(communication, f"communication report BS={bs}")
                 if rank == 0:
                     (timer_dir / "communication.json").write_text(
                         json.dumps(summarize(communication_records), indent=2) + "\n", encoding="utf-8"
                     )
-            del timer
         if args.save_output_reference or args.reference_output_dir:
             from .output_check import save, signature, verify
 

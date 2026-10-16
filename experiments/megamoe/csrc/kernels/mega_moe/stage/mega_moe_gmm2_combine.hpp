@@ -244,6 +244,9 @@ struct WaveCombineBufferConfig {
 };
 
 struct WaveCombineScratch {
+    AscendTimerDevice* auditTimer = nullptr;
+    uint32_t auditExpert = 0;
+    uint32_t auditRowBase = 0;
     LocalTensor<int32_t> metaInfoTensor;
     LocalTensor<bfloat16_t> rowBufferTensor;
     LocalTensor<float> quantTempTensor;
@@ -401,6 +404,11 @@ __aicore__ inline void SendWaveCombineToken(const MoeStageCommonConfig& common,
                                             uint64_t gmRemoteBaseOffset, uint32_t tokenLocal,
                                             LocalTensor<int32_t>& tokenMetaInfo, uint32_t slot)
 {
+    if (scratch.auditTimer != nullptr) {
+        const auto route = CombineImpl::LoadCombineTokenRoute(tokenMetaInfo, 0U);
+        scratch.auditTimer->AuditTransfer(1U, scratch.auditExpert, scratch.auditRowBase + tokenLocal, route.dstRankId,
+                                          route.tokenIdx, route.topkIdx);
+    }
     TEventID eventId = static_cast<TEventID>(static_cast<int32_t>(EVENT_ID0) + static_cast<int32_t>(slot));
     if constexpr (IsBufferReuse) {
         WaitFlag<HardEvent::MTE3_MTE2>(eventId);
@@ -1192,6 +1200,7 @@ __aicore__ inline void RunCommSplitCombineSlice(const MoeStageCommonConfig& comm
                                                 AscendTimerDevice& timer, WaveCombineScratch& scratch)
 {
     if (owned.rows == 0U) return;
+    scratch.auditRowBase = 0U;
     auto buffers = common.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS
                        ? InitWaveCombineBuffers<COMBINE_NO_QUANT>(common, scratch)
                        : InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 2U>(common, scratch);
@@ -1234,6 +1243,8 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
     }
     uint64_t globalRowStart = static_cast<uint64_t>(state.globalTokenStartIndex) + rowStart;
     WorkRange owned = GetWaveCombineOwnedRange(job, rowCount, globalRowStart);
+    timer.SetCommunicationRows(state.expertIdx, rowStart + owned.start, owned.count);
+    scratch.auditRowBase = rowStart;
     if (owned.count == 0U) {
         return;
     }

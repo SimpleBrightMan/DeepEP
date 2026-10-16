@@ -12,7 +12,7 @@ import subprocess
 import pytest
 
 
-def test_comm_split_route_ready_inverse_oracle(tmp_path):
+def compile_and_run(source, tmp_path):
     compiler = os.environ.get("CXX")
     command = shlex.split(compiler) if compiler else []
     if not command:
@@ -21,7 +21,7 @@ def test_comm_split_route_ready_inverse_oracle(tmp_path):
             pytest.skip("A host C++17 compiler is required for the communication split oracle")
         command = [available]
     root = Path(__file__).resolve().parents[3]
-    executable = tmp_path / ("comm_split.exe" if os.name == "nt" else "comm_split")
+    executable = tmp_path / (Path(source).stem + (".exe" if os.name == "nt" else ""))
     subprocess.run(
         [
             *command,
@@ -32,12 +32,21 @@ def test_comm_split_route_ready_inverse_oracle(tmp_path):
             "-Werror",
             "-I",
             str(root / "experiments/megamoe/csrc/kernels/mega_moe"),
-            str(Path(__file__).with_name("comm_split_test.cpp")),
+            str(Path(__file__).with_name(source)),
             "-o",
             str(executable),
         ],
         check=True,
         timeout=180,
     )
-    completed = subprocess.run([str(executable)], check=True, capture_output=True, text=True, timeout=120)
+    return subprocess.run([str(executable)], check=True, capture_output=True, text=True, timeout=120)
+
+
+def test_comm_split_route_ready_inverse_oracle(tmp_path):
+    completed = compile_and_run("comm_split_test.cpp", tmp_path)
     assert "7680 independent route/ready/inverse cases, all 27 splits passed" in completed.stdout
+
+
+def test_actual_timer_writer_audit_isolation_and_nested_spans(tmp_path):
+    completed = compile_and_run("comm_timer_device_test.cpp", tmp_path)
+    assert "exact wire, independent spans, zero rows, audit isolation passed" in completed.stdout

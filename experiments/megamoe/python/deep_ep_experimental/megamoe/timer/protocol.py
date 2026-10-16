@@ -37,6 +37,8 @@ DYNAMIC_NAMES = [
     "AIV_DISPATCH_CROSS",
     "AIV_COMBINE_INTRA",
     "AIV_COMBINE_CROSS",
+    "AIV_DISPATCH_COMM",
+    "AIV_COMBINE_COMM",
 ]
 
 # W4 动态槽保存 tile/slice；其他路径保持原有区间协议。
@@ -52,7 +54,14 @@ TASK_METADATA_SIZE = N_CORE_COUNT * len(DYNAMIC_NAMES) * MAX_DYNAMIC_ITER * 2
 NO_WAVE = -1
 WAVE_ID_OFFSET = TASK_METADATA_OFFSET + TASK_METADATA_SIZE
 WAVE_ID_PER_CORE = (len(FIXED_NAMES) + len(DYNAMIC_NAMES) * MAX_DYNAMIC_ITER + 15) // 16 * 16
-TOTAL_BUFFER_SIZE = WAVE_ID_OFFSET + WAVE_ID_PER_CORE * N_CORE_COUNT
+COMM_AUDIT_ENABLE_OFFSET = WAVE_ID_OFFSET + WAVE_ID_PER_CORE * N_CORE_COUNT
+COMM_M_GROUPS_PER_WAVE_OFFSET = COMM_AUDIT_ENABLE_OFFSET + 1
+COMM_AUDIT_COUNT_OFFSET = COMM_AUDIT_ENABLE_OFFSET + 2
+TOTAL_BUFFER_SIZE = COMM_AUDIT_COUNT_OFFSET + N_CORE_COUNT
+COMM_AUDIT_RECORD_OFFSET = TOTAL_BUFFER_SIZE
+COMM_AUDIT_MAX_RECORDS_PER_CORE = 131072
+COMM_AUDIT_RECORD_WORDS = 3
+COMM_AUDIT_BUFFER_SIZE = TOTAL_BUFFER_SIZE + N_CORE_COUNT * COMM_AUDIT_MAX_RECORDS_PER_CORE * COMM_AUDIT_RECORD_WORDS
 
 
 def task_metadata(raw, core_id, logical_index):
@@ -82,6 +91,8 @@ def task_metadata(raw, core_id, logical_index):
     family = DYNAMIC_NAMES[dynamic_index // MAX_DYNAMIC_ITER]
     if family in ("AIV_DISPATCH_INTRA", "AIV_DISPATCH_CROSS", "AIV_COMBINE_INTRA", "AIV_COMBINE_CROSS"):
         result.update(granularity="cohort_slice", row_count_semantics="transferred_rows_not_contiguous")
+    if family in ("AIV_DISPATCH_COMM", "AIV_COMBINE_COMM"):
+        result.update(granularity="communication_slice", row_count_semantics="actual_transferred_rows")
     if "_SHARED_" in family:
         result["expert_kind"] = "shared"
     if n_tile >= 0:

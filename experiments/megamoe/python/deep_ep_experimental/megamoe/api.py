@@ -233,14 +233,19 @@ class SymmBuffer:
     def timer_enabled(self) -> bool:
         return bool(_extension().timer_enabled and self.mma_type == "fp8xfp4")
 
-    def allocate_timer(self) -> Tensor:
-        """Fresh zeroed device trace; pass only to a separate diagnostic invocation."""
+    def allocate_timer(self, *, audit: bool = False) -> Tensor:
+        """Fresh diagnostic buffer; audit=True additionally records actual communication identities.
+
+        Audit writes run in a separate validation invocation, never in a bandwidth
+        sample. The native launcher enables them only for the larger audit buffer.
+        """
         import torch
 
         self._runtime.ensure_alive()
         if not self.timer_enabled:
             raise RuntimeError("W4A8 timer requires DEEPEP_MEGAMOE_TIMER=ON")
-        return torch.zeros(_extension().timer_numel, dtype=torch.int64, device=self._device)
+        size = _extension().timer_audit_numel if audit else _extension().timer_numel
+        return torch.zeros(size, dtype=torch.int64, device=self._device)
 
     def validate_inputs(self, bs: int, *, x: Tensor | None = None) -> None:
         """Collective, synchronizing routing scan. Run after filling inputs, outside timing."""

@@ -44,6 +44,10 @@ struct TokenDispatchConfig {
 
 template <typename ActivationType>
 struct TokenDispatchScratch {
+    AscendTimerDevice* commTimer = nullptr;
+    AscendTimerDevice* auditTimer = nullptr;
+    uint32_t auditExpert = 0;
+    uint32_t auditExpertGlobalRow = 0;
     PeerRowLimitsCache peerRowLimitsCache{};  // 标量对象状态；与可复用的 UB Tensor 内容分离。
     GlobalTensor<int32_t> expertRevNumsGlobalTensor;
     GlobalTensor<int32_t> cumsumInfoGlobalTensor;
@@ -202,6 +206,13 @@ __aicore__ inline void CopyTokensAndMetaForDispatch(const TokenDispatchConfig& c
         }
         int32_t issueBufferIdx = progress.issuedRows % bufferCount;
         int32_t topkIndex = scratch.validTopkIndexTensor.GetValue(copyStartIdx + issueIdx);
+        if (scratch.auditTimer != nullptr) {
+            scratch.auditTimer->AuditTransfer(
+                0U, scratch.auditExpert, static_cast<uint32_t>(rowDstOffset + issueIdx) - scratch.auditExpertGlobalRow,
+                static_cast<uint32_t>(remoteRankIdx),
+                static_cast<uint32_t>(topkIndex) / static_cast<uint32_t>(params.tilingData->topK),
+                static_cast<uint32_t>(topkIndex) % static_cast<uint32_t>(params.tilingData->topK));
+        }
         if (progress.issuedRows < static_cast<uint32_t>(bufferCount)) {
             FetchDispatchTokenAndMetaInfo<false, TopkWeightsPrefetch>(context, params, scratch, issueBufferIdx,
                                                                       topkIndex, remoteRankIdx, remoteRankGlobalTensor);
@@ -294,6 +305,10 @@ __aicore__ inline int32_t DispatchRankTokens(const TokenDispatchConfig& context,
                                              DispatchCopyProgress& progress)
 {
     constexpr uint32_t itemsPerBlock = ALIGN_32 / sizeof(int32_t);
+    if (scratch.auditTimer != nullptr) {
+        scratch.auditExpert = localExpertId;
+        scratch.auditExpertGlobalRow = static_cast<uint32_t>(expertGlobalRowBegin);
+    }
     const uint32_t capacity = static_cast<uint32_t>(context.bufferConfig.routeItemsPerBatch);
     int32_t processed = 0;
     const int32_t rowCount = segmentMatchOrdinalEnd - segmentMatchOrdinalBegin;
@@ -442,6 +457,7 @@ __aicore__ inline void DispatchCommSplitSlice(const TokenDispatchConfig& context
     const uint32_t expertGlobal = static_cast<uint32_t>(range.begin.globalTokenIndex) - first;
     const auto owned = PlanCommSplitSlice(common, params, scratch, expert, first, first + rows, physicalCore,
                                           params.tilingData->dispatchIntraCores, range.begin.globalTokenIndex + wave);
+    timer.SetCommunicationRows(expert, first, owned.rows);
     if (owned.rows == 0U) return;
     const auto type = physicalCore < params.tilingData->dispatchIntraCores ? AscendTimer::AIV_DISPATCH_INTRA
                                                                            : AscendTimer::AIV_DISPATCH_CROSS;
@@ -573,6 +589,10 @@ __aicore__ inline void DispatchTokenRange(const TokenDispatchConfig& context, co
     // 对整个输入范围一次连续均分；按全局起点轮转首 owner，避免余数长期集中在低编号 AIV1。
     WorkRange ownedRange =
         GetRotatedBalancedTokenRange(dispatchRowCount, blockJob.jobIndex, blockJob.totalJobs, dispatchGlobalRowBegin);
+    if (scratch.commTimer != nullptr) {
+        scratch.commTimer->SetCommunicationRows(range.begin.expertIdx,
+                                                range.begin.tokenIndexInExpert + ownedRange.start, ownedRange.count);
+    }
     if (ownedRange.count == 0U) {
         return;
     }

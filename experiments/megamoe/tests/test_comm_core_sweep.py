@@ -1,6 +1,7 @@
 # Copyright (c) 2026, SimpleBright_Man
 
 import copy
+import csv
 import importlib.util
 import json
 from pathlib import Path
@@ -10,8 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from deep_ep_experimental.megamoe import comm_report, output_check
-from deep_ep_experimental.megamoe.timer import protocol as p
+from deep_ep_experimental.megamoe import output_check
 
 ROOT = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location(
@@ -26,15 +26,17 @@ def test_plan_does_not_touch_devices_or_create_output(tmp_path, capsys):
     sweep.main(["--plan", "--output-dir", str(target), "--intra-cores", "2,4,6", "--bs-values", "2048"])
     planned = json.loads(capsys.readouterr().out)
     assert not target.exists()
-    assert planned["total_case_launches"] == 5  # baseline + 3D + confirmation
-    assert planned["mode"] == "dispatch" and planned["combine_fixed"]
-    assert planned["combine_intra_candidates"] == [12]
+    assert planned["total_case_launches"] == 1
+    assert planned["mode"] == "baseline"
+    assert planned["combine_intra_candidates"] == []
     assert planned["model"]["num_topk"] == 8
     assert not planned["global_optimum_guaranteed"]
 
 
 def test_staged_cached_case_and_grid_counts():
-    args = sweep.parse_args(["--mode", "staged", "--intra-cores", "7,12,21", "--bs-values", "4096"])
+    args = sweep.parse_args(
+        ["--mode", "staged", "--intra-cores", "7,12,21", "--bs-values", "4096", "--combine-intra", "12"]
+    )
     assert sweep.plan(args)["case_launches_per_bs"] == 7
     args.mode = "fullgrid"
     assert sweep.plan(args)["case_launches_per_bs"] == 11
@@ -50,7 +52,8 @@ def test_staged_cached_case_and_grid_counts():
         ("--bs-values", "0"),
         ("--comparison-atol", "nan"),
         ("--initial-combine-intra", "28"),
-        ("--combine-intra", "0"),
+        ("--combine-intra", "-1"),
+        ("--combine-intra", "12"),  # baseline must preserve both original schedules
         ("--combine-intra-cores", "10,12"),
         ("--case-gap-seconds", "-1"),
         ("--case-gap-seconds", "nan"),
@@ -75,6 +78,11 @@ def test_original_environment_cleared_and_pair_command(tmp_path):
     command = sweep.command(args, tmp_path / "model.json", tmp_path / "test", (12, 7), tmp_path / "base")
     assert "--no-timer-raw" in command and "--comm-report" in command and "0-15" in command
     assert "--save-output-reference" not in command
+    original_command = sweep.command(args, tmp_path / "model.json", tmp_path / "base", None, tmp_path / "base")
+    assert "--save-output-reference" in original_command
+    assert "--timer" in original_command and "--comm-report" in original_command
+    dispatch_only = sweep.candidate_environment((10, 0), inherited)
+    assert dispatch_only[sweep.ENV_DISPATCH] == "10" and dispatch_only[sweep.ENV_COMBINE] == "0"
 
 
 def test_selection_uses_slowest_rank_not_fastest():
@@ -101,7 +109,18 @@ def test_staged_search_retains_first_stage_winner_outside_combine_candidates(tmp
 
     monkeypatch.setattr(sweep, "read_case", read)
     sweep.main(
-        ["--mode", "staged", "--output-dir", str(tmp_path / "run"), "--bs-values", "2048", "--intra-cores", "2,4"]
+        [
+            "--mode",
+            "staged",
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--bs-values",
+            "2048",
+            "--intra-cores",
+            "2,4",
+            "--combine-intra",
+            "12",
+        ]
     )
     assert selections[-1]["pair"] == [2, 12]
     assert selections[-1]["confirmation_us"] == 90
@@ -124,6 +143,8 @@ def test_dispatch_only_keeps_combine_fixed_through_scan_and_confirmation(tmp_pat
     monkeypatch.setattr(sweep, "read_case", read)
     sweep.main(
         [
+            "--mode",
+            "dispatch",
             "--output-dir",
             str(tmp_path / "run"),
             "--bs-values",
@@ -143,11 +164,30 @@ def test_dispatch_only_keeps_combine_fixed_through_scan_and_confirmation(tmp_pat
 
 
 def test_dispatch_only_plan_counts_and_legacy_fixed_combine_alias():
-    args = sweep.parse_args(["--intra-cores", "10,12,16,20"])
+    args = sweep.parse_args(["--mode", "dispatch", "--intra-cores", "10,12,16,20"])
     plan = sweep.plan(args)
     assert plan["case_launches_per_bs"] == 6 and plan["total_case_launches"] == 18
-    args = sweep.parse_args(["--initial-combine-intra", "8"])
+    assert args.combine_cores == [0]
+    args = sweep.parse_args(["--mode", "dispatch", "--initial-combine-intra", "8"])
     assert args.combine_cores == [8] and args.initial_combine_intra == 8
+
+
+def test_default_baseline_runs_each_bs_once_without_selection(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        sweep, "os", SimpleNamespace(name="posix", environ={sweep.ENV_DISPATCH: "10", sweep.ENV_COMBINE: "12"})
+    )
+    monkeypatch.setattr(sweep.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="", stderr=""))
+    launches, results, selections = [], [], []
+    monkeypatch.setattr(sweep, "execute", lambda argv, **kwargs: launches.append((argv, kwargs["environment"])))
+    monkeypatch.setattr(sweep, "print_case", results.append)
+    monkeypatch.setattr(sweep, "write_summary", lambda path, plan, records, chosen: selections.extend(chosen))
+    monkeypatch.setattr(sweep, "read_case", lambda output, bs, pair: dict(bs=bs, pair=pair, passed=True))
+    sweep.main(["--output-dir", str(tmp_path / "run"), "--case-gap-seconds", "0"])
+    assert [item["bs"] for item in results] == [2048, 4096, 8192]
+    assert all(item["pair"] is None and item["stage"] == "baseline" for item in results)
+    assert not selections and len(launches) == 3
+    assert all("--comm-report" in argv and "--timer" in argv for argv, env in launches)
+    assert all(sweep.ENV_DISPATCH not in env and sweep.ENV_COMBINE not in env for argv, env in launches)
 
 
 def test_fresh_endpoint_preserves_host_and_skips_previous_ports(monkeypatch):
@@ -189,8 +229,9 @@ def test_execute_waits_and_records_exit_without_masking_child_failure(tmp_path, 
     assert records[-1]["event"] == "torchrun_exit" and records[-1]["returncode"] == status
 
 
-def test_case_reader_accepts_complete_data_and_rejects_incomplete_ranks(tmp_path):
-    pair, bs = (12, 12), 16
+@pytest.mark.parametrize("pair", [None, (12, 0), (12, 12)])
+def test_case_reader_accepts_complete_data_and_rejects_incomplete_ranks(tmp_path, pair):
+    bs = 2048
     for rank in range(16):
         directory = tmp_path / f"rank_{rank}"
         directory.mkdir()
@@ -200,123 +241,48 @@ def test_case_reader_accepts_complete_data_and_rejects_incomplete_ranks(tmp_path
             mode="perf",
             routing="balanced",
             input="fp8",
-            comm_core_split={sweep.ENV_DISPATCH: "12", sweep.ENV_COMBINE: "12"},
+            comm_core_split={
+                sweep.ENV_DISPATCH: str(pair[0]) if pair else None,
+                sweep.ENV_COMBINE: str(pair[1]) if pair else None,
+            },
             config=dict(bs_values=[bs]),
             build={"test": True},
         )
         (directory / "manifest.json").write_text(json.dumps(manifest))
-    rank0 = tmp_path / "rank_0" / "bs_16"
+    rank0 = tmp_path / "rank_0" / f"bs_{bs}"
     rank0.mkdir()
     profile = dict(timer_pass=False, per_rank_rounds_us=[[100.0 + rank, 102.0 + rank] for rank in range(16)])
     (rank0 / "profiling.json").write_text(json.dumps(profile))
     checks = [dict(rank=rank, passed=True) for rank in range(16)]
     (rank0 / "output_comparison.json").write_text(json.dumps(checks))
     (rank0 / "timer_accuracy.json").write_text(json.dumps(checks))
-    timer = tmp_path / "bs_16" / "timer"
+    (rank0 / "communication_audit_accuracy.json").write_text(json.dumps(checks))
+    timer = tmp_path / f"bs_{bs}" / "timer"
     timer.mkdir(parents=True)
-    reports = [comm_report.rank_report(events(rank), rank, bs, 3584, 8, 12, 12) for rank in range(16)]
-    (timer / "communication.json").write_text(json.dumps(comm_report.summarize(reports)))
+    communication = dict(
+        schema_version=2,
+        ranks=[dict(rank=rank, validation=dict(strict_wave_core=True)) for rank in range(16)],
+        operations={
+            operation: dict(gbps_per_card_mean=80.0, gbps_per_card_min=75.0, gbps_per_card_max=85.0)
+            for operation in ("DISPATCH", "COMBINE")
+        },
+    )
+    (timer / "communication.json").write_text(json.dumps(communication))
     report = sweep.read_case(tmp_path, bs, pair)
     assert report["operator_rank_max_mean_us"] == 116.0
     assert report["operator_rank_min_mean_us"] == 101.0
     (rank0 / "timer_accuracy.json").write_text(json.dumps(checks[:-1]))
     with pytest.raises(ValueError, match="timer-on/off"):
         sweep.read_case(tmp_path, bs, pair)
-
-
-@pytest.mark.parametrize("hidden,expected", [(3584, 3712), (3712, 3968), (4096, 4224), (6144, 6336), (8192, 8448)])
-def test_payload_alignment(hidden, expected):
-    assert comm_report.payload_bytes(hidden, "DISPATCH") == expected
-    assert comm_report.payload_bytes(hidden, "COMBINE") == hidden * 2
-
-
-@pytest.mark.parametrize("bs", [1, 3, 2048, 4096, 8192])
-@pytest.mark.parametrize("topk", [1, 6, 8, 17])
-def test_balanced_counts_independent_enumeration(bs, topk):
-    length = bs * topk
-    for rank in (0, 3, 7, 15):
-        oracle = {"INTRA": 0, "CROSS": 0}
-        for source in range(16):
-            routes = np.arange(source * length, (source + 1) * length)
-            key = "INTRA" if source // 4 == rank // 4 else "CROSS"
-            oracle[key] += int(np.count_nonzero(routes % 16 == rank))
-        assert comm_report.expected_rows(bs, topk, rank) == oracle
-
-
-def events(rank=0):
-    # Two waves. One core per cohort; other cores may legitimately have no work.
-    result = []
-    for operation in ("DISPATCH", "COMBINE"):
-        for kind, rows, core in (("INTRA", 16, 0), ("CROSS", 48, 12)):
-            for wave in (0, 1):
-                result.append(
-                    dict(
-                        rank=rank,
-                        core=core,
-                        family=f"AIV_{operation}_{kind}",
-                        wave=wave,
-                        row_count=rows,
-                        start_cycle=1000 + 100000 * wave,
-                        end_cycle=11000 + 100000 * wave,
-                    )
-                )
-    return result
-
-
-def test_wave_envelope_not_whole_operator_or_sum_of_cores():
-    record = comm_report.rank_report(events(), 0, 16, 3584, 8, 12, 12)
-    value = record["classes"]["DISPATCH_INTRA"]
-    assert value["rows"] == 32
-    assert value["summed_wave_envelopes_us"] == 20  # excludes the gap between waves
-    assert value["gbps"] == pytest.approx(32 * 3712 / 20 / 1000)
-    records = [comm_report.rank_report(events(rank), rank, 16, 3584, 8, 12, 12) for rank in range(16)]
-    assert comm_report.summarize(records)["classes"]["DISPATCH_INTRA"]["gbps_per_card_mean"] == value["gbps"]
-
-
-@pytest.mark.parametrize("mutation", ["missing", "row_count", "wrong_cohort", "wave", "duration"])
-def test_reject_missing_or_corrupt_timer_rows(mutation):
-    sample = events()
-    if mutation == "missing":
-        sample.pop()
-    elif mutation == "row_count":
-        sample[0]["row_count"] += 1
-    elif mutation == "wrong_cohort":
-        sample[0]["core"] = 12
-    elif mutation == "wave":
-        sample[0]["wave"] = -1
-    else:
-        sample[0]["end_cycle"] = sample[0]["start_cycle"]
-    with pytest.raises(ValueError):
-        comm_report.rank_report(sample, 0, 16, 3584, 8, 12, 12)
-
-
-def test_sparse_raw_protocol_extraction():
-    class SparseRaw:
-        def __init__(self):
-            self.values = {}
-
-        def __len__(self):
-            return p.TOTAL_BUFFER_SIZE
-
-        def __getitem__(self, index):
-            if isinstance(index, slice):
-                return [self.values.get(i, 0) for i in range(index.start, index.stop)]
-            return self.values.get(index, 0)
-
-    raw = SparseRaw()
-    core, family = 2, p.DYNAMIC_NAMES.index("AIV_DISPATCH_INTRA")
-    logical = len(p.FIXED_NAMES) + family * p.MAX_DYNAMIC_ITER
-    raw.values[p.N_TIMING_COUNTER + core * p.DYNAMIC_ITER_PER_CORE + family] = 1
-    raw.values[core * p.COUNTERS_PER_CORE + logical * 2] = 1000
-    raw.values[core * p.COUNTERS_PER_CORE + logical * 2 + 1] = 2000
-    offset = (
-        p.TASK_METADATA_OFFSET + (core * len(p.DYNAMIC_NAMES) * p.MAX_DYNAMIC_ITER + family * p.MAX_DYNAMIC_ITER) * 2
-    )
-    raw.values[offset], raw.values[offset + 1] = 1 << 32, 7
-    raw.values[p.WAVE_ID_OFFSET + core * p.WAVE_ID_PER_CORE + logical] = 3
-    event = comm_report.read_events(raw, 4)[0]
-    assert event["row_count"] == 7 and event["wave"] == 3 and event["core"] == 0
-    assert event["granularity"] == "cohort_slice"
+    (rank0 / "timer_accuracy.json").write_text(json.dumps(checks))
+    (rank0 / "communication_audit_accuracy.json").write_text(json.dumps(checks[:-1]))
+    with pytest.raises(ValueError, match="audit output"):
+        sweep.read_case(tmp_path, bs, pair)
+    (rank0 / "communication_audit_accuracy.json").write_text(json.dumps(checks))
+    communication["ranks"][4]["validation"]["strict_wave_core"] = False
+    (timer / "communication.json").write_text(json.dumps(communication))
+    with pytest.raises(ValueError, match="per-wave/core"):
+        sweep.read_case(tmp_path, bs, pair)
 
 
 def test_output_reference_is_full_finite_exact_and_signature_bound(tmp_path):
@@ -338,3 +304,36 @@ def test_output_reference_is_full_finite_exact_and_signature_bound(tmp_path):
     wrong["seed"] += 1
     with pytest.raises(ValueError, match="signature"):
         output_check.verify(actual, counts, wrong, tmp_path)
+
+
+def test_summary_and_console_keep_dispatch_combine_independent(tmp_path, capsys):
+    operation_values = {
+        "DISPATCH": dict(gbps_per_card_mean=70.0, gbps_per_card_min=65.0, gbps_per_card_max=75.0),
+        "COMBINE": dict(gbps_per_card_mean=130.0, gbps_per_card_min=125.0, gbps_per_card_max=135.0),
+    }
+    cases = [
+        dict(
+            bs=2048,
+            stage="baseline" if pair is None else "dispatch",
+            pair=pair,
+            output_dir=str(tmp_path / ("baseline" if pair is None else "candidate")),
+            operator_rank_max_mean_us=2400.0,
+            operator_rank_min_mean_us=2350.0,
+            operator_all_ranks_mean_us=2375.0,
+            communication=dict(operations=operation_values),
+        )
+        for pair in (None, [10, 0])
+    ]
+    sweep.write_summary(tmp_path, {}, cases, [])
+    with (tmp_path / "summary.csv").open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 2
+    assert all(row["DISPATCH_GBps"] == "70.0" and row["COMBINE_GBps"] == "130.0" for row in rows)
+    assert rows[0]["dispatch_intra"] == "0" and rows[0]["dispatch_cross"] == ""
+    assert rows[1]["combine_intra"] == "0" and rows[1]["combine_cross"] == ""
+    sweep.print_case(cases[1])
+    printed = capsys.readouterr().out
+    assert "D=10/18 C=original" in printed
+    assert "[BW] DISPATCH" in printed and "[BW] COMBINE" in printed
+    assert "all 28 core communication times / 28" in printed
+    assert "wave envelopes" not in printed

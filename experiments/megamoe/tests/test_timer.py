@@ -28,9 +28,14 @@ def test_device_schema_and_extended_size():
 
     assert names("FixedTiming", "FIXED_TIMING_COUNT") == p.FIXED_NAMES
     assert names("DynamicTimingType", "DYNAMIC_TYPE_COUNT_ENUM") == p.DYNAMIC_NAMES
-    for name in ("MAX_DYNAMIC_ITER", "N_CORE_COUNT"):
+    for name in ("MAX_DYNAMIC_ITER", "N_CORE_COUNT", "COMM_AUDIT_MAX_RECORDS_PER_CORE", "COMM_AUDIT_RECORD_WORDS"):
         assert int(re.search(rf"{name}\s*=\s*(\d+)", header)[1]) == getattr(p, name)
-    assert p.TOTAL_BUFFER_SIZE == p.WAVE_ID_OFFSET + p.WAVE_ID_PER_CORE * p.N_CORE_COUNT
+    assert p.COMM_AUDIT_ENABLE_OFFSET == p.WAVE_ID_OFFSET + p.WAVE_ID_PER_CORE * p.N_CORE_COUNT
+    assert p.COMM_M_GROUPS_PER_WAVE_OFFSET == p.COMM_AUDIT_ENABLE_OFFSET + 1
+    assert p.COMM_AUDIT_COUNT_OFFSET == p.COMM_AUDIT_ENABLE_OFFSET + 2
+    assert p.TOTAL_BUFFER_SIZE == p.COMM_AUDIT_COUNT_OFFSET + p.N_CORE_COUNT
+    assert p.COMM_AUDIT_RECORD_OFFSET == p.TOTAL_BUFFER_SIZE
+    assert p.COMM_AUDIT_BUFFER_SIZE == p.TOTAL_BUFFER_SIZE + p.N_CORE_COUNT * p.COMM_AUDIT_MAX_RECORDS_PER_CORE * 3
     assert p.TASK_METADATA_SIZE == p.N_CORE_COUNT * len(p.DYNAMIC_NAMES) * p.MAX_DYNAMIC_ITER * 2
 
 

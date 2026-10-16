@@ -46,11 +46,100 @@ public:
         for (int typeId = 0; typeId < AscendTimer::DYNAMIC_TYPE_COUNT; ++typeId) {
             dynamicCounts_[typeId] = 0;
         }
+        AscendC::GlobalTensor<int64_t> control;
+        control.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(timerAddr_));
+        auditEnabled_ = control.GetValue(AscendTimer::COMM_AUDIT_ENABLE_OFFSET) != 0;
+        auditCount_ = 0;
     }
 
     __aicore__ inline bool Enabled() const
     {
         return timerAddr_ != nullptr && coreId_ >= 0 && coreId_ < AscendTimer::N_CORE_COUNT;
+    }
+
+    __aicore__ inline bool AuditEnabled() const
+    {
+        return Enabled() && auditEnabled_;
+    }
+
+    __aicore__ inline void SetCommunicationWaveBudget(uint32_t mGroups)
+    {
+        if (Enabled() && coreId_ == 2) {
+            WriteValue(AscendTimer::COMM_M_GROUPS_PER_WAVE_OFFSET, mGroups);
+        }
+    }
+
+    // These intervals observe existing completion/ready boundaries. They do
+    // not introduce PIPE_ALL and do not share the nested tile/span state.
+    __aicore__ inline int64_t CommunicationCycle() const
+    {
+        return Enabled() ? AscendC::GetSystemCycle() : 0;
+    }
+
+    __aicore__ inline void StartCommunication(AscendTimer::DynamicTimingType type, int64_t beginCycle = 0)
+    {
+        if (!Enabled()) return;
+        commType_ = static_cast<int>(type);
+        commIndex_ = dynamicCounts_[commType_]++;
+        commExpert_ = -1;
+        if (commIndex_ < AscendTimer::MAX_DYNAMIC_ITER) {
+            WriteWave(DynamicTimingIndex(commType_, commIndex_), waveId_);
+            WriteStart(DynamicTimingIndex(commType_, commIndex_),
+                       beginCycle != 0 ? beginCycle : AscendC::GetSystemCycle());
+        }
+    }
+
+    __aicore__ inline void SetCommunicationRows(uint32_t expert, uint32_t first, uint32_t rows)
+    {
+        if (!Enabled()) return;
+        commExpert_ = static_cast<int>(expert);
+        commRow_ = first;
+        commRows_ = rows;
+    }
+
+    __aicore__ inline void EndCommunication()
+    {
+        if (!Enabled() || commType_ < 0) return;
+        if (commExpert_ < 0 || commRows_ == 0U) {
+            // Zero-transfer workers contribute zero communication time; the
+            // host still divides the sum by all 28 communication workers.
+            --dynamicCounts_[commType_];
+            commType_ = commIndex_ = -1;
+            return;
+        }
+        const int64_t end = AscendC::GetSystemCycle();
+        if (commIndex_ < AscendTimer::MAX_DYNAMIC_ITER) {
+            EndRaw(commType_, commIndex_, end);
+            if (commExpert_ >= 0) {
+                const int offset =
+                    AscendTimer::TASK_METADATA_OFFSET +
+                    ((coreId_ * AscendTimer::DYNAMIC_TYPE_COUNT + commType_) * AscendTimer::MAX_DYNAMIC_ITER +
+                     commIndex_) *
+                        2;
+                WriteValue(offset, static_cast<int64_t>((static_cast<uint64_t>(commExpert_ + 1) << 32) | commRow_));
+                WriteValue(offset + 1, static_cast<int64_t>(commRows_));
+            }
+        }
+        commType_ = commIndex_ = -1;
+    }
+
+    // Exact identities are emitted only by the separate audit invocation.
+    // Dispatch calls this with the actual fetched route-index entry; Combine
+    // calls it with the metadata used for the actual remote destination.
+    __aicore__ inline void AuditTransfer(uint32_t operation, uint32_t expert, uint32_t row, uint32_t sourceRank,
+                                         uint32_t sourceToken, uint32_t topkSlot)
+    {
+        if (!AuditEnabled()) return;
+        const uint32_t index = auditCount_++;
+        if (index >= AscendTimer::COMM_AUDIT_MAX_RECORDS_PER_CORE) return;
+        const int offset =
+            AscendTimer::COMM_AUDIT_RECORD_OFFSET +
+            (coreId_ * AscendTimer::COMM_AUDIT_MAX_RECORDS_PER_CORE + index) * AscendTimer::COMM_AUDIT_RECORD_WORDS;
+        WriteValue(offset, waveId_);
+        WriteValue(offset + 1, static_cast<int64_t>((static_cast<uint64_t>(operation) << 56) |
+                                                    (static_cast<uint64_t>(expert) << 32) | row));
+        WriteValue(offset + 2, static_cast<int64_t>((static_cast<uint64_t>(sourceRank) << 48) |
+                                                    (static_cast<uint64_t>(topkSlot) << 32) | sourceToken));
     }
 
     // 由调度层指定实际服务的 Wave，不能从本核任务序号反推。
@@ -209,6 +298,7 @@ public:
             int32_t index = AscendTimer::N_TIMING_COUNTER + coreId_ * AscendTimer::DYNAMIC_ITER_PER_CORE_ALIGN + typeId;
             WriteValue(index, dynamicCounts_[typeId]);
         }
+        WriteValue(AscendTimer::COMM_AUDIT_COUNT_OFFSET + coreId_, auditCount_);
     }
 
 private:
@@ -227,6 +317,13 @@ private:
     uint32_t sliceRow_ = 0;
     uint32_t rowStart_ = 0;
     uint32_t rows_ = 0;
+    bool auditEnabled_ = false;
+    uint32_t auditCount_ = 0;
+    int commType_ = -1;
+    int commIndex_ = -1;
+    int commExpert_ = -1;
+    uint32_t commRow_ = 0;
+    uint32_t commRows_ = 0;
 
     __aicore__ inline void WriteMetadata(int typeId, int index)
     {

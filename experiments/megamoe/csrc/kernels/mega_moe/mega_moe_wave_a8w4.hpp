@@ -150,6 +150,11 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
         params_.workspaceInfo.expertRevTokenNumsPtr, countWorkspace_, commonConfig_.moeExpertPerRank, mGroupsPerWave_,
         waveMGroupCount, position);
     if (range.end.globalTokenIndex > range.begin.globalTokenIndex) {
+        timer_.SetWave(static_cast<int64_t>(waveId));
+        timer_.StartCommunication(AscendTimer::AIV_DISPATCH_COMM);
+        timer_.SetCommunicationRows(range.begin.expertIdx, range.begin.tokenIndexInExpert, 0U);
+        tokenDispatchScratch_.commTimer = timer_.Enabled() ? &timer_ : nullptr;
+        tokenDispatchScratch_.auditTimer = timer_.AuditEnabled() ? &timer_ : nullptr;
         // SwiGLU/Combine 会复用 UB；从 GM 备份恢复本专家 prefix，不依赖上一阶段的 UB 内容。
         ReloadDispatchCumsumRange(commonConfig_, tokenDispatchScratch_, range.begin.expertIdx, range.begin.expertIdx);
         timer_.SetWave(static_cast<int64_t>(waveId));
@@ -158,6 +163,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
                 tokenDispatchConfig_, commonConfig_, syncWorkspaceLayout_, params_, g_winRankAddr_,
                 tokenDispatchScratch_, range, gmmExecutionConfig_.blockJob.jobIndex, waveId, timer_);
             position = range.end;
+            timer_.EndCommunication();
             return;
         }
         timer_.StartSpan(AscendTimer::AIV_DISPATCH);
@@ -185,6 +191,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
                 tokenDispatchScratch_, range);
         }
         timer_.EndSpan(AscendTimer::AIV_DISPATCH);
+        timer_.EndCommunication();
     }
     // 数据和 ready flag 发布后才提交进度；空专家也要推进，避免重复或死循环。
     position = range.end;
@@ -281,6 +288,9 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
 template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunReadyCombine(const AivTaskCursor& cursor)
 {
+    // Keep the original ownership and nonblocking ready probe in place. Only
+    // successful attempts create an interval; failed probes do not emit data.
+    const int64_t communicationBegin = timer_.CommunicationCycle();
     const auto& begin = cursor.slice.begin;
     uint32_t rows = static_cast<uint32_t>(cursor.slice.end.globalTokenIndex - begin.globalTokenIndex);
     // 只轮换当前 AIV1 的通信任务，不修改成员中的物理核编号。
@@ -314,14 +324,19 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     state.expertIdx = begin.expertIdx;
     state.globalTokenStartIndex = begin.globalTokenIndex - begin.tokenIndexInExpert;
     timer_.SetWave(static_cast<int64_t>(cursor.wave));
+    timer_.StartCommunication(AscendTimer::AIV_COMBINE_COMM, communicationBegin);
+    waveCombineScratch_.auditTimer = timer_.AuditEnabled() ? &timer_ : nullptr;
+    waveCombineScratch_.auditExpert = begin.expertIdx;
     if (params_.tilingData->combineIntraCores != 0U) {
         ReloadDispatchCumsumRange(commonConfig_, tokenDispatchScratch_, begin.expertIdx, begin.expertIdx);
         const auto segments =
             PlanCommSplitSlice(commonConfig_, params_, tokenDispatchScratch_, begin.expertIdx, begin.tokenIndexInExpert,
                                begin.tokenIndexInExpert + rows, combineJob.jobIndex,
                                params_.tilingData->combineIntraCores, begin.globalTokenIndex + cursor.wave);
+        timer_.SetCommunicationRows(begin.expertIdx, begin.tokenIndexInExpert, segments.rows);
         RunCommSplitCombineSlice(commonConfig_, params_, state, begin.tokenIndexInExpert, segments, combineJob.jobIndex,
                                  timer_, waveCombineScratch_);
+        timer_.EndCommunication();
         return true;
     }
     // 将就绪检查使用的同一份 job 传给实际发送，保证判定和发送的行范围一致。
@@ -330,6 +345,7 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     // timer 仍记录物理核；完整行发送及 UB 排空规则保持原样。
     RunTokenCombineSlice<true>(commonConfig_, combineJob, params_, state, begin.tokenIndexInExpert, rows, timer_,
                                waveCombineScratch_);
+    timer_.EndCommunication();
     return true;
 }
 
@@ -436,6 +452,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     PrepareMoeExpertTokenCountTable<true>(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
     if constexpr (g_coreType == AIV && CombineQuantMode == COMBINE_NO_QUANT) {
         if (GetSubBlockIdx() == 1U) {
+            timer_.SetCommunicationWaveBudget(mGroupsPerWave_);
             ProcessAiv1PriorityStages(gmm1TileReadySequence);
             return;
         }

@@ -32,13 +32,13 @@ uint32_t ReadCommCores(const char* name)
 {
     const char* value = std::getenv(name);
     if (value == nullptr) return 0U;
-    TORCH_CHECK(*value != '\0', name, " must be an integer in [1,27]");
+    TORCH_CHECK(*value != '\0', name, " must be an integer in [0,27] (0 keeps the original schedule)");
     uint32_t parsed = 0U;
     for (const char* cursor = value; *cursor != '\0'; ++cursor) {
-        TORCH_CHECK(*cursor >= '0' && *cursor <= '9' && parsed <= 27U, name, " must be an integer in [1,27]");
+        TORCH_CHECK(*cursor >= '0' && *cursor <= '9' && parsed <= 27U, name, " must be an integer in [0,27]");
         parsed = parsed * 10U + static_cast<uint32_t>(*cursor - '0');
     }
-    TORCH_CHECK(parsed >= 1U && parsed <= 27U, name, " must be an integer in [1,27]");
+    TORCH_CHECK(parsed <= 27U, name, " must be an integer in [0,27]");
     return parsed;
 }
 
@@ -330,9 +330,8 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     tiling_.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
     tiling_.dispatchIntraCores = ReadCommCores("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES");
     tiling_.combineIntraCores = ReadCommCores("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES");
-    TORCH_CHECK((tiling_.dispatchIntraCores == 0U) == (tiling_.combineIntraCores == 0U),
-                "Set both DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES and DEEPEP_MEGAMOE_COMBINE_INTRA_CORES, or neither");
-    TORCH_CHECK(tiling_.dispatchIntraCores == 0U || (is_a8w4 && world == 16 && platform_.aic == 28U),
+    TORCH_CHECK((tiling_.dispatchIntraCores == 0U && tiling_.combineIntraCores == 0U) ||
+                    (is_a8w4 && world == 16 && platform_.aic == 28U),
                 "Communication core split requires W4A8, EP16 and 28 AIC groups; physical ranks form groups of four");
     static_assert(sizeof(MegaMoeTilingData) == 232, "MegaMoE tiling ABI changed");
     const MegaMoeImpl::WorkspaceInfo info(nullptr, &tiling_);
@@ -391,8 +390,10 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         TORCH_CHECK(is_a8w4, "MegaMoE timer is supported only by the A8W4 wave kernel");
         CheckTensor(*timer, 1, "timer");
         TORCH_CHECK(timer->scalar_type() == torch::kInt64, "timer must be int64");
-        TORCH_CHECK(timer->numel() == AscendTimer::TOTAL_BUFFER_SIZE, "timer must contain exactly ",
-                    AscendTimer::TOTAL_BUFFER_SIZE, " int64 values");
+        TORCH_CHECK(
+            timer->numel() == AscendTimer::TOTAL_BUFFER_SIZE || timer->numel() == AscendTimer::COMM_AUDIT_BUFFER_SIZE,
+            "timer must contain ", AscendTimer::TOTAL_BUFFER_SIZE, " timing or ", AscendTimer::COMM_AUDIT_BUFFER_SIZE,
+            " audit int64 values");
     }
     TORCH_CHECK(weight2.scalar_type() == weight1.scalar_type(), "weight1 and weight2 must use the same dtype");
     TORCH_CHECK(is_a8w4 || weight1.scalar_type() == c10::ScalarType::Float8_e4m3fn,
@@ -470,6 +471,19 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     torch::Tensor expert_tokens = torch::empty({experts}, x.options().dtype(torch::kInt32));
 
     const auto stream = c10_npu::getCurrentNPUStream();
+    if (timer.has_value()) {
+        // Derive the device audit permission from the checked allocation size.
+        // A normal-size buffer can never enable writes beyond its allocation,
+        // even if its user-visible control word was accidentally set to one.
+        const bool audit = timer->numel() == AscendTimer::COMM_AUDIT_BUFFER_SIZE;
+        void* control = timer->data_ptr<int64_t>() + AscendTimer::COMM_AUDIT_ENABLE_OFFSET;
+        TORCH_CHECK(aclrtMemsetAsync(control, sizeof(int64_t), 0, sizeof(int64_t), stream.stream()) == ACL_SUCCESS,
+                    "Could not initialize communication audit control");
+        if (audit) {
+            TORCH_CHECK(aclrtMemsetAsync(control, sizeof(int64_t), 1, 1, stream.stream()) == ACL_SUCCESS,
+                        "Could not enable communication audit control");
+        }
+    }
     auto ptr = [](const torch::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
     auto opt = [&](const c10::optional<torch::Tensor>& tensor) { return tensor ? ptr(*tensor) : nullptr; };
     mega_moe_kernel_do(platform_.block_dim, platform_.ub, stream.stream(), is_a8w4, ptr(context_), ptr(x),
