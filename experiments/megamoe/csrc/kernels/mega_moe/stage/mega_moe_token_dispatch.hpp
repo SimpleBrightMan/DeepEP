@@ -20,6 +20,8 @@
 
 #include "../common/mega_moe_utils.hpp"
 #include "../common/mega_moe_peer_rows.hpp"
+#include "../common/mega_moe_comm_split.hpp"
+#include "../common/ascend_timer_v2_device.hpp"
 #include "mega_moe_token_quant.hpp"
 #include "mega_moe_count_arrival.hpp"
 
@@ -407,6 +409,67 @@ struct DispatchPeerCounts {
         return static_cast<uint32_t>(prefix.GetValue(index) - begin);
     }
 };
+
+template <typename ActivationType>
+__aicore__ inline CommOwnedSegments PlanCommSplitSlice(const MoeStageCommonConfig& common, const Params& params,
+                                                       const TokenDispatchScratch<ActivationType>& scratch,
+                                                       uint32_t expert, uint32_t sliceBegin, uint32_t sliceEnd,
+                                                       uint32_t physicalCore, uint32_t intraCores, uint64_t rotation)
+{
+    CommPeerSegment peers[COMM_SPLIT_PEERS];
+    DispatchPeerCounts counts{scratch.cumsumInfoTensor, expert * common.worldSize};
+    BuildCommPeerSegments(counts, common.rankId, params.tilingData->dispatchRanksPerNode, sliceBegin, sliceEnd,
+                          common.tokenNum > W4A8_SMALL_BATCH_MAX_TOKENS, peers);
+    return SelectCommOwnedSegments(peers, common.rankId, physicalCore, params.tilingData->aicNum, intraCores, rotation);
+}
+
+// Each worker owns disjoint source segments, not one continuous output range.
+// Publish only these exact rows after all stores finish, so a GMM1 tile cannot
+// become ready because a different owner's rows were counted on its behalf.
+template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTileM, bool TopkWeightsPrefetch>
+__aicore__ inline void DispatchCommSplitSlice(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
+                                              const MoeSyncWorkspaceLayout& syncLayout, const Params& params,
+                                              GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
+                                              const ExpertTokenRange& range, uint32_t physicalCore, uint64_t wave,
+                                              AscendTimerDevice& timer)
+{
+    if (range.begin.globalTokenIndex >= context.maxOutputSize) return;
+    const uint32_t expert = range.begin.expertIdx;
+    const uint32_t first = range.begin.tokenIndexInExpert;
+    const uint64_t globalEnd =
+        range.end.globalTokenIndex < context.maxOutputSize ? range.end.globalTokenIndex : context.maxOutputSize;
+    const uint32_t rows = static_cast<uint32_t>(globalEnd - range.begin.globalTokenIndex);
+    const uint32_t expertGlobal = static_cast<uint32_t>(range.begin.globalTokenIndex) - first;
+    const auto owned = PlanCommSplitSlice(common, params, scratch, expert, first, first + rows, physicalCore,
+                                          params.tilingData->dispatchIntraCores, range.begin.globalTokenIndex + wave);
+    if (owned.rows == 0U) return;
+    const auto type = physicalCore < params.tilingData->dispatchIntraCores ? AscendTimer::AIV_DISPATCH_INTRA
+                                                                           : AscendTimer::AIV_DISPATCH_CROSS;
+    // rows is the exact transferred payload count; the selected intervals can
+    // be disjoint. row_start identifies the original expert slice.
+    timer.SetSlice(expert, first, owned.rows);
+    timer.StartSpan(type);
+    DispatchRouteBatch batch{};
+    DispatchCopyProgress progress{};
+    for (uint32_t i = 0U; i < owned.count; ++i) {
+        const auto& segment = owned.segments[i];
+        DispatchRankTokens<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+            context, common, params, winRankAddr, scratch, expert, static_cast<int32_t>(expertGlobal), segment.peer,
+            static_cast<int32_t>(segment.rowBegin), static_cast<int32_t>(segment.sourceBegin),
+            static_cast<int32_t>(segment.sourceBegin + segment.count), batch, progress);
+    }
+    FlushDispatchRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, winRankAddr, scratch,
+                                                                                 batch, progress);
+    DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch, progress);
+    for (uint32_t i = 0U; i < owned.count; ++i) {
+        const auto& segment = owned.segments[i];
+        PublishGmm1TileReady(syncLayout, params, expert, static_cast<int32_t>(PipelineTileM),
+                             static_cast<int32_t>(segment.rowBegin),
+                             static_cast<int32_t>(segment.rowBegin + segment.count));
+    }
+    timer.EndSpan(type);
+    timer.ClearSlice();
+}
 
 // 同一 slice 内各 peer 分段取数，直接落入原连续工作区；GMM/timer 继续使用原 slice 边界。
 template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTileM, bool TopkWeightsPrefetch>

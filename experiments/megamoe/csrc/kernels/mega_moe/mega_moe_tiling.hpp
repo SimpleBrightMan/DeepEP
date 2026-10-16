@@ -206,5 +206,9 @@ struct MegaMoeTilingData {
     uint32_t numMaxTokensPerRank;
     // 物理每机 EP rank 数，rank 按机器连续编号；0 表示未知，仅关闭刀片交错；peer均衡及wave轮换仍有效。
     uint32_t dispatchRanksPerNode;
+    // Zero keeps the original owner mapping. EP16 four-card-group experiments
+    // reserve the first N physical AIV1 workers for the own group, including self.
+    uint32_t dispatchIntraCores;
+    uint32_t combineIntraCores;
 };
 #endif

@@ -263,6 +263,13 @@ def test_timer_disabled_and_destroyed_buffer_fail_explicitly(backend):
         api.fp8_fp4_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), *weights(), backend.buffer)
 
 
+def test_prepare_rejects_changed_comm_cohort_environment(backend, monkeypatch):
+    monkeypatch.setenv("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "7")
+    monkeypatch.setenv("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES", "8")
+    with pytest.raises(ValueError, match="Communication core environment changed"):
+        backend.buffer.prepare(17)
+
+
 @pytest.mark.parametrize("dtype", ["int8", "uint8"])
 def test_fp4_and_packed_e8m0_are_reinterpreted_without_numeric_cast(backend, dtype):
     raw = np.arange(512 * 64, dtype=np.uint8).reshape(1, 512, 64)

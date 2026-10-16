@@ -33,6 +33,10 @@ DYNAMIC_NAMES = [
     "AIC_SHARED_GMM2",
     "AIV_SHARED_GMM2_PROLOGUE",
     "AIV_SHARED_SWIGLU",
+    "AIV_DISPATCH_INTRA",
+    "AIV_DISPATCH_CROSS",
+    "AIV_COMBINE_INTRA",
+    "AIV_COMBINE_CROSS",
 ]
 
 # W4 动态槽保存 tile/slice；其他路径保持原有区间协议。
@@ -75,6 +79,8 @@ def task_metadata(raw, core_id, logical_index):
         granularity="tile" if n_tile >= 0 else "slice",
     )
     family = DYNAMIC_NAMES[dynamic_index // MAX_DYNAMIC_ITER]
+    if family in ("AIV_DISPATCH_INTRA", "AIV_DISPATCH_CROSS", "AIV_COMBINE_INTRA", "AIV_COMBINE_CROSS"):
+        result.update(granularity="cohort_slice", row_count_semantics="transferred_rows_not_contiguous")
     if "_SHARED_" in family:
         result["expert_kind"] = "shared"
     if n_tile >= 0:

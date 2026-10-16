@@ -52,6 +52,8 @@ def rank_breakdown(events, rank):
     families = defaultdict(list)
     for event in active:
         families[event_family(event["name"])].append(event)
+    if not families["AIV_DISPATCH"]:
+        families["AIV_DISPATCH"] = families["AIV_DISPATCH_INTRA"] + families["AIV_DISPATCH_CROSS"]
     required = ("AIV_DISPATCH", "AIC_GMM1", "AIC_GMM2", "AIV_UNPERMUTE")
     missing = [name for name in required if not families[name]]
     if missing:

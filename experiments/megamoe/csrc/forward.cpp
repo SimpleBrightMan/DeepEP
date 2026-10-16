@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 
 #include <acl/acl.h>
@@ -26,6 +27,20 @@ namespace {
 // Raw launches allocate the kernel-visible WorkspaceInfo regions,
 // the AscendC system workspace, and a 50 MiB reserve.
 constexpr int64_t kReservedWorkspaceBytes = 50LL * 1024LL * 1024LL;
+
+uint32_t ReadCommCores(const char* name)
+{
+    const char* value = std::getenv(name);
+    if (value == nullptr) return 0U;
+    TORCH_CHECK(*value != '\0', name, " must be an integer in [1,27]");
+    uint32_t parsed = 0U;
+    for (const char* cursor = value; *cursor != '\0'; ++cursor) {
+        TORCH_CHECK(*cursor >= '0' && *cursor <= '9' && parsed <= 27U, name, " must be an integer in [1,27]");
+        parsed = parsed * 10U + static_cast<uint32_t>(*cursor - '0');
+    }
+    TORCH_CHECK(parsed >= 1U && parsed <= 27U, name, " must be an integer in [1,27]");
+    return parsed;
+}
 
 template <typename T>
 T CeilDiv(T value, T divisor)
@@ -313,7 +328,13 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     tiling_ = MakeTiling(example.size(0), example.size(1), intermediate * 2, topk, experts, world, max_tokens, 0,
                          is_a8w4, shared_experts, platform_);
     tiling_.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
-    static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
+    tiling_.dispatchIntraCores = ReadCommCores("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES");
+    tiling_.combineIntraCores = ReadCommCores("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES");
+    TORCH_CHECK((tiling_.dispatchIntraCores == 0U) == (tiling_.combineIntraCores == 0U),
+                "Set both DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES and DEEPEP_MEGAMOE_COMBINE_INTRA_CORES, or neither");
+    TORCH_CHECK(tiling_.dispatchIntraCores == 0U || (is_a8w4 && world == 16 && platform_.aic == 28U),
+                "Communication core split requires W4A8, EP16 and 28 AIC groups; physical ranks form groups of four");
+    static_assert(sizeof(MegaMoeTilingData) == 232, "MegaMoE tiling ABI changed");
     const MegaMoeImpl::WorkspaceInfo info(nullptr, &tiling_);
     const int64_t bytes =
         info.workspaceSize + static_cast<int64_t>(platform_.system_workspace) + kReservedWorkspaceBytes;

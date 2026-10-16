@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 import importlib
+import os
 import threading
 from typing import TYPE_CHECKING
 
@@ -123,6 +124,8 @@ class SymmBuffer:
             activation,
             ranks_per_node,
             timeout,
+            os.environ.get("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES"),
+            os.environ.get("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES"),
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
@@ -135,6 +138,7 @@ class SymmBuffer:
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
         self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
         self.ranks_per_node = ranks_per_node
+        self._comm_core_environment = config[-2:]
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
         try:
@@ -197,6 +201,12 @@ class SymmBuffer:
             try:
                 self._runtime.ensure_alive()
                 integer("BS", bs, 1, self.num_max_tokens_per_rank)
+                current_split = (
+                    os.environ.get("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES"),
+                    os.environ.get("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES"),
+                )
+                if current_split != self._comm_core_environment:
+                    raise ValueError("Communication core environment changed; create a fresh SymmBuffer/process")
             except Exception as failure:
                 error = str(failure)
             collective_check(self.group, "prepare", error, bs)

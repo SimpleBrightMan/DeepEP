@@ -1183,6 +1183,44 @@ __aicore__ inline void NotifyTokenCombineSliceReady(const Params& params, uint32
 // 按完整 token 行发送当前专家 slice；调用方传入的 job 已包含所需的通信 owner 轮换。
 // InputReadyChecked=true 仅供已探测同一 slice 就绪的优先级调度器使用。
 // 其他调用保留一次阻塞等待；输出 metadata、发送目的地及 timer 协议不变。
+// The priority scheduler has already observed this slice's original GMM2
+// producer count. Keep one row ring across all selected peer/group segments;
+// metadata contains the original source rank, token and top-k return slot.
+__aicore__ inline void RunCommSplitCombineSlice(const MoeStageCommonConfig& common, const Params& params,
+                                                const ExpertLoopState& state, uint32_t rowStart,
+                                                const CommOwnedSegments& owned, uint32_t physicalCore,
+                                                AscendTimerDevice& timer, WaveCombineScratch& scratch)
+{
+    if (owned.rows == 0U) return;
+    auto buffers = common.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS
+                       ? InitWaveCombineBuffers<COMBINE_NO_QUANT>(common, scratch)
+                       : InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 2U>(common, scratch);
+    const auto type = physicalCore < params.tilingData->combineIntraCores ? AscendTimer::AIV_COMBINE_INTRA
+                                                                          : AscendTimer::AIV_COMBINE_CROSS;
+    timer.SetSlice(state.expertIdx, rowStart, owned.rows);
+    timer.StartSpan(type);
+    const uint64_t expertGlobal = static_cast<uint64_t>(state.globalTokenStartIndex);
+    GM_ADDR output = params.workspaceInfo.gmm2MmadResPtr + expertGlobal * common.tokenHiddenDim * sizeof(bfloat16_t);
+    uint32_t sequence = 0U;
+    for (uint32_t i = 0U; i < owned.count; ++i) {
+        const auto& segment = owned.segments[i];
+        for (uint32_t done = 0U; done < segment.count;) {
+            uint32_t count = segment.count - done;
+            count = count < WAVE_COMBINE_META_INFO_TOKEN_CAPACITY ? count : WAVE_COMBINE_META_INFO_TOKEN_CAPACITY;
+            PreloadWaveCombineMetaInfo(params, scratch, expertGlobal + segment.rowBegin + done, count, 0U);
+            CombineWaveTokenRange<COMBINE_NO_QUANT>(common, buffers, scratch, params, output, segment.rowBegin + done,
+                                                    count, 0U, sequence);
+            // Metadata is consumed by Scalar while issuing each row's address.
+            // Only row slots remain in flight; preloading the next metadata
+            // chunk cannot overwrite the UB data used by those MTE3 operations.
+            done += count;
+        }
+    }
+    DrainCombineRowBuffers(sequence, buffers.rowBufferCount);
+    timer.EndSpan(type);
+    timer.ClearSlice();
+}
+
 template <bool InputReadyChecked = false>
 __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, const AivJobContext& job,
                                             const Params& params, const ExpertLoopState& state, uint32_t rowStart,

@@ -5,6 +5,9 @@ Modified by Joyce_An 2026
 
 # MegaMoE Prefill Beta
 
+本分支新增单机 EP16、28 核的生产算子通信核心配比扫描，详见
+[Dispatch/Combine 配比扫描](COMM_CORE_SWEEP.md)。默认不设置配比环境变量时保留原调度。
+
 公开入口：`deep_ep_experimental.megamoe`。W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度。
 构建和多机测试入口位于本目录的 `scripts/`；机器地址及环境配置由使用者提供。
 
@@ -99,7 +102,7 @@ Token Combine 按实际单卡 B 选择：B≤256 使用六槽，B>256 使用两�
 输出握手再推进一次；大 BS 使用输入/输出跨卡握手。共享 GMM1 后无需全核屏障。
 共享 SwiGLU 在 AIV1 上优先于 Combine，共享 GMM2 按本核路由完成及共享激活就绪推进。
 S=0 的 W4A8 小 BS 也使用上述量化完成/count 就绪协议；W8A8 使用输入/输出跨卡握手。
-tiling ABI 为 224 字节。
+本分支 tiling ABI 为 232 字节（新增 Dispatch/Combine 本组核数各一个 uint32）。
 CATLASS GMM 的布局和同步机制见 [GMM 说明](csrc/kernels/mega_moe/catlass_gmm/README.md)。
 
 所有 rank 必须按相同顺序、相同 B 调用，切换 B 时在计时前集体调用 `prepare(B)`。

@@ -153,6 +153,13 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
         // SwiGLU/Combine 会复用 UB；从 GM 备份恢复本专家 prefix，不依赖上一阶段的 UB 内容。
         ReloadDispatchCumsumRange(commonConfig_, tokenDispatchScratch_, range.begin.expertIdx, range.begin.expertIdx);
         timer_.SetWave(static_cast<int64_t>(waveId));
+        if (params_.tilingData->dispatchIntraCores != 0U) {
+            DispatchCommSplitSlice<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch>(
+                tokenDispatchConfig_, commonConfig_, syncWorkspaceLayout_, params_, g_winRankAddr_,
+                tokenDispatchScratch_, range, gmmExecutionConfig_.blockJob.jobIndex, waveId, timer_);
+            position = range.end;
+            return;
+        }
         timer_.StartSpan(AscendTimer::AIV_DISPATCH);
         // AIC-balance使用独立GMM1/GMM2游标；只映射通信job，不能修改计算游标或物理核号。
         auto dispatchJob = gmmExecutionConfig_.blockJob;
@@ -281,7 +288,8 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     // BS>=4096 时 GMM2 滞后一轮，使用其他阶段的 wave 会把同一批输出分给错误的 owner。
     // GMM2 反向分核、通信 owner 轮换都不改变 slice 的身份和实际生产核数量。
     auto combineJob = waveCombineJob_;
-    if (combineJob.totalJobs != 0U && combineJob.jobIndex < combineJob.totalJobs) {
+    if (params_.tilingData->combineIntraCores == 0U && combineJob.totalJobs != 0U &&
+        combineJob.jobIndex < combineJob.totalJobs) {
         uint32_t shift = static_cast<uint32_t>(cursor.wave % combineJob.totalJobs);
         // 与 Dispatch 相同：物理核 c 在 wave w 执行逻辑核 (c-w) mod 核数 的连续行任务。
         // 条件减法避免无符号下溢；先取模再转换，保证较大的 wave 编号也能正确轮换。
@@ -292,7 +300,7 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     // (sliceGlobalRowStart + cursor.wave) mod 核数；同 wave 跨专家的 slice 使用同一偏移。
     // 空任务判断必须使用轮换后的 owner，否则小 batch/尾片可能被错误跳过而漏发。
     WorkRange owned = GetWaveCombineOwnedRange(combineJob, rows, begin.globalTokenIndex);
-    if (owned.count == 0U) {
+    if (params_.tilingData->combineIntraCores == 0U && owned.count == 0U) {
         return true;
     }
     // 只读取当前 expert/slice 的计数；不同 slice 不共用槽，快核后续通知不能代偿慢核。
@@ -306,6 +314,16 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     state.expertIdx = begin.expertIdx;
     state.globalTokenStartIndex = begin.globalTokenIndex - begin.tokenIndexInExpert;
     timer_.SetWave(static_cast<int64_t>(cursor.wave));
+    if (params_.tilingData->combineIntraCores != 0U) {
+        ReloadDispatchCumsumRange(commonConfig_, tokenDispatchScratch_, begin.expertIdx, begin.expertIdx);
+        const auto segments =
+            PlanCommSplitSlice(commonConfig_, params_, tokenDispatchScratch_, begin.expertIdx, begin.tokenIndexInExpert,
+                               begin.tokenIndexInExpert + rows, combineJob.jobIndex,
+                               params_.tilingData->combineIntraCores, begin.globalTokenIndex + cursor.wave);
+        RunCommSplitCombineSlice(commonConfig_, params_, state, begin.tokenIndexInExpert, segments, combineJob.jobIndex,
+                                 timer_, waveCombineScratch_);
+        return true;
+    }
     // 将就绪检查使用的同一份 job 传给实际发送，保证判定和发送的行范围一致。
     // 当前 slice 已检查就绪，模板 true 跳过发送入口内的重复等待。计数只增不减，
     // 到本次算子结束前不会重置，因此检查与发送之间无需再次轮询。

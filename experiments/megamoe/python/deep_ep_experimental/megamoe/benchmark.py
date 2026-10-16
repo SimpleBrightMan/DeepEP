@@ -133,10 +133,28 @@ def main():
         "--golden-dir", type=Path, default=Path("benchmark-golden"), help="Precomputed CPU Golden cache"
     )
     parser.add_argument("--relative-rmse", type=float, default=0.02, help="Timer on/off output tolerance only")
+    parser.add_argument(
+        "--save-output-reference", action="store_true", help="Save full output/counts after an untimed call"
+    )
+    parser.add_argument("--reference-output-dir", type=Path, help="Check every output element against a baseline run")
+    parser.add_argument("--comparison-rtol", type=float, default=0.0)
+    parser.add_argument("--comparison-atol", type=float, default=0.0)
+    parser.add_argument(
+        "--comm-report", action="store_true", help="Export split Dispatch/Combine per-wave payload bandwidth"
+    )
+    parser.add_argument(
+        "--no-timer-raw", action="store_true", help="Keep compact reports instead of large raw timer buffers"
+    )
     args = parser.parse_args()
     config = load_config(args.config, args.bs_values)
     if args.check_tokens < 0 or not 0 < args.relative_rmse < 1:
         parser.error("Invalid accuracy sample count or tolerance")
+    if args.comm_report and (not args.timer or args.timer_ranks != list(range(16))):
+        parser.error("--comm-report requires --timer --timer-ranks 0-15")
+    if args.no_timer_raw and not args.comm_report:
+        parser.error("--no-timer-raw requires --comm-report")
+    if (args.save_output_reference or args.reference_output_dir) and args.routing != "balanced":
+        parser.error("Output regression currently requires balanced routing")
     import torch
     import torch_npu  # noqa: F401 - Registers NPU dtype/device/stream support.
     from .api import StoreGroup
@@ -173,6 +191,11 @@ def run(args, config, group):
             args.timer_ranks,
             args.check_tokens,
             args.relative_rmse,
+            str(args.reference_output_dir),
+            args.save_output_reference,
+            args.comparison_rtol,
+            args.comparison_atol,
+            args.comm_report,
         ),
     )
     timer_ranks = args.timer_ranks if args.timer_ranks is not None else list(range(min(world, 8)))
@@ -215,6 +238,10 @@ def run(args, config, group):
         numerical_contract="ascend_post_gmm2_route_weight_v1",
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
+        comm_core_split={
+            name: os.environ.get(name)
+            for name in ("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES")
+        },
     )
     (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     model = config["model"]
@@ -348,7 +375,9 @@ def run(args, config, group):
                     flush=True,
                 )
         if args.timer:
-            uninstrumented = result.float().cpu().numpy() if args.mode == "accuracy" else None
+            uninstrumented = (
+                result.float().cpu().numpy() if args.mode == "accuracy" or args.reference_output_dir else None
+            )
             timer, error = None, None
             try:
                 timer = buffer.allocate_timer() if rank in timer_ranks else None
@@ -364,12 +393,26 @@ def run(args, config, group):
             enqueue_batch(call, torch, prefix, config["alignment"], config["iters"], timer)
             torch.npu.synchronize()
             if uninstrumented is not None:
+                import numpy as np
                 from .reference import error_metrics
 
-                metrics = error_metrics(result.float().cpu().numpy(), uninstrumented)
+                instrumented = result.float().cpu().numpy()
+                metrics = error_metrics(instrumented, uninstrumented)
+                metrics["passed"] = bool(metrics["finite"] and metrics["relative_rmse"] <= args.relative_rmse)
+                if args.reference_output_dir:
+                    metrics["output_equal"] = bool(
+                        np.allclose(
+                            instrumented,
+                            uninstrumented,
+                            rtol=args.comparison_rtol,
+                            atol=args.comparison_atol,
+                            equal_nan=False,
+                        )
+                    )
+                    metrics["passed"] &= metrics["output_equal"]
                 comparisons = group.all_gather(dict(rank=rank, **metrics), f"timer accuracy BS={bs}")
                 (case / "timer_accuracy.json").write_text(json.dumps(comparisons, indent=2), encoding="utf-8")
-                if any(not item["finite"] or item["relative_rmse"] > args.relative_rmse for item in comparisons):
+                if any(not item["passed"] for item in comparisons):
                     raise AssertionError(f"BS={bs}: timer-on/off output mismatch")
             timer_dir = args.output_dir / f"bs_{bs}" / "timer"
             breakdown = None
@@ -378,17 +421,59 @@ def run(args, config, group):
 
                 timer_dir.mkdir(parents=True, exist_ok=True)
                 raw_timer = timer.cpu().numpy().astype("<i8", copy=False).reshape(-1)
-                raw_timer.tofile(timer_dir / f"rank_{rank}_npu_time.bin")
+                if not args.no_timer_raw:
+                    raw_timer.tofile(timer_dir / f"rank_{rank}_npu_time.bin")
                 breakdown = rank_breakdown(compact_events(raw_timer, rank), rank)
+                if args.comm_report:
+                    from .comm_report import read_events, rank_report
+
+                    communication = rank_report(
+                        read_events(raw_timer, rank),
+                        rank,
+                        bs,
+                        model["hidden"],
+                        model["num_topk"],
+                        int(os.environ["DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES"]),
+                        int(os.environ["DEEPEP_MEGAMOE_COMBINE_INTRA_CORES"]),
+                    )
                 del raw_timer
-                print(f"[TIMER] rank={rank} BS={bs} raw saved; offline parse required", flush=True)
+                print(
+                    f"[TIMER] rank={rank} BS={bs} {'compact report' if args.no_timer_raw else 'raw saved'}", flush=True
+                )
             records = group.all_gather(breakdown, f"timer breakdown BS={bs}")
             if rank == 0:
                 from .timer.breakdown import write_breakdown
 
                 timer_dir.mkdir(parents=True, exist_ok=True)
                 write_breakdown([r for r in records if r is not None], timer_dir, f"BS={bs}")
+            if args.comm_report:
+                from .comm_report import summarize
+
+                communication_records = group.all_gather(communication, f"communication report BS={bs}")
+                if rank == 0:
+                    (timer_dir / "communication.json").write_text(
+                        json.dumps(summarize(communication_records), indent=2) + "\n", encoding="utf-8"
+                    )
             del timer
+        if args.save_output_reference or args.reference_output_dir:
+            from .output_check import save, signature, verify
+
+            stats = torch.zeros((model["num_experts"] // world,), dtype=torch.int32, device="npu")
+            call(stats=stats)
+            torch.npu.synchronize()
+            actual, counts = result.float().cpu().numpy(), stats.cpu().numpy()
+            spec = signature(config, rank, world, bs, args.input, args.routing)
+            comparison = verify(
+                actual, counts, spec, args.reference_output_dir, rtol=args.comparison_rtol, atol=args.comparison_atol
+            )
+            comparisons = group.all_gather(comparison, f"baseline regression BS={bs}")
+            (case / "output_comparison.json").write_text(json.dumps(comparisons, indent=2), encoding="utf-8")
+            if not all(item["passed"] for item in comparisons):
+                raise AssertionError(f"BS={bs}: output/count regression FAILED; see {case}")
+            if args.save_output_reference:
+                save(case / "output_reference.npz", actual, counts, spec)
+            if rank == 0:
+                print(f"[REGRESSION] BS={bs}: full output/count verification passed on {world} ranks", flush=True)
         del prefix
         group.barrier(f"case complete BS={bs}")
     group.barrier("before SHMEM teardown")
