@@ -1,0 +1,22 @@
+Looking in indexes: https://repo.huaweicloud.com/repository/pypi/simple/
+Processing /home/codex-deepep/megamoe-maintainable-1016/source
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: ascend-deepep
+  Building wheel for ascend-deepep (pyproject.toml): started
+  Building wheel for ascend-deepep (pyproject.toml): still running...
+  Building wheel for ascend-deepep (pyproject.toml): finished with status 'done'
+  Created wheel for ascend-deepep: filename=ascend_deepep-0.1.0.dev5-cp311-cp311-linux_aarch64.whl size=1956431 sha256=549008008dad28675a597cfd3cb968a994a2244c32b25453601f8a95e03534df
+  Stored in directory: /tmp/pip-ephem-wheel-cache-xglnjmdo/wheels/59/ce/0b/9eb9846d3df0d78d6c18ce3b71bc4320c56529a3ba0dc3bc7b
+Successfully built ascend-deepep
+
+[notice] A new release of pip is available: 24.0 -> 26.2.1
+[notice] To update, run: pip install --upgrade pip
+Looking in indexes: https://repo.huaweicloud.com/repository/pypi/simple/
+Processing /home/codex-deepep/megamoe-maintainable-1016/wheels/ascend_deepep-0.1.0.dev5-cp311-cp311-linux_aarch64.whl
+Installing collected packages: ascend-deepep
+Successfully installed ascend-deepep-0.1.0.dev5
+
+[notice] A new release of pip is available: 24.0 -> 26.2.1
+[notice] To update, run: pip install --upgrade pip
+/home/codex-deepep/megamoe-maintainable-1016/venv/lib/python3.11/site-packages/deep_ep/__init__.py
