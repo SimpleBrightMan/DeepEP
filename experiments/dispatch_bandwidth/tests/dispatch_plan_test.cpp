@@ -162,16 +162,18 @@ void VerifyGroupRoundRobin(const Config& config, uint32_t rank)
     std::vector<std::vector<uint32_t>> starts(groups, std::vector<uint32_t>(config.cores, UINT32_MAX));
     std::vector<uint8_t> seen(expected.size(), 0U);
     uint64_t next_task = 0U;
-    uint32_t minimum = UINT32_MAX, maximum = 0U;
+    std::array<uint32_t, 2> minimum{UINT32_MAX, UINT32_MAX}, maximum{};
     for (uint32_t logical = 0U; logical < config.cores; ++logical) {
         const Worker& worker = plan.workers[logical];
-        Require(worker.traffic == static_cast<uint32_t>(Traffic::All) && worker.reserved == 0U,
-                "group worker must use the mixed-traffic tag");
+        const uint32_t queue = logical < kIntraWorkers ? 0U : 1U;
+        const Traffic traffic = queue == 0U ? Traffic::Intra : Traffic::Cross;
+        Require(worker.traffic == static_cast<uint32_t>(traffic) && worker.reserved == 0U,
+                "group worker queue or ABI tag changed");
         Require(worker.begin == next_task && static_cast<uint64_t>(worker.begin) + worker.count <= plan.tasks.size(),
                 "group worker interval");
         next_task += worker.count;
-        minimum = std::min(minimum, worker.count);
-        maximum = std::max(maximum, worker.count);
+        minimum[queue] = std::min(minimum[queue], worker.count);
+        maximum[queue] = std::max(maximum[queue], worker.count);
         uint32_t previous_phase = 0U;
         for (uint32_t row = 0U; row < worker.count; ++row) {
             const CopyTask& task = plan.tasks[worker.begin + row];
@@ -182,6 +184,7 @@ void VerifyGroupRoundRobin(const Config& config, uint32_t rank)
                 task.peer == reference.peer && task.token == reference.token && task.topk_slot == reference.topk_slot,
                 "group source identity or destination changed");
             const uint32_t phase = group_to_phase[task.peer / config.group_size];
+            Require(queue == 0U ? phase == 0U : phase != 0U, "worker crossed intra/cross queue boundary");
             Require(phase >= previous_phase, "worker GET source groups are not phase ordered");
             previous_phase = phase;
             if (counts[phase][logical] == 0U) {
@@ -195,27 +198,38 @@ void VerifyGroupRoundRobin(const Config& config, uint32_t rank)
     }
     Require(next_task == plan.tasks.size(), "group unassigned task suffix");
     Require(std::all_of(seen.begin(), seen.end(), [](uint8_t value) { return value == 1U; }), "group route omitted");
-    Require(maximum - minimum <= 1U, "whole-worker round workload imbalance");
+    for (uint32_t queue = 0U; queue < 2U; ++queue) {
+        Require(maximum[queue] - minimum[queue] <= 1U, "within-queue whole-worker workload imbalance");
+    }
     std::array<uint64_t, kTrafficKinds> totals{};
     uint32_t extra_cursor = 0U;
     for (uint32_t phase = 0U; phase < groups; ++phase) {
         Require(actual_traffic[phase] == expected_traffic[phase] &&
                     plan.phases[phase].traffic_rows == expected_traffic[phase],
                 "group phase traffic row accounting");
-        const auto range = std::minmax_element(counts[phase].begin(), counts[phase].end());
+        const uint32_t first_worker = phase == 0U ? 0U : kIntraWorkers;
+        const uint32_t workers = phase == 0U ? kIntraWorkers : kCrossWorkers;
+        const auto range =
+            std::minmax_element(counts[phase].begin() + first_worker, counts[phase].begin() + first_worker + workers);
         Require(*range.second - *range.first <= 1U, "group phase workload imbalance");
-        const uint32_t phase_start = extra_cursor;
-        std::vector<uint32_t> reference_counts(config.cores,
-                                               static_cast<uint32_t>(phase_rows[phase].size() / config.cores));
+        const uint32_t phase_start = phase == 0U ? 0U : extra_cursor;
+        uint32_t phase_cursor = phase_start;
+        std::vector<uint32_t> reference_counts(config.cores, 0U);
+        for (uint32_t worker = first_worker; worker < first_worker + workers; ++worker) {
+            reference_counts[worker] = static_cast<uint32_t>(phase_rows[phase].size() / workers);
+        }
         // Independently distribute leftover rows one at a time around the ring.
-        for (uint32_t extra = static_cast<uint32_t>(phase_rows[phase].size() % config.cores); extra != 0U; --extra) {
-            ++reference_counts[extra_cursor];
-            extra_cursor = (extra_cursor + 1U) % config.cores;
+        for (uint32_t extra = static_cast<uint32_t>(phase_rows[phase].size() % workers); extra != 0U; --extra) {
+            ++reference_counts[first_worker + phase_cursor];
+            phase_cursor = (phase_cursor + 1U) % workers;
+        }
+        if (phase != 0U) {
+            extra_cursor = phase_cursor;
         }
         Require(counts[phase] == reference_counts, "phase remainder work did not rotate fairly");
         uint32_t next_offset = 0U;
-        for (uint32_t chunk = 0U; chunk < config.cores; ++chunk) {
-            const uint32_t worker = (phase_start + chunk) % config.cores;
+        for (uint32_t chunk = 0U; chunk < workers; ++chunk) {
+            const uint32_t worker = first_worker + (phase_start + chunk) % workers;
             if (counts[phase][worker] != 0U) {
                 Require(starts[phase][worker] == next_offset, "rotated phase chunk ownership changed");
             }
@@ -261,12 +275,20 @@ void Validation()
     Invalid([](Config& config) { config.worker_counts = {2U, 26U, 0U}; });
     Invalid([](Config& config) { config.worker_counts = {2U, 5U, 20U}; });
     Invalid([](Config& config) { config.worker_counts = {UINT32_MAX, UINT32_MAX, 30U}; });
-    for (uint32_t cores : {0U, 33U, UINT32_MAX}) {
+    for (uint32_t cores : {0U, 1U, 12U, 16U, 27U, 29U, 32U, 33U, UINT32_MAX}) {
         Invalid([cores](Config& config) {
             config.group_round_robin = true;
             config.cores = cores;
         });
     }
+    Invalid([](Config& config) {
+        config.group_round_robin = true;
+        config.world = 8U;
+    });
+    Invalid([](Config& config) {
+        config.group_round_robin = true;
+        config.group_size = 2U;
+    });
     for (uint32_t value : {0U, 65537U, UINT32_MAX}) {
         Invalid([value](Config& config) { config.batch = value; });
     }
@@ -336,7 +358,7 @@ void GroupRoundRobin()
 {
     Config config;
     config.group_round_robin = true;
-    // These fields have no ownership meaning under the phase schedule.
+    // The split schedule fixes ownership at 12 intra-group plus 16 cross-group.
     config.worker_counts = {0U, 0U, 0U};
     for (uint32_t batch : {2048U, 4096U, 8192U}) {
         config.batch = batch;
@@ -349,12 +371,12 @@ void GroupRoundRobin()
     }
     config.batch = 4096U;
     const Plan reference = BuildPlan(config, 0U);
-    // Each phase has 8192 rows: base 292, with 16 extras rotating across
-    // all 28 workers instead of repeatedly favoring the first 16 workers.
-    constexpr std::array<uint32_t, 4> extra_starts{0U, 16U, 4U, 20U};
+    // The own group has 8192 rows split 682/683 across 12 workers. Each
+    // remote group has 512 rows per cross worker, for 1536 rows in total.
     for (uint32_t logical = 0U; logical < config.cores; ++logical) {
         const Worker& worker = reference.workers[logical];
-        Require(worker.count == 1170U + static_cast<uint32_t>(logical < 8U), "whole-round reference quota");
+        Require(worker.count == (logical < kIntraWorkers ? 682U + static_cast<uint32_t>(logical < 8U) : 1536U),
+                "split-queue reference quota");
         std::array<uint32_t, 4> phase_counts{};
         for (uint32_t row = 0U; row < worker.count; ++row) {
             const uint32_t group = reference.tasks[worker.begin + row].peer / config.group_size;
@@ -362,9 +384,9 @@ void GroupRoundRobin()
             ++phase_counts[phase];
         }
         for (uint32_t phase = 0U; phase < 4U; ++phase) {
-            Require(
-                phase_counts[phase] == 292U + static_cast<uint32_t>((logical + 28U - extra_starts[phase]) % 28U < 16U),
-                "per-phase reference remainder rotation");
+            const uint32_t expected =
+                logical < kIntraWorkers ? (phase == 0U ? worker.count : 0U) : (phase == 0U ? 0U : 512U);
+            Require(phase_counts[phase] == expected, "split-queue per-phase reference quota");
         }
     }
     for (uint32_t hidden : {3712U, 4096U, 6144U, 8192U}) {
@@ -374,10 +396,20 @@ void GroupRoundRobin()
             VerifyGroupRoundRobin(config, rank);
         }
     }
-    for (uint32_t cores : {1U, 3U, 5U, 28U, 32U}) {
-        config.cores = cores;
-        VerifyGroupRoundRobin(config, 0U);
-        VerifyGroupRoundRobin(config, 15U);
+    Require(kWorkerRotationPeriod == 48U, "queue rotation period");
+    for (uint32_t rotation = 0U; rotation < 2U * kWorkerRotationPeriod; ++rotation) {
+        std::array<uint32_t, 28> seen{};
+        for (uint32_t physical = 0U; physical < config.cores; ++physical) {
+            const uint32_t logical = RotatedWorkerIndex(physical, rotation);
+            Require(logical < config.cores && (physical < kIntraWorkers) == (logical < kIntraWorkers),
+                    "rotation crossed the fixed physical queue boundary");
+            Require(++seen[logical] == 1U, "rotation duplicated a task queue");
+            Require(logical == RotatedWorkerIndex(physical, rotation % kWorkerRotationPeriod),
+                    "rotation period mismatch");
+        }
+    }
+    for (uint32_t physical = 0U; physical < 32U; ++physical) {
+        Require(RotatedWorkerIndex(physical, 0U) == physical, "concurrent worker identity changed");
     }
 }
 
@@ -400,7 +432,10 @@ void BoundaryAndVariedShapes()
         Require(plan.workers[1].count == 0U && plan.workers[2].count == 0U, "empty traffic classes must be allowed");
         Config grouped = tiny;
         grouped.group_round_robin = true;
-        grouped.cores = 2U;
+        grouped.world = 16U;
+        grouped.group_size = 4U;
+        grouped.experts = 16U;
+        grouped.cores = 28U;
         grouped.worker_counts = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
         VerifyGroupRoundRobin(grouped, rank);
     }
@@ -434,7 +469,11 @@ void BoundaryAndVariedShapes()
         const uint32_t rank = random() % config.world;
         Verify(config, rank);
         config.group_round_robin = true;
-        config.cores = config.group_size * (1U + random() % 8U);
+        config.world = 16U;
+        config.group_size = 4U;
+        config.cores = 28U;
+        config.experts = config.world * (1U + random() % 11U);
+        config.topk = std::min(config.topk, config.experts);
         VerifyGroupRoundRobin(config, rank);
     }
 }

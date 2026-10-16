@@ -80,7 +80,7 @@ def parse_args(argv=None):
         parser.error("--group-size must divide world and leave nonempty GROUP and CROSS classes")
     if args.schedule == "group-round-robin":
         if explicit_workers:
-            parser.error("group-round-robin uses all 28 workers; omit --workers")
+            parser.error("group-round-robin fixes 12 INTRA and 16 CROSS workers; omit --workers")
         if (world, args.group_size, args.cores, args.buffer_count) != (16, 4, 28, 6):
             parser.error("group-round-robin requires world=16, group-size=4, cores=28 and buffer-count=6")
     elif (
@@ -168,13 +168,16 @@ def make_plan(args, directory):
         metadata_mode=args.metadata_mode,
         world=len(args.devices),
         devices=args.devices,
-        workers={"all": 28} if args.schedule == "group-round-robin" else dict(zip(report.TRAFFIC, args.workers)),
+        workers={"intra": 12, "cross": 16}
+        if args.schedule == "group-round-robin"
+        else dict(zip(report.TRAFFIC, args.workers)),
         buffer_count=args.buffer_count,
         output_dir=str(directory),
         cases=cases,
         note=(
-            "One kernel keeps each worker's six-slot ring continuous across four source groups; "
-            "source_group=(own_group-offset+4)%4. Workers progress independently without phase synchronization. "
+            "One kernel runs 12 INTRA workers concurrently with 16 CROSS workers. "
+            "CROSS keeps the six-slot ring continuous across three source groups; "
+            "source_group=(own_group-offset+4)%4 for offset=1,2,3, without phase synchronization. "
             if args.schedule == "group-round-robin"
             else "One kernel concurrently executes all three classes. "
         )
@@ -273,7 +276,7 @@ def run_case(args, bs, directory):
         repeats=args.repeat,
     )
     if args.schedule == "group-round-robin":
-        expected.update(mode="group_round_robin", phase_count=4)
+        expected.update(mode="group_round_robin", phase_count=4, worker_counts={"intra": 12, "cross": 16})
     else:
         expected["worker_counts"] = dict(zip(report.TRAFFIC, args.workers))
     for rank, raw in enumerate(reports):
@@ -281,7 +284,7 @@ def run_case(args, bs, directory):
             raise report.ReportError(f"rank {rank}: report does not match the requested native launch")
         if args.schedule == "group-round-robin":
             backend.validate_report(raw, expected_iterations=args.iters)
-            if any(row["worker_rotation"] != (args.warmup + row["iteration"]) % 28 for row in raw["rounds"]):
+            if any(row["worker_rotation"] != (args.warmup + row["iteration"]) % 48 for row in raw["rounds"]):
                 raise report.ReportError(f"rank {rank}: worker rotation does not match warmup and measured iteration")
     summary = backend.summarize_reports(reports, expected_world=len(args.devices), expected_iterations=args.iters)
     _write_json(directory / "summary.json", summary)
@@ -344,7 +347,7 @@ def main(argv=None):
     _write_json(directory / "plan.json", plan)
     _resource_snapshot(directory)
     combined = dict(
-        schema_version=4 if args.schedule == "group-round-robin" else 2,
+        schema_version=5 if args.schedule == "group-round-robin" else 2,
         mode=plan["mode"],
         metadata_mode=args.metadata_mode,
         status="running",

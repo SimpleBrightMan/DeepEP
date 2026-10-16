@@ -359,7 +359,8 @@ double ValidateTimers(const Options& options, const Plan& plan, const std::vecto
     uint64_t last = 0U;
     for (uint32_t worker = 0U; worker < options.config.cores; ++worker) {
         const TimerRecord& record = records[worker];
-        const Worker& expected = plan.workers[(worker + worker_rotation) % options.config.cores];
+        const uint32_t logical_worker = RotatedWorkerIndex(worker, worker_rotation);
+        const Worker& expected = plan.workers[logical_worker];
         const uint64_t rows = static_cast<uint64_t>(expected.count) * options.repeats;
         if (record.traffic != expected.traffic || record.rows != rows || record.end < record.start ||
             (rows != 0U && (record.start == 0U || record.end == record.start))) {
@@ -379,7 +380,7 @@ double ValidateTimers(const Options& options, const Plan& plan, const std::vecto
 std::string Report(const Options& options, const Plan& plan, const std::vector<Round>& rounds)
 {
     std::ostringstream json;
-    json << std::setprecision(17) << "{\n\"schema_version\":" << (options.config.group_round_robin ? 4U : 2U)
+    json << std::setprecision(17) << "{\n\"schema_version\":" << (options.config.group_round_robin ? 5U : 2U)
          << ",\"rank\":" << options.rank << ",\"world\":" << options.config.world << ",\"device\":" << options.device
          << ",\"cores\":" << options.config.cores << ",\"group_size\":" << options.config.group_size
          << ",\"batch\":" << options.config.batch << ",\"hidden\":" << options.config.hidden
@@ -396,7 +397,9 @@ std::string Report(const Options& options, const Plan& plan, const std::vector<R
     }
     json << '}';
     if (options.config.group_round_robin) {
-        json << ",\"mode\":\"group_round_robin\",\"phase_count\":" << plan.phase_count << ",\"phase_peer_groups\":[";
+        json << ",\"mode\":\"group_round_robin\",\"worker_counts\":{\"intra\":" << kIntraWorkers
+             << ",\"cross\":" << kCrossWorkers << "},\"phase_count\":" << plan.phase_count
+             << ",\"phase_peer_groups\":[";
         for (uint32_t phase = 0U; phase < plan.phase_count; ++phase) {
             json << (phase == 0U ? "" : ",") << plan.phases[phase].peer_group;
         }
@@ -429,7 +432,8 @@ std::string Report(const Options& options, const Plan& plan, const std::vector<R
         for (uint32_t worker = 0U; worker < options.config.cores; ++worker) {
             const TimerRecord& record = round.records[worker];
             json << (worker == 0U ? "" : ",") << "{\"group_id\":" << worker << ",\"traffic\":\""
-                 << (options.config.group_round_robin ? "all" : kTrafficNames[plan.workers[worker].traffic])
+                 << (options.config.group_round_robin ? (worker < kIntraWorkers ? "intra" : "cross")
+                                                      : kTrafficNames[plan.workers[worker].traffic])
                  << "\",\"rows\":" << record.rows << ",\"start_cycle\":" << record.start
                  << ",\"end_cycle\":" << record.end << '}';
         }
@@ -565,7 +569,7 @@ void Run(const Options& options)
     std::cerr << "[rank " << options.rank << "] source_stride=" << plan.row_bytes << " rows=" << plan.total_rows
               << " workers=";
     if (options.config.group_round_robin) {
-        std::cerr << "all:" << options.config.cores;
+        std::cerr << "intra:" << kIntraWorkers << ",cross:" << kCrossWorkers;
     } else {
         std::cerr << options.config.worker_counts[0] << ',' << options.config.worker_counts[1] << ','
                   << options.config.worker_counts[2];
@@ -589,7 +593,7 @@ void Run(const Options& options)
             aclrtMemset(timer, plan.workers.size() * sizeof(TimerRecord), 0, plan.workers.size() * sizeof(TimerRecord)),
             "aclrtMemset(timer)");
         aclshmem_barrier_all();
-        kernel.worker_rotation = options.config.group_round_robin ? iteration % options.config.cores : 0U;
+        kernel.worker_rotation = options.config.group_round_robin ? iteration % kWorkerRotationPeriod : 0U;
         Check(aclrtRecordEvent(start, stream), "aclrtRecordEvent(start)");
         dispatch_bandwidth_kernel_do(options.config.cores, static_cast<uint32_t>(ub_bytes), stream, peer_table, tasks,
                                      metadata_input, workers, output_tokens, output_scales, output_metadata, timer,
@@ -642,7 +646,7 @@ int main(int argc, char** argv)
                          "[--world 16 --bs 4096 --hidden 3584 --intermediate 1280 --experts 384 --topk 8]\n"
                          "[--group-size 4 --cores 28 --workers 2,5,21 --buffer-count 6 --repeat 1]\n"
                          "[--scope all|first-expert --metadata-mode scalar|dma|preload]\n"
-                         "[--schedule concurrent|group-round-robin (28 AIV1, six slots, one kernel)]\n"
+                         "[--schedule concurrent|group-round-robin (12 INTRA + 16 CROSS AIV1, six slots, one kernel)]\n"
                          "[--warmup 10 --iters 20 --timer]\n";
             return 0;
         }

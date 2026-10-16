@@ -92,13 +92,16 @@ but does not affect the copy stage.
 ## Group round-robin schedule
 
 On branch `codex/dispatch-group-round-robin`, select
-`--schedule group-round-robin` explicitly to compare a different task order with
-the original concurrent schedule. The host prepares the reordered task tables;
-the kernel keeps the original continuous six-slot `Run()` loop. This mode keeps
-**one kernel launch per rank and iteration and all 28 AIV1 workers**.
+`--schedule group-round-robin` explicitly to compare a fixed **12 INTRA / 16
+CROSS worker split** with the original concurrent schedule. INTRA includes reads
+from the receiver itself and the other three ranks in its physical group. The
+host prepares separate task tables for the two classes; the kernel keeps the
+original continuous six-slot `Run()` loop. This mode keeps **one kernel launch
+per rank and iteration and all 28 AIV1 workers**, with both classes concurrent.
 AIC and AIV0 still do no work. It requires EP16, four consecutive ranks per group,
 `--cores 28` and `--buffer-count 6`; it does not select a smaller launch or scan
-different worker/slot counts.
+different worker/slot counts. Explicit `--workers` is rejected in this mode;
+the 12/16 allocation is fixed.
 
 ```bash
 python experiments/dispatch_bandwidth/run.py \
@@ -121,51 +124,65 @@ python experiments/dispatch_bandwidth/run.py \
     --schedule group-round-robin --bs-values 4096 --plan
 ```
 
-For a receiving rank in physical group `G`, group segment `p` reads from source group
-`(G - p + 4) % 4`. Since these are GETs, this corresponds to a sending group
-`Gi` supplying receiving group `(Gi + p) % 4`:
+Physical AIV1 workers 0..11 read only from the receiver's own group. Workers
+12..27 read only from the other three groups, in the order below. For a receiving
+rank in physical group `G`, CROSS segment `p` reads from source group
+`(G - p + 4) % 4`, for `p=1,2,3`. Since these are GETs, this corresponds to a
+sending group `Gi` supplying receiving group `(Gi + p) % 4`:
 
-| Segment | Source group relative to receiver | Traffic | Workers sharing group rows |
+| Queue / segment | Source group relative to receiver | Traffic | Workers sharing rows |
 | --- | --- | --- | ---: |
-| 0 | Same group | LOCAL and GROUP | 28 |
-| 1 | Previous group, modulo four | CROSS | 28 |
-| 2 | Two groups earlier, modulo four | CROSS | 28 |
-| 3 | Three groups earlier, modulo four | CROSS | 28 |
+| INTRA queue | Same group | LOCAL and GROUP | 12 |
+| CROSS segment 1 | Previous group, modulo four | CROSS | 16 |
+| CROSS segment 2 | Two groups earlier, modulo four | CROSS | 16 |
+| CROSS segment 3 | Three groups earlier, modulo four | CROSS | 16 |
 
-For each source group, the host collects its full row list and divides it across
-all 28 workers: `q, r = divmod(group_rows, 28)`. Each worker gets `q` or `q+1`
-rows. An extra-owner cursor starts at zero and advances by `r` after each group;
-the next group's complete chunks are assigned with that rotated ownership.
-Thus row counts differ by at most one both within each group and over the full
-four-group task list. For BS4096, each group has 8192 rows, so each worker gets
-292 or 293 rows from a group, and 1170 or 1171 rows in total.
+The host divides all INTRA rows across 12 workers independently, with row counts
+differing by at most one. Each remote source group's full row list is divided
+across the 16 CROSS workers: `q, r = divmod(group_rows, 16)`. Each CROSS worker
+gets `q` or `q+1` rows. An extra-owner cursor starts at zero and advances by `r`
+after each remote group; the next group's complete chunks are assigned with
+that rotated ownership. Thus CROSS row counts differ by at most one both within
+each group and over the complete three-group task list. The two classes have
+separate queues and never exchange worker roles.
 
-Each worker's task table concatenates its four group chunks in the order above.
-The physical-to-logical worker mapping shifts once per kernel invocation,
-including warmups, spreading the extra rows across physical workers.
+Each CROSS worker's task table concatenates its three remote-group chunks in
+the order above; INTRA workers independently process their own-group tasks.
+The physical-to-logical worker mapping shifts once per kernel invocation within
+each class, including warmups, spreading task ownership and extra rows across
+physical workers without changing the 12/16 split. Reports record
+`worker_rotation = launch_index % 48`; INTRA uses this value modulo 12 and CROSS
+uses it modulo 16, giving a joint period of 48 kernel launches.
 `--repeat` replays the complete task table with the same worker mapping; it does
 not advance this rotation. Source indices, packed read size and total row counts
-are unchanged. For the BS4096 default, segment 0 contains 2048 LOCAL and 6144
-GROUP rows per receiving card; each later segment contains 8192 CROSS rows,
-for the original 24576 CROSS rows in total.
+are unchanged. For the BS4096 default, the INTRA queue contains 2048 LOCAL and
+6144 GROUP rows per receiving card, giving each INTRA worker 682 or 683 rows.
+Each remote-group segment contains 8192 CROSS rows, giving each CROSS worker
+512 rows per group and 1536 rows in total, for the original 24576 CROSS rows
+per card.
 
-These segments exist only in the host-prepared task order. **There is no phase
+The remote-group segments exist only in the host-prepared task order. **There is no phase
 fence, phase drain, phase timer, or host/cross-rank/cross-core phase barrier.**
-The six-slot ring carries on across group boundaries, allowing reads and writes
-from adjacent groups to remain in flight together. Initialization and iteration
+Each CROSS worker's six-slot ring carries on across remote-group boundaries,
+allowing reads and writes from adjacent groups to remain in flight together.
+INTRA and CROSS workers do not wait for one another. Initialization and iteration
 boundaries retain ordinary SHMEM synchronization. Workers and cards may reach
 the next group at different times. The ordering does not guarantee removal of
 physical-link hotspots or identical per-worker durations.
 
-Timer output remains **28 whole-worker intervals**, each tagged `ALL`, using the
-original start and completion timestamps. `TOTAL` bandwidth uses all payload
-bytes divided by the same-card span `max(end) - min(start)` across active workers;
-the report also gives all payload bytes over the single whole-kernel ACL window.
-LOCAL/GROUP/CROSS values are their byte contributions over these shared TOTAL
-windows, not separate class timings or isolated class bandwidth. Use the
-**whole-kernel ACL event time as the main comparison** with
-`--schedule concurrent`, and whole-worker timers to inspect tails. No timestamps
-are subtracted across different cards. This mode adds no plotting or sweep step.
+Timer output remains **28 whole-worker intervals**, tagged `INTRA` for physical
+workers 0..11 and `CROSS` for workers 12..27, using the original start and
+completion timestamps. Each class has its own envelope
+`max(class_end) - min(class_start)` and prints its useful read-payload bandwidth
+over that envelope. INTRA combines LOCAL and GROUP bytes; the report does not
+claim separate LOCAL/GROUP elapsed times. `TOTAL` bandwidth uses all payload
+bytes divided by the same-card span across both classes; the report also gives
+all payload bytes over the single whole-kernel ACL window. Source-group
+diagnostics retain byte counts for the own group and three remote groups, with
+no per-group timers. Use the **whole-kernel ACL event time as the main comparison** with
+`--schedule concurrent`, and class envelopes and whole-worker timers to inspect
+overlap and tails. No timestamps are subtracted across different cards. This
+mode adds no plotting or sweep step.
 
 ## Workload and byte counts
 
@@ -240,7 +257,10 @@ they do not require NPUs.
 Dispatch workload. The default is `dma`, removing per-row Scalar synchronization;
 select `scalar` explicitly to reproduce the original benchmark.
 Native reports include `metadata_mode`. The original concurrent format remains
-schema version 2; group ordering uses schema version 4 with whole-worker timers.
+schema version 2; group ordering uses schema version 5 with `mode` set to
+`group_round_robin`, `worker_counts` of `intra: 12` and `cross: 16`, and
+class-tagged whole-worker timers. Its `traffic_rows` retains LOCAL/GROUP/CROSS
+counts for byte accounting, while printed class bandwidth uses INTRA/CROSS.
 Aggregation rejects mixed metadata modes or report formats. Timer CSV and trace
 files also identify the mode.
 

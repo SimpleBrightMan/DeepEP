@@ -10,8 +10,21 @@ namespace deepep::dispatch_bench {
 constexpr uint32_t kTrafficKinds = 3U;
 constexpr uint32_t kMaxRanks = 16U;
 constexpr uint32_t kMetaWords = 8U;
+constexpr uint32_t kIntraWorkers = 12U;
+constexpr uint32_t kCrossWorkers = 16U;
+constexpr uint32_t kWorkerRotationPeriod = 48U;
 
-enum class Traffic : uint32_t { Local = 0U, Group = 1U, Cross = 2U, All = 3U };
+enum class Traffic : uint32_t { Local = 0U, Group = 1U, Cross = 2U, Intra = 3U };
+
+inline uint32_t RotatedWorkerIndex(uint32_t physical_worker, uint32_t rotation)
+{
+    if (rotation == 0U) {
+        return physical_worker;
+    }
+    return physical_worker < kIntraWorkers
+               ? (physical_worker + rotation) % kIntraWorkers
+               : kIntraWorkers + (physical_worker - kIntraWorkers + rotation) % kCrossWorkers;
+}
 
 enum class MetadataMode : uint32_t { Scalar = 0U, Dma = 1U, Preload = 2U };
 

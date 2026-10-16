@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by SimpleBright_Man 2026
 
-"""Validate continuous-ring group ordering without inventing per-group timers."""
+"""Validate concurrent intra-group and staggered cross-group worker timers."""
 
 import csv
 import json
@@ -18,7 +18,9 @@ ReportError = report.ReportError
 distribution = report.distribution
 load_reports = report.load_reports
 TRAFFIC = report.TRAFFIC
-COMMON_FIELDS = tuple(field for field in report.COMMON_FIELDS if field != "worker_counts") + ("phase_count",)
+WORKER_COUNTS = {"intra": 12, "cross": 16}
+CLASSES = tuple(WORKER_COUNTS)
+COMMON_FIELDS = report.COMMON_FIELDS + ("phase_count",)
 
 
 def _require(condition, message):
@@ -51,11 +53,30 @@ def _plan(raw):
             traffic_rows[_traffic(raw["rank"], peer)] += counts[peer]
         phases.append(traffic_rows)
     traffic_rows = {traffic: sum(phase[traffic] for phase in phases) for traffic in TRAFFIC}
-    # A zero-initialized extra cursor carried between groups makes the full
-    # worker quotas exactly the quotient/remainder split of the complete work.
-    base, extra = divmod(sum(traffic_rows.values()), 28)
-    logical_counts = [base + int(logical < extra) for logical in range(28)]
+    intra_base, intra_extra = divmod(sum(phases[0].values()), 12)
+    logical_counts = [intra_base + int(logical < intra_extra) for logical in range(12)] + [0] * 16
+    extra_cursor = 0
+    for phase in phases[1:]:
+        base, extra = divmod(sum(phase.values()), 16)
+        for logical in range(16):
+            chunk = (logical - extra_cursor) % 16
+            logical_counts[12 + logical] += base + int(chunk < extra)
+        extra_cursor = (extra_cursor + extra) % 16
     return groups, phases, traffic_rows, logical_counts
+
+
+def _logical_worker(physical, rotation):
+    if physical < 12:
+        return (physical + rotation) % 12
+    return 12 + (physical - 12 + rotation) % 16
+
+
+def _class_rows(raw, traffic):
+    return (
+        (raw["traffic_rows"]["local"] + raw["traffic_rows"]["group"])
+        if traffic == "intra"
+        else raw["traffic_rows"]["cross"]
+    )
 
 
 def _envelope(raw, workers):
@@ -86,7 +107,7 @@ def validate_report(raw, *, expected_iterations=None):
     }
     _require(not required - set(raw), "Missing group report field(s): " + ", ".join(sorted(required - set(raw))))
     _require(
-        type(raw["schema_version"]) is int and raw["schema_version"] == 4 and raw["mode"] == "group_round_robin",
+        type(raw["schema_version"]) is int and raw["schema_version"] == 5 and raw["mode"] == "group_round_robin",
         "Unsupported group report schema/mode",
     )
     for name in (
@@ -112,6 +133,10 @@ def validate_report(raw, *, expected_iterations=None):
         "Group ordering requires EP16/group4/28 workers/6 slots/4 groups",
     )
     _require(raw["rank"] < 16, "rank must be within world")
+    report._mapping(raw["worker_counts"], CLASSES, "worker_counts")
+    for traffic in CLASSES:
+        report._integer(raw["worker_counts"][traffic], f"worker_counts.{traffic}", 1)
+    _require(raw["worker_counts"] == WORKER_COUNTS, "Group ordering requires 12 INTRA and 16 CROSS workers")
     _require(
         raw["batch"] <= 65536
         and raw["experts"] % 16 == 0
@@ -171,7 +196,7 @@ def validate_report(raw, *, expected_iterations=None):
         )
         iteration = report._integer(measured["iteration"], "iteration")
         rotation = report._integer(measured["worker_rotation"], "worker_rotation")
-        _require(rotation < 28, "worker_rotation must be in [0,27]")
+        _require(rotation < 48, "worker_rotation must be in [0,47]")
         seen.append(iteration)
         rotations[iteration] = rotation
         report._positive(measured["kernel_elapsed_us"], "kernel_elapsed_us")
@@ -185,11 +210,15 @@ def validate_report(raw, *, expected_iterations=None):
                 "Malformed worker record",
             )
             physical = report._integer(worker["group_id"], "group_id")
-            _require(physical < 28 and worker["traffic"] == "all", "Group timers must describe one whole worker")
+            _require(physical < 28, "Physical worker must be within 28 workers")
+            _require(
+                worker["traffic"] == ("intra" if physical < 12 else "cross"),
+                "Worker traffic must match fixed 12 INTRA and 16 CROSS partition",
+            )
             physicals.append(physical)
             amount = report._integer(worker["rows"], "worker.rows")
             _require(
-                amount == logical_counts[(physical + rotation) % 28] * raw["repeats"],
+                amount == logical_counts[_logical_worker(physical, rotation)] * raw["repeats"],
                 "Worker rows disagree with rotated per-group chunk ownership",
             )
             start = report._integer(worker["start_cycle"], "start_cycle")
@@ -212,7 +241,7 @@ def validate_report(raw, *, expected_iterations=None):
         )
     _require(sorted(seen) == list(range(len(rounds))), "Missing or duplicate measured iteration")
     _require(
-        all(rotations[index] == (rotations[0] + index) % 28 for index in range(len(rounds))),
+        all(rotations[index] == (rotations[0] + index) % 48 for index in range(len(rounds))),
         "Worker rotation must advance once per measured kernel",
     )
     return raw
@@ -225,12 +254,15 @@ def rank_measurements(raw, *, expected_iterations=None):
         envelope = _envelope(raw, measured["workers"])
         kernel = measured["kernel_elapsed_us"]
         classes = {}
-        for traffic in TRAFFIC:
-            rows = raw["traffic_rows"][traffic] * raw["repeats"]
+        for traffic in CLASSES:
+            rows = _class_rows(raw, traffic) * raw["repeats"]
             byte_count = rows * raw["row_bytes"]
+            class_envelope = _envelope(raw, [worker for worker in measured["workers"] if worker["traffic"] == traffic])
             classes[traffic] = dict(
                 rows=rows,
                 bytes=byte_count,
+                envelope_us=class_envelope,
+                gbps=byte_count / (class_envelope * 1000) if rows else None,
                 shared_timer_window_gbps=byte_count / (envelope * 1000) if rows else None,
                 single_acl_window_gbps=byte_count / (kernel * 1000) if rows else None,
             )
@@ -286,11 +318,33 @@ def summarize_reports(reports, *, expected_world=None, expected_iterations=None)
         kernel_elapsed_us_per_card=distribution([row["kernel_elapsed_us"] for row in flat]),
     )
     classes = {}
-    for traffic in TRAFFIC:
+    for traffic in CLASSES:
         values = [row["classes"][traffic] for row in flat]
         classes[traffic] = dict(
+            workers=WORKER_COUNTS[traffic],
+            gbps_per_card=distribution([row["gbps"] for row in values]),
+            rank_mean_gbps_per_card=distribution(
+                [
+                    statistics.mean(
+                        row["classes"][traffic]["gbps"] for row in rounds if row["classes"][traffic]["gbps"] is not None
+                    )
+                    for rounds in measurements
+                    if any(row["classes"][traffic]["gbps"] is not None for row in rounds)
+                ]
+            ),
+            round_rank_gbps={
+                stat: distribution(
+                    [
+                        distribution([rounds[index]["classes"][traffic]["gbps"] for rounds in measurements])[stat]
+                        for index in range(len(rotations))
+                        if any(rounds[index]["classes"][traffic]["gbps"] is not None for rounds in measurements)
+                    ]
+                )
+                for stat in ("min", "mean", "max")
+            },
             bytes_per_round_per_card=distribution([row["bytes"] for row in values]),
-            rows_per_round_per_card=distribution([raw["traffic_rows"][traffic] * raw["repeats"] for raw in reports]),
+            rows_per_round_per_card=distribution([_class_rows(raw, traffic) * raw["repeats"] for raw in reports]),
+            envelope_us_per_card=distribution([row["envelope_us"] for row in values]),
         )
         for metric in ("shared_timer_window_gbps", "single_acl_window_gbps"):
             classes[traffic][metric + "_per_card"] = distribution([row[metric] for row in values])
@@ -310,19 +364,21 @@ def summarize_reports(reports, *, expected_world=None, expected_iterations=None)
             )
         )
     return dict(
-        schema_version=4,
+        schema_version=5,
         mode="group_round_robin",
         configuration={key: first[key] for key in COMMON_FIELDS},
         metric="rank_local_total_payload_gbps",
-        class_metric="payload_contributions_over_shared_total_windows",
+        class_metric="rank_local_class_payload_gbps",
+        percentile_method="linear_interpolation",
         successful_ranks=16,
         successful_rank_rounds=16 * len(rotations),
         checked_rows=sum(raw["validation"]["checked_rows"] for raw in reports),
         notes=[
-            "One kernel, one continuous six-slot ring per worker, without phase drains or phase timers.",
+            "One kernel concurrently runs 12 INTRA workers and 16 CROSS workers, each with a continuous six-slot ring.",
+            "CROSS workers visit the three remote source groups without phase drains or phase timers.",
             "TOTAL uses all active workers' min(start)..max(end) on one NPU.",
-            "Class values are byte contributions over the same TOTAL timer or single ACL window; not isolated class bandwidth.",
-            "LOCAL includes local reads; metadata input reads are excluded from the payload numerator.",
+            "Each class uses only its own active workers' min(start)..max(end) on one NPU; class rates do not add to TOTAL.",
+            "INTRA includes same-rank and same-group reads; metadata input reads are excluded from the payload numerator.",
             "Raw timestamps are never subtracted across different NPUs.",
         ],
         timing_validation=dict(status="consistent", tolerance="max(2us, 10% of ACL kernel duration)"),
@@ -378,7 +434,7 @@ def export_timers(raw, directory):
                     measured["iteration"],
                     measured["worker_rotation"],
                     worker["group_id"],
-                    "all",
+                    worker["traffic"],
                     worker["rows"],
                     worker["rows"] * raw["row_bytes"],
                     worker["start_cycle"],
@@ -393,16 +449,20 @@ def export_timers(raw, directory):
                         ph="X",
                         pid=f"rank_{raw['rank']}",
                         tid=f"AIV1_group_{worker['group_id']}",
-                        name=f"round_{measured['iteration']}_ALL",
+                        name=f"round_{measured['iteration']}_{worker['traffic'].upper()}",
                         ts=start,
                         dur=duration,
-                        cat="all",
+                        cat=worker["traffic"],
                         args=dict(
                             mode="group_round_robin",
                             metadata_mode=raw["metadata_mode"],
                             buffer_count=6,
                             worker_rotation=measured["worker_rotation"],
-                            source_group_order=raw["phase_peer_groups"],
+                            source_group_order=(
+                                raw["phase_peer_groups"][:1]
+                                if worker["traffic"] == "intra"
+                                else raw["phase_peer_groups"][1:]
+                            ),
                             rows=worker["rows"],
                             bytes=worker["rows"] * raw["row_bytes"],
                             time_origin="rank_first_measured_start",
@@ -434,8 +494,8 @@ def export_timers(raw, directory):
 def print_summary(summary):
     config = summary["configuration"]
     print(
-        f"[GROUP_ROUND_ROBIN] BS={config['batch']} metadata_mode={config['metadata_mode']} slots=6 workers=28; "
-        "one continuous kernel, no phase timers.",
+        f"[GROUP_ROUND_ROBIN] BS={config['batch']} metadata_mode={config['metadata_mode']} slots=6 workers=INTRA:12/CROSS:16; "
+        "concurrent in one kernel; CROSS GET order=own-1,own-2,own-3 (mod 4), no phase timers.",
         flush=True,
     )
     total = summary["total"]
@@ -448,21 +508,20 @@ def print_summary(summary):
         f"ACL-kernel-us={total['kernel_elapsed_us_per_card']['mean']:.3f}",
         flush=True,
     )
-    for traffic in TRAFFIC:
+    for traffic in CLASSES:
         value = summary["classes"][traffic]
-        rate = value["rank_mean_shared_timer_window_gbps_per_card"]
-        acl = value["rank_mean_single_acl_window_gbps_per_card"]
-        label = f"{rate['mean']:.3f}" if rate is not None else "N/A"
-        acl_label = f"{acl['mean']:.3f}" if acl is not None else "N/A"
+        rate = value["rank_mean_gbps_per_card"]
+        if rate is None:
+            print(f"{traffic.upper()} GB/s/card=N/A; no payload rows; workers={WORKER_COUNTS[traffic]}", flush=True)
+            continue
+        round_rate = value["round_rank_gbps"]["mean"]
+        span = value["envelope_us_per_card"]
+        byte_count = value["bytes_per_round_per_card"]
         print(
-            f"{traffic.upper():5} shared-TOTAL contribution GB/s/card={label}; single-ACL contribution={acl_label}; "
-            f"bytes/card/round={value['bytes_per_round_per_card']['mean']:g}",
-            flush=True,
-        )
-    for phase in summary["phase_diagnostics"]:
-        value = phase["bytes_per_round_per_card"]
-        print(
-            f"ORDER {phase['phase']} diagnostic bytes/card/round={value['min']:g}..{value['max']:g}; "
-            "source_group=(own_group-offset+4)%4; no phase timing",
+            f"{traffic.upper()} GB/s/card mean={rate['mean']:.3f} rank-min/max={rate['min']:.3f}/{rate['max']:.3f} "
+            f"round-mean p50/p95={round_rate['p50']:.3f}/{round_rate['p95']:.3f} "
+            f"bytes/card/round={byte_count['min']:g}..{byte_count['max']:g} "
+            f"class-envelope-us mean={span['mean']:.3f} min/max={span['min']:.3f}/{span['max']:.3f} "
+            f"workers={WORKER_COUNTS[traffic]}",
             flush=True,
         )

@@ -77,9 +77,11 @@ inline void Validate(const Config& config, uint32_t rank)
     Require(rank < config.world, "rank must be less than world");
     Require(config.group_size >= 2U && config.group_size < config.world && config.world % config.group_size == 0U,
             "group_size must divide world and satisfy 1 < group_size < world");
-    Require(config.cores >= (config.group_round_robin ? 1U : kTrafficKinds) && config.cores <= 32U,
-            "cores must be in [1,32] for group round robin or [3,32] for concurrent traffic");
-    if (!config.group_round_robin) {
+    Require(config.cores >= kTrafficKinds && config.cores <= 32U, "cores must be in [3,32]");
+    if (config.group_round_robin) {
+        Require(config.world == 16U && config.group_size == 4U && config.cores == kIntraWorkers + kCrossWorkers,
+                "group round robin requires EP16, groups of four and 28 cores");
+    } else {
         uint64_t workers = 0U;
         for (uint32_t count : config.worker_counts) {
             Require(count > 0U, "each traffic class must have at least one worker");
@@ -185,24 +187,30 @@ inline Plan BuildPlan(const Config& config, uint32_t rank)
                                                                   : static_cast<uint32_t>(Traffic::Cross));
                 ++phase_plan.traffic_rows[traffic];
             }
-            const uint32_t base = static_cast<uint32_t>(rows.size() / config.cores);
-            const uint32_t extra = static_cast<uint32_t>(rows.size() % config.cores);
-            for (uint32_t logical_worker = 0U; logical_worker < config.cores; ++logical_worker) {
-                const uint32_t quota_owner = (logical_worker + config.cores - extra_cursor) % config.cores;
+            const uint32_t workers = phase == 0U ? kIntraWorkers : kCrossWorkers;
+            const uint32_t first_worker = phase == 0U ? 0U : kIntraWorkers;
+            const uint32_t cursor = phase == 0U ? 0U : extra_cursor;
+            const uint32_t base = static_cast<uint32_t>(rows.size() / workers);
+            const uint32_t extra = static_cast<uint32_t>(rows.size() % workers);
+            for (uint32_t logical_worker = 0U; logical_worker < workers; ++logical_worker) {
+                const uint32_t quota_owner = (logical_worker + workers - cursor) % workers;
                 const uint32_t offset = quota_owner * base + std::min(quota_owner, extra);
                 const uint32_t count = base + static_cast<uint32_t>(quota_owner < extra);
-                auto& owned = worker_rows[logical_worker];
+                auto& owned = worker_rows[first_worker + logical_worker];
                 owned.insert(owned.end(), rows.begin() + offset, rows.begin() + offset + count);
             }
-            extra_cursor = (extra_cursor + extra) % config.cores;
+            if (phase != 0U) {
+                extra_cursor = (extra_cursor + extra) % kCrossWorkers;
+            }
             plan.phases.push_back(phase_plan);
         }
         plan.workers.reserve(config.cores);
-        for (const auto& rows : worker_rows) {
+        for (uint32_t logical_worker = 0U; logical_worker < config.cores; ++logical_worker) {
+            const auto& rows = worker_rows[logical_worker];
             const uint32_t begin = static_cast<uint32_t>(plan.tasks.size());
             plan.tasks.insert(plan.tasks.end(), rows.begin(), rows.end());
-            plan.workers.push_back(
-                {static_cast<uint32_t>(Traffic::All), begin, static_cast<uint32_t>(rows.size()), 0U});
+            const Traffic traffic = logical_worker < kIntraWorkers ? Traffic::Intra : Traffic::Cross;
+            plan.workers.push_back({static_cast<uint32_t>(traffic), begin, static_cast<uint32_t>(rows.size()), 0U});
         }
         if (plan.tasks.size() != plan.total_rows) {
             throw std::logic_error("Group-round-robin route conservation failed");
