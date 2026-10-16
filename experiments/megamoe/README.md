@@ -25,11 +25,56 @@ python experiments/megamoe/scripts/batch_launch.py --ep-size 8 --bs-values 32,96
 
 ## 0. 先读主流程，再读计算实现
 
-`codex/megamoe-readable` 基于 `main@8ffafeb` 整理调度层，目标是看清执行角色和依赖，
-不替换 GEMM/SwiGLU/通信算法，不改公开接口、tiling ABI、workspace 布局、flag 值或 timer 口径。
-未混入本机 EP8 启动脚本的独立改动。风格参考
+本轮 main 候选基于性能分支 `codex/megamoe-passive-timer-1013@bef32bca3`，迁入
+`codex/megamoe-readable@bf1a1b7d8` 的职责划分、命名和 Dispatch 规划，没有覆盖为旧 readable 的计算后端。
+保留异步 FIX 完成、跨 GMM 资源 handoff、独立 UB 输入/输出槽、供数/缓存和被动 timer 策略；
+不改变公开接口、tiling ABI、workspace 布局、flag 协议或数学契约，包含现成本机 EP8 启动入口。风格参考
 [DeepGEMM-Ascend 的 MegaMoE](https://github.com/deepseek-ai/DeepGEMM-Ascend/blob/main/deep_gemm/include/deep_gemm/mega_moe.hpp)：
 按角色组织流水、显式保留调度游标，在同步和复用边界说明约束；没有复制其实现或改变当前后端。
+
+### GMM1 调用层次：哪些保留，哪些删除？
+
+```text
+ProcessGmmWaves                     决定 GMM1/GMM2 的 Wave 顺序
+  → RunGmm1Wave / RunNextGmm1Slice   规划单专家 slice，推进游标
+  → RunGmm1ActivationForExpert       绑定专家地址和同步区
+  → RunGmm1A8W4                     派生一次配置和分核，直接按角色执行
+      AIC/AIV0 → RunGmm1ComputeTiles → AIC tile循环 / AIV0权重转换循环
+      兼容AIV1 → RunGmm1VectorEpilogueA8W4
+```
+
+原 `Gmm1ExecA8W4` 纯分派包装层已移除。AIC/AIV0 不再建立只为包装器准备的 A/B/scale/bias Tensor，
+也不再各复制一份 persistent/local 分派。计算 helper 是资源生命周期边界，tile 循环是输入依赖及输出通知边界，
+CATLASS 是物理缓冲/引擎边界，因此保留；不把所有工作塞成大函数，也不继续增加纯转发层。
+现役非量化 AIV1 走独立优先级调度器，而非这里的兼容 epilogue。维护约定见本目录 `AGENTS.md`。
+
+异步 routed GMM1/GMM2 用 `HandoffTo` 转移唯一资源 owner；GMM2 在发布 Combine ready 前
+`DrainOutput` 等真正 FIX 完成，**不是每个 Wave 都销毁/重建流水**。最终 owner 在 routed 阶段结束时统一 End。
+
+### 2026-10-16 整合验收
+
+设备代码提交 `0f90f5333` 与 `bef32bca3` 在同一 Ascend950DT 八卡节点交替执行 A/B/B/A。
+H7168/I3072/E384/TopK6、FP8/FP4、无共享专家、balanced；每组预热10次、正式20次，
+统计后10轮的逐轮 rank-min 均值，另保留 rank-max。全部是完整通信 kernel Duration、timer-off。
+
+| BS | 性能基线 μs | 整理后 μs | 延迟变化（正值变慢） |
+| --- | --- | --- | --- |
+| 32 | 631.848 | 632.901 | +0.17% |
+| 96 | 660.025 | 661.108 | +0.16% |
+| 256 | 722.746 | 721.634 | −0.15% |
+| 1024 | 1164.709 | 1163.576 | −0.10% |
+| 4096 | 4130.505 | 4129.038 | −0.04% |
+
+结论是本轮重构基本保持该性能基线，不宣称新的加速或所有平台/EP上的“最快”。
+四组全部 rank/shape 的完整 BF16 输出 SHA256 一致；随机路由 BS33/257/4104 和共享专家1个的
+BS32/257 也完成基线/候选全输出等价回归。等价回归不是独立 Golden，未继承历史精度 PASS。
+Linux CPU 完整套件312项通过，含实际生产函数的调度、角色、供数、资源交接及被动 timer 桩；
+timer 协议校验通过。本次没有重测 timer-on/off 开销、EP32/128、A8W8 或量化 Combine 的设备用例。
+
+复现入口、wheel/SDK/源码指纹、逐轮数据与原始 CSV 归档位于
+[`analysis/main-readable-1016`](../../analysis/main-readable-1016/)。该目录的 `benchmark_entry.py`
+只在 profiler 采集结束后复制输出，不在计时区间插入 D2H。最终归档提交只补文档、测试和证据，
+设备生产代码与上述受测提交一致。
 
 ### 阅读顺序
 
@@ -99,7 +144,7 @@ GMM1/GMM2 各自保留跨专家分核游标，GMM2 物理分核方向反转。AI
 | `ExpertTokenPosition` | 下一次待规划的专家、专家内行和本卡紧凑 GM 行 | `TakeNextExpertSliceInWave` 内调用原推进算法更新 |
 | `ExpertWaveRange` | 一整个 Wave 的起止位置与最后非空专家 | GMM1 记录，GMM2 通过 `GetExpertSliceInWave` 重放 |
 
-`globalRowStart = state.globalTokenStartIndex + rowStartInExpert`，是本卡紧凑 GM 行号，
+`globalRowStart = expertContext.globalTokenStartIndex + rowStartInExpert`，是本卡紧凑 GM 行号，
 不是源卡 token ID。切片可以让下一位置进入下一个专家，但本次 slice 和专家状态仍属于旧专家。
 `ExpertContext.problemShape.M` 始终是专家总行数；执行时复制形状并设置 `M=slice.rowCount`。
 GMM2 由相同 N/K 约定构造实际计算维度：`N=H`、`K=I`。count 表在阶段入口只等待一次，
@@ -159,7 +204,7 @@ token 环形槽跨 peer 复用。两种布局共享同一个收尾边界：末�
 | 量化/打包 → 对端 Dispatch | 本地 token/scale 完成后才发布 count；接收方验证本轮 epoch |
 | Dispatch → GMM1 | `flagDispatchToGmm1Ptr`：本 M-group 已落地的实际行数 |
 | AIV0 Prologue → AIC | `AIV_SYNC_AIC_FLAG` 发布 L1 B ready；`AIC_SYNC_AIV_FLAG` 允许复用槽位 |
-| GMM1 → routed SwiGLU | 现役非 Prefetch 路径用 `flagGmmToEpiloguePtr` 的逐核完成序号 |
+| GMM1 → routed SwiGLU | 异步路径 `flagGmmToEpiloguePtr` 是逐核 issued 序号；MTE2 必须再等真实 FIX full 后读取 |
 | routed SwiGLU → GMM2 | `flagActivationToGmm2Ptr`：对应输入行块的激活完成计数 |
 | GMM2 → Combine | 对应 expert/slice 的完成计数，必须覆盖实际生产者 |
 | 共享 GMM1 → 共享激活 → 共享 GMM2 | 独立的 `flagSharedGmm1DonePtr` / `flagSharedActivationDonePtr`，不借用 routed 序号 |

@@ -99,6 +99,19 @@ static void CheckOrder(unsigned shared, unsigned bs, unsigned sub)
 
 int main()
 {
+    // 诊断 replay 只能走计算；重构公共入口时不能意外恢复通信或输出归约。
+    {
+        Pipeline<true, AIC> p(0, 4096, 0);
+        p.computeReplay_ = true;
+        p.ProcessWave(p);
+        assert(p.events == std::vector<std::string>({"buffers", "reset", "local-sync", "routed-w4", "drain", "local-sync"}));
+    }
+    {
+        Pipeline<true, AIV> p(0, 4096, 1);
+        p.computeReplay_ = true;
+        p.ProcessWave(p);
+        assert(p.events == std::vector<std::string>({"buffers", "reset", "drain", "local-sync", "routed-w4", "drain", "local-sync"}));
+    }
     for (unsigned shared : {0U, 1U, 8U}) {
         for (unsigned bs : {1U, 96U, 255U, 256U, 257U, 4096U}) {
             CheckOrder<true, AIC>(shared, bs, 0);

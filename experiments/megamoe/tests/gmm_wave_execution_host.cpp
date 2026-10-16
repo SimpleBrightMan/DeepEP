@@ -4,6 +4,7 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstddef>
 #include <utility>
 #include <vector>
 
@@ -13,7 +14,7 @@ constexpr uint32_t M_VALUE = 0, N_VALUE = 1, K_VALUE = 2;
 constexpr int AIC = 0, AIV = 1, COMBINE_NO_QUANT = 0;
 constexpr uint32_t ACTIVATION_N_HALF = 2;
 constexpr uint32_t L1_TILE_N = 256;
-template <size_t I, typename T> auto& Get(T& value) { return std::get<I>(value); }
+template <std::size_t I, typename T> auto& Get(T& value) { return std::get<I>(value); }
 namespace Ops::Base {
 template <typename T> T CeilDiv(T a, T b) { return a / b + (a % b != 0); }
 }

@@ -30,6 +30,11 @@ def test_device_policy_and_wave_arithmetic(tmp_path):
     compile_and_run(Path(__file__).with_name("device_schedule_host.cpp"), tmp_path)
 
 
+def test_passive_timer_only_needs_clock_and_private_stores(tmp_path):
+    # 桩不提供 barrier/flag API；若计时器意外增加同步，编译即失败。
+    compile_and_run(Path(__file__).with_name("passive_timer_cpu.cpp"), tmp_path)
+
+
 def test_production_pipeline_stage_order(tmp_path):
     source = (ROOT / "experiments/megamoe/csrc/kernels/mega_moe/mega_moe_arch35.hpp").read_text(encoding="utf-8")
     methods = []
