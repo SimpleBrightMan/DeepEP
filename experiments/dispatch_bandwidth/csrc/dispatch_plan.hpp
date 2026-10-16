@@ -5,6 +5,7 @@
 
 #include "dispatch_types.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -26,10 +27,17 @@ struct Config {
     uint32_t ring_slots = 6U;
     std::array<uint32_t, kTrafficKinds> worker_counts{2U, 5U, 21U};
     bool first_expert = false;
+    bool group_round_robin = false;
+};
+
+struct PhasePlan {
+    uint32_t peer_group;
+    std::array<uint64_t, kTrafficKinds> traffic_rows;
 };
 
 struct Plan {
-    // Tasks are grouped by traffic, then divided into worker-owned intervals.
+    // Concurrent tasks are grouped by traffic. Group-round-robin tasks are
+    // grouped by worker, with source-group chunks in phase order per worker.
     // destination retains the expert/peer ordered output row before regrouping.
     std::vector<CopyTask> tasks;
     std::vector<Worker> workers;
@@ -37,6 +45,9 @@ struct Plan {
     uint32_t total_rows = 0U;
     uint32_t row_bytes = 0U;
     uint32_t scale_elements = 0U;
+    uint32_t phase_count = 1U;
+    // Only the group-round-robin schedule has explicit source-group phases.
+    std::vector<PhasePlan> phases;
 };
 
 namespace detail {
@@ -66,13 +77,16 @@ inline void Validate(const Config& config, uint32_t rank)
     Require(rank < config.world, "rank must be less than world");
     Require(config.group_size >= 2U && config.group_size < config.world && config.world % config.group_size == 0U,
             "group_size must divide world and satisfy 1 < group_size < world");
-    Require(config.cores >= kTrafficKinds && config.cores <= 32U, "cores must be in [3,32]");
-    uint64_t workers = 0U;
-    for (uint32_t count : config.worker_counts) {
-        Require(count > 0U, "each traffic class must have at least one worker");
-        workers += count;
+    Require(config.cores >= (config.group_round_robin ? 1U : kTrafficKinds) && config.cores <= 32U,
+            "cores must be in [1,32] for group round robin or [3,32] for concurrent traffic");
+    if (!config.group_round_robin) {
+        uint64_t workers = 0U;
+        for (uint32_t count : config.worker_counts) {
+            Require(count > 0U, "each traffic class must have at least one worker");
+            workers += count;
+        }
+        Require(workers == config.cores, "worker_counts must sum to cores");
     }
-    Require(workers == config.cores, "worker_counts must sum to cores");
     Require(config.batch > 0U && config.batch <= 65536U, "batch must be in [1,65536]");
     Require(config.hidden >= 1024U && config.hidden <= 8192U && config.hidden % 64U == 0U,
             "hidden must be a multiple of 64 in [1024,8192]");
@@ -144,6 +158,57 @@ inline Plan BuildPlan(const Config& config, uint32_t rank)
     }
     plan.total_rows = static_cast<uint32_t>(destination);
     plan.tasks.reserve(plan.total_rows);
+    if (config.group_round_robin) {
+        const uint32_t group_count = config.world / config.group_size;
+        std::vector<std::vector<CopyTask>> group_rows(group_count), worker_rows(config.cores);
+        for (uint32_t traffic = 0U; traffic < kTrafficKinds; ++traffic) {
+            plan.traffic_rows[traffic] = queues[traffic].size();
+            for (const CopyTask& task : queues[traffic]) {
+                group_rows[task.peer / config.group_size].push_back(task);
+            }
+        }
+        for (auto& rows : group_rows) {
+            std::sort(rows.begin(), rows.end(),
+                      [](const CopyTask& left, const CopyTask& right) { return left.destination < right.destination; });
+        }
+        plan.phase_count = group_count;
+        plan.phases.reserve(group_count);
+        uint32_t extra_cursor = 0U;
+        for (uint32_t phase = 0U; phase < group_count; ++phase) {
+            const uint32_t peer_group = (rank / config.group_size + group_count - phase) % group_count;
+            PhasePlan phase_plan{peer_group, {}};
+            const auto& rows = group_rows[peer_group];
+            for (const CopyTask& task : rows) {
+                const uint32_t traffic = task.peer == rank ? static_cast<uint32_t>(Traffic::Local)
+                                                           : (peer_group == rank / config.group_size
+                                                                  ? static_cast<uint32_t>(Traffic::Group)
+                                                                  : static_cast<uint32_t>(Traffic::Cross));
+                ++phase_plan.traffic_rows[traffic];
+            }
+            const uint32_t base = static_cast<uint32_t>(rows.size() / config.cores);
+            const uint32_t extra = static_cast<uint32_t>(rows.size() % config.cores);
+            for (uint32_t logical_worker = 0U; logical_worker < config.cores; ++logical_worker) {
+                const uint32_t quota_owner = (logical_worker + config.cores - extra_cursor) % config.cores;
+                const uint32_t offset = quota_owner * base + std::min(quota_owner, extra);
+                const uint32_t count = base + static_cast<uint32_t>(quota_owner < extra);
+                auto& owned = worker_rows[logical_worker];
+                owned.insert(owned.end(), rows.begin() + offset, rows.begin() + offset + count);
+            }
+            extra_cursor = (extra_cursor + extra) % config.cores;
+            plan.phases.push_back(phase_plan);
+        }
+        plan.workers.reserve(config.cores);
+        for (const auto& rows : worker_rows) {
+            const uint32_t begin = static_cast<uint32_t>(plan.tasks.size());
+            plan.tasks.insert(plan.tasks.end(), rows.begin(), rows.end());
+            plan.workers.push_back(
+                {static_cast<uint32_t>(Traffic::All), begin, static_cast<uint32_t>(rows.size()), 0U});
+        }
+        if (plan.tasks.size() != plan.total_rows) {
+            throw std::logic_error("Group-round-robin route conservation failed");
+        }
+        return plan;
+    }
     plan.workers.reserve(config.cores);
     for (uint32_t traffic = 0U; traffic < kTrafficKinds; ++traffic) {
         const uint64_t rows = queues[traffic].size();

@@ -43,7 +43,8 @@ public:
 
         GlobalTensor<uint32_t> workerWords;
         workerWords.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(workers));
-        const uint32_t workerOffset = workerId * kWorkerWords;
+        const uint32_t logicalWorker = (workerId + config.worker_rotation) % config.cores;
+        const uint32_t workerOffset = logicalWorker * kWorkerWords;
         worker_.traffic = workerWords.GetValue(workerOffset);
         worker_.begin = workerWords.GetValue(workerOffset + 1U);
         worker_.count = workerWords.GetValue(workerOffset + 2U);

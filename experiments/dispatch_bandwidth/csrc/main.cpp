@@ -52,6 +52,7 @@ struct Round {
     double kernel_us;
     double envelope_us;
     std::vector<TimerRecord> records;
+    uint32_t worker_rotation;
 };
 
 const char* MetadataModeName(MetadataMode mode)
@@ -170,6 +171,11 @@ Options ParseOptions(int argc, char** argv)
             options.metadata_mode = value == "scalar" ? MetadataMode::Scalar
                                     : value == "dma"  ? MetadataMode::Dma
                                                       : MetadataMode::Preload;
+        } else if (name == "--schedule") {
+            if (value != "concurrent" && value != "group-round-robin") {
+                throw std::invalid_argument("--schedule must be concurrent or group-round-robin");
+            }
+            options.config.group_round_robin = value == "group-round-robin";
         } else if (name == "--scope") {
             if (value != "all" && value != "first-expert") {
                 throw std::invalid_argument("--scope must be all or first-expert");
@@ -192,6 +198,12 @@ Options ParseOptions(int argc, char** argv)
         options.warmup > 100000U) {
         throw std::invalid_argument(
             "device exceeds int32; repeat must be [1,65536], iters [1,100000], warmup [0,100000]");
+    }
+    if (options.config.group_round_robin &&
+        (options.config.world != 16U || options.config.group_size != 4U || options.config.cores != 28U ||
+         options.config.ring_slots != 6U || seen.count("--workers") != 0U)) {
+        throw std::invalid_argument(
+            "group-round-robin requires world=16, group-size=4, cores=28, buffer-count=6 and no --workers");
     }
     return options;
 }
@@ -340,13 +352,14 @@ void ValidateOutput(const Options& options, const Plan& plan, const uint8_t* out
     }
 }
 
-double ValidateTimers(const Options& options, const Plan& plan, const std::vector<TimerRecord>& records)
+double ValidateTimers(const Options& options, const Plan& plan, const std::vector<TimerRecord>& records,
+                      uint32_t worker_rotation)
 {
     uint64_t first = UINT64_MAX;
     uint64_t last = 0U;
     for (uint32_t worker = 0U; worker < options.config.cores; ++worker) {
         const TimerRecord& record = records[worker];
-        const Worker& expected = plan.workers[worker];
+        const Worker& expected = plan.workers[(worker + worker_rotation) % options.config.cores];
         const uint64_t rows = static_cast<uint64_t>(expected.count) * options.repeats;
         if (record.traffic != expected.traffic || record.rows != rows || record.end < record.start ||
             (rows != 0U && (record.start == 0U || record.end == record.start))) {
@@ -366,8 +379,8 @@ double ValidateTimers(const Options& options, const Plan& plan, const std::vecto
 std::string Report(const Options& options, const Plan& plan, const std::vector<Round>& rounds)
 {
     std::ostringstream json;
-    json << std::setprecision(17) << "{\n\"schema_version\":2,\"rank\":" << options.rank
-         << ",\"world\":" << options.config.world << ",\"device\":" << options.device
+    json << std::setprecision(17) << "{\n\"schema_version\":" << (options.config.group_round_robin ? 4U : 2U)
+         << ",\"rank\":" << options.rank << ",\"world\":" << options.config.world << ",\"device\":" << options.device
          << ",\"cores\":" << options.config.cores << ",\"group_size\":" << options.config.group_size
          << ",\"batch\":" << options.config.batch << ",\"hidden\":" << options.config.hidden
          << ",\"intermediate\":" << options.config.intermediate << ",\"experts\":" << options.config.experts
@@ -381,22 +394,44 @@ std::string Report(const Options& options, const Plan& plan, const std::vector<R
     for (uint32_t traffic = 0U; traffic < kTrafficKinds; ++traffic) {
         json << (traffic == 0U ? "" : ",") << '"' << kTrafficNames[traffic] << "\":" << plan.traffic_rows[traffic];
     }
-    json << "},\"worker_counts\":{";
-    for (uint32_t traffic = 0U; traffic < kTrafficKinds; ++traffic) {
-        json << (traffic == 0U ? "" : ",") << '"' << kTrafficNames[traffic]
-             << "\":" << options.config.worker_counts[traffic];
+    json << '}';
+    if (options.config.group_round_robin) {
+        json << ",\"mode\":\"group_round_robin\",\"phase_count\":" << plan.phase_count << ",\"phase_peer_groups\":[";
+        for (uint32_t phase = 0U; phase < plan.phase_count; ++phase) {
+            json << (phase == 0U ? "" : ",") << plan.phases[phase].peer_group;
+        }
+        json << "],\"phase_traffic_rows\":[";
+        for (uint32_t phase = 0U; phase < plan.phase_count; ++phase) {
+            json << (phase == 0U ? "" : ",") << '{';
+            for (uint32_t traffic = 0U; traffic < kTrafficKinds; ++traffic) {
+                json << (traffic == 0U ? "" : ",") << '"' << kTrafficNames[traffic]
+                     << "\":" << plan.phases[phase].traffic_rows[traffic];
+            }
+            json << '}';
+        }
+        json << ']';
+    } else {
+        json << ",\"worker_counts\":{";
+        for (uint32_t traffic = 0U; traffic < kTrafficKinds; ++traffic) {
+            json << (traffic == 0U ? "" : ",") << '"' << kTrafficNames[traffic]
+                 << "\":" << options.config.worker_counts[traffic];
+        }
+        json << '}';
     }
-    json << "},\"validation\":{\"passed\":true,\"checked_rows\":" << plan.total_rows << "},\"rounds\":[\n";
+    json << ",\"validation\":{\"passed\":true,\"checked_rows\":" << plan.total_rows << "},\"rounds\":[\n";
     for (std::size_t iteration = 0U; iteration < rounds.size(); ++iteration) {
         const Round& round = rounds[iteration];
         json << (iteration == 0U ? "" : ",\n") << "{\"iteration\":" << iteration
              << ",\"kernel_elapsed_us\":" << round.kernel_us << ",\"timer_envelope_us\":" << round.envelope_us
+             << (options.config.group_round_robin ? ",\"worker_rotation\":" + std::to_string(round.worker_rotation)
+                                                  : "")
              << ",\"workers\":[";
         for (uint32_t worker = 0U; worker < options.config.cores; ++worker) {
             const TimerRecord& record = round.records[worker];
             json << (worker == 0U ? "" : ",") << "{\"group_id\":" << worker << ",\"traffic\":\""
-                 << kTrafficNames[plan.workers[worker].traffic] << "\",\"rows\":" << record.rows
-                 << ",\"start_cycle\":" << record.start << ",\"end_cycle\":" << record.end << '}';
+                 << (options.config.group_round_robin ? "all" : kTrafficNames[plan.workers[worker].traffic])
+                 << "\",\"rows\":" << record.rows << ",\"start_cycle\":" << record.start
+                 << ",\"end_cycle\":" << record.end << '}';
         }
         json << "]}";
     }
@@ -522,13 +557,21 @@ void Run(const Options& options)
                         plan.row_bytes,
                         options.config.ring_slots,
                         options.repeats,
-                        static_cast<uint32_t>(options.metadata_mode)};
+                        static_cast<uint32_t>(options.metadata_mode),
+                        0U};
     std::vector<Round> rounds;
     rounds.reserve(options.iterations);
     const uint32_t total_rounds = options.warmup + options.iterations;
     std::cerr << "[rank " << options.rank << "] source_stride=" << plan.row_bytes << " rows=" << plan.total_rows
-              << " workers=" << options.config.worker_counts[0] << ',' << options.config.worker_counts[1] << ','
-              << options.config.worker_counts[2] << " metadata_mode=" << MetadataModeName(options.metadata_mode)
+              << " workers=";
+    if (options.config.group_round_robin) {
+        std::cerr << "all:" << options.config.cores;
+    } else {
+        std::cerr << options.config.worker_counts[0] << ',' << options.config.worker_counts[1] << ','
+                  << options.config.worker_counts[2];
+    }
+    std::cerr << " metadata_mode=" << MetadataModeName(options.metadata_mode)
+              << " schedule=" << (options.config.group_round_robin ? "group-round-robin" : "concurrent")
               << " AIC/AIV=" << aic << '/' << aiv << '\n';
     for (uint32_t iteration = 0U; iteration < total_rounds; ++iteration) {
         // These resets and the collective are deliberately outside ACL timing.
@@ -546,6 +589,7 @@ void Run(const Options& options)
             aclrtMemset(timer, plan.workers.size() * sizeof(TimerRecord), 0, plan.workers.size() * sizeof(TimerRecord)),
             "aclrtMemset(timer)");
         aclshmem_barrier_all();
+        kernel.worker_rotation = options.config.group_round_robin ? iteration % options.config.cores : 0U;
         Check(aclrtRecordEvent(start, stream), "aclrtRecordEvent(start)");
         dispatch_bandwidth_kernel_do(options.config.cores, static_cast<uint32_t>(ub_bytes), stream, peer_table, tasks,
                                      metadata_input, workers, output_tokens, output_scales, output_metadata, timer,
@@ -561,8 +605,8 @@ void Run(const Options& options)
             }
             std::vector<TimerRecord> records(plan.workers.size());
             CopyToHost(records.data(), timer, records.size() * sizeof(TimerRecord));
-            const double envelope = ValidateTimers(options, plan, records);
-            rounds.push_back({elapsed_us, envelope, std::move(records)});
+            const double envelope = ValidateTimers(options, plan, records, kernel.worker_rotation);
+            rounds.push_back({elapsed_us, envelope, std::move(records), kernel.worker_rotation});
         }
     }
     ValidateOutput(options, plan, output_tokens, output_scales, output_metadata);
@@ -598,6 +642,7 @@ int main(int argc, char** argv)
                          "[--world 16 --bs 4096 --hidden 3584 --intermediate 1280 --experts 384 --topk 8]\n"
                          "[--group-size 4 --cores 28 --workers 2,5,21 --buffer-count 6 --repeat 1]\n"
                          "[--scope all|first-expert --metadata-mode scalar|dma|preload]\n"
+                         "[--schedule concurrent|group-round-robin (28 AIV1, six slots, one kernel)]\n"
                          "[--warmup 10 --iters 20 --timer]\n";
             return 0;
         }

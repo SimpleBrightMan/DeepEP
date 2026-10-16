@@ -1,7 +1,8 @@
 # Concurrent Dispatch bandwidth benchmark
 
-This standalone Ascend950 benchmark runs LOCAL, GROUP and CROSS traffic concurrently
-in **one mixed kernel on every rank**. It isolates the packed-token copy stage of
+This standalone Ascend950 benchmark defaults to `--schedule concurrent`, running
+LOCAL, GROUP and CROSS traffic concurrently in **one mixed kernel on every rank**.
+It isolates the packed-token copy stage of
 MegaMoE Dispatch, without GMM, SwiGLU, quantization or device-side route generation.
 It does not change the installed DeepEP extension.
 
@@ -16,8 +17,8 @@ communication workers have fixed roles:
 | GROUP | Other three ranks in the same four-rank group | 5 |
 | CROSS | Twelve ranks in other groups on this node | 21 |
 
-Workers never switch classes. The three classes start in the same kernel, but
-may finish at different times. This measures concurrency under a fixed Dispatch
+In this default schedule, workers never switch classes. The three classes start
+in the same kernel, but may finish at different times. This measures concurrency under a fixed Dispatch
 load; it does not keep all three classes saturated after the smaller ones finish.
 Rank order follows `--devices`: keep its order consistent with the physical groups.
 This benchmark uses MTE peer access within one node, not RoCE or multi-node SHMEM.
@@ -88,6 +89,84 @@ the same output, increasing cache reuse; interpret them separately from a larger
 batch. The intermediate dimension is checked and recorded for model identity,
 but does not affect the copy stage.
 
+## Group round-robin schedule
+
+On branch `codex/dispatch-group-round-robin`, select
+`--schedule group-round-robin` explicitly to compare a different task order with
+the original concurrent schedule. The host prepares the reordered task tables;
+the kernel keeps the original continuous six-slot `Run()` loop. This mode keeps
+**one kernel launch per rank and iteration and all 28 AIV1 workers**.
+AIC and AIV0 still do no work. It requires EP16, four consecutive ranks per group,
+`--cores 28` and `--buffer-count 6`; it does not select a smaller launch or scan
+different worker/slot counts.
+
+```bash
+python experiments/dispatch_bandwidth/run.py \
+    --schedule group-round-robin \
+    --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+    --group-size 4 --cores 28 --buffer-count 6 \
+    --bs-values 2048,4096,8192 \
+    --hidden 3584 --intermediate 1280 --experts 384 --topk 8 \
+    --metadata-mode dma --timer
+
+# Run the original schedule with the same model, batches and metadata mode.
+python experiments/dispatch_bandwidth/run.py \
+    --schedule concurrent --workers 2,5,21 \
+    --bs-values 2048,4096,8192 \
+    --hidden 3584 --intermediate 1280 --experts 384 --topk 8 \
+    --metadata-mode dma --buffer-count 6 --timer
+
+# Inspect the group schedule without launching a kernel or allocating ports.
+python experiments/dispatch_bandwidth/run.py \
+    --schedule group-round-robin --bs-values 4096 --plan
+```
+
+For a receiving rank in physical group `G`, group segment `p` reads from source group
+`(G - p + 4) % 4`. Since these are GETs, this corresponds to a sending group
+`Gi` supplying receiving group `(Gi + p) % 4`:
+
+| Segment | Source group relative to receiver | Traffic | Workers sharing group rows |
+| --- | --- | --- | ---: |
+| 0 | Same group | LOCAL and GROUP | 28 |
+| 1 | Previous group, modulo four | CROSS | 28 |
+| 2 | Two groups earlier, modulo four | CROSS | 28 |
+| 3 | Three groups earlier, modulo four | CROSS | 28 |
+
+For each source group, the host collects its full row list and divides it across
+all 28 workers: `q, r = divmod(group_rows, 28)`. Each worker gets `q` or `q+1`
+rows. An extra-owner cursor starts at zero and advances by `r` after each group;
+the next group's complete chunks are assigned with that rotated ownership.
+Thus row counts differ by at most one both within each group and over the full
+four-group task list. For BS4096, each group has 8192 rows, so each worker gets
+292 or 293 rows from a group, and 1170 or 1171 rows in total.
+
+Each worker's task table concatenates its four group chunks in the order above.
+The physical-to-logical worker mapping shifts once per kernel invocation,
+including warmups, spreading the extra rows across physical workers.
+`--repeat` replays the complete task table with the same worker mapping; it does
+not advance this rotation. Source indices, packed read size and total row counts
+are unchanged. For the BS4096 default, segment 0 contains 2048 LOCAL and 6144
+GROUP rows per receiving card; each later segment contains 8192 CROSS rows,
+for the original 24576 CROSS rows in total.
+
+These segments exist only in the host-prepared task order. **There is no phase
+fence, phase drain, phase timer, or host/cross-rank/cross-core phase barrier.**
+The six-slot ring carries on across group boundaries, allowing reads and writes
+from adjacent groups to remain in flight together. Initialization and iteration
+boundaries retain ordinary SHMEM synchronization. Workers and cards may reach
+the next group at different times. The ordering does not guarantee removal of
+physical-link hotspots or identical per-worker durations.
+
+Timer output remains **28 whole-worker intervals**, each tagged `ALL`, using the
+original start and completion timestamps. `TOTAL` bandwidth uses all payload
+bytes divided by the same-card span `max(end) - min(start)` across active workers;
+the report also gives all payload bytes over the single whole-kernel ACL window.
+LOCAL/GROUP/CROSS values are their byte contributions over these shared TOTAL
+windows, not separate class timings or isolated class bandwidth. Use the
+**whole-kernel ACL event time as the main comparison** with
+`--schedule concurrent`, and whole-worker timers to inspect tails. No timestamps
+are subtracted across different cards. This mode adds no plotting or sweep step.
+
 ## Workload and byte counts
 
 Routes reproduce the repository's balanced stream: for source rank `s`, token
@@ -96,8 +175,8 @@ Routes reproduce the repository's balanced stream: for source rank `s`, token
 The default includes **all local experts**. Each destination receives all its
 matching routes from all source ranks. A source token can be read more than once
 when multiple selected experts are on that destination; these are distinct
-Dispatch rows, not deduplicated tokens. Task order is local expert, cyclic source
-rank, then source token/TopK slot. Dedicated class queues replace MegaMoE's wave
+Dispatch rows, not deduplicated tokens. In the concurrent schedule, task order
+is local expert, cyclic source rank, then source token/TopK slot. Dedicated class queues replace MegaMoE's wave
 scheduling, while preserving the source indices, per-row copy size and counts.
 
 For H=3584, a read is 3584 FP8 bytes plus 128 bytes of padded scale storage:
@@ -122,8 +201,8 @@ integer differences across ranks; the report uses the actual planned counts.
 
 ## Bandwidth definition
 
-For each class, rank and iteration, the device timer records each worker's start
-and completion after its outstanding output writes drain. Class elapsed time is
+For the concurrent schedule, the device timer records each worker's start and
+completion on every rank and iteration after outstanding output writes drain. Class elapsed time is
 `max(end_cycle) - min(start_cycle)` over workers with nonzero rows. The bandwidth
 is `class_rows * repeats * row_bytes / elapsed_us / 1000`, in decimal GB/s.
 Cycles use the same Ascend950 system-counter conversion as MegaMoE's timer
@@ -160,8 +239,10 @@ they do not require NPUs.
 `--metadata-mode scalar|dma|preload` selects three implementations of the same
 Dispatch workload. The default is `dma`, removing per-row Scalar synchronization;
 select `scalar` explicitly to reproduce the original benchmark.
-Native reports use schema version 2 and include `metadata_mode`; aggregation
-rejects mixed modes. Timer CSV and trace files also identify the mode.
+Native reports include `metadata_mode`. The original concurrent format remains
+schema version 2; group ordering uses schema version 4 with whole-worker timers.
+Aggregation rejects mixed metadata modes or report formats. Timer CSV and trace
+files also identify the mode.
 
 ```bash
 for mode in scalar dma preload; do

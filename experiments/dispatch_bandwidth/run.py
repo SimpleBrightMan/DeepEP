@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by SimpleBright_Man 2026
 
-"""Launch one native process per local NPU for concurrent LOCAL/GROUP/CROSS Dispatch."""
+"""Launch one native process per local NPU for concurrent or group-ordered Dispatch."""
 
 import argparse
 from datetime import datetime, timezone
@@ -16,8 +16,9 @@ import time
 import uuid
 
 if __package__:
-    from . import report
+    from . import group_report, report
 else:
+    import group_report
     import report
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -49,7 +50,8 @@ def parse_args(argv=None):
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--group-size", type=int, default=4, help="Contiguous rank IDs in one direct-link domain")
     parser.add_argument("--cores", type=int, default=28)
-    parser.add_argument("--workers", type=_csv_integers, default=[2, 5, 21], help="Dedicated LOCAL,GROUP,CROSS cores")
+    parser.add_argument("--schedule", choices=("concurrent", "group-round-robin"), default="concurrent")
+    parser.add_argument("--workers", type=_csv_integers, help="Dedicated LOCAL,GROUP,CROSS cores (concurrent only)")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=1)
@@ -68,12 +70,20 @@ def parse_args(argv=None):
         "--plan", action="store_true", help="Print native commands without writes, ports or NPU queries"
     )
     args = parser.parse_args(argv)
+    explicit_workers = args.workers is not None
+    if args.workers is None:
+        args.workers = [2, 5, 21]
     world = len(args.devices)
     if not 4 <= world <= 16 or len(set(args.devices)) != world or any(device < 0 for device in args.devices):
         parser.error("--devices must contain 4..16 distinct nonnegative ACL device IDs")
     if not 1 < args.group_size < world or world % args.group_size:
         parser.error("--group-size must divide world and leave nonempty GROUP and CROSS classes")
-    if (
+    if args.schedule == "group-round-robin":
+        if explicit_workers:
+            parser.error("group-round-robin uses all 28 workers; omit --workers")
+        if (world, args.group_size, args.cores, args.buffer_count) != (16, 4, 28, 6):
+            parser.error("group-round-robin requires world=16, group-size=4, cores=28 and buffer-count=6")
+    elif (
         not 3 <= args.cores <= 32
         or len(args.workers) != 3
         or any(count < 1 for count in args.workers)
@@ -126,6 +136,9 @@ def native_command(args, *, rank, bs, endpoint, directory):
         "warmup": args.warmup,
         "iters": args.iters,
     }
+    if args.schedule == "group-round-robin":
+        values.pop("workers")
+        values["schedule"] = args.schedule
     command = [str(args.binary.resolve())]
     for name, value in values.items():
         command.extend(("--" + name, str(value)))
@@ -150,14 +163,22 @@ def make_plan(args, directory):
             )
         )
     return dict(
-        mode="concurrent_local_group_cross",
+        mode="group_round_robin" if args.schedule == "group-round-robin" else "concurrent_local_group_cross",
+        schedule=args.schedule,
         metadata_mode=args.metadata_mode,
         world=len(args.devices),
         devices=args.devices,
-        workers=dict(zip(report.TRAFFIC, args.workers)),
+        workers={"all": 28} if args.schedule == "group-round-robin" else dict(zip(report.TRAFFIC, args.workers)),
+        buffer_count=args.buffer_count,
         output_dir=str(directory),
         cases=cases,
-        note="One kernel concurrently executes all three classes. Each BS starts fresh native processes.",
+        note=(
+            "One kernel keeps each worker's six-slot ring continuous across four source groups; "
+            "source_group=(own_group-offset+4)%4. Workers progress independently without phase synchronization. "
+            if args.schedule == "group-round-robin"
+            else "One kernel concurrently executes all three classes. "
+        )
+        + "Each BS starts fresh native processes.",
     )
 
 
@@ -235,7 +256,8 @@ def run_case(args, bs, directory):
         _stop_owned(processes)
         for stream in logs:
             stream.close()
-    reports = report.load_reports(directory, len(args.devices))
+    backend = group_report if args.schedule == "group-round-robin" else report
+    reports = backend.load_reports(directory, len(args.devices))
     expected = dict(
         world=len(args.devices),
         cores=args.cores,
@@ -249,20 +271,30 @@ def run_case(args, bs, directory):
         metadata_mode=args.metadata_mode,
         buffer_count=args.buffer_count,
         repeats=args.repeat,
-        worker_counts=dict(zip(report.TRAFFIC, args.workers)),
     )
+    if args.schedule == "group-round-robin":
+        expected.update(mode="group_round_robin", phase_count=4)
+    else:
+        expected["worker_counts"] = dict(zip(report.TRAFFIC, args.workers))
     for rank, raw in enumerate(reports):
         if raw.get("device") != args.devices[rank] or any(raw.get(key) != value for key, value in expected.items()):
             raise report.ReportError(f"rank {rank}: report does not match the requested native launch")
-    summary = report.summarize_reports(reports, expected_world=len(args.devices), expected_iterations=args.iters)
+        if args.schedule == "group-round-robin":
+            backend.validate_report(raw, expected_iterations=args.iters)
+            if any(row["worker_rotation"] != (args.warmup + row["iteration"]) % 28 for row in raw["rounds"]):
+                raise report.ReportError(f"rank {rank}: worker rotation does not match warmup and measured iteration")
+    summary = backend.summarize_reports(reports, expected_world=len(args.devices), expected_iterations=args.iters)
     _write_json(directory / "summary.json", summary)
     if args.timer:
         for raw in reports:
-            report.export_timers(raw, directory / "timer")
+            backend.export_timers(raw, directory / "timer")
     return summary
 
 
 def print_summary(summary):
+    if summary.get("mode") == "group_round_robin":
+        group_report.print_summary(summary)
+        return
     config = summary["configuration"]
     print(
         f"[CONCURRENT] BS={config['batch']} scope={config['scope']} metadata_mode={config['metadata_mode']}; "
@@ -312,7 +344,7 @@ def main(argv=None):
     _write_json(directory / "plan.json", plan)
     _resource_snapshot(directory)
     combined = dict(
-        schema_version=2,
+        schema_version=4 if args.schedule == "group-round-robin" else 2,
         mode=plan["mode"],
         metadata_mode=args.metadata_mode,
         status="running",
