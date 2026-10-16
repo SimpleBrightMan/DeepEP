@@ -12,7 +12,7 @@ enum class Stage { INPUT_PREPARE, SHARED_EXPERT_GMM1, CROSS_RANK_SYNC_INPUT,
 }
 namespace AscendTimer {
 enum { KERNEL_TIMING, AIC_WAIT_INPUT_PREP, AIV_ROUTE_MASK, AIV_INPUT_CROSS_RANK_SYNC,
-       AIV_EXPORT_SYNC, AIV_FINAL_CROSS_RANK_WAIT, AIV_UNPERMUTE };
+       AIV_EXPORT_SYNC, AIV_FINAL_CROSS_RANK_WAIT, AIV_UNPERMUTE, AIV_RESET };
 }
 struct Timer {
     void Start(int) {} void End(int) {} void FlushDynamicCounts() {}
@@ -26,6 +26,10 @@ struct Pipeline {
     static constexpr bool ENABLE_A8W4 = W4;
     static constexpr int g_coreType = Role, CombineQuantMode = 0;
     static constexpr bool TopkWeightsPrefetch = false;
+    bool computeReplay_ = false;
+    int resetBatchElementCount_ = 0, resetTensor_ = 0;
+    void SendAndQuantBuffInit() { events.push_back("buffers"); }
+    template <bool, class... T> void ResetSyncStatus(T...) { events.push_back("reset"); }
     static constexpr unsigned GMM1_TILE_M = 256;
     using TopkWeightsType = int;
     unsigned sharedExpertNum_, subBlock;

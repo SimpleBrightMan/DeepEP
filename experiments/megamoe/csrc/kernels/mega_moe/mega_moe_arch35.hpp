@@ -742,7 +742,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
         if constexpr (pairwiseCombine) {
             gmm2TileSequence = &pairwiseTileSequence;
         }
-        timer_.SetSlice(state.expertIdx, slice.rowStartInExpert, slice.rowCount);
+        timer_.SetSlice(expertContext.expertIdx, slice.rowStartInExpert, slice.rowCount);
         // TokenCombine逐tile记录ISSUE；独立slice在出口排空，wave上下文由调用者统一收尾。
         if constexpr (g_coreType == AIC && CombineQuantMode != COMBINE_NO_QUANT) {
             timer_.StartSpan(AscendTimer::AIC_GMM2);
@@ -771,7 +771,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
             // 无wave上下文时，RunGmm2A8W4内的局部对象已析构并完成FIX_S。
             // wave 上下文仍有在途 FIX；由调用者在 End 后统一发布，不能提前通知消费者。
             if (gmm2WaveContext == nullptr) {
-                NotifyTokenCombineSliceReady(params_, state.expertIdx, slice.rowStartInExpert);
+                NotifyTokenCombineSliceReady(params_, expertContext.expertIdx, slice.rowStartInExpert);
             }
         }
     }

@@ -254,15 +254,15 @@ __aicore__ inline void Gmm1AicMmadGeneric(WorkSet& workSet, const GMMAddrInfo& g
 }
 
 // 执行 A8W4 GMM1 AIC tile 循环，并维持 Dispatch/GMM1 和 GMM1/SwiGLU 的同步关系。
-template <typename BlockMmad, bool IsShared, bool TopkWeightsPrefetch, typename WorkSet, typename Config>
-__aicore__ inline void Gmm1AicMmadA8W4(BlockMmad& blockMmad, WorkSet& workSet, const Params& params,
+template <typename BlockMmad, bool IsShared, bool TopkWeightsPrefetch, typename Scheduler, typename Config>
+__aicore__ inline void Gmm1AicMmadA8W4(BlockMmad& blockMmad, Scheduler& scheduler,
                                        const GMMAddrInfo& gmmAddrInfo, const Config& config, uint32_t startLoopIdx,
                                        uint32_t tileNum, int32_t& gmm1TileReadySequence, uint32_t expertIdx)
 {
     uint32_t lastWaveWaited = static_cast<uint32_t>(-1);
     for (uint32_t loopIdx = startLoopIdx; loopIdx < tileNum; loopIdx += config.blockNum) {
-        auto blockCoord = workSet.scheduler.GetBlockCoord(loopIdx);
-        auto actualShape = workSet.scheduler.GetBlockShape(blockCoord);
+        auto blockCoord = scheduler.GetBlockCoord(loopIdx);
+        auto actualShape = scheduler.GetBlockShape(blockCoord);
         uint32_t mLoc = Get<M_VALUE>(blockCoord);
         uint32_t nLoc = Get<N_VALUE>(blockCoord);
         AscendTimerTileScope tileTimer(gmmAddrInfo.timer,
@@ -771,9 +771,9 @@ __aicore__ inline void Gmm1Aiv1EpilogueA8W4(WorkSet& workSet, const GMMAddrInfo&
     }
 }
 
-// Kernel lifetime is independent of scratch ownership: each slice begins and drains events.
-template <bool IsShared, bool TopkWeightsPrefetch, typename Config, typename WorkSet>
-__aicore__ inline void RunGmm1CatlassTiles(CatlassGmm1<Config>& kernel, WorkSet& workSet, const Params& params,
+// 这里只管理计算资源与 tile 循环：异步 routed 流水由外层 handoff，其他路径仍在 slice 末归还。
+template <bool IsShared, bool TopkWeightsPrefetch, typename Config, typename Scheduler>
+__aicore__ inline void RunGmm1ComputeTiles(CatlassGmm1<Config>& kernel, Scheduler& scheduler,
                                            const GMMAddrInfo& addr, const Config& config, uint32_t startLoopIdx,
                                            uint32_t tileNum, int32_t& readySequence, uint32_t expertIdx)
 {
@@ -781,81 +781,45 @@ __aicore__ inline void RunGmm1CatlassTiles(CatlassGmm1<Config>& kernel, WorkSet&
     kernel.Begin();
     if constexpr (g_coreType == AscendC::AIC) {
         Gmm1AicMmadA8W4<CatlassGmm1<Config>, IsShared, TopkWeightsPrefetch>(
-            kernel, workSet, params, addr, config, startLoopIdx, tileNum, readySequence, expertIdx);
+            kernel, scheduler, addr, config, startLoopIdx, tileNum, readySequence, expertIdx);
         if (!addr.gmm1AsyncCompletion) kernel.End(true);  // 同步路径逐tile已排空FIX。
     } else {
-        Gmm1Aiv0PrologueA8W4(kernel, workSet.scheduler, config, startLoopIdx, tileNum);
+        Gmm1Aiv0PrologueA8W4(kernel, scheduler, config, startLoopIdx, tileNum);
         if (!addr.gmm1AsyncCompletion) kernel.End();
     }
 }
 
-// 根据 GM 地址建立执行资源，并执行 A8W4 GMM1/SwiGLU 阶段。
-template <typename ElementC, typename MakeLayoutC, bool IsShared, typename Scheduler, typename Config,
-          bool TopkWeightsPrefetch, bool IsWaveFlagGrained, typename ActivationQuantOp>
-__aicore__ inline void Gmm1ExecA8W4(Scheduler& scheduler, const Params& params, const GMMAddrInfo& gmmAddrInfo,
-                                    const Config& config, uint32_t startLoopIdx, uint32_t tileNum,
-                                    int32_t& gmm1TileReadySequence, ActivationQuantOp& activationQuantOp,
-                                    uint32_t expertBeforeCnt, uint32_t expertIdx, CatlassGmm1<Config>* persistentKernel)
+// AIV1 兼容消费路径：只建立输出视图；独立优先级调度器继续使用 ready-tile 入口。
+template <typename ElementC, typename MakeLayoutC, bool TopkWeightsPrefetch, bool IsWaveFlagGrained,
+          typename Scheduler, typename Config, typename ActivationQuantOp>
+__aicore__ inline void RunGmm1VectorEpilogueA8W4(
+    Scheduler& scheduler, const Params& params, const GMMAddrInfo& addr, const Config& config,
+    uint32_t startLoopIdx, uint32_t tileNum, int32_t& readySequence,
+    ActivationQuantOp& activationQuantOp, uint32_t expertBeforeCnt, uint32_t expertIdx)
 {
+    // 只给实际消费结果的 AIV1 建立视图；AIC/AIV0 不需要旧 WorkSet 中的 A/B/scale/bias Tensor。
     using KernelConfig = typename Config::KernelConfig;
-    using ElementA = typename KernelConfig::ElementAType;
-    using ElementB = typename KernelConfig::ElementBType;
-    using ElementMxScaleA = typename KernelConfig::ElementMxScaleAType;
-    using ElementMxScaleB = typename KernelConfig::ElementMxScaleBType;
-    using BiasType = typename KernelConfig::BiasType;
-
     auto layouts = KernelConfig::BuildLayouts(config);
     auto gmC = Te::MakeTensor(
-        Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementC*>(gmmAddrInfo.gmm1OutGlobal)), layouts.c);
-    auto gmA = Te::MakeTensor(Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementA*>(gmmAddrInfo.aGlobal)),
-                              layouts.a);
-    auto gmB = Te::MakeTensor(Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementB*>(gmmAddrInfo.bGlobal)),
-                              layouts.b);
-    auto gmScaleA = Te::MakeTensor(
-        Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementMxScaleA*>(gmmAddrInfo.aScaleGlobal)),
-        layouts.scaleA);
-    auto gmScaleB = Te::MakeTensor(
-        Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementMxScaleB*>(gmmAddrInfo.bScaleGlobal)),
-        layouts.scaleB);
-    auto gmBias =
-        Te::MakeTensor(Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ BiasType*>(0UL)), layouts.bias);
+        Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ ElementC*>(addr.gmm1OutGlobal)), layouts.c);
     AscendC::GlobalTensor<float> metaInfoGm;
-    if constexpr (TopkWeightsPrefetch && g_coreType == AscendC::AIV) {
-        metaInfoGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(gmmAddrInfo.metaInfoGlobal));
+    if constexpr (TopkWeightsPrefetch) {
+        metaInfoGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(addr.metaInfoGlobal));
     }
-
-    using WorkSetType = Gmm1WorkSet<Scheduler, decltype(gmA), decltype(gmB), decltype(gmScaleA), decltype(gmScaleB),
-                                    decltype(gmBias), decltype(gmC), decltype(metaInfoGm)>;
-    WorkSetType workSet{scheduler, gmA, gmB, gmScaleA, gmScaleB, gmBias, gmC, metaInfoGm};
-    if constexpr (g_coreType == AscendC::AIC) {
-        if (persistentKernel != nullptr) {
-            RunGmm1CatlassTiles<IsShared, TopkWeightsPrefetch>(*persistentKernel, workSet, params, gmmAddrInfo, config,
-                                                               startLoopIdx, tileNum, gmm1TileReadySequence, expertIdx);
-        } else {
-            CatlassGmm1<Config> kernel;
-            RunGmm1CatlassTiles<IsShared, TopkWeightsPrefetch>(kernel, workSet, params, gmmAddrInfo, config,
-                                                               startLoopIdx, tileNum, gmm1TileReadySequence, expertIdx);
-        }
-    } else if (GetSubBlockIdx() == 0) {
-        AscendTimerSpanScope prologueTimer(IsShared ? gmmAddrInfo.timer : nullptr,
-                                           AscendTimer::AIV_SHARED_GMM1_PROLOGUE);
-        if (persistentKernel != nullptr) {
-            RunGmm1CatlassTiles<IsShared, TopkWeightsPrefetch>(*persistentKernel, workSet, params, gmmAddrInfo, config,
-                                                               startLoopIdx, tileNum, gmm1TileReadySequence, expertIdx);
-        } else {
-            CatlassGmm1<Config> kernel;
-            RunGmm1CatlassTiles<IsShared, TopkWeightsPrefetch>(kernel, workSet, params, gmmAddrInfo, config,
-                                                               startLoopIdx, tileNum, gmm1TileReadySequence, expertIdx);
-        }
+    using OutputTensor = decltype(gmC);
+    using MetadataTensor = decltype(metaInfoGm);
+    // 保留既有 epilogue 接口的字段名，不让它持有无关的计算输入。
+    struct WorkSet {
+        Scheduler& scheduler;
+        OutputTensor gmC;
+        MetadataTensor metaInfoGm;
+    } workSet{scheduler, gmC, metaInfoGm};
+    if constexpr (TopkWeightsPrefetch) {
+        Gmm1Aiv1PrefetchEpilogueA8W4<ElementC, MakeLayoutC, IsWaveFlagGrained>(
+            workSet, params, addr, config, startLoopIdx, tileNum, activationQuantOp, expertBeforeCnt, expertIdx);
     } else {
-        if constexpr (TopkWeightsPrefetch) {
-            Gmm1Aiv1PrefetchEpilogueA8W4<ElementC, MakeLayoutC, IsWaveFlagGrained>(
-                workSet, params, gmmAddrInfo, config, startLoopIdx, tileNum, activationQuantOp, expertBeforeCnt,
-                expertIdx);
-        } else {
-            Gmm1Aiv1EpilogueA8W4<ElementC, MakeLayoutC, IsWaveFlagGrained>(
-                workSet, gmmAddrInfo, config, startLoopIdx, tileNum, gmm1TileReadySequence, activationQuantOp);
-        }
+        Gmm1Aiv1EpilogueA8W4<ElementC, MakeLayoutC, IsWaveFlagGrained>(
+            workSet, addr, config, startLoopIdx, tileNum, readySequence, activationQuantOp);
     }
 }
 
@@ -1006,10 +970,25 @@ __aicore__ inline void RunGmm1A8W4(BlockEpilogueActivationMxQuant<ElementA, Elem
         return;
     }
 
-    GmmKernel::Gmm1ExecA8W4<ElementC, MakeLayoutC, IsShared, GmmKernel::BlockScheduler, decltype(config),
-                            TopkWeightsPrefetch, IsWaveFlagGrained>(
-        scheduler, params, gmmAddrInfo, config, startLoopIdx, tileNum, gmm1TileReadySequence, activationQuantOp,
-        expertBeforeCnt, expertIdx, reinterpret_cast<GmmKernel::CatlassGmm1<decltype(config)>*>(persistentKernel));
+    // 配置/分核后直接按角色执行，不再经过通用 Exec 包装和重复的 AIC/AIV0 分派。
+    if (g_coreType == AIC || GetSubBlockIdx() == 0U) {
+        AscendTimerSpanScope sharedPrologueTimer(
+            g_coreType == AIV && IsShared ? gmmAddrInfo.timer : nullptr, AscendTimer::AIV_SHARED_GMM1_PROLOGUE);
+        using Kernel = GmmKernel::CatlassGmm1<decltype(config)>;
+        if (persistentKernel != nullptr) {
+            GmmKernel::RunGmm1ComputeTiles<IsShared, TopkWeightsPrefetch>(
+                *static_cast<Kernel*>(persistentKernel), scheduler, gmmAddrInfo, config,
+                startLoopIdx, tileNum, gmm1TileReadySequence, expertIdx);
+        } else {
+            Kernel kernel;
+            GmmKernel::RunGmm1ComputeTiles<IsShared, TopkWeightsPrefetch>(
+                kernel, scheduler, gmmAddrInfo, config, startLoopIdx, tileNum, gmm1TileReadySequence, expertIdx);
+        }
+    } else {
+        GmmKernel::RunGmm1VectorEpilogueA8W4<ElementC, MakeLayoutC, TopkWeightsPrefetch, IsWaveFlagGrained>(
+            scheduler, params, gmmAddrInfo, config, startLoopIdx, tileNum, gmm1TileReadySequence,
+            activationQuantOp, expertBeforeCnt, expertIdx);
+    }
 
     startBlockIdx = (startBlockIdx + tileNum) % config.blockNum;
 }

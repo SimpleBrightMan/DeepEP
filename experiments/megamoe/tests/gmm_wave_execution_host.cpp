@@ -12,6 +12,7 @@ using ProblemShape = std::array<int64_t, 4>;
 constexpr uint32_t M_VALUE = 0, N_VALUE = 1, K_VALUE = 2;
 constexpr int AIC = 0, AIV = 1, COMBINE_NO_QUANT = 0;
 constexpr uint32_t ACTIVATION_N_HALF = 2;
+constexpr uint32_t L1_TILE_N = 256;
 template <size_t I, typename T> auto& Get(T& value) { return std::get<I>(value); }
 namespace Ops::Base {
 template <typename T> T CeilDiv(T a, T b) { return a / b + (a % b != 0); }
@@ -26,7 +27,10 @@ using ExpertLoopState = ExpertContext;  // Frozen baseline spelling, not a produ
 ExpertContext CreateExpertLoopState(const MoeStageCommonConfig& c) { return CreateExpertContext(c); }
 struct GMMAddrInfo {};
 struct FakeParams {
-    int workspaceInfo = 0;
+    struct Workspace {
+        int expertRevTokenNumsPtr = 0;
+        operator int() const { return 0; }
+    } workspaceInfo;
     operator int() const { return 0; }
 };
 struct WaveCombineBufferConfig { uint32_t rowBufferCount = 0; };
@@ -45,6 +49,12 @@ struct Timer {
     void EndSpan(int) {}
 };
 using Event = std::array<uint64_t, 9>;
+struct PipelineStub {
+    void HandoffTo(PipelineStub&) {}
+    void DrainOutput() {}
+    void End() {}
+};
+struct Gmm1AsyncCompletion { static void DrainProducer() {} };
 
 template <int Core, int CombineQuantMode, bool FuseGateUp = false>
 struct WaveHarness {
@@ -52,6 +62,16 @@ struct WaveHarness {
     static constexpr uint32_t GMM1_TILE_M = 256;
     static constexpr uint32_t GMM1_TASK_N = FuseGateUp ? 128 : 256;
     static constexpr bool ENABLE_A8W4 = true;
+    static constexpr bool ASYNC_GMM1 = CombineQuantMode == COMBINE_NO_QUANT;
+    PipelineStub gmm1CatlassContext_, gmm2WaveContext_;
+    struct { struct { uint32_t jobIndex = 0, totalJobs = 32; } blockJob; } gmmExecutionConfig_;
+    int countWorkspace_ = 0;
+    uint32_t GetExpertTokenCountFromWorkspace(int, int, uint32_t, uint32_t expert) { return counts.at(expert); }
+    uint32_t GetMGroupCountForRows(uint32_t rows, uint32_t tile) { return (rows + tile - 1) / tile; }
+    uint32_t GetGmmFirstOwnedTile(uint32_t index, uint32_t jobs, uint32_t start, bool reverse) {
+        return ((reverse ? jobs - 1 - index : index) + jobs - start) % jobs;
+    }
+    void NotifyTokenCombineSliceReady(FakeParams&, uint32_t, uint32_t) {}
     uint32_t sharedExpertNum_ = 0;
     FakeParams params_;
     int waveCombineJob_ = 0;
@@ -147,7 +167,7 @@ struct WaveHarness {
     template <bool SourceFused>
     void RunGmm2CombineForExpert(const ExpertContext& context, const ExpertSlice& slice, GMMAddrInfo&,
                                 uint32_t& start, WaveCombineBufferConfig&, uint32_t& rowSequence,
-                                int32_t&, bool final, bool reverse) {
+                                int32_t&, bool final, bool reverse, void* = nullptr) {
         assert(reverse);
         assert(context.expertIdx == slice.expertIdx);
         assert(context.globalTokenStartIndex + slice.rowStartInExpert == slice.globalRowStart);
