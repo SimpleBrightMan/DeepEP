@@ -19,7 +19,7 @@ export DEEPEP_MEGAMOE_TIMER=ON
 bash experiments/megamoe/scripts/build.sh
 
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091  # 使用当前机器的空闲端口。
+export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091  # 默认复用此 IP，每轮自动选新端口。
 export LD_LIBRARY_PATH="${SHMEM_ROOT:-$PWD/third-party/shmem/install/shmem}/lib:$ASCEND_HOME_PATH/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # 只预览，不访问设备、不创建输出目录。
@@ -33,6 +33,19 @@ python3 experiments/megamoe/scripts/comm_core_sweep.py
 使用仓库原有 rank-first balanced 路由；默认 BS=2048/4096/8192。每种配比单独启动 torchrun，
 避免修改运行中的设备计划；每个算子调用仍只启动一个融合 kernel。
 `npu-smi info` 只保存只读快照，入口不会杀掉、抢占已有作业；16 张可见卡需由使用者分配。
+
+每个实际启动的 case 都使用新的 SHMEM runtime 和不同的 bootstrap 端口，包括 baseline 和最优复测。
+同一轮已使用的端口不会再次分配；默认保留 `DEEPEP_SHMEM_ENDPOINT` 的 IP，环境变量未设置时使用 127.0.0.1。
+正常 worker 路径执行流同步、SHMEM barrier/free/finalize，再关闭 TCPStore；父进程等待 torchrun 完整退出后才启动下一轮。
+轮间默认额外等待 2 秒，位于算子计时区间之外；`--case-gap-seconds 5` 可增加等待，`0` 可关闭。
+`--shmem-port-policy fixed` 可显式恢复固定 endpoint，便于对照；默认 `fresh`。
+各 case 日志记录 SHMEM endpoint、worker Python 和 torchrun 返回码。
+
+若错误为 `communication report ... Object of type int64 is not JSON serializable`，
+则是计时报告的 NumPy 整数序列化错误，通常发生在 baseline 后第一个带 timer 的候选，
+不表示已进入后续核数或 SHMEM 初始化失败。修复在 `timer/protocol.py`：
+从原始 timer 解码 metadata 前转换为 Python `int`，使报告可经 TCPStore JSON 交换。
+这是 Python 修复；已安装包也需要更新，单纯 `git pull` 不会更新 `site-packages`。
 
 ```bash
 # 首轮少量点验证；数字代表 INTRA 核数，CROSS=28-INTRA。

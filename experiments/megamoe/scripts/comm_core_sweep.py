@@ -7,13 +7,17 @@ import argparse
 import csv
 from datetime import datetime, timezone
 import itertools
+import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import signal
+import socket
 import statistics
 import subprocess
 import sys
+import time
 import uuid
 
 ENV_DISPATCH = "DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES"
@@ -44,6 +48,18 @@ def parse_args(argv=None):
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--timeout", type=int, default=3600, help="Seconds per fresh torchrun case")
+    parser.add_argument(
+        "--case-gap-seconds",
+        type=float,
+        default=2.0,
+        help="Wait between fully exited process groups; outside operator timing",
+    )
+    parser.add_argument(
+        "--shmem-port-policy",
+        choices=("fresh", "fixed"),
+        default="fresh",
+        help="Fresh SHMEM bootstrap port per case, or explicitly reuse the inherited endpoint",
+    )
     parser.add_argument("--alignment-rows", type=int, default=100000)
     parser.add_argument("--alignment-cols", type=int, default=30000)
     parser.add_argument("--alignment-repeats", type=int, default=20)
@@ -63,6 +79,8 @@ def parse_args(argv=None):
         parser.error("Invalid initial cohort, warmup or seed")
     if min(args.iters, args.timeout, args.alignment_rows, args.alignment_cols, args.alignment_repeats) < 1:
         parser.error("Iterations, timeout and alignment dimensions/repeats must be positive")
+    if not math.isfinite(args.case_gap_seconds) or not 0 <= args.case_gap_seconds <= 60:
+        parser.error("case-gap-seconds must be finite and in [0,60]")
     if any(not 0 <= value < float("inf") for value in (args.comparison_rtol, args.comparison_atol)):
         parser.error("Comparison tolerances must be finite and nonnegative")
     if args.output_dir is None:
@@ -101,6 +119,8 @@ def plan(args):
         dispatch_intra_candidates=args.dispatch_cores,
         combine_intra_candidates=args.combine_cores,
         initial_combine_intra=args.initial_combine_intra,
+        shmem_port_policy=args.shmem_port_policy,
+        case_gap_seconds=args.case_gap_seconds,
         case_launches_per_bs=candidates + 2,
         total_case_launches=len(args.bs_values) * (candidates + 2),
         selection="minimum timer-off mean(per-round maximum rank kernel duration)",
@@ -120,6 +140,7 @@ def plan(args):
             "Dispatch and Combine keep production slot policies (Prefill Combine has two slots).",
             "Staged search can miss interactions; fullgrid only finds the best sampled pair in this run.",
             "Timer pass is separate from timer-off operator profiling; no plots are generated.",
+            "Each launched case owns a new SHMEM runtime; fresh ports avoid cross-case bootstrap reuse.",
             f"Alignment scratch per rank: {args.alignment_rows * args.alignment_cols * 4} bytes.",
         ],
     )
@@ -132,7 +153,44 @@ def candidate_environment(pair, base=None):
     if pair is not None:
         environment[ENV_DISPATCH], environment[ENV_COMBINE] = map(str, pair)
     environment.setdefault("OMP_NUM_THREADS", "1")
+    environment["PYTHON_EXEC"] = sys.executable
     return environment
+
+
+def fresh_endpoint(environment, used):
+    """Choose a local IPv4 bootstrap port not used by another case in this run."""
+    inherited = environment.get("DEEPEP_SHMEM_ENDPOINT", "tcp://127.0.0.1:19091")
+    if not inherited.startswith("tcp://"):
+        raise ValueError("DEEPEP_SHMEM_ENDPOINT must be tcp://<local IPv4>:<port>")
+    host, separator, port = inherited[6:].partition(":")
+    if not separator or not port.isdecimal() or not 1024 <= int(port) <= 65535:
+        raise ValueError("DEEPEP_SHMEM_ENDPOINT must use an unprivileged TCP port")
+    host = str(ipaddress.IPv4Address(host))
+    for _ in range(128):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+            reservation.bind((host, 0))
+            selected = reservation.getsockname()[1]
+        endpoint = f"tcp://{host}:{selected}"
+        if endpoint not in used:
+            used.add(endpoint)
+            return endpoint
+    raise RuntimeError("Unable to choose a new SHMEM bootstrap port")
+
+
+def stop_owned_group(process):
+    """Only target the isolated process group created for this case."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
 
 
 def command(args, config_path, output, pair, baseline):
@@ -181,7 +239,15 @@ def execute(argv, *, cwd, environment, logfile, timeout):
     """Each case owns a process group so timeout cannot leave competing rank workers."""
     with logfile.open("w", encoding="utf-8") as log:
         log.write(
-            json.dumps(dict(argv=argv, comm_split={k: environment.get(k) for k in (ENV_DISPATCH, ENV_COMBINE)})) + "\n"
+            json.dumps(
+                dict(
+                    argv=argv,
+                    shmem_endpoint=environment.get("DEEPEP_SHMEM_ENDPOINT"),
+                    worker_python=environment.get("PYTHON_EXEC"),
+                    comm_split={k: environment.get(k) for k in (ENV_DISPATCH, ENV_COMBINE)},
+                )
+            )
+            + "\n"
         )
         log.flush()
         process = subprocess.Popen(
@@ -190,14 +256,11 @@ def execute(argv, *, cwd, environment, logfile, timeout):
         try:
             code = process.wait(timeout=timeout)
         except BaseException:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            stop_owned_group(process)
             raise
+        log.write(json.dumps(dict(event="torchrun_exit", pid=process.pid, returncode=code)) + "\n")
     if code:
+        stop_owned_group(process)
         raise RuntimeError(f"Case exited with status {code}; inspect {logfile}")
 
 
@@ -351,6 +414,7 @@ def main(argv=None):
         flush=True,
     )
     records, selections = [], []
+    used_endpoints, launched = set(), False
     for bs in args.bs_values:
         directory = args.output_dir / f"bs_{bs}"
         directory.mkdir()
@@ -360,18 +424,27 @@ def main(argv=None):
         cached = {}
 
         def run_case(pair, stage, fresh=False):
+            nonlocal launched
             if pair is not None and pair in cached and not fresh:
                 return cached[pair]
             name = "baseline" if pair is None else f"{stage}_d{pair[0]}_c{pair[1]}"
             output = directory / name
+            if launched and args.case_gap_seconds:
+                print(f"[CASE_GAP] previous torchrun exited; waiting {args.case_gap_seconds:g}s", flush=True)
+                time.sleep(args.case_gap_seconds)
+            environment = candidate_environment(pair)
+            if args.shmem_port_policy == "fresh":
+                environment["DEEPEP_SHMEM_ENDPOINT"] = fresh_endpoint(environment, used_endpoints)
+            print(f"[SHMEM_SESSION] new process group; endpoint={environment.get('DEEPEP_SHMEM_ENDPOINT')}", flush=True)
             print(f"[RUN] BS={bs} stage={stage} pair={pair}; log={directory / (name + '.log')}", flush=True)
             execute(
                 command(args, config_path, output, pair, baseline),
                 cwd=directory,
-                environment=candidate_environment(pair),
+                environment=environment,
                 logfile=directory / (name + ".log"),
                 timeout=args.timeout,
             )
+            launched = True
             item = dict(read_case(output, bs, pair), stage=stage)
             records.append(item)
             if pair is not None:

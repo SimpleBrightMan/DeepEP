@@ -61,7 +61,8 @@ def task_metadata(raw, core_id, logical_index):
     if dynamic_index < 0:
         return {}
     offset = TASK_METADATA_OFFSET + (core_id * len(DYNAMIC_NAMES) * MAX_DYNAMIC_ITER + dynamic_index) * 2
-    first, second = raw[offset : offset + 2]
+    # Device traces arrive as NumPy int64; reports go through TCPStore JSON.
+    first, second = map(int, raw[offset : offset + 2])
     if first == second == 0:
         return {}
     mask = (1 << 32) - 1

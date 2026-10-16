@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -47,6 +48,10 @@ def test_staged_cached_case_and_grid_counts():
         ("--bs-values", "0"),
         ("--comparison-atol", "nan"),
         ("--initial-combine-intra", "28"),
+        ("--case-gap-seconds", "-1"),
+        ("--case-gap-seconds", "nan"),
+        ("--case-gap-seconds", "61"),
+        ("--shmem-port-policy", "invalid"),
     ],
 )
 def test_reject_invalid_scan(option, value):
@@ -61,6 +66,7 @@ def test_original_environment_cleared_and_pair_command(tmp_path):
     pair = sweep.candidate_environment((12, 7), inherited)
     assert pair[sweep.ENV_DISPATCH] == "12" and pair[sweep.ENV_COMBINE] == "7"
     assert pair["LD_LIBRARY_PATH"] == "/sdk/lib"
+    assert pair["PYTHON_EXEC"] == sys.executable
     args = sweep.parse_args([])
     command = sweep.command(args, tmp_path / "model.json", tmp_path / "test", (12, 7), tmp_path / "base")
     assert "--no-timer-raw" in command and "--comm-report" in command and "0-15" in command
@@ -78,7 +84,9 @@ def test_selection_uses_slowest_rank_not_fastest():
 def test_staged_search_retains_first_stage_winner_outside_combine_candidates(tmp_path, monkeypatch):
     monkeypatch.setattr(sweep, "os", SimpleNamespace(name="posix", environ={}))
     monkeypatch.setattr(sweep.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="", stderr=""))
-    monkeypatch.setattr(sweep, "execute", lambda *a, **k: None)
+    launches, gaps = [], []
+    monkeypatch.setattr(sweep, "execute", lambda *a, **k: launches.append(k["environment"]))
+    monkeypatch.setattr(sweep.time, "sleep", gaps.append)
     monkeypatch.setattr(sweep, "print_case", lambda *a: None)
     selections = []
     monkeypatch.setattr(sweep, "write_summary", lambda path, plan, records, chosen: selections.extend(chosen))
@@ -91,6 +99,47 @@ def test_staged_search_retains_first_stage_winner_outside_combine_candidates(tmp
     sweep.main(["--output-dir", str(tmp_path / "run"), "--bs-values", "2048", "--intra-cores", "2,4"])
     assert selections[-1]["pair"] == [2, 12]
     assert selections[-1]["confirmation_us"] == 90
+    assert len(launches) == 6 and gaps == [2.0] * 5
+    assert len({env["DEEPEP_SHMEM_ENDPOINT"] for env in launches}) == len(launches)
+
+
+def test_fresh_endpoint_preserves_host_and_skips_previous_ports(monkeypatch):
+    ports, bound = iter([41001, 41001, 41002]), []
+
+    class Reservation:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def bind(self, address):
+            bound.append(address)
+
+        def getsockname(self):
+            return "127.0.0.1", next(ports)
+
+    monkeypatch.setattr(sweep.socket, "socket", lambda *args: Reservation())
+    used = set()
+    env = {"DEEPEP_SHMEM_ENDPOINT": "tcp://127.0.0.1:19091"}
+    assert sweep.fresh_endpoint(env, used) == "tcp://127.0.0.1:41001"
+    assert sweep.fresh_endpoint(env, used) == "tcp://127.0.0.1:41002"
+    assert bound == [("127.0.0.1", 0)] * 3
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Isolated process groups require Linux")
+@pytest.mark.parametrize("status", [0, 3])
+def test_execute_waits_and_records_exit_without_masking_child_failure(tmp_path, status):
+    log = tmp_path / "case.log"
+    argv = [sys.executable, "-c", f"raise SystemExit({status})"]
+    kwargs = dict(cwd=tmp_path, environment=sweep.candidate_environment(None), logfile=log, timeout=10)
+    if status:
+        with pytest.raises(RuntimeError, match="status 3"):
+            sweep.execute(argv, **kwargs)
+    else:
+        sweep.execute(argv, **kwargs)
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    assert records[-1]["event"] == "torchrun_exit" and records[-1]["returncode"] == status
 
 
 def test_case_reader_accepts_complete_data_and_rejects_incomplete_ranks(tmp_path):
