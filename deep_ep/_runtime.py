@@ -84,7 +84,8 @@ class Runtime:
     ):
         global _OWNER
         native = require_native("Runtime.__init__")
-        integer("capacity", capacity, 2 << 20, (1 << 30) if self._megamoe else (1 << 63) - 1)
+        # The optional hierarchy prototype reserves FP32 rank/group partials.
+        integer("capacity", capacity, 2 << 20, (8 << 30) if self._megamoe else (1 << 63) - 1)
         if capacity % (2 << 20):
             raise ValueError("capacity must be aligned to 2 MiB")
         integer("timeout", timeout, 1, 3600)

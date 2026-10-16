@@ -5,6 +5,10 @@ Modified by Joyce_An 2026
 
 # MegaMoE Prefill Beta
 
+本分支新增单机 EP16、四卡组的分层去重原型，完整说明和一键测试命令见
+[分层去重实现与验证](HIERARCHICAL_DEDUP.md)。原型采用多 kernel 和阶段同步，
+默认公共调用保持原路径，显式配置 `hierarchical=True` 和 `configure_hierarchy()` 后启用。
+
 公开入口：`deep_ep_experimental.megamoe`。W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度。
 构建和多机测试入口位于本目录的 `scripts/`；机器地址及环境配置由使用者提供。
 

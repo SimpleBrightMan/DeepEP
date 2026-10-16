@@ -12,6 +12,7 @@
 #ifndef MEGA_MOE_TYPES_H
 #define MEGA_MOE_TYPES_H
 
+#include "hierarchy_types.hpp"
 #include "lib/std/tuple.h"
 #include "tensor_api/tensor.h"
 #include "../mega_moe_tiling.hpp"
@@ -97,6 +98,7 @@ struct ExpertWeightTensorListAddrs {
 };
 
 struct Params {
+    MegaMoeHierarchyConfig hierarchy{};
     GM_ADDR aGmAddr;
     GM_ADDR inputScaleGmAddr = nullptr;  // 非空表示已经量化的 FP8 输入。
     GM_ADDR expertIdxGmAddr;

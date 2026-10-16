@@ -75,6 +75,11 @@ public:
                                 GM_ADDR expertTokenNumsOut, GM_ADDR workspaceGM, MegaMoeTilingData* tilingData,
                                 GM_ADDR tilingGM, GM_ADDR timerGM = nullptr);
 
+    __aicore__ inline void SetHierarchy(const MegaMoeHierarchyConfig& hierarchy)
+    {
+        params_.hierarchy = hierarchy;
+    }
+
 private:
     using SendMaskBufferConfig = MegaMoeSendMaskBufferConfig;
     using UnpermuteBufferConfig = MegaMoeUnpermuteBufferConfig;
@@ -914,7 +919,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
 
     // Decode: dual-AIV Quant/Route/reset; prefill shared: Route follows the public barrier.
     exceptionDump_.UpdateStage(MegaMoeImpl::Stage::INPUT_PREPARE);
-    ProcessInputPreparationStage();
+    if (params_.hierarchy.mode != 2U) ProcessInputPreparationStage();
     if constexpr (g_coreType == AIV) {
         PipeBarrier<PIPE_ALL>();
     } else {
@@ -923,6 +928,13 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
     SyncAll<false>();  // AIC 等待 AIV 完成输入准备后再进入 GMM。
     if constexpr (g_coreType == AIC) {
         timer_.End(AscendTimer::AIC_WAIT_INPUT_PREP);
+    }
+
+    if (params_.hierarchy.mode == 1U) {
+        SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(oriOverflowMode);
+        timer_.End(AscendTimer::KERNEL_TIMING);
+        timer_.FlushDynamicCounts();
+        return;
     }
 
     int32_t gmm1TileReadySequence = 0;
@@ -982,6 +994,13 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         // 阶段 4：可选的共享专家 GMM2，其结果由输出聚合阶段合并。
         exceptionDump_.UpdateStage(MegaMoeImpl::Stage::SHARED_EXPERT_GMM2);
         ProcessSharedExpertGmm2();
+    }
+
+    if (params_.hierarchy.mode == 2U) {
+        SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(oriOverflowMode);
+        timer_.End(AscendTimer::KERNEL_TIMING);
+        timer_.FlushDynamicCounts();
+        return;
     }
 
     // 阶段 5：所有 rank 完成 Combine 结果发送后，AIV 执行输出聚合。

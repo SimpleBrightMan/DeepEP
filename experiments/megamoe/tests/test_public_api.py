@@ -189,6 +189,39 @@ def weights():
     return prepared
 
 
+def test_hierarchy_route_guard_accepts_fresh_views_and_dynamic_weights(backend, monkeypatch):
+    b = backend.buffer
+    b.prepare(17)
+    monkeypatch.setattr(Tensor, "data_ptr", lambda self: self.data.ctypes.data, raising=False)
+    b._hierarchy_configured = True
+    b._hierarchy_route_version = b.topk_idx._version
+    y = Tensor(np.zeros((17, 1024)), "bfloat16")
+    for _ in range(2):
+        b.topk_weights.add_(Tensor(np.ones((17, 2)), "float32"))
+        api.fp8_fp4_mega_moe(y, *weights(), b)
+    launches = [event for event in backend.events if isinstance(event, tuple) and event[0] == "launch"]
+    assert len(launches) == 2
+    b.topk_idx.add_(Tensor(np.zeros((17, 2)), "int32"))
+    with pytest.raises(ValueError, match="reconfigure"):
+        api.fp8_fp4_mega_moe(y, *weights(), b)
+    b.prepare(1)
+    assert not b._hierarchy_configured and b._hierarchy_route_version is None
+
+
+def test_hierarchy_guard_rejects_timer_and_changed_route_storage(backend, monkeypatch):
+    b = backend.buffer
+    b.prepare(17)
+    monkeypatch.setattr(Tensor, "data_ptr", lambda self: self.data.ctypes.data, raising=False)
+    b._hierarchy_configured = True
+    b._hierarchy_route_version = b.topk_idx._version
+    y = Tensor(np.zeros((17, 1024)), "bfloat16")
+    with pytest.raises(ValueError, match="timer=None"):
+        api.fp8_fp4_mega_moe(y, *weights(), b, timer=b.allocate_timer())
+    w1, w2 = weights()
+    with pytest.raises(ValueError, match="configured routes"):
+        api.mega_moe((b.x, b.x_sf), b.topk_idx.clone(), b.topk_weights, w1, w2, b, out=y)
+
+
 @pytest.mark.parametrize("bf16", [False, True])
 def test_public_workflow_output_stats_timer_and_preparation_reuse(backend, bf16):
     b = backend.buffer

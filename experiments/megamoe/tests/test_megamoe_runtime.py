@@ -13,7 +13,9 @@ from deep_ep_experimental.megamoe.api import _MegaRuntime
 
 
 @pytest.mark.parametrize("backend", ["store", "gloo"])
-@pytest.mark.parametrize("case", ["same-host", "different-host", "missing-host", "mapping", "device", "engine"])
+@pytest.mark.parametrize(
+    "case", ["same-host", "different-host", "missing-host", "mapping", "device", "engine", "large-workspace"]
+)
 def test_megamoe_bootstrap(monkeypatch, backend, case):
     monkeypatch.setattr(_runtime, "endpoint", lambda: "tcp://127.0.0.1:19091")
     monkeypatch.setattr(_runtime, "_OWNER", None)
@@ -81,9 +83,16 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
             _MegaRuntime(group, 2 << 20)
         assert not created
     else:
-        runtime = _MegaRuntime(group, 2 << 20)
+        capacity = (8 << 30) if case == "large-workspace" else (2 << 20)
+        runtime = _MegaRuntime(group, capacity)
         try:
             assert len(created) == 1
-            assert created[0][:3] == (0, 2, 2 << 20)
+            assert created[0][:3] == (0, 2, capacity)
         finally:
             runtime.close()
+
+
+def test_hierarchy_capacity_rejects_over_limit_before_allocation(monkeypatch):
+    monkeypatch.setattr(_runtime, "require_native", lambda _: SimpleNamespace())
+    with pytest.raises(ValueError, match="capacity"):
+        _MegaRuntime(None, (8 << 30) + (2 << 20))

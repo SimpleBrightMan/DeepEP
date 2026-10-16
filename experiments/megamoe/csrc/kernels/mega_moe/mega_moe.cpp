@@ -15,6 +15,7 @@
 #endif
 
 using namespace AscendC;
+#include "hierarchy_kernels.hpp"
 
 // Explicit types replace asc_opc dtype/format/tiling-key specialisation.
 // A8W4's existing matmul prologue continues to interpret weights as NZ/C0_32.
@@ -26,7 +27,7 @@ __schedmode__(1) __global__
                                        GM_ADDR weight_scales2, GM_ADDR shared_weight1, GM_ADDR shared_weight2,
                                        GM_ADDR shared_weight_scales1, GM_ADDR shared_weight_scales2, GM_ADDR y,
                                        GM_ADDR expert_token_nums, GM_ADDR workspace, GM_ADDR timer,
-                                       MegaMoeTilingData tiling, uint64_t ffts_addr)
+                                       MegaMoeTilingData tiling, uint64_t ffts_addr, MegaMoeHierarchyConfig hierarchy)
 {
 #if defined(__NPU_DEVICE__)
     InitSocState();
@@ -39,6 +40,7 @@ __schedmode__(1) __global__
         op.Init(context, x, topk_ids, topk_weights, weight1, weight2, nullptr, weight_scales1, weight_scales2, x_scales,
                 shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
                 workspace, &tiling, nullptr, timer);
+        op.SetHierarchy(hierarchy);
         op.Process();
     } else {
         MegaMoeImpl::MegaMoeA8W8Wave<bfloat16_t, bfloat16_t, float, fp8_e4m3fn_t, kDispatchE4M3,
@@ -57,7 +59,7 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
     uint8_t* topk_ids, uint8_t* topk_weights, uint8_t* weight1, uint8_t* weight2, uint8_t* weight_scales1,
     uint8_t* weight_scales2, uint8_t* shared_weight1, uint8_t* shared_weight2, uint8_t* shared_weight_scales1,
     uint8_t* shared_weight_scales2, uint8_t* y, uint8_t* expert_token_nums, uint8_t* workspace, uint8_t* timer,
-    const uint8_t* tiling_host, uint64_t ffts_addr)
+    const uint8_t* tiling_host, uint64_t ffts_addr, MegaMoeHierarchyConfig hierarchy)
 {
     const auto& tiling = *reinterpret_cast<const MegaMoeTilingData*>(tiling_host);
     static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
@@ -66,16 +68,16 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
         mega_moe_kernel<true, true><<<block_dim, ub_bytes, stream>>>(
             context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
             shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
-            workspace, timer, tiling, ffts_addr);
+            workspace, timer, tiling, ffts_addr, hierarchy);
     } else if (is_a8w4) {
         mega_moe_kernel<true, false><<<block_dim, ub_bytes, stream>>>(
             context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
             shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
-            workspace, timer, tiling, ffts_addr);
+            workspace, timer, tiling, ffts_addr, hierarchy);
     } else {
         mega_moe_kernel<false><<<block_dim, ub_bytes, stream>>>(
             context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
             shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
-            workspace, timer, tiling, ffts_addr);
+            workspace, timer, tiling, ffts_addr, hierarchy);
     }
 }

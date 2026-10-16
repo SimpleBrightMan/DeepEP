@@ -3,6 +3,7 @@
 
 #include "forward.hpp"
 #include "kernel_launch.hpp"
+#include "hierarchy_host.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -295,7 +296,7 @@ void CheckTensor(const torch::Tensor& t, int64_t dims, const char* name)
 Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world,
            int64_t max_tokens, bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts,
            uint64_t symmetric_address, int64_t symmetric_bytes)
-    : ffts_(ffts)
+    : ffts_(ffts), symmetric_address_(symmetric_address), symmetric_bytes_(symmetric_bytes)
 {
     CheckTensor(example, 2, "plan input");
     TORCH_CHECK(example.size(0) > 0 && example.size(0) <= max_tokens && max_tokens <= 65536,
@@ -451,11 +452,19 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     const auto stream = c10_npu::getCurrentNPUStream();
     auto ptr = [](const torch::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
     auto opt = [&](const c10::optional<torch::Tensor>& tensor) { return tensor ? ptr(*tensor) : nullptr; };
-    mega_moe_kernel_do(platform_.block_dim, platform_.ub, stream.stream(), is_a8w4, ptr(context_), ptr(x),
-                       opt(x_scales), ptr(topk_ids), ptr(topk_weights), ptr(weight1), ptr(weight2), ptr(weight_scales1),
-                       ptr(weight_scales2), opt(shared_weight1), opt(shared_weight2), opt(shared_weight_scales1),
-                       opt(shared_weight_scales2), ptr(y), ptr(expert_tokens), ptr(workspace_), opt(timer),
-                       reinterpret_cast<const uint8_t*>(&tiling_), ffts_);
+    auto launch = [&](MegaMoeHierarchyConfig hierarchy) {
+        mega_moe_kernel_do(platform_.block_dim, platform_.ub, stream.stream(), is_a8w4, ptr(context_), ptr(x),
+                           opt(x_scales), ptr(topk_ids), ptr(topk_weights), ptr(weight1), ptr(weight2),
+                           ptr(weight_scales1), ptr(weight_scales2), opt(shared_weight1), opt(shared_weight2),
+                           opt(shared_weight_scales1), opt(shared_weight_scales2), ptr(y), ptr(expert_tokens),
+                           ptr(workspace_), hierarchy.mode == 1 ? nullptr : opt(timer),
+                           reinterpret_cast<const uint8_t*>(&tiling_), ffts_, hierarchy);
+    };
+    if (hierarchy_) {
+        ExecuteHierarchy(*hierarchy_, topk_ids, topk_weights, y, platform_, stream.stream(), ffts_, launch);
+    } else {
+        launch({});
+    }
     // The direct kernel launch bypasses the PyTorch dispatcher; record that
     // every argument remains live until the current NPU stream reaches it.
     for (const auto* tensor : {&x, &topk_ids, &topk_weights, &weight1, &weight2, &weight_scales1, &weight_scales2,

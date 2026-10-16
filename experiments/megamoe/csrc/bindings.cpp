@@ -14,10 +14,13 @@ PYBIND11_MODULE(_C, module)
     module.attr("api_protocol") = 4;
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.def("buffer_size", &deepep::megamoe::buffer_size);
+    module.def("hierarchy_buffer_size", &deepep::megamoe::hierarchy_buffer_size);
     py::class_<Plan>(module, "Plan")
         .def(py::init<torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t, int64_t, uint64_t,
                       uint64_t, int64_t>())
         .def("forward", &Plan::forward)
+        .def("configure_hierarchy", &Plan::configure_hierarchy)
+        .def("hierarchy_metrics", &Plan::hierarchy_metrics)
         .def_property_readonly("workspace_bytes", &Plan::workspace_bytes);
     module.def("ffts_config", [] { return shmemx_get_ffts_config(); });
     module.attr("timer_numel") = AscendTimer::TOTAL_BUFFER_SIZE;

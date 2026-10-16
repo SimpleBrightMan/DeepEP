@@ -4,11 +4,16 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <string>
 #include <tuple>
 #include <torch/extension.h>
 #include "kernels/mega_moe/mega_moe_tiling.hpp"
 
 namespace deepep::megamoe {
+
+struct HierarchyState;
 
 struct PlatformInfo {
     uint32_t aic;
@@ -37,14 +42,21 @@ public:
         return workspace_.numel();
     }
 
+    void configure_hierarchy(torch::Tensor global_topk_ids);
+    std::map<std::string, double> hierarchy_metrics() const;
+
 private:
     PlatformInfo platform_;
     MegaMoeTilingData tiling_;
     torch::Tensor workspace_;
     torch::Tensor context_;
     uint64_t ffts_;
+    uint64_t symmetric_address_ = 0;
+    int64_t symmetric_bytes_ = 0;
+    std::shared_ptr<HierarchyState> hierarchy_;
 };
 
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden);
+int64_t hierarchy_buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden);
 
 }  // namespace deepep::megamoe

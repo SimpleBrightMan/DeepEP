@@ -81,6 +81,7 @@ class SymmBuffer:
         *,
         ranks_per_node: int = 0,
         timeout: int = 120,
+        hierarchical: bool = False,
     ):
         import torch
         import torch.distributed as dist
@@ -109,6 +110,17 @@ class SymmBuffer:
                 raise ValueError("Experts must divide EP, with at most 128 local experts")
             if ranks_per_node and size % ranks_per_node:
                 raise ValueError("ranks_per_node must divide EP (contiguous node-major ranks)")
+            if type(hierarchical) is not bool:
+                raise TypeError("hierarchical must be bool")
+            if hierarchical and (
+                size != 16
+                or mma_type != "fp8xfp4"
+                or num_shared_experts
+                or hidden % 256
+                or not 384 <= num_max_tokens_per_rank <= 8192
+                or num_max_tokens_per_rank % 128
+            ):
+                raise ValueError("Hierarchy v1 requires EP16, W4A8, S=0, H%256=0, capacity in [384,8192] and %128=0")
         except (TypeError, ValueError) as failure:
             error = str(failure)
         # 在进入 SHMEM 之前共同校验布局，不能各 rank 各自选择通信偏移。
@@ -123,10 +135,14 @@ class SymmBuffer:
             activation,
             ranks_per_node,
             timeout,
+            hierarchical,
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
-        capacity = int(ext.buffer_size(size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden))
+        if hierarchical and not hasattr(ext, "hierarchy_buffer_size"):
+            raise RuntimeError("Rebuild and install the hierarchical-dedup branch before enabling hierarchy")
+        size_fn = ext.hierarchy_buffer_size if hierarchical else ext.buffer_size
+        capacity = int(size_fn(size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden))
         self._lock = threading.Lock()
         self._device = torch.device(f"npu:{npu_api().current_device()}")
         self._plan = self._plan_bs = None
@@ -135,6 +151,9 @@ class SymmBuffer:
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
         self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
         self.ranks_per_node = ranks_per_node
+        self.hierarchical = hierarchical
+        self._hierarchy_configured = False
+        self._hierarchy_route_version = None
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
         try:
@@ -171,6 +190,8 @@ class SymmBuffer:
             return
         # 只保留当前 BS 的计划，不让不同 BS 的最坏容量 workspace 累积占满 HBM。
         self._plan = self._plan_bs = None
+        self._hierarchy_configured = False
+        self._hierarchy_route_version = None
         runtime = self._runtime
         address = require_native("MegaMoE").megamoe_workspace_address(runtime.native)
         ext = _extension()
@@ -209,6 +230,56 @@ class SymmBuffer:
                 error = str(failure)
             collective_check(self.group, f"prepare BS={bs}", error)
         return self
+
+    def configure_hierarchy(self):
+        """Collectively build a fixed-route plan from this buffer's actual routing IDs.
+
+        Call after prepare(B) and filling topk_idx. Reconfigure after any route-ID
+        mutation. Inputs and route weights may change without rebuilding the plan.
+        Planning includes D2H and CPU/TCPStore metadata exchange, outside forward.
+        """
+        import time
+        import torch
+        from .hierarchy import gather_route_ids
+
+        started = time.perf_counter()
+        with self._lock:
+            error = None
+            try:
+                self._runtime.ensure_alive()
+                if not self.hierarchical or self._plan is None or self._plan_bs <= 256 or self._plan_bs % 128:
+                    raise ValueError("Create hierarchical=True buffer and prepare(B>256,B%128=0) first")
+                if not isinstance(self.group, StoreGroup):
+                    raise ValueError("Hierarchy v1 planning requires StoreGroup")
+            except Exception as failure:
+                error = str(failure)
+            collective_check(self.group, "hierarchy plan preflight", error, self._plan_bs)
+            ids = None
+            try:
+                ids = self.topk_idx[: self._plan_bs].cpu().numpy()
+            except Exception as failure:
+                error = str(failure)
+            collective_check(self.group, "hierarchy routing D2H", error)
+            global_ids = gather_route_ids(self.group, ids, self.num_experts)
+            try:
+                runtime = self._runtime
+                runtime.stream.wait_stream(npu_api().current_stream(runtime.device))
+                with npu_api().stream(runtime.stream):
+                    self._plan.configure_hierarchy(torch.from_numpy(global_ids))
+                runtime.stream.synchronize()
+            except Exception as failure:
+                error = str(failure)
+            collective_check(self.group, "hierarchy native plan", error)
+            self._hierarchy_configured = True
+            self._hierarchy_route_version = self.topk_idx._version
+            self.hierarchy_plan_wall_ms = (time.perf_counter() - started) * 1000
+        return global_ids
+
+    @property
+    def hierarchy_metrics(self):
+        if not self._hierarchy_configured:
+            raise RuntimeError("configure_hierarchy() must complete first")
+        return dict(self._plan.hierarchy_metrics())
 
     @property
     def workspace_bytes(self) -> int:
@@ -274,6 +345,9 @@ class SymmBuffer:
 
     def destroy(self):
         with self._lock:
+            if getattr(self, "hierarchical", False):
+                self._runtime.stream.synchronize()
+                self._plan = self._plan_bs = None
             self._runtime.close()
             self._plan = self._plan_bs = None
             self.x = self.x_sf = self.topk_idx = self.topk_weights = None
@@ -502,6 +576,16 @@ def _run(
     runtime = b._runtime
     with b._lock:
         runtime.ensure_alive()
+        if getattr(b, "_hierarchy_configured", False):
+            error = None
+            if (
+                b._plan_bs != data.shape[0]
+                or topk_idx.data_ptr() != b.topk_idx.data_ptr()
+                or b.topk_idx._version != b._hierarchy_route_version
+                or timer is not None
+            ):
+                error = "Hierarchy requires unchanged configured routes/BS and timer=None; reconfigure after ID changes"
+            collective_check(b.group, "hierarchy forward plan", error, (b._plan_bs, True))
         caller = npu_api().current_stream(runtime.device)
         runtime.stream.wait_stream(caller)
         # 同一 owner 的调用串行进入专属流，禁止不同流覆盖仍在使用的对称空间。

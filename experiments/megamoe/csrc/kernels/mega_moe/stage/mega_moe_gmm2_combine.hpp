@@ -91,9 +91,18 @@ __aicore__ inline void SendCombineTokenRow(uint32_t rowElements, uint64_t gmRemo
     CombineTokenRoute route = LoadCombineTokenRoute(metaInfoTensor, 0U);
 
     GlobalTensor<Element> gmRemoteD;
-    gmRemoteD.SetGlobalBuffer(
-        reinterpret_cast<__gm__ Element*>(GetRankWinAddrWithOffset(route.dstRankId, gmRemoteBaseOffset)));
     uint64_t gmDstRowOffset = GetCombineDstRowIndex(route, params) * rowElements;
+    if (params.hierarchy.mode == 2U) {
+        const uint64_t key = (static_cast<uint64_t>(route.dstRankId) * params.hierarchy.batch + route.tokenIdx) *
+                                 params.tilingData->topK +
+                             route.topkIdx;
+        const auto* slots = reinterpret_cast<__gm__ int32_t*>(params.hierarchy.edge_slots);
+        gmRemoteD.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(params.hierarchy.edge_outputs));
+        gmDstRowOffset = static_cast<uint64_t>(slots[key]) * rowElements;
+    } else {
+        gmRemoteD.SetGlobalBuffer(
+            reinterpret_cast<__gm__ Element*>(GetRankWinAddrWithOffset(route.dstRankId, gmRemoteBaseOffset)));
+    }
 
     DataCopyExtParams ub2GmParams{1U, static_cast<uint32_t>(rowElements * sizeof(Element)), 0U, 0U, 0U};
     DataCopyPad(gmRemoteD[gmDstRowOffset], rowTensor, ub2GmParams);

@@ -47,7 +47,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     combine_only_ = combine_only;
     constexpr uint64_t alignment = 2ULL * 1024 * 1024;
     if (size < 2 || size > (megamoe ? 128 : 512) || (!megamoe && (size & (size - 1))) || rank < 0 || rank >= size ||
-        bytes < alignment || bytes > (megamoe ? (1ULL << 30) : ((1ULL << 63) - 1U)) || bytes % alignment != 0 ||
+        bytes < alignment || bytes > (megamoe ? (8ULL << 30) : ((1ULL << 63) - 1U)) || bytes % alignment != 0 ||
         timeout < 1 || timeout > 3600 || (megamoe && (udma || mpi)) ||
         (!mpi && (endpoint.empty() || endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN ||
                   endpoint.find('\0') != std::string::npos))) {

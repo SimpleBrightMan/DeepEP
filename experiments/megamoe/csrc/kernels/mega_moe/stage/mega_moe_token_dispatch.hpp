@@ -122,7 +122,16 @@ __aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
     if constexpr (IsBufferReuse) {
         WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
     }
-    DataCopy(copyTmpTensor, remoteRankGlobalTensor[remoteCopyOffset], context.quantTokenScaleAlignBytes);
+    if (params.hierarchy.mode == 2U) {
+        const uint64_t key = static_cast<uint64_t>(remoteRankIdx) * params.hierarchy.batch + tokenIndex;
+        const auto* slots = reinterpret_cast<__gm__ int32_t*>(params.hierarchy.token_slots);
+        GlobalTensor<ActivationType> localCache;
+        localCache.SetGlobalBuffer(reinterpret_cast<__gm__ ActivationType*>(params.hierarchy.local_cache));
+        DataCopy(copyTmpTensor, localCache[static_cast<uint64_t>(slots[key]) * context.quantTokenScaleAlignBytes],
+                 context.quantTokenScaleAlignBytes);
+    } else {
+        DataCopy(copyTmpTensor, remoteRankGlobalTensor[remoteCopyOffset], context.quantTokenScaleAlignBytes);
+    }
     SetFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
 
     if constexpr (IsBufferReuse) {
