@@ -189,6 +189,82 @@ def weights():
     return prepared
 
 
+def replay_backend(backend):
+    b = backend.buffer
+    b.group.size = lambda: 16
+    b.group.rank = lambda: 0
+    b.num_experts = 32
+    backend.ext.small_batch_max_tokens = 1
+    backend.ext.communication_replay_protocol = 1
+    route = np.arange(17 * b.num_topk)
+    b.topk_idx.data[:] = ((route % 16) * 2 + (route // 16) % 2).reshape(17, b.num_topk)
+    events = backend.events
+
+    def prepare(plan, payload):
+        events.append(("prepare_comm", payload))
+
+    def forward(plan, data, scales, ids, weights, timer, out):
+        events.append(("comm_launch", timer))
+        out.data.fill(9)
+        return out, Tensor([17, 17], "int32")
+
+    def snapshot(plan, rows):
+        events.append(("snapshot", rows))
+        return (
+            Tensor(np.zeros((rows, 1024)), "float8_e4m3fn"),
+            Tensor(np.zeros((rows, 32)), "float8_e8m0fnu"),
+            Tensor(np.zeros((rows, 8)), "int32"),
+        )
+
+    backend.ext.Plan.prepare_communication = prepare
+    backend.ext.Plan.communication_forward = forward
+    backend.ext.Plan.communication_snapshot = snapshot
+    return Tensor(np.ones((34, 1024)), "bfloat16")
+
+
+def test_communication_replay_without_weight_arguments_and_snapshot_stream_lifetime(backend):
+    payload = replay_backend(backend)
+    b = backend.buffer
+    b.prepare_communication(17, combine_payload=payload)
+    out = Tensor(np.zeros((17, 1024)), "bfloat16")
+    timer = b.allocate_timer()
+    for _ in range(2):
+        y, counts = api.communication_forward(b, bs=17, timer=timer, out=out)
+        assert y is out and counts.tolist() == [17, 17]
+        np.testing.assert_array_equal(y.data, 9)
+    snapshot = b.communication_snapshot(34)
+    assert set(snapshot) == {"data", "scales", "metadata"}
+    assert all(tensor.streams == [b._runtime.stream] for tensor in snapshot.values())
+    assert sum(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple)) == 1
+    assert sum(event[0] == "comm_launch" for event in backend.events if isinstance(event, tuple)) == 2
+    assert not any(event[0] == "launch" for event in backend.events if isinstance(event, tuple))
+
+
+@pytest.mark.parametrize("change", ["route_version", "route_replaced", "bs", "full_operator"])
+def test_communication_replay_rejects_stale_preparation(backend, change):
+    payload = replay_backend(backend)
+    b = backend.buffer
+    b.prepare_communication(17, combine_payload=payload)
+    if change == "route_version":
+        b.topk_idx._version += 1
+    elif change == "route_replaced":
+        b.topk_idx = b.topk_idx.clone()
+    elif change == "full_operator":
+        backend.ext.small_batch_max_tokens = 256
+        api.fp8_fp4_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), *weights(), b)
+    with pytest.raises(RuntimeError, match="prepare_communication again"):
+        api.communication_forward(b, bs=16 if change == "bs" else 17)
+    assert not any(event[0] == "comm_launch" for event in backend.events if isinstance(event, tuple))
+
+
+def test_communication_preparation_rejects_valid_but_unbalanced_routes(backend):
+    payload = replay_backend(backend)
+    backend.buffer.topk_idx.data[:] = [0, 1]
+    with pytest.raises(ValueError, match="exact rank-first balanced routing"):
+        backend.buffer.prepare_communication(17, combine_payload=payload)
+    assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
+
+
 @pytest.mark.parametrize("bf16", [False, True])
 def test_public_workflow_output_stats_timer_and_preparation_reuse(backend, bf16):
     b = backend.buffer

@@ -42,6 +42,55 @@ def test_staged_cached_case_and_grid_counts():
     assert sweep.plan(args)["case_launches_per_bs"] == 11
 
 
+def test_full_reference_is_explicit_and_included_in_launch_plan():
+    args = sweep.parse_args(["--run-full-reference", "--timing-rtol", "0.05", "--require-timing-match"])
+    planned = sweep.plan(args)
+    assert planned["workload"] == "communication_only"
+    assert planned["total_case_launches"] == 6
+    assert planned["full_reference"] == "run" and planned["timing_rtol"] == 0.05
+    with pytest.raises(SystemExit):
+        sweep.parse_args(["--require-timing-match"])
+    with pytest.raises(SystemExit):
+        sweep.parse_args(["--run-full-reference", "--full-reference-dir", "old"])
+
+
+@pytest.mark.parametrize("different", ["intermediate_hidden", "alignment", "rank", "split"])
+def test_full_reference_rejects_incomparable_manifest_before_comparing_timers(tmp_path, different):
+    args = sweep.parse_args([])
+    reference, candidate = tmp_path / "full", tmp_path / "simulation"
+    timer = reference / "bs_2048" / "timer"
+    timer.mkdir(parents=True)
+    (timer / "communication.json").write_text("{}")
+    config = sweep.configuration(args, 2048)
+    manifest = dict(
+        api="fp8_fp4_mega_moe",
+        rank=0,
+        ep_size=16,
+        mode="perf",
+        input="fp8",
+        routing="balanced",
+        timer_ranks=list(range(16)),
+        config=config,
+        comm_core_split={sweep.ENV_DISPATCH: None, sweep.ENV_COMBINE: None},
+    )
+    simulated = dict(manifest, workload="communication_only", api="communication_forward")
+    altered = copy.deepcopy(manifest)
+    if different == "intermediate_hidden":
+        altered["config"]["model"]["intermediate_hidden"] = 1536
+    elif different == "alignment":
+        altered["config"]["alignment"]["repeats"] += 1
+    elif different == "rank":
+        altered["rank"] = 1
+    else:
+        altered["comm_core_split"][sweep.ENV_DISPATCH] = "12"
+    for root, value in ((reference, altered), (candidate, simulated)):
+        directory = root / "rank_0"
+        directory.mkdir(parents=True)
+        (directory / "manifest.json").write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="matching model/BS/alignment"):
+        sweep.compare_reference(args, reference, candidate, 2048, tmp_path / "comparison.json")
+
+
 @pytest.mark.parametrize(
     "option,value",
     [
@@ -50,7 +99,9 @@ def test_staged_cached_case_and_grid_counts():
         ("--intra-cores", "2,2"),
         ("--dispatch-intra-cores", "x"),
         ("--bs-values", "0"),
-        ("--comparison-atol", "nan"),
+        ("--bs-values", "256"),
+        ("--bs-values", "2048,1024"),
+        ("--timing-atol-us", "nan"),
         ("--initial-combine-intra", "28"),
         ("--combine-intra", "-1"),
         ("--combine-intra", "12"),  # baseline must preserve both original schedules
@@ -76,19 +127,24 @@ def test_original_environment_cleared_and_pair_command(tmp_path):
     assert pair["PYTHON_EXEC"] == sys.executable
     args = sweep.parse_args([])
     command = sweep.command(args, tmp_path / "model.json", tmp_path / "test", (12, 7), tmp_path / "base")
-    assert "--no-timer-raw" in command and "--comm-report" in command and "0-15" in command
+    assert "--no-timer-raw" in command and "deep_ep_experimental.megamoe.comm_benchmark" in command
     assert "--save-output-reference" not in command
     original_command = sweep.command(args, tmp_path / "model.json", tmp_path / "base", None, tmp_path / "base")
-    assert "--save-output-reference" in original_command
-    assert "--timer" in original_command and "--comm-report" in original_command
+    assert "--save-output-reference" not in original_command
+    assert "deep_ep_experimental.megamoe.comm_benchmark" in original_command
+    reference_command = sweep.command(
+        args, tmp_path / "model.json", tmp_path / "reference", None, tmp_path / "base", full_reference=True
+    )
+    assert "deep_ep_experimental.megamoe.benchmark" in reference_command
+    assert "--comm-report" in reference_command
     dispatch_only = sweep.candidate_environment((10, 0), inherited)
     assert dispatch_only[sweep.ENV_DISPATCH] == "10" and dispatch_only[sweep.ENV_COMBINE] == "0"
 
 
 def test_selection_uses_slowest_rank_not_fastest():
     records = [
-        dict(passed=True, pair=[7, 7], operator_rank_max_mean_us=110, operator_rank_min_mean_us=80),
-        dict(passed=True, pair=[8, 8], operator_rank_max_mean_us=100, operator_rank_min_mean_us=90),
+        dict(passed=True, pair=[7, 7], comm_kernel_rank_max_mean_us=110, comm_kernel_rank_min_mean_us=80),
+        dict(passed=True, pair=[8, 8], comm_kernel_rank_max_mean_us=100, comm_kernel_rank_min_mean_us=90),
     ]
     assert sweep.choose(records)["pair"] == [8, 8]
 
@@ -105,7 +161,7 @@ def test_staged_search_retains_first_stage_winner_outside_combine_candidates(tmp
     durations = {None: 200, (2, 12): 90, (4, 12): 100, (2, 2): 150, (2, 4): 130}
 
     def read(output, bs, pair):
-        return dict(pair=list(pair) if pair else None, passed=True, operator_rank_max_mean_us=durations[pair])
+        return dict(pair=list(pair) if pair else None, passed=True, comm_kernel_rank_max_mean_us=durations[pair])
 
     monkeypatch.setattr(sweep, "read_case", read)
     sweep.main(
@@ -138,7 +194,7 @@ def test_dispatch_only_keeps_combine_fixed_through_scan_and_confirmation(tmp_pat
     durations = {None: 200, (10, 7): 120, (12, 7): 110, (16, 7): 130, (20, 7): 125}
 
     def read(output, bs, pair):
-        return dict(pair=list(pair) if pair else None, passed=True, operator_rank_max_mean_us=durations[pair])
+        return dict(pair=list(pair) if pair else None, passed=True, comm_kernel_rank_max_mean_us=durations[pair])
 
     monkeypatch.setattr(sweep, "read_case", read)
     sweep.main(
@@ -186,7 +242,7 @@ def test_default_baseline_runs_each_bs_once_without_selection(tmp_path, monkeypa
     assert [item["bs"] for item in results] == [2048, 4096, 8192]
     assert all(item["pair"] is None and item["stage"] == "baseline" for item in results)
     assert not selections and len(launches) == 3
-    assert all("--comm-report" in argv and "--timer" in argv for argv, env in launches)
+    assert all("deep_ep_experimental.megamoe.comm_benchmark" in argv for argv, env in launches)
     assert all(sweep.ENV_DISPATCH not in env and sweep.ENV_COMBINE not in env for argv, env in launches)
 
 
@@ -239,6 +295,7 @@ def test_case_reader_accepts_complete_data_and_rejects_incomplete_ranks(tmp_path
             rank=rank,
             ep_size=16,
             mode="perf",
+            workload="communication_only",
             routing="balanced",
             input="fp8",
             comm_core_split={
@@ -251,10 +308,14 @@ def test_case_reader_accepts_complete_data_and_rejects_incomplete_ranks(tmp_path
         (directory / "manifest.json").write_text(json.dumps(manifest))
     rank0 = tmp_path / "rank_0" / f"bs_{bs}"
     rank0.mkdir()
-    profile = dict(timer_pass=False, per_rank_rounds_us=[[100.0 + rank, 102.0 + rank] for rank in range(16)])
+    profile = dict(
+        timer_pass=False,
+        metric="communication_only_kernel_duration_us",
+        per_rank_rounds_us=[[100.0 + rank, 102.0 + rank] for rank in range(16)],
+    )
     (rank0 / "profiling.json").write_text(json.dumps(profile))
     checks = [dict(rank=rank, passed=True) for rank in range(16)]
-    (rank0 / "output_comparison.json").write_text(json.dumps(checks))
+    (rank0 / "payload_accuracy.json").write_text(json.dumps(checks))
     (rank0 / "timer_accuracy.json").write_text(json.dumps(checks))
     (rank0 / "communication_audit_accuracy.json").write_text(json.dumps(checks))
     timer = tmp_path / f"bs_{bs}" / "timer"
@@ -269,8 +330,8 @@ def test_case_reader_accepts_complete_data_and_rejects_incomplete_ranks(tmp_path
     )
     (timer / "communication.json").write_text(json.dumps(communication))
     report = sweep.read_case(tmp_path, bs, pair)
-    assert report["operator_rank_max_mean_us"] == 116.0
-    assert report["operator_rank_min_mean_us"] == 101.0
+    assert report["comm_kernel_rank_max_mean_us"] == 116.0
+    assert report["comm_kernel_rank_min_mean_us"] == 101.0
     (rank0 / "timer_accuracy.json").write_text(json.dumps(checks[:-1]))
     with pytest.raises(ValueError, match="timer-on/off"):
         sweep.read_case(tmp_path, bs, pair)
@@ -317,9 +378,9 @@ def test_summary_and_console_keep_dispatch_combine_independent(tmp_path, capsys)
             stage="baseline" if pair is None else "dispatch",
             pair=pair,
             output_dir=str(tmp_path / ("baseline" if pair is None else "candidate")),
-            operator_rank_max_mean_us=2400.0,
-            operator_rank_min_mean_us=2350.0,
-            operator_all_ranks_mean_us=2375.0,
+            comm_kernel_rank_max_mean_us=2400.0,
+            comm_kernel_rank_min_mean_us=2350.0,
+            comm_kernel_all_ranks_mean_us=2375.0,
             communication=dict(operations=operation_values),
         )
         for pair in (None, [10, 0])

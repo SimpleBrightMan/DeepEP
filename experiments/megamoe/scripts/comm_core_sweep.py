@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026, SimpleBright_Man
 
-"""EP16 production W4A8 per-wave communication baseline and optional core-ratio sweeps."""
+"""EP16 communication-only MegaMoE simulation and optional core-ratio sweeps."""
 
 import argparse
 import csv
@@ -79,8 +79,24 @@ def parse_args(argv=None):
     parser.add_argument("--alignment-rows", type=int, default=100000)
     parser.add_argument("--alignment-cols", type=int, default=30000)
     parser.add_argument("--alignment-repeats", type=int, default=20)
-    parser.add_argument("--comparison-rtol", type=float, default=0.0)
-    parser.add_argument("--comparison-atol", type=float, default=0.0)
+    references = parser.add_mutually_exclusive_group()
+    references.add_argument(
+        "--run-full-reference",
+        action="store_true",
+        help="Run full MegaMoE once per BS and compare original per-core communication timers",
+    )
+    references.add_argument(
+        "--full-reference-dir", type=Path, help="Reuse a full MegaMoE sweep root containing bs_<BS>/baseline"
+    )
+    parser.add_argument(
+        "--timing-rtol", type=float, default=0.10, help="Per-core communication timing comparison relative tolerance"
+    )
+    parser.add_argument("--timing-atol-us", type=float, default=0.0)
+    parser.add_argument(
+        "--require-timing-match",
+        action="store_true",
+        help="Stop if any original-schedule core differs beyond timing tolerance",
+    )
     parser.add_argument("--keep-raw-timers", action="store_true", help="Can consume hundreds of GB across a sweep")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--plan", action="store_true", help="No build, device access, process launch or output files")
@@ -95,6 +111,8 @@ def parse_args(argv=None):
         )
     except argparse.ArgumentTypeError as error:
         parser.error(str(error))
+    if any(bs not in (2048, 4096, 8192) for bs in args.bs_values):
+        parser.error("Communication simulator currently supports BS2048/4096/8192 only")
     if not 0 <= args.initial_combine_intra <= 27 or args.warmup < 0 or args.seed < 0:
         parser.error("Invalid initial cohort, warmup or seed")
     if args.mode in ("baseline", "dispatch") and args.combine_intra_cores is not None:
@@ -105,8 +123,10 @@ def parse_args(argv=None):
         parser.error("Iterations, timeout and alignment dimensions/repeats must be positive")
     if not math.isfinite(args.case_gap_seconds) or not 0 <= args.case_gap_seconds <= 60:
         parser.error("case-gap-seconds must be finite and in [0,60]")
-    if any(not 0 <= value < float("inf") for value in (args.comparison_rtol, args.comparison_atol)):
+    if any(not 0 <= value < float("inf") for value in (args.timing_rtol, args.timing_atol_us)):
         parser.error("Comparison tolerances must be finite and nonnegative")
+    if args.require_timing_match and not (args.run_full_reference or args.full_reference_dir):
+        parser.error("--require-timing-match requires a full MegaMoE reference")
     if args.output_dir is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SZ")
         args.output_dir = ROOT / "benchmark-runs" / "megamoe_comm_core_sweep" / f"{stamp}_{uuid.uuid4().hex[:8]}"
@@ -129,7 +149,7 @@ def configuration(args, bs):
 def plan(args):
     if args.mode == "baseline":
         candidates = 0
-        stages = ["original production schedule + per-wave/core communication validation + full-output save"]
+        stages = ["communication-only original schedule + independent payload and wave/core validation"]
     elif args.mode == "dispatch":
         candidates = len(args.dispatch_cores)
         sweep_stage = "Dispatch sweep with Combine fixed; no Combine sweep"
@@ -143,13 +163,14 @@ def plan(args):
         sweep_stage = "Dispatch sweep with Combine fixed, then Combine sweep with best Dispatch"
     if args.mode != "baseline":
         stages = [
-            "original production schedule baseline + per-wave/core communication validation + full-output save",
+            "communication-only original schedule baseline + independent payload and wave/core validation",
             sweep_stage,
             "fresh-process confirmation of selected pair",
         ]
-    case_launches = 1 if args.mode == "baseline" else candidates + 2
+    case_launches = (1 if args.mode == "baseline" else candidates + 2) + int(args.run_full_reference)
     return dict(
-        schema_version=2,
+        schema_version=3,
+        workload="communication_only",
         mode=args.mode,
         ep_size=16,
         physical_aiv1_workers=28,
@@ -162,20 +183,27 @@ def plan(args):
         case_gap_seconds=args.case_gap_seconds,
         case_launches_per_bs=case_launches,
         total_case_launches=len(args.bs_values) * case_launches,
-        selection="minimum timer-off mean(per-round maximum rank kernel duration)",
+        selection="minimum timer-off communication-only mean(per-round maximum rank kernel duration)",
+        full_reference="run"
+        if args.run_full_reference
+        else str(args.full_reference_dir)
+        if args.full_reference_dir
+        else None,
+        timing_rtol=args.timing_rtol,
+        timing_atol_us=args.timing_atol_us,
         stages=stages,
         bandwidth="Each operation separately: rank payload bytes / (sum of all 28 core communication durations / 28)",
         global_optimum_guaranteed=False,
         model=configuration(args, args.bs_values[0])["model"],
         output_dir=str(args.output_dir),
         notes=[
-            "Every candidate checks every output element and expert counts against the original schedule.",
-            "Baseline is a regression reference, not an independent CPU Golden correctness proof.",
+            "Every case checks Dispatch bytes/scales/metadata and Combine output against independent synthetic payload expectations.",
+            "No weights, GMM1, SwiGLU or GMM2 run in communication-only cases; synthetic GMM2 rows are prepared once before timing.",
             "Dispatch and Combine keep production slot policies (Prefill Combine has two slots).",
             "Combine=0 means original Combine ownership; Dispatch experiments can leave Combine unchanged.",
-            "Baseline and candidates validate each wave/core against the production wave/task oracle.",
+            "Baseline and candidates validate each wave/core against the production wave/task oracle; workload equality alone does not prove matching time.",
             "Staged search can miss interactions; fullgrid only finds the best sampled pair in this run.",
-            "Timer pass is separate from timer-off operator profiling; no plots are generated.",
+            "Timer pass is separate from timer-off communication-only kernel profiling; no plots are generated.",
             "Each launched case owns a new SHMEM runtime; fresh ports avoid cross-case bootstrap reuse.",
             f"Alignment scratch per rank: {args.alignment_rows * args.alignment_cols * 4} bytes.",
         ],
@@ -229,7 +257,7 @@ def stop_owned_group(process):
         process.wait()
 
 
-def command(args, config_path, output, pair, baseline):
+def command(args, config_path, output, pair, baseline, *, full_reference=False):
     result = [
         sys.executable,
         "-I",
@@ -239,30 +267,25 @@ def command(args, config_path, output, pair, baseline):
         "--nnodes=1",
         "--nproc-per-node=16",
         "--module",
-        "deep_ep_experimental.megamoe.benchmark",
+        "deep_ep_experimental.megamoe.benchmark" if full_reference else "deep_ep_experimental.megamoe.comm_benchmark",
         "--config",
         str(config_path),
-        "--mode",
-        "perf",
-        "--input",
-        "fp8",
-        "--routing",
-        "balanced",
         "--output-dir",
         str(output),
     ]
-    if pair is None:
-        result.append("--save-output-reference")
-    else:
+    if full_reference:
         result += [
-            "--reference-output-dir",
-            str(baseline),
-            "--comparison-rtol",
-            str(args.comparison_rtol),
-            "--comparison-atol",
-            str(args.comparison_atol),
+            "--mode",
+            "perf",
+            "--input",
+            "fp8",
+            "--routing",
+            "balanced",
+            "--timer",
+            "--timer-ranks",
+            "0-15",
+            "--comm-report",
         ]
-    result += ["--timer", "--timer-ranks", "0-15", "--comm-report"]
     if not args.keep_raw_timers:
         result.append("--no-timer-raw")
     return result
@@ -308,6 +331,7 @@ def read_case(output, bs, pair):
             or manifest["mode"] != "perf"
             or manifest["routing"] != "balanced"
             or manifest["input"] != "fp8"
+            or manifest.get("workload") != "communication_only"
             or manifest["comm_core_split"] != expected_environment
             or manifest["config"]["bs_values"] != [bs]
         ):
@@ -317,12 +341,13 @@ def read_case(output, bs, pair):
         raise ValueError("Ranks loaded different installed builds")
     rank0 = output / "rank_0" / f"bs_{bs}"
     profile = json.loads((rank0 / "profiling.json").read_text(encoding="utf-8"))
-    comparisons = json.loads((rank0 / "output_comparison.json").read_text(encoding="utf-8"))
+    comparisons = json.loads((rank0 / "payload_accuracy.json").read_text(encoding="utf-8"))
     if sorted(r["rank"] for r in comparisons) != list(range(16)) or not all(r["passed"] for r in comparisons):
-        raise ValueError("Missing or failed full-output regression ranks")
+        raise ValueError("Missing or failed independent communication payload verification ranks")
     per_rank = profile["per_rank_rounds_us"]
     if (
         profile["timer_pass"]
+        or profile.get("metric") != "communication_only_kernel_duration_us"
         or len(per_rank) != 16
         or not per_rank[0]
         or any(len(v) != len(per_rank[0]) for v in per_rank)
@@ -336,9 +361,9 @@ def read_case(output, bs, pair):
         pair=list(pair) if pair else None,
         output_dir=str(output),
         passed=True,
-        operator_rank_max_mean_us=slowest,
-        operator_rank_min_mean_us=statistics.mean(min(values) for values in zip(*per_rank)),
-        operator_all_ranks_mean_us=statistics.mean(v for row in per_rank for v in row),
+        comm_kernel_rank_max_mean_us=slowest,
+        comm_kernel_rank_min_mean_us=statistics.mean(min(values) for values in zip(*per_rank)),
+        comm_kernel_all_ranks_mean_us=statistics.mean(v for row in per_rank for v in row),
         timer_pass=False,
         selected_rounds=len(per_rank[0]),
         communication=None,
@@ -369,10 +394,61 @@ def read_case(output, bs, pair):
     return report
 
 
+def compare_reference(args, reference, candidate, bs, destination):
+    """Installed comparison code checks identical tasks before timing tolerances."""
+    reference_report = reference / f"bs_{bs}" / "timer" / "communication.json"
+    candidate_report = candidate / f"bs_{bs}" / "timer" / "communication.json"
+    if not reference_report.is_file():
+        raise ValueError(f"Missing full MegaMoE reference: {reference_report}")
+    for rank in range(16):
+        manifest = json.loads((reference / f"rank_{rank}" / "manifest.json").read_text(encoding="utf-8"))
+        simulated = json.loads((candidate / f"rank_{rank}" / "manifest.json").read_text(encoding="utf-8"))
+        if (
+            manifest.get("api") != "fp8_fp4_mega_moe"
+            or manifest.get("rank") != rank
+            or manifest.get("ep_size") != 16
+            or manifest.get("mode") != "perf"
+            or manifest.get("input") != "fp8"
+            or manifest.get("routing") != "balanced"
+            or manifest.get("timer_ranks") != list(range(16))
+            or simulated.get("timer_ranks") != list(range(16))
+            or simulated.get("workload") != "communication_only"
+            or bs not in manifest.get("config", {}).get("bs_values", [])
+            or manifest.get("config", {}).get("model") != simulated["config"]["model"]
+            or manifest.get("config", {}).get("alignment") != simulated["config"].get("alignment")
+            or any(
+                manifest.get("comm_core_split", {}).get(name) not in (None, "0") for name in (ENV_DISPATCH, ENV_COMBINE)
+            )
+        ):
+            raise ValueError(
+                "Full reference must use EP16 original schedule, matching model/BS/alignment and balanced FP8 performance inputs"
+            )
+    argv = [
+        sys.executable,
+        "-I",
+        "-m",
+        "deep_ep_experimental.megamoe.comm_compare",
+        "--reference",
+        str(reference_report),
+        "--candidate",
+        str(candidate_report),
+        "--timing-rtol",
+        str(args.timing_rtol),
+        "--timing-atol-us",
+        str(args.timing_atol_us),
+        "--output",
+        str(destination),
+    ]
+    if args.require_timing_match:
+        argv.append("--require-timing-match")
+    subprocess.run(argv, check=True)
+    return json.loads(destination.read_text(encoding="utf-8"))
+
+
 def choose(records):
     if not records or any(not item["passed"] for item in records):
         raise ValueError("Cannot select from missing/failed cases")
-    return min(records, key=lambda item: (item["operator_rank_max_mean_us"], item["pair"]))
+    return min(records, key=lambda item: (item["comm_kernel_rank_max_mean_us"], item["pair"]))
 
 
 def write_summary(path, launch_plan, records, selections):
@@ -386,9 +462,9 @@ def write_summary(path, launch_plan, records, selections):
             "dispatch_cross",
             "combine_intra",
             "combine_cross",
-            "operator_rank_max_mean_us",
-            "operator_rank_min_mean_us",
-            "operator_all_ranks_mean_us",
+            "comm_kernel_rank_max_mean_us",
+            "comm_kernel_rank_min_mean_us",
+            "comm_kernel_all_ranks_mean_us",
             "DISPATCH_GBps",
             "COMBINE_GBps",
             "communication_report",
@@ -402,9 +478,9 @@ def write_summary(path, launch_plan, records, selections):
                 for key in (
                     "bs",
                     "stage",
-                    "operator_rank_max_mean_us",
-                    "operator_rank_min_mean_us",
-                    "operator_all_ranks_mean_us",
+                    "comm_kernel_rank_max_mean_us",
+                    "comm_kernel_rank_min_mean_us",
+                    "comm_kernel_all_ranks_mean_us",
                 )
             }
             if pair:
@@ -436,8 +512,8 @@ def print_case(item):
 
     label = f"D={schedule(pair[0])} C={schedule(pair[1])}" if pair else "original schedule"
     print(
-        f"[CASE] BS={item['bs']} {label} E2E rank-max-mean={item['operator_rank_max_mean_us']:.3f}us "
-        f"rank-min-mean={item['operator_rank_min_mean_us']:.3f}us (timer off; full-output regression passed)",
+        f"[CASE] BS={item['bs']} {label} COMM-KERNEL rank-max-mean={item['comm_kernel_rank_max_mean_us']:.3f}us "
+        f"rank-min-mean={item['comm_kernel_rank_min_mean_us']:.3f}us (timer off; independent payload verification passed)",
         flush=True,
     )
     if item["communication"]:
@@ -477,6 +553,25 @@ def main(argv=None):
         config_path.write_text(json.dumps(configuration(args, bs), indent=2) + "\n", encoding="utf-8")
         baseline = directory / "baseline"
         cached = {}
+        full_reference = None
+        if args.run_full_reference:
+            full_reference = directory / "full_reference"
+            if launched and args.case_gap_seconds:
+                time.sleep(args.case_gap_seconds)
+            environment = candidate_environment(None)
+            if args.shmem_port_policy == "fresh":
+                environment["DEEPEP_SHMEM_ENDPOINT"] = fresh_endpoint(environment, used_endpoints)
+            print(f"[REFERENCE] BS={bs} full MegaMoE; log={directory / 'full_reference.log'}", flush=True)
+            execute(
+                command(args, config_path, full_reference, None, baseline, full_reference=True),
+                cwd=directory,
+                environment=environment,
+                logfile=directory / "full_reference.log",
+                timeout=args.timeout,
+            )
+            launched = True
+        elif args.full_reference_dir:
+            full_reference = args.full_reference_dir.resolve() / f"bs_{bs}" / "baseline"
 
         def run_case(pair, stage, fresh=False):
             nonlocal launched
@@ -509,6 +604,17 @@ def main(argv=None):
             return item
 
         original = run_case(None, "baseline")
+        if full_reference is not None:
+            original["full_megamoe_comparison"] = compare_reference(
+                args, full_reference, baseline, bs, directory / "full_megamoe_comparison.json"
+            )
+            comparison = original["full_megamoe_comparison"]
+            print(
+                f"[REFERENCE_COMPARE] BS={bs} workload_match={comparison['workload_match']} "
+                f"timing_match={comparison['timing_match']}; {directory / 'full_megamoe_comparison.json'}",
+                flush=True,
+            )
+            write_summary(args.output_dir, launch_plan, records, selections)
         if args.mode == "baseline":
             continue
         if args.mode == "dispatch":
@@ -529,20 +635,22 @@ def main(argv=None):
             dict(
                 bs=bs,
                 pair=best["pair"],
-                selection_us=best["operator_rank_max_mean_us"],
-                confirmation_us=confirmed["operator_rank_max_mean_us"],
-                baseline_us=original["operator_rank_max_mean_us"],
-                speedup=original["operator_rank_max_mean_us"] / confirmed["operator_rank_max_mean_us"],
+                selection_us=best["comm_kernel_rank_max_mean_us"],
+                confirmation_us=confirmed["comm_kernel_rank_max_mean_us"],
+                baseline_us=original["comm_kernel_rank_max_mean_us"],
+                speedup=original["comm_kernel_rank_max_mean_us"] / confirmed["comm_kernel_rank_max_mean_us"],
             )
         )
         write_summary(args.output_dir, launch_plan, records, selections)
         print(
             f"[SELECTED] BS={bs} D_INTRA={best['pair'][0]} C_INTRA={best['pair'][1]} "
-            f"confirmed E2E={confirmed['operator_rank_max_mean_us']:.3f}us "
+            f"confirmed COMM-KERNEL={confirmed['comm_kernel_rank_max_mean_us']:.3f}us "
             f"speedup={selections[-1]['speedup']:.3f}x against original schedule",
             flush=True,
         )
-    print(f"[PASSED] {len(records)} case launches; {args.output_dir / 'summary.json'}", flush=True)
+    timing_mismatch = any(item.get("full_megamoe_comparison", {}).get("timing_match") is False for item in records)
+    status = "COMPLETED_TIMING_MISMATCH" if timing_mismatch else "PAYLOAD_AND_TASKS_PASSED"
+    print(f"[{status}] {len(records)} communication case launches; {args.output_dir / 'summary.json'}", flush=True)
 
 
 if __name__ == "__main__":

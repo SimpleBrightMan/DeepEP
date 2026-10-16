@@ -133,6 +133,7 @@ class SymmBuffer:
         self._lock = threading.Lock()
         self._device = torch.device(f"npu:{npu_api().current_device()}")
         self._plan = self._plan_bs = None
+        self._communication_route = None
         self.group, self.num_experts = group, num_experts
         self.num_max_tokens_per_rank, self.num_topk = num_max_tokens_per_rank, num_topk
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
@@ -175,6 +176,7 @@ class SymmBuffer:
             return
         # 只保留当前 BS 的计划，不让不同 BS 的最坏容量 workspace 累积占满 HBM。
         self._plan = self._plan_bs = None
+        self._communication_route = None
         runtime = self._runtime
         address = require_native("MegaMoE").megamoe_workspace_address(runtime.native)
         ext = _extension()
@@ -224,6 +226,78 @@ class SymmBuffer:
     def workspace_bytes(self) -> int:
         """Prepared local scratch only; excludes symmetric heap, inputs and weights."""
         return self._plan.workspace_bytes if self._plan is not None else 0
+
+    def prepare_communication(self, bs: int, *, combine_payload: Tensor) -> SymmBuffer:
+        """Prepare a balanced Prefill communication replay, outside timed launches.
+
+        combine_payload contains synthetic BF16 expert-major rows that replace
+        GMM2's output. Dispatch, Combine and their transfer buffers are unchanged.
+        No matrix weights are allocated or used. All ranks call this together.
+        """
+        import numpy as np
+        import torch
+
+        self._communication_route = None
+        self.validate_inputs(bs)
+        error = None
+        try:
+            extension = _extension()
+            if getattr(extension, "communication_replay_protocol", None) != 1:
+                raise RuntimeError("Rebuild and reinstall this branch to enable communication-only kernels")
+            if (
+                self.group.size() != 16
+                or self.num_shared_experts != 0
+                or self.mma_type != "fp8xfp4"
+                or bs <= extension.small_batch_max_tokens
+            ):
+                raise ValueError("Communication replay requires EP16, Prefill, FP8xFP4 and no shared experts")
+            if (
+                combine_payload.device != self._device
+                or combine_payload.dtype != torch.bfloat16
+                or tuple(combine_payload.shape) != (bs * self.num_topk, self.hidden)
+                or not combine_payload.is_contiguous()
+                or combine_payload.requires_grad
+            ):
+                raise ValueError("combine_payload must be contiguous inference-only BF16 [BS*topK,H] on the buffer NPU")
+            rank = self.group.rank()
+            route = np.arange(rank * bs * self.num_topk, (rank + 1) * bs * self.num_topk, dtype=np.int64)
+            local_experts = self.num_experts // self.group.size()
+            expected = (route % self.group.size()) * local_experts + (route // self.group.size()) % local_experts
+            actual = np.asarray(self.topk_idx[:bs].cpu().tolist())
+            if not np.array_equal(actual, expected.reshape(bs, self.num_topk)):
+                raise ValueError("Communication replay requires the repository's exact rank-first balanced routing")
+        except Exception as failure:
+            error = str(failure)
+        collective_check(self.group, "communication preparation inputs", error, bs)
+        self.prepare(bs)
+        with self._lock:
+            runtime = self._runtime
+            try:
+                runtime.ensure_alive()
+                runtime.stream.wait_stream(npu_api().current_stream(runtime.device))
+                with npu_api().stream(runtime.stream):
+                    self._plan.prepare_communication(combine_payload)
+                self._communication_route = (bs, self.topk_idx, self.topk_idx._version)
+            except Exception as failure:
+                error = str(failure)
+            collective_check(self.group, "communication payload preparation", error, bs)
+        return self
+
+    def communication_snapshot(self, rows: int) -> dict[str, Tensor]:
+        """Copy Dispatch data, scales and return metadata after replay, outside timing."""
+        with self._lock:
+            runtime = self._runtime
+            runtime.ensure_alive()
+            if self._communication_route is None:
+                raise RuntimeError("Call prepare_communication and communication_forward before taking a snapshot")
+            caller = npu_api().current_stream(runtime.device)
+            runtime.stream.wait_stream(caller)
+            with npu_api().stream(runtime.stream):
+                snapshot = self._plan.communication_snapshot(rows)
+            caller.wait_stream(runtime.stream)
+            for tensor in snapshot:
+                tensor.record_stream(caller)
+            return dict(zip(("data", "scales", "metadata"), snapshot, strict=True))
 
     @property
     def symmetric_buffer_bytes(self) -> int:
@@ -291,6 +365,7 @@ class SymmBuffer:
         with self._lock:
             self._runtime.close()
             self._plan = self._plan_bs = None
+            self._communication_route = None
             self.x = self.x_sf = self.topk_idx = self.topk_weights = None
 
     def __del__(self):
@@ -522,10 +597,55 @@ def _run(
         # 同一 owner 的调用串行进入专属流，禁止不同流覆盖仍在使用的对称空间。
         with npu_api().stream(runtime.stream):
             b._prepare(data.shape[0])
+            b._communication_route = None
             result = b._plan.forward(data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, out)
             if cumulative_stats is not None:
                 cumulative_stats.add_(result[1])
                 cumulative_stats.record_stream(runtime.stream)
+        caller.wait_stream(runtime.stream)
+        for tensor in result:
+            tensor.record_stream(caller)
+        return result
+
+
+def communication_forward(sym_buffer: SymmBuffer, *, bs: int, timer: Tensor | None = None, out: Tensor | None = None):
+    """Run the communication-only kernel using prepared buffer inputs, without GMM.
+
+    The kernel retains routing preparation, Dispatch GET, Combine PUT and final
+    Unpermute. Transfer timers exclude the input/output preparation stages.
+    Synthetic expert output must have been installed by prepare_communication.
+    """
+    if not isinstance(sym_buffer, SymmBuffer):
+        raise TypeError("sym_buffer must be this installation's MegaMoE SymmBuffer")
+    b = sym_buffer
+    integer("BS", bs, 1, b.num_max_tokens_per_rank)
+    with b._lock:
+        runtime = b._runtime
+        runtime.ensure_alive()
+        prepared = b._communication_route
+        if prepared is None or prepared[0] != bs or prepared[1] is not b.topk_idx or prepared[2] != b.topk_idx._version:
+            raise RuntimeError("Call prepare_communication again after changing BS, routing or running full MegaMoE")
+        current_split = (
+            os.environ.get("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES"),
+            os.environ.get("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES"),
+        )
+        if current_split != b._comm_core_environment:
+            raise ValueError("Communication core environment changed; create a fresh SymmBuffer/process")
+        if any(t.requires_grad for t in (b.x, b.x_sf, b.topk_weights, out) if t is not None):
+            raise NotImplementedError("Communication replay is inference-only")
+        tensors = (b.x, b.x_sf, b.topk_idx, b.topk_weights, timer)
+        if out is not None and any(
+            out.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr()
+            for tensor in tensors
+            if tensor is not None
+        ):
+            raise ValueError("out must not overlap any communication input or timer storage")
+        caller = npu_api().current_stream(runtime.device)
+        runtime.stream.wait_stream(caller)
+        with npu_api().stream(runtime.stream):
+            result = b._plan.communication_forward(
+                b.x[:bs], b.x_sf[:bs], b.topk_idx[:bs], b.topk_weights[:bs], timer, out
+            )
         caller.wait_stream(runtime.stream)
         for tensor in result:
             tensor.record_stream(caller)

@@ -31,6 +31,7 @@ private:
 public:
     using MegaMoeBase::Init;
     __aicore__ inline void Process();
+    __aicore__ inline void ProcessCommunication();
 
 private:
     using QuantOutType = typename MegaMoeBase::QuantOutType;
@@ -103,6 +104,8 @@ private:
                                                       WaveCombineBufferConfig& combineBufferConfig,
                                                       uint32_t& combineRowSequence, int32_t& gmm1TileReadySequence);
     __aicore__ inline void ProcessMoeExpertStages(int32_t& gmm1TileReadySequence);
+    __aicore__ inline void ProcessCommunicationStages();
+    __aicore__ inline void PublishCommunicationSliceReadiness();
 };
 
 // 更新当前专家切片的输入、输出及同步地址，并执行 GMM1 和 Activation。
@@ -592,6 +595,101 @@ template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process()
 {
     this->ProcessWave(*this);
+}
+
+// The replay's BF16 expert outputs were initialized by the host on this stream.
+// They are immutable during the measured kernel. AIV0 only replaces the absent
+// GMM producer notification: it waits for the *real* Dispatch row counters, so
+// Combine never consumes metadata still being written by another AIV1 owner.
+// Each slice has one publisher, distributed across AIV0 cores. No extra local
+// or cross-rank phase barrier is introduced and no compute latency is invented.
+template <TemplateMegaMoeA8W4WaveTypeClass>
+__aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::PublishCommunicationSliceReadiness()
+{
+    WaitForMoeExpertTokenCountReady(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr, countWorkspace_, 0U);
+    ExpertTokenPosition position{};
+    uint32_t groups = 0U;
+    uint32_t sliceOrdinal = 0U;
+    const auto& job = gmmExecutionConfig_.blockJob;
+    while (position.expertIdx < commonConfig_.moeExpertPerRank) {
+        if (groups >= mGroupsPerWave_) {
+            groups = 0U;
+        }
+        const auto range = PlanNextExpertTokenRangeInWave<GMM1_TILE_M>(params_.workspaceInfo.expertRevTokenNumsPtr,
+                                                                       countWorkspace_, commonConfig_.moeExpertPerRank,
+                                                                       mGroupsPerWave_, groups, position);
+        position = range.end;
+        const uint32_t rows = static_cast<uint32_t>(range.end.globalTokenIndex - range.begin.globalTokenIndex);
+        if (rows == 0U) {
+            continue;
+        }
+        const uint32_t publisher = sliceOrdinal++ % job.totalJobs;
+        if (job.jobIndex != publisher) {
+            continue;
+        }
+        const uint32_t expert = range.begin.expertIdx;
+        const uint32_t rowStart = range.begin.tokenIndexInExpert;
+        auto dispatchReady = reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagDispatchToGmm1Ptr) +
+                             static_cast<uint64_t>(expert) * syncWorkspaceLayout_.dispatchFlagSlotCountPerExpert;
+        for (uint32_t done = 0U; done < rows; done += GMM1_TILE_M) {
+            const uint32_t tileRows = rows - done < GMM1_TILE_M ? rows - done : GMM1_TILE_M;
+            const uint64_t slot = static_cast<uint64_t>((rowStart + done) / GMM1_TILE_M) * INT_CACHELINE;
+            WaitUntilGmFlagEquals(dispatchReady + slot, static_cast<int32_t>(tileRows));
+        }
+        WriteGmByPassDCache(GetTokenCombineReadyCounter(params_, expert, rowStart),
+                            static_cast<int32_t>(GetTokenCombineProducerCount(commonConfig_, waveCombineJob_, rows)));
+    }
+}
+
+template <TemplateMegaMoeA8W4WaveTypeClass>
+__aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessCommunicationStages()
+{
+    static_assert(CombineQuantMode == COMBINE_NO_QUANT && !TopkWeightsPrefetch,
+                  "Communication replay supports the production W4A8 BF16-combine path");
+    if constexpr (g_coreType == AIV) {
+        DispatchBuffInit();
+        PrepareMoeExpertTokenCountTable<true>(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
+        if (GetSubBlockIdx() == 0U) {
+            PublishCommunicationSliceReadiness();
+            return;
+        }
+        timer_.SetCommunicationWaveBudget(mGroupsPerWave_);
+        ExpertTokenPosition dispatch{};
+        uint32_t dispatchGroups = 0U;
+        uint64_t dispatchWave = 0U;
+        // The production AIV1 priority loop always chooses any pending Dispatch
+        // before Combine. Removing Activation therefore yields this same order.
+        // Every slice retains its original wave budget, physical owner rotation,
+        // peer range, UB ring, ready publication and drain/timer boundaries.
+        while (dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
+            if (dispatchGroups >= mGroupsPerWave_) {
+                dispatchGroups = 0U;
+                ++dispatchWave;
+            }
+            DispatchNextExpertSlice(dispatch, dispatchGroups, dispatchWave);
+        }
+        AivTaskCursor combine{};
+        bool hasCombine = NextAivSlice(combine, false);
+        while (hasCombine) {
+            if (TryRunReadyCombine(combine)) {
+                hasCombine = NextAivSlice(combine, false);
+                continue;
+            }
+            // Ordinary readiness polling only; never pad the measured transfer
+            // intervals to resemble a full operator's duration.
+            int64_t start = AscendC::GetSystemCycle();
+            while (AscendC::GetSystemCycle() - start < GM_FLAG_POLL_BACKOFF_CYCLES) {
+            }
+        }
+        timer_.ClearSlice();
+        timer_.SetWave(AscendTimer::NO_WAVE);
+    }
+}
+
+template <TemplateMegaMoeA8W4WaveTypeClass>
+__aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessCommunication()
+{
+    this->template ProcessWave<MegaMoeA8W4Wave, true>(*this);
 }
 
 }  // namespace MegaMoeImpl

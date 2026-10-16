@@ -32,6 +32,15 @@ public:
         c10::optional<torch::Tensor> shared_weight2, c10::optional<torch::Tensor> shared_weight_scales1,
         c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<torch::Tensor> out);
 
+    // Experimental communication replay uses the same workspace and tiling as
+    // forward, with precomputed BF16 expert rows instead of GMM execution.
+    void prepare_communication(torch::Tensor combine_payload);
+    std::tuple<torch::Tensor, torch::Tensor> communication_forward(torch::Tensor x, torch::Tensor x_scales,
+                                                                   torch::Tensor topk_ids, torch::Tensor topk_weights,
+                                                                   c10::optional<torch::Tensor> timer,
+                                                                   c10::optional<torch::Tensor> out);
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> communication_snapshot(int64_t rows);
+
     int64_t workspace_bytes() const
     {
         return workspace_.numel();
@@ -43,6 +52,8 @@ private:
     torch::Tensor workspace_;
     torch::Tensor context_;
     uint64_t ffts_;
+    int64_t communication_rows_ = 0;
+    bool communication_completed_ = false;
 };
 
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden);

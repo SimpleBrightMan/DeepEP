@@ -11,3 +11,11 @@ extern "C" void mega_moe_kernel_do(uint32_t block_dim, uint32_t ub_bytes, void* 
                                    uint8_t* shared_weight1, uint8_t* shared_weight2, uint8_t* shared_weight_scales1,
                                    uint8_t* shared_weight_scales2, uint8_t* y, uint8_t* expert_token_nums,
                                    uint8_t* workspace, uint8_t* timer, const uint8_t* tiling_host, uint64_t ffts_addr);
+
+// Communication replay uses the same mixed-core launch and production stages.
+// The caller has populated the BF16 expert-row GMM2 workspace before launch.
+extern "C" void mega_moe_communication_kernel_do(uint32_t block_dim, uint32_t ub_bytes, void* stream, uint8_t* context,
+                                                 uint8_t* x, uint8_t* x_scales, uint8_t* topk_ids,
+                                                 uint8_t* topk_weights, uint8_t* y, uint8_t* expert_token_nums,
+                                                 uint8_t* workspace, uint8_t* timer, const uint8_t* tiling_host,
+                                                 uint64_t ffts_addr);

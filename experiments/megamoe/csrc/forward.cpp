@@ -364,6 +364,9 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     c10::optional<torch::Tensor> shared_weight2, c10::optional<torch::Tensor> shared_weight_scales1,
     c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<torch::Tensor> out)
 {
+    // A real GMM call overwrites the replay payload prepared in this workspace.
+    communication_rows_ = 0;
+    communication_completed_ = false;
     CheckTensor(x, 2, "x");
     CheckTensor(topk_ids, 2, "topk_ids");
     CheckTensor(topk_weights, 2, "topk_weights");
@@ -510,6 +513,112 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         c10_npu::NPUCachingAllocator::recordStream(x_scales->storage().data_ptr(), stream);
     }
     return {y, expert_tokens};
+}
+
+void Plan::prepare_communication(torch::Tensor combine_payload)
+{
+    communication_rows_ = 0;
+    communication_completed_ = false;
+    TORCH_CHECK(tiling_.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 &&
+                    tiling_.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT && tiling_.sharedExpertNum == 0U &&
+                    tiling_.epWorldSize == 16U && platform_.aic == 28U &&
+                    tiling_.bs > MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS,
+                "Communication replay requires Prefill W4A8, no shared experts, BF16 Combine, EP16 and 28 AIC groups");
+    CheckTensor(combine_payload, 2, "combine_payload");
+    const int64_t rows = static_cast<int64_t>(tiling_.bs) * tiling_.topK;
+    TORCH_CHECK(combine_payload.scalar_type() == torch::kBFloat16 && combine_payload.device() == workspace_.device() &&
+                    combine_payload.sizes() == torch::IntArrayRef({rows, tiling_.h}) && rows <= tiling_.maxOutputSize,
+                "combine_payload must be BF16 [BS*topK,H] on the plan NPU; replay requires balanced routing");
+    const MegaMoeImpl::WorkspaceInfo info(static_cast<uint8_t*>(workspace_.data_ptr()), &tiling_);
+    const auto stream = c10_npu::getCurrentNPUStream();
+    const size_t bytes = static_cast<size_t>(combine_payload.numel()) * sizeof(at::BFloat16);
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpyAsync(info.gmm2MmadResPtr, bytes, combine_payload.data_ptr(), bytes,
+                                             ACL_MEMCPY_DEVICE_TO_DEVICE, stream.stream()));
+    c10_npu::NPUCachingAllocator::recordStream(combine_payload.storage().data_ptr(), stream);
+    c10_npu::NPUCachingAllocator::recordStream(workspace_.storage().data_ptr(), stream);
+    communication_rows_ = rows;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> Plan::communication_forward(torch::Tensor x, torch::Tensor x_scales,
+                                                                     torch::Tensor topk_ids, torch::Tensor topk_weights,
+                                                                     c10::optional<torch::Tensor> timer,
+                                                                     c10::optional<torch::Tensor> out)
+{
+    TORCH_CHECK(communication_rows_ > 0, "Call prepare_communication after preparing the plan or running full MegaMoE");
+    CheckTensor(x, 2, "x");
+    CheckTensor(x_scales, 2, "x_scales");
+    CheckTensor(topk_ids, 2, "topk_ids");
+    CheckTensor(topk_weights, 2, "topk_weights");
+    TORCH_CHECK(
+        x.scalar_type() == c10::ScalarType::Float8_e4m3fn && x.sizes() == torch::IntArrayRef({tiling_.bs, tiling_.h}),
+        "Communication x must be FP8 E4M3 [BS,H] matching the plan");
+    TORCH_CHECK(x_scales.scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
+                    x_scales.sizes() == torch::IntArrayRef({tiling_.bs, CeilDiv(tiling_.h, uint32_t{32})}),
+                "Communication x_scales must be E8M0 [BS,H/32]");
+    TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32 && topk_weights.scalar_type() == torch::kFloat32 &&
+                    topk_ids.sizes() == torch::IntArrayRef({tiling_.bs, tiling_.topK}) &&
+                    topk_weights.sizes() == topk_ids.sizes(),
+                "Communication routing must be int32 IDs and float32 weights of shape [BS,topK]");
+    for (const auto* tensor : {&x, &x_scales, &topk_ids, &topk_weights}) {
+        TORCH_CHECK(tensor->device() == workspace_.device(), "Communication tensors must be on the plan NPU");
+    }
+    if (timer.has_value()) {
+#ifndef DEEPEP_MEGAMOE_TIMER
+        TORCH_CHECK(false, "Rebuild with DEEPEP_MEGAMOE_TIMER=ON before passing timer");
+#endif
+        CheckTensor(*timer, 1, "timer");
+        TORCH_CHECK(timer->device() == workspace_.device() && timer->scalar_type() == torch::kInt64 &&
+                        (timer->numel() == AscendTimer::TOTAL_BUFFER_SIZE ||
+                         timer->numel() == AscendTimer::COMM_AUDIT_BUFFER_SIZE),
+                    "Communication timer must be a normal or audit int64 buffer on the plan NPU");
+    }
+    auto y = out.has_value() ? *out : torch::empty(x.sizes(), x.options().dtype(torch::kBFloat16));
+    CheckTensor(y, 2, "out");
+    TORCH_CHECK(y.device() == workspace_.device() && y.scalar_type() == torch::kBFloat16 && y.sizes() == x.sizes(),
+                "Communication out must be BF16 [BS,H] on the plan NPU");
+    auto counts = torch::empty({tiling_.moeExpertPerRank}, x.options().dtype(torch::kInt32));
+    const auto stream = c10_npu::getCurrentNPUStream();
+    if (timer.has_value()) {
+        void* control = timer->data_ptr<int64_t>() + AscendTimer::COMM_AUDIT_ENABLE_OFFSET;
+        ASCEND_DEEPEP_CHECK_ACL(aclrtMemsetAsync(control, sizeof(int64_t), 0, sizeof(int64_t), stream.stream()));
+        if (timer->numel() == AscendTimer::COMM_AUDIT_BUFFER_SIZE) {
+            ASCEND_DEEPEP_CHECK_ACL(aclrtMemsetAsync(control, sizeof(int64_t), 1, 1, stream.stream()));
+        }
+    }
+    auto ptr = [](const torch::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
+    mega_moe_communication_kernel_do(platform_.block_dim, platform_.ub, stream.stream(), ptr(context_), ptr(x),
+                                     ptr(x_scales), ptr(topk_ids), ptr(topk_weights), ptr(y), ptr(counts),
+                                     ptr(workspace_), timer ? ptr(*timer) : nullptr,
+                                     reinterpret_cast<const uint8_t*>(&tiling_), ffts_);
+    for (const auto* tensor : {&x, &x_scales, &topk_ids, &topk_weights, &y, &counts, &workspace_, &context_}) {
+        c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
+    }
+    if (timer) c10_npu::NPUCachingAllocator::recordStream(timer->storage().data_ptr(), stream);
+    communication_completed_ = true;
+    return {y, counts};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> Plan::communication_snapshot(int64_t rows)
+{
+    TORCH_CHECK(communication_completed_ && rows == communication_rows_,
+                "Snapshot requires a completed communication launch and its exact prepared row count");
+    const MegaMoeImpl::WorkspaceInfo info(static_cast<uint8_t*>(workspace_.data_ptr()), &tiling_);
+    auto data = torch::empty({rows, tiling_.h}, workspace_.options().dtype(c10::ScalarType::Float8_e4m3fn));
+    auto scales = torch::empty({rows, CeilDiv(tiling_.h, uint32_t{32})},
+                               workspace_.options().dtype(c10::ScalarType::Float8_e8m0fnu));
+    auto metadata = torch::empty({rows, 8}, workspace_.options().dtype(torch::kInt32));
+    const auto stream = c10_npu::getCurrentNPUStream();
+    auto copy = [&](torch::Tensor& tensor, uint8_t* source) {
+        const size_t bytes = static_cast<size_t>(tensor.numel()) * tensor.element_size();
+        ASCEND_DEEPEP_CHECK_ACL(
+            aclrtMemcpyAsync(tensor.data_ptr(), bytes, source, bytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream.stream()));
+        c10_npu::NPUCachingAllocator::recordStream(tensor.storage().data_ptr(), stream);
+    };
+    copy(data, info.dispatchRevDataPtr);
+    copy(scales, info.dispatchRevScalePtr);
+    copy(metadata, info.metaInfoPtr);
+    c10_npu::NPUCachingAllocator::recordStream(workspace_.storage().data_ptr(), stream);
+    return {data, scales, metadata};
 }
 
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden)

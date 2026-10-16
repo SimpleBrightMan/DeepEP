@@ -112,7 +112,7 @@ protected:
         bool done = false;
     };
     __aicore__ inline bool TryRunSharedExpertActivation(SharedActivationCursor& cursor);
-    template <typename Derived>
+    template <typename Derived, bool CommunicationOnly = false>
     __aicore__ inline void ProcessWave(Derived& derived);
 
     __gm__ Mc2MoeContext* mc2Context_{nullptr};
@@ -904,7 +904,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
  * 所有 MTE Wave 路径共用相同的阶段边界，派生类只负责 MoE 专家 Wave 的具体编排。
  */
 template <TemplateMegaMoeTypeClass>
-template <typename Derived>
+template <typename Derived, bool CommunicationOnly>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& derived)
 {
     timer_.Start(AscendTimer::KERNEL_TIMING);
@@ -926,10 +926,12 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
     }
 
     int32_t gmm1TileReadySequence = 0;
-    if (sharedExpertNum_ > 0U) {
-        // Shared AIC/AIV0 start GMM1; AIV1 enters count/Dispatch (decode) or Route/handshake (prefill).
-        exceptionDump_.UpdateStage(MegaMoeImpl::Stage::SHARED_EXPERT_GMM1);
-        ProcessSharedExpertGmm1(gmm1TileReadySequence);
+    if constexpr (!CommunicationOnly) {
+        if (sharedExpertNum_ > 0U) {
+            // Shared AIC/AIV0 start GMM1; AIV1 enters count/Dispatch (decode) or Route/handshake (prefill).
+            exceptionDump_.UpdateStage(MegaMoeImpl::Stage::SHARED_EXPERT_GMM1);
+            ProcessSharedExpertGmm1(gmm1TileReadySequence);
+        }
     }
 
     // Decode uses per-slot epoch/count readiness; prefill retains its rank handshake.
@@ -962,14 +964,18 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         }
     }
     // 阶段 3：由派生类编排 MoE 专家的 Dispatch、GMM1/Activation 和 GMM2/Combine。
-    if constexpr (ENABLE_A8W4) {
+    if constexpr (CommunicationOnly) {
+        derived.ProcessCommunicationStages();
+    } else if constexpr (ENABLE_A8W4) {
         derived.ProcessMoeExpertStages(gmm1TileReadySequence);
     } else {
         derived.ProcessMoeExpertStages();
     }
-    if (ENABLE_A8W4 && sharedExpertNum_ > 0U) {
-        // AIC/AIV0 enter the shared tail without waiting for AIV1's final Combine.
-        ProcessSharedExpertTail();
+    if constexpr (!CommunicationOnly) {
+        if (ENABLE_A8W4 && sharedExpertNum_ > 0U) {
+            // AIC/AIV0 enter the shared tail without waiting for AIV1's final Combine.
+            ProcessSharedExpertTail();
+        }
     }
     if constexpr (g_coreType == AIV) {
         timer_.Start(AscendTimer::AIV_EXPORT_SYNC);
@@ -978,10 +984,12 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         SyncAll<true>();
         timer_.End(AscendTimer::AIV_EXPORT_SYNC);
     }
-    if (sharedExpertNum_ > 0U && !ENABLE_A8W4) {
-        // 阶段 4：可选的共享专家 GMM2，其结果由输出聚合阶段合并。
-        exceptionDump_.UpdateStage(MegaMoeImpl::Stage::SHARED_EXPERT_GMM2);
-        ProcessSharedExpertGmm2();
+    if constexpr (!CommunicationOnly) {
+        if (sharedExpertNum_ > 0U && !ENABLE_A8W4) {
+            // 阶段 4：可选的共享专家 GMM2，其结果由输出聚合阶段合并。
+            exceptionDump_.UpdateStage(MegaMoeImpl::Stage::SHARED_EXPERT_GMM2);
+            ProcessSharedExpertGmm2();
+        }
     }
 
     // 阶段 5：所有 rank 完成 Combine 结果发送后，AIV 执行输出聚合。
