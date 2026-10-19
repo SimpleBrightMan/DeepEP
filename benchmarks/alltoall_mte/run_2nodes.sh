@@ -60,6 +60,10 @@ done
     exit 2
 }
 [[ -f "$CANN_ENV" ]] || { echo "CANN_ENV not found: $CANN_ENV" >&2; exit 2; }
+if ! command -v "$PYTHON" >/dev/null 2>&1; then
+    echo "PYTHON not found on PATH: $PYTHON" >&2
+    exit 2
+fi
 [[ "$WORLD_SIZE" == "16" && "$NPROC_PER_NODE" == "8" ]] || {
     echo "this launcher targets EP16 over 2x8 NPUs" >&2
     exit 2

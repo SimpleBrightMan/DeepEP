@@ -54,7 +54,10 @@ done
 [[ "$WORLD_SIZE" == "16" ]] || { echo "this launcher targets exactly 16 ranks" >&2; exit 2; }
 [[ -n "$SHMEM_ROOT" ]] || { echo "SHMEM_ROOT must point at the installed SHMEM SDK" >&2; exit 2; }
 [[ -f "$CANN_ENV" ]] || { echo "CANN_ENV not found: $CANN_ENV" >&2; exit 2; }
-[[ -x "$PYTHON" ]] || { echo "PYTHON not executable: $PYTHON" >&2; exit 2; }
+if ! command -v "$PYTHON" >/dev/null 2>&1; then
+    echo "PYTHON not found on PATH: $PYTHON" >&2
+    exit 2
+fi
 
 source "$CANN_ENV"
 [[ ! -f "$SHMEM_ROOT/set_env.sh" ]] || source "$SHMEM_ROOT/set_env.sh"
