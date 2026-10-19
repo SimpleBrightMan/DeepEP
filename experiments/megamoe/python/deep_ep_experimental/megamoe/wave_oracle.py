@@ -84,6 +84,29 @@ def _balanced_owners(rows, workers, rotation):
     return result
 
 
+def _alltoall_owners(rows, rank, split, rotation):
+    """Stripe each cross-group peer's unchanged rows over the CROSS workers.
+
+    Enumerating every token makes the oracle independent of the device's
+    first-ordinal/stride representation. The rotating cursor carries across
+    peers even when their row counts differ or some peers have no rows.
+    """
+    by_peer = defaultdict(list)
+    for row in rows:
+        by_peer[row[1]].append(row)
+    workers = list(range(split, CORES))
+    result = []
+    cursor = rotation
+    for group_offset in (1, 2, 3):
+        group = (rank // 4 + group_offset) % 4
+        for lane_offset in range(4):
+            peer = group * 4 + (rank % 4 + lane_offset) % 4
+            for row in by_peer[peer]:
+                result.append((workers[cursor % len(workers)], row))
+                cursor += 1
+    return result
+
+
 def plan(
     bs,
     hidden,
@@ -104,8 +127,8 @@ def plan(
     """
     if any(type(n) is not int or not 0 <= n < CORES for n in (dispatch_intra, combine_intra)):
         raise ValueError("INTRA core counts must be 0 (original) or 1..27")
-    if group_order not in ("reverse", "paired-xor"):
-        raise ValueError("group_order must be reverse or paired-xor")
+    if group_order not in ("reverse", "paired-xor", "alltoall"):
+        raise ValueError("group_order must be reverse, paired-xor or alltoall")
     if group_order == "paired-xor" and (dispatch_intra == 0 or combine_intra == 0):
         raise ValueError("paired-xor requires EP16 with dispatch_intra and combine_intra each in 1..27")
     queues = route_queues(bs, topk, experts, rank)
@@ -147,6 +170,9 @@ def plan(
                     owned = []
                     for intra, workers in ((True, list(range(split))), (False, list(range(split, CORES)))):
                         rotation = global_row + wave
+                        if not intra and group_order == "alltoall":
+                            owned.extend(_alltoall_owners(identities, rank, split, rotation))
+                            continue
                         offsets = [0] if intra else [1, 2, 3]
                         for offset in offsets:
                             group = (rank // 4) ^ offset if group_order == "paired-xor" else (rank // 4 - offset) % 4

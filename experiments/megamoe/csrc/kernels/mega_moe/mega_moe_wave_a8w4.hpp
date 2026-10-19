@@ -32,7 +32,7 @@ public:
     using MegaMoeBase::Init;
     __aicore__ inline void Process();
     __aicore__ inline void ProcessCommunication(GM_ADDR dispatchMetadata = nullptr, uint32_t combineBufferCount = 2U,
-                                                bool pairedGroups = false);
+                                                uint32_t groupSchedule = 0U);
 
 private:
     using QuantOutType = typename MegaMoeBase::QuantOutType;
@@ -336,7 +336,7 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
         const auto segments = PlanCommSplitSlice(
             commonConfig_, params_, tokenDispatchScratch_, begin.expertIdx, begin.tokenIndexInExpert,
             begin.tokenIndexInExpert + rows, combineJob.jobIndex, params_.tilingData->combineIntraCores,
-            begin.globalTokenIndex + cursor.wave, waveCombineScratch_.pairedGroups);
+            begin.globalTokenIndex + cursor.wave, waveCombineScratch_.pairedGroups, waveCombineScratch_.alltoall);
         timer_.SetCommunicationRows(begin.expertIdx, begin.tokenIndexInExpert, segments.rows);
         RunCommSplitCombineSlice(commonConfig_, params_, state, begin.tokenIndexInExpert, segments, combineJob.jobIndex,
                                  timer_, waveCombineScratch_);
@@ -689,12 +689,14 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
 
 template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessCommunication(
-    GM_ADDR dispatchMetadata, uint32_t combineBufferCount, bool pairedGroups)
+    GM_ADDR dispatchMetadata, uint32_t combineBufferCount, uint32_t groupSchedule)
 {
     tokenDispatchScratch_.dmaMetadataInput = dispatchMetadata;
-    tokenDispatchScratch_.pairedGroups = pairedGroups;
+    tokenDispatchScratch_.pairedGroups = groupSchedule == 1U;
+    tokenDispatchScratch_.alltoall = groupSchedule == 2U;
     waveCombineScratch_.rowBufferCountOverride = combineBufferCount;
-    waveCombineScratch_.pairedGroups = pairedGroups;
+    waveCombineScratch_.pairedGroups = groupSchedule == 1U;
+    waveCombineScratch_.alltoall = groupSchedule == 2U;
     this->template ProcessWave<MegaMoeA8W4Wave, true>(*this);
 }
 

@@ -50,6 +50,7 @@ python3 experiments/megamoe/scripts/comm_core_sweep.py \
 通信模拟默认 `--dispatch-metadata-mode dma`，`scalar` 保留原逐 token metadata 写法供同构建对照。
 此开关只作用于通信实验；完整 MegaMoE 算子和 `--run-full-reference` 仍使用原 scalar metadata 路径。
 `baseline` 指原核心任务分配；metadata 算法由该独立开关指定。
+当任一通信阶段设置了 INTRA 核数时，DMA 选项还会自动启用下文的 `alltoall` 跨组分配与顺序，作用于所有已分核的阶段；未分核阶段仍保留原 owner。没有新增用户开关。
 
 DMA 模式在计时前生成本地 GM 只读身份表，每行 32B，含源 rank、源 token、TopK 槽位。
 Dispatch 通过 MTE2 把对应表项读到 UB，然后随 token/scale 一起由 MTE3 写入原 metadata 位置，去掉逐 token scalar metadata 写入及其 MTE3→S 等待。
@@ -57,19 +58,19 @@ Dispatch 通过 MTE2 把对应表项读到 UB，然后随 token/scale 一起由 
 每个 dispatch token 额外读取 32B **本地** GM，不增加跨卡通信 payload；带宽分子保持原定义。
 表的生成与准备在 timer-off profiler 和普通 timer 调用之前完成，表读取包含在通信计时内。
 
-两种模式沿用相同 Wave、每核任务、槽位数量、ready 协议和 Dispatch/Combine timer 边界。
-默认 Combine 仍为原 2 槽；下面的独立开关可测试 4/6 槽。批量读取路由索引所需 `MTE2_S`、slice ready 同步和槽位复用等待仍保留；metadata 实验不代表去除了全部 scalar 依赖。
+两种模式沿用相同 Wave token 集合、槽位数量、ready 协议和 Dispatch/Combine timer 边界。未分核 baseline 的每核任务不变；分核 DMA 的 CROSS 任务归属按 `alltoall` 重新分配，INTRA 分配保持原策略。
+默认 Combine 仍为原 2 槽；下面的独立开关可测试 4/6/8 槽。批量读取路由索引所需 `MTE2_S`、slice ready 同步和槽位复用等待仍保留；metadata 实验不代表去除了全部 scalar 依赖。
 `plan.json`、rank manifest、详细通信报告、`summary.json` / `summary.csv` 和控制台均记录 `dispatch_metadata_mode`，防止结果混淆。
 
 ## Combine 流水槽位实验
 
 `--combine-buffer-count {2,4,6,8}` 只改变通信模拟的 Prefill Combine 流水槽位，默认 2。
 完整 MegaMoE 及 `--run-full-reference` 仍按原策略使用 2 槽；Dispatch metadata 默认仍为 DMA，Dispatch 槽位和核心任务分配不受此开关影响。
-本次新增 8 槽选项；上一版 Combine metadata 批量预取已撤销，仍使用原逐 peer 段的 metadata 读取与等待。Dispatch 实现不改。
-Wave、每核 token 任务和传输字节数、ready 协议、两类通信 timer 边界保持原定义。
+8 槽选项继续保留；Combine metadata 批量预取仍处于撤销状态。此次只改变分核 DMA 的跨组任务分配与顺序，不改变槽数、每槽 token 数和计时口径。
+在相同调度配置下切换槽位，Wave、每核 token 任务和传输字节数、ready 协议、两类通信 timer 边界保持原定义。
 增加槽位扩大可同时在途的 Combine 搬运数量，是否改善带宽需要实测，不能由槽位数直接推断。
 BF16 payload 的 UB 空间为 120 KiB，必须满足 `align_up(H*2, 32) * slots <= 120*1024`；H3584 的 8 槽需要 56 KiB，H7680 的 8 槽恰好占满，H8192 的 8 槽会在准备阶段报错，应减少槽位。
-本次 Python/native 通信协议升级为 6，必须完整重新编译安装；旧二进制会提示重建。
+本次 Python/native 通信协议升级为 7，必须完整重新编译安装；旧二进制会提示重建。
 
 重新编译安装一次后，在同一构建下循环测试 2/4/6/8 槽，每个槽位跑 BS2048/4096/8192：
 
@@ -87,13 +88,24 @@ done
 控制台当前 GB/s 仍使用平均核时归一化口径，不是真实链路带宽；本次不改统计实现，主要比较 timer-off `COMM-KERNEL rank-max-mean` 和原始 timer。
 省略 `combine_buffer_count` 字段的旧报告按原 2 槽读取，不能作为 4/6/8 槽结果接受。
 
-## 配对组轮转与核心配比控制实验
+## 分组顺序与核心配比控制实验
 
 `--mode paired-groups` 默认每个 BS 运行一次 12/16 配置：Dispatch、Combine 均由 AIV1 核 0..11 处理 INTRA，核 12..27 处理 CROSS。
 可用 `--group-intra-cores 12,4,6` 按列出的顺序运行三种配置；Dispatch、Combine 的 INTRA 核数同时取该值，CROSS 为 `28-INTRA`。
 每种配置各运行一次，不增加 baseline、选优或 confirm。核心数取不同的整数 `1..27`，两种通信分别按各自任务量做均分。
 
-INTRA 包含本卡和同组其它三卡；`--group-order paired-xor` 为默认顺序，CROSS 按 `peer_group = own_group XOR phase`，依次 `phase=1,2,3` 处理：
+INTRA 包含本卡和同组其它三卡。DMA 分核路径自动采用 `group_order=alltoall`：
+
+- 跨组顺序为 `(own_group+1)%4`、`(own_group+2)%4`、`(own_group+3)%4`。
+- 每个目标组内，peer 从本 rank 的组内编号开始轮转：`(rank%4+step)%4`，`step=0,1,2,3`。
+- CROSS 核按该 peer 顺序轮转分配 token；一个核在同一 peer 内以 CROSS 核数为步长推进，替换原来按整组拼接行切连续区间的方式。
+- 保持每 Wave/slice 的 token 集合、源与目标布局以及有效 payload 字节数；INTRA 核分配不变，未分核阶段也不改变 owner。
+
+原 alltoall 使用每个 peer 等长的 token 区间；这里按实际路由的 peer 行数推进轮转起点，并保留 slice 的余数轮转，避免小 slice 的尾数总落在同一批核上。
+跨步分配后，Dispatch 会读取包含选中行的连续 route-index 区间，因此不同核会重复读取一部分索引；有效 token/scale/metadata payload 不增加，但总路由索引读取量可能增加。Combine 用 32B 步进 DMA 将该核的 metadata 收集到连续 UB，不改变 payload 的源行和返回地址。
+
+旧 `--group-order reverse` / `paired-xor` 参数仍可传入，但 DMA 且任一阶段分核时都被有效顺序 `alltoall` 覆盖；不会把实测结果标为 XOR 或 reverse。
+仅在 `--dispatch-metadata-mode scalar` 下，`--group-order paired-xor` 保留旧 XOR 顺序，CROSS 按 `peer_group = own_group XOR phase`，依次 `phase=1,2,3` 处理：
 
 | 逻辑阶段 | 配对组 |
 |---|---|
@@ -103,28 +115,28 @@ INTRA 包含本卡和同组其它三卡；`--group-order paired-xor` 为默认�
 
 这只是各核发起通信的先后顺序，没有新增阶段全卡同步、Host 同步或切组流水排空。
 各 rank/核心可因执行速度不同进入不同逻辑阶段，因此运行时不保证严格只有两组互通。
-`--group-order reverse` 则使用原错峰顺序 `(own_group-phase+4)%4`；可在相同配比下对比两种顺序。
+scalar 下的 `--group-order reverse` 使用原错峰顺序 `(own_group-phase+4)%4`；可在相同配比下对比这两种旧顺序。
 同一 kernel 内 INTRA 与 CROSS 并发；保留每 Wave 的 token 集合、搬运字节和现有 timer 边界，核心归属按所选配比重新划分。
 组内任务继续采用余数轮转均分，避免无法整除的余数一直落在固定核心。
 
-更新并按前文重新编译后运行（保持已测的 4/24 配比、XOR 顺序、Dispatch DMA，仅将 Combine 从 6 槽改为 8 槽；CLI 默认配比仍为 12/16）：
+更新并按前文重新编译后运行（保持最近测试的 4/24 配比、Dispatch DMA 和 Combine 8 槽，只替换跨组调度；无需传 `--group-order`。CLI 默认配比仍为 12/16）：
 
 ```bash
 python3 experiments/megamoe/scripts/comm_core_sweep.py \
   --mode paired-groups --bs-values 2048,4096,8192 \
-  --group-intra-cores 4 --group-order paired-xor \
+  --group-intra-cores 4 \
   --dispatch-metadata-mode dma --combine-buffer-count 8 \
   --no-validation --keep-raw-timers
 ```
 
-针对 BS4096，一次编译后做两种组顺序 × 12/4/6 INTRA 核的控制实验：
+仅当需要对照 scalar 旧路径时，针对 BS4096 做两种旧组顺序 × 12/4/6 INTRA 核的控制实验：
 
 ```bash
 for order in paired-xor reverse; do
   python3 experiments/megamoe/scripts/comm_core_sweep.py \
     --mode paired-groups --bs-values 4096 \
     --group-intra-cores 12,4,6 --group-order "$order" \
-    --dispatch-metadata-mode dma --combine-buffer-count 6 \
+    --dispatch-metadata-mode scalar --combine-buffer-count 8 \
     --no-validation --keep-raw-timers || break
 done
 ```
@@ -137,8 +149,10 @@ INTRA 为该类字节数除以 **N 个 INTRA 核累计通信耗时的均值**，
 这不是把分类时间稀释到 28 核的折算值，也不是整段 class-envelope 时间；两类带宽不能直接相加得到总带宽。
 原 Dispatch/Combine 总指标仍用全部 28 核累计通信时间的均值作分母，定义不变。
 原 baseline 核心同时承担混合拓扑任务，不生成无法从 timer 区分的分类带宽，CSV 对应列留空。
-driver 在选择 paired-xor 时设置 `DEEPEP_MEGAMOE_COMM_GROUP_ORDER=paired-xor`；选择 reverse、其它模式及完整 reference 都清除此继承变量，保持原 reverse 顺序。
-旧报告缺少 `group_order` 字段时按 `reverse` 解释，不能作为 paired-xor 结果接受。
+driver 对 DMA 分核 case 设置 `DEEPEP_MEGAMOE_COMM_GROUP_ORDER=alltoall`，并在启动行、manifest 和汇总中记录实际顺序；plan 另外记录 `requested_group_order` 和固定为 `reverse` 的 `baseline_group_order`。
+scalar 分核 case 使用请求的 reverse / paired-xor；baseline 和完整 reference 会清除继承的分核与顺序变量，保持原 owner / reverse。扫描中 baseline 与候选分别按自己的实际顺序核对报告。
+直接调用 API/native 时也按 metadata 模式和实际分核数推导顺序；DMA 没有分核时为 reverse，scalar 与显式 `alltoall` 环境值组合会报错。
+旧报告缺少 `group_order` 字段时按 `reverse` 解释，不能作为 paired-xor 或 alltoall 结果接受。
 
 `--mode baseline` 仍保留原 28 核分工；`--combine-buffer-count` 的全局默认仍为 2。
 `--group-intra-cores`、`--group-order` 仅用于 paired-groups；新的配比列表不能与旧 `--intra-cores` / Dispatch / Combine 扫描参数混用。
@@ -200,7 +214,7 @@ python3 experiments/megamoe/scripts/comm_core_sweep.py \
 ```
 
 普通扫描中，`0` 或不设置表示该阶段原调度；`1..27` 表示 INTRA 核数，CROSS 为 `28-INTRA`。
-例如 Dispatch=10 时 AIV1 0..9 负责 INTRA，10..27 负责 CROSS。跨组按本组−1、本组−2、本组−3 处理，组切换不添加全卡屏障或排空流水。
+例如 Dispatch=10 时 AIV1 0..9 负责 INTRA，10..27 负责 CROSS。默认 DMA 使用上述 alltoall 跨组分配；若 Combine=0，Combine 仍使用原 owner。scalar 普通扫描仍按本组−1、本组−2、本组−3 处理，组切换不添加全卡屏障或排空流水。
 Prefill Dispatch 保留生产槽位策略（通常 6 槽）；通信模拟的 Combine 默认为原 2 槽，可用 `--combine-buffer-count 4`、`6` 或 `8` 做独立实验。
 默认模式为 baseline，扫描必须显式选 dispatch；仍保留显式 `--mode staged` / `--mode fullgrid`。
 候选选择标准为 timer-off **通信 kernel** 的每轮最慢 rank 耗时均值，最优候选在新进程中复测。

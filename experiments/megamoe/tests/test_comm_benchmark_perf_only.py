@@ -196,6 +196,7 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(
     if group_order == "paired-xor":
         monkeypatch.setenv("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "12")
         monkeypatch.setenv("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES", "12")
+    effective_order = "alltoall" if metadata_mode == "dma" and group_order == "paired-xor" else group_order
     bench.run(run.args, run.config, run.group)
     state, output = run.state, run.args.output_dir
     assert state.forbidden == []
@@ -214,7 +215,7 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(
     assert manifest["workload"] == "communication_only" and manifest["validation"] == "skipped"
     assert manifest["dispatch_metadata_mode"] == metadata_mode
     assert manifest["combine_buffer_count"] == combine_buffer_count
-    assert manifest["group_order"] == group_order
+    assert manifest["group_order"] == effective_order
     profile = json.loads((output / "rank_0/bs_8/profiling.json").read_text())
     assert profile["metric"] == "communication_only_kernel_duration_us"
     assert profile["rank_max_mean_us"] == 19.0
@@ -227,7 +228,7 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(
     assert detail["validation"]["status"] == "skipped"
     assert detail["dispatch_metadata_mode"] == metadata_mode
     assert detail["combine_buffer_count"] == combine_buffer_count
-    assert detail["group_order"] == group_order
+    assert detail["group_order"] == effective_order
     assert detail["validation"]["accounting"] == "timer_row_counts"
     assert [wave["operation"] for wave in detail["waves"]] == ["DISPATCH", "COMBINE"]
     assert all(len(wave["cores"]) == 28 for wave in detail["waves"])
@@ -235,7 +236,7 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(
     assert summary["validation"] == dict(strict_wave_core=False, status="skipped")
     assert summary["dispatch_metadata_mode"] == metadata_mode
     assert summary["combine_buffer_count"] == combine_buffer_count
-    assert summary["group_order"] == group_order
+    assert summary["group_order"] == effective_order
     assert len(summary["ranks"]) == 16
     for operation, mean_core_us in (("DISPATCH", 1.0), ("COMBINE", 2.0)):
         measured = detail["operations"][operation]
@@ -254,7 +255,7 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(
     printed = capsys.readouterr().out
     assert "validation skipped; no GMM executed" in printed
     assert f"combine_buffer_count={combine_buffer_count}" in printed
-    assert f"group_order={group_order}" in printed
+    assert f"group_order={effective_order}" in printed
 
 
 def test_strict_run_still_calls_oracle_before_timing(mocked_run):
@@ -266,7 +267,7 @@ def test_strict_run_still_calls_oracle_before_timing(mocked_run):
     assert run.state.timer_allocations == []
 
 
-@pytest.mark.parametrize("dispatch,combine", [(4, 4), (6, 6), (1, 27), (4, 6)])
+@pytest.mark.parametrize("dispatch,combine", [(4, 4), (6, 6), (1, 27), (4, 6), (4, 0), (0, 4)])
 def test_strict_run_passes_actual_paired_split_to_payload_oracle(mocked_run, monkeypatch, dispatch, combine):
     run = mocked_run
     run.args.no_validation = False
@@ -282,5 +283,20 @@ def test_strict_run_passes_actual_paired_split_to_payload_oracle(mocked_run, mon
     monkeypatch.setattr(bench, "expected_output", expected)
     with pytest.raises(RuntimeError, match="payload oracle reached"):
         bench.run(run.args, run.config, run.group)
-    assert observed == [dict(group_order="paired-xor", dispatch_intra=dispatch, combine_intra=combine)]
+    assert observed == [dict(group_order="alltoall", dispatch_intra=dispatch, combine_intra=combine)]
     assert run.state.timer_allocations == []
+
+
+@pytest.mark.parametrize("dispatch,combine", [(4, 0), (0, 4), (4, 6)])
+@pytest.mark.parametrize("requested", ["reverse", "paired-xor", "alltoall"])
+def test_dma_split_reports_effective_alltoall_for_each_stage(mocked_run, monkeypatch, dispatch, combine, requested):
+    run = mocked_run
+    monkeypatch.setenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", requested)
+    monkeypatch.setenv("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", str(dispatch))
+    monkeypatch.setenv("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES", str(combine))
+    bench.run(run.args, run.config, run.group)
+    manifest = json.loads((run.args.output_dir / "rank_0/manifest.json").read_text())
+    summary = json.loads((run.args.output_dir / "bs_8/timer/communication.json").read_text())
+    assert manifest["group_order"] == summary["group_order"] == "alltoall"
+    for operation, count in (("DISPATCH", dispatch), ("COMBINE", combine)):
+        assert ("cohorts" in summary["operations"][operation]) == (count > 0)

@@ -68,7 +68,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--group-order",
         choices=("paired-xor", "reverse"),
-        help="paired-groups only: cross-group ordering (default: paired-xor)",
+        help="paired-groups only: scalar cross-group order; DMA split cases use alltoall (default: paired-xor)",
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument(
@@ -215,14 +215,14 @@ def configuration(args, bs):
 
 def plan(args):
     validation_stage = "validation skipped" if args.no_validation else "independent payload and wave/core validation"
+    example_pair = None if args.mode == "baseline" else (args.dispatch_cores[0], args.initial_combine_intra)
+    group_order = effective_group_order(example_pair, args.group_order, args.dispatch_metadata_mode)
     if args.mode == "baseline":
         candidates = 0
         stages = [f"communication-only original schedule + {validation_stage}"]
     elif args.mode == "paired-groups":
         candidates = len(args.group_cores)
-        stages = [
-            f"Dispatch/Combine matched INTRA counts {args.group_cores}, order={args.group_order} + {validation_stage}"
-        ]
+        stages = [f"Dispatch/Combine matched INTRA counts {args.group_cores}, order={group_order} + {validation_stage}"]
     elif args.mode == "dispatch":
         candidates = len(args.dispatch_cores)
         sweep_stage = "Dispatch sweep with Combine fixed; no Combine sweep"
@@ -248,7 +248,9 @@ def plan(args):
         workload="communication_only",
         validation="skipped" if args.no_validation else "strict",
         mode=args.mode,
-        group_order=args.group_order,
+        group_order=group_order,
+        requested_group_order=args.group_order,
+        baseline_group_order="reverse",
         dispatch_metadata_mode=args.dispatch_metadata_mode,
         combine_buffer_count=args.combine_buffer_count,
         ep_size=16,
@@ -284,11 +286,13 @@ def plan(args):
             if args.no_validation
             else "Every case checks Dispatch bytes/scales/metadata and Combine output against independent synthetic payload expectations.",
             "No weights, GMM1, SwiGLU or GMM2 run in communication-only cases; synthetic GMM2 rows are prepared once before timing.",
-            "Paired groups use own_group XOR phase (1,2,3), with no inter-group barrier or pipeline drain at group switches."
-            if args.group_order == "paired-xor"
+            "DMA split stages use alltoall cross-group order (own+1,+2,+3) and peer token round-robin; unsplit stages retain original ownership."
+            if group_order == "alltoall"
+            else "Paired groups use own_group XOR phase (1,2,3), with no inter-group barrier or pipeline drain at group switches."
+            if group_order == "paired-xor"
             else "Split schedules use reverse cross-group order; inherited paired-group settings are cleared.",
             f"Dispatch keeps its production slot policy; communication-only Prefill Combine uses {args.combine_buffer_count} slots (original: 2).",
-            "Dispatch metadata DMA adds one local 32-byte read per row; remote payload bytes and task ownership are unchanged.",
+            "Dispatch metadata DMA adds one local 32-byte read per row; payload bytes and Wave token sets remain unchanged, while split CROSS ownership uses alltoall.",
             "Full MegaMoE reference retains original scalar Dispatch metadata; metadata modes need not match for optional task/timing comparisons.",
             "Combine=0 means original Combine ownership; Dispatch experiments can leave Combine unchanged.",
             "Timer structure and complete rank/profile reports are still checked; no task or full-operator timing comparison runs."
@@ -302,19 +306,32 @@ def plan(args):
     )
 
 
-def candidate_environment(pair, base=None, *, group_order="reverse"):
-    environment = dict(os.environ if base is None else base)
-    if group_order not in ("reverse", "paired-xor"):
-        raise ValueError("Group order must be reverse or paired-xor")
-    if group_order == "paired-xor" and (
-        pair is None or len(pair) != 2 or any(type(n) is not int or not 1 <= n <= 27 for n in pair)
-    ):
+def effective_group_order(pair, group_order="reverse", dispatch_metadata_mode="dma"):
+    if group_order not in ("reverse", "paired-xor", "alltoall"):
+        raise ValueError("Group order must be reverse, paired-xor or alltoall")
+    if dispatch_metadata_mode not in ("dma", "scalar"):
+        raise ValueError("Dispatch metadata mode must be dma or scalar")
+    if pair is not None and (len(pair) != 2 or any(type(n) is not int or not 0 <= n <= 27 for n in pair)):
+        raise ValueError("Communication INTRA counts must be 0 (original) or 1..27")
+    if dispatch_metadata_mode == "scalar" and group_order == "alltoall":
+        raise ValueError("alltoall group order requires DMA metadata")
+    if pair is None:
+        return "reverse"
+    if dispatch_metadata_mode == "dma":
+        return "alltoall" if any(pair) else "reverse"
+    if group_order == "paired-xor" and not all(pair):
         raise ValueError("paired-xor requires Dispatch/Combine INTRA counts in 1..27")
+    return group_order
+
+
+def candidate_environment(pair, base=None, *, group_order="reverse", dispatch_metadata_mode="dma"):
+    environment = dict(os.environ if base is None else base)
+    group_order = effective_group_order(pair, group_order, dispatch_metadata_mode)
     for name in (ENV_DISPATCH, ENV_COMBINE, ENV_GROUP_ORDER):
         environment.pop(name, None)
     if pair is not None:
         environment[ENV_DISPATCH], environment[ENV_COMBINE] = map(str, pair)
-    if group_order == "paired-xor":
+    if group_order != "reverse":
         environment[ENV_GROUP_ORDER] = group_order
     environment.setdefault("OMP_NUM_THREADS", "1")
     environment["PYTHON_EXEC"] = sys.executable
@@ -767,11 +784,18 @@ def main(argv=None):
             if launched and args.case_gap_seconds:
                 print(f"[CASE_GAP] previous torchrun exited; waiting {args.case_gap_seconds:g}s", flush=True)
                 time.sleep(args.case_gap_seconds)
-            environment = candidate_environment(pair, group_order=args.group_order)
+            environment = candidate_environment(
+                pair, group_order=args.group_order, dispatch_metadata_mode=args.dispatch_metadata_mode
+            )
+            actual_group_order = environment.get(ENV_GROUP_ORDER, "reverse")
             if args.shmem_port_policy == "fresh":
                 environment["DEEPEP_SHMEM_ENDPOINT"] = fresh_endpoint(environment, used_endpoints)
             print(f"[SHMEM_SESSION] new process group; endpoint={environment.get('DEEPEP_SHMEM_ENDPOINT')}", flush=True)
-            print(f"[RUN] BS={bs} stage={stage} pair={pair}; log={directory / (name + '.log')}", flush=True)
+            print(
+                f"[RUN] BS={bs} stage={stage} pair={pair} group_order={actual_group_order} "
+                f"(requested={args.group_order}); log={directory / (name + '.log')}",
+                flush=True,
+            )
             execute(
                 command(args, config_path, output, pair, baseline),
                 cwd=directory,
@@ -788,7 +812,7 @@ def main(argv=None):
                     validate=not args.no_validation,
                     dispatch_metadata_mode=args.dispatch_metadata_mode,
                     combine_buffer_count=args.combine_buffer_count,
-                    group_order=args.group_order,
+                    group_order=actual_group_order,
                 ),
                 stage=stage,
             )

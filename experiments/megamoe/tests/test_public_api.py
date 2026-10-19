@@ -203,7 +203,7 @@ def replay_backend(backend):
     b.group.rank = lambda: 0
     b.num_experts = 32
     backend.ext.small_batch_max_tokens = 1
-    backend.ext.communication_replay_protocol = 6
+    backend.ext.communication_replay_protocol = 7
     route = np.arange(17 * b.num_topk)
     b.topk_idx.data[:] = ((route % 16) * 2 + (route // 16) % 2).reshape(17, b.num_topk)
     events = backend.events
@@ -279,7 +279,7 @@ def test_communication_metadata_mode_must_match_all_ranks(backend, monkeypatch):
     assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
 
 
-@pytest.mark.parametrize("protocol", [None, 1, 2, 3, 4, 5])
+@pytest.mark.parametrize("protocol", [None, 1, 2, 3, 4, 5, 6])
 def test_communication_metadata_rejects_stale_extension_protocol(backend, protocol):
     payload = replay_backend(backend)
     backend.ext.communication_replay_protocol = protocol
@@ -363,9 +363,12 @@ def test_communication_combine_buffer_count_changes_on_repreparation(backend):
     ],
     indirect=True,
 )
-def test_communication_group_order_is_collectively_prepared(backend, monkeypatch, request):
+@pytest.mark.parametrize("metadata_mode", ["dma", "scalar"])
+def test_communication_group_order_is_collectively_prepared(backend, monkeypatch, request, metadata_mode):
     payload = replay_backend(backend)
     expected_order = request.node.callspec.params["backend"]["DEEPEP_MEGAMOE_COMM_GROUP_ORDER"]
+    if metadata_mode == "dma" and expected_order == "paired-xor":
+        expected_order = "alltoall"
     signatures = []
 
     def gather(output, value, **kwargs):
@@ -373,10 +376,12 @@ def test_communication_group_order_is_collectively_prepared(backend, monkeypatch
         signatures.append(value)
 
     monkeypatch.setattr(backend.dist, "all_gather_object", gather)
-    backend.buffer.prepare_communication(17, combine_payload=payload, combine_buffer_count=6)
-    assert signatures.count((None, (17, "dma", 6, expected_order))) == 2
+    backend.buffer.prepare_communication(
+        17, combine_payload=payload, combine_buffer_count=6, dispatch_metadata_mode=metadata_mode
+    )
+    assert signatures.count((None, (17, metadata_mode, 6, expected_order))) == 2
     prepared = [event for event in backend.events if isinstance(event, tuple) and event[0] == "prepare_comm"]
-    assert len(prepared) == 1 and prepared[0][2:] == (True, 6)
+    assert len(prepared) == 1 and prepared[0][2:] == (metadata_mode == "dma", 6)
     out = Tensor(np.zeros((17, 1024)), "bfloat16")
     api.communication_forward(backend.buffer, bs=17, out=out)
     assert any(event[0] == "comm_launch" for event in backend.events if isinstance(event, tuple))
@@ -386,7 +391,7 @@ def test_communication_group_order_is_collectively_prepared(backend, monkeypatch
 def test_communication_rejects_invalid_or_empty_group_order(backend, monkeypatch, order):
     payload = replay_backend(backend)
     monkeypatch.setenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", order)
-    with pytest.raises(ValueError, match="DEEPEP_MEGAMOE_COMM_GROUP_ORDER must be reverse or paired-xor"):
+    with pytest.raises(ValueError, match="DEEPEP_MEGAMOE_COMM_GROUP_ORDER must be reverse, paired-xor or alltoall"):
         backend.buffer.prepare_communication(17, combine_payload=payload)
     assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
 
@@ -425,8 +430,8 @@ def test_paired_groups_requires_valid_intra_core_settings(backend, monkeypatch, 
     ):
         if value is not None:
             monkeypatch.setenv(name, value)
-    with pytest.raises(ValueError, match=r"paired-xor requires Dispatch and Combine INTRA core counts in \[1,27\]"):
-        backend.buffer.prepare_communication(17, combine_payload=payload)
+    with pytest.raises(ValueError, match=r"paired-xor requires|Communication INTRA core counts"):
+        backend.buffer.prepare_communication(17, combine_payload=payload, dispatch_metadata_mode="scalar")
     assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
 
 
@@ -502,16 +507,45 @@ def test_communication_group_order_must_match_all_ranks(backend, monkeypatch):
 def test_communication_group_order_change_requires_repreparation(backend, monkeypatch):
     payload = replay_backend(backend)
     buffer = backend.buffer
-    buffer.prepare_communication(17, combine_payload=payload)
+    buffer.prepare_communication(17, combine_payload=payload, dispatch_metadata_mode="scalar")
     monkeypatch.setenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "reverse")
     with pytest.raises(RuntimeError, match="prepare_communication again after changing communication group order"):
         api.communication_forward(buffer, bs=17)
     assert not any(event[0] == "comm_launch" for event in backend.events if isinstance(event, tuple))
-    buffer.prepare_communication(17, combine_payload=payload)
+    buffer.prepare_communication(17, combine_payload=payload, dispatch_metadata_mode="scalar")
     out = Tensor(np.zeros((17, 1024)), "bfloat16")
     api.communication_forward(buffer, bs=17, out=out)
     assert sum(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple)) == 2
     assert sum(event[0] == "comm_launch" for event in backend.events if isinstance(event, tuple)) == 1
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        {"DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES": str(d), "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES": str(c)}
+        for d, c in ((0, 0), (4, 0), (0, 4), (4, 4), (4, 6))
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize("requested", ["reverse", "paired-xor", "alltoall"])
+def test_dma_replay_resolves_actual_schedule_and_ignores_overridden_order(backend, monkeypatch, request, requested):
+    payload = replay_backend(backend)
+    counts = request.node.callspec.params["backend"]
+    expected = "alltoall" if any(int(value) for value in counts.values()) else "reverse"
+    monkeypatch.setenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", requested)
+    backend.buffer.prepare_communication(17, combine_payload=payload)
+    assert backend.buffer._communication_route[3:] == (expected, "dma")
+    monkeypatch.setenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "reverse" if requested != "reverse" else "paired-xor")
+    api.communication_forward(backend.buffer, bs=17, out=Tensor(np.zeros((17, 1024)), "bfloat16"))
+    assert sum(event[0] == "comm_launch" for event in backend.events if isinstance(event, tuple)) == 1
+
+
+def test_scalar_replay_rejects_alltoall_environment(backend, monkeypatch):
+    payload = replay_backend(backend)
+    monkeypatch.setenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "alltoall")
+    with pytest.raises(ValueError, match="alltoall group order requires"):
+        backend.buffer.prepare_communication(17, combine_payload=payload, dispatch_metadata_mode="scalar")
+    assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
 
 
 @pytest.mark.parametrize("change", ["route_version", "route_replaced", "bs", "full_operator"])

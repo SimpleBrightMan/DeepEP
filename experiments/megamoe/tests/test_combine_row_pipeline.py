@@ -37,6 +37,7 @@ def test_actual_combine_row_pipeline_and_ub_limits(tmp_path):
         _function(source, "InitWaveCombineBuffers", template=True),
         _function(source, "InitTokenCombineSliceBuffers"),
         _function(source, "DrainCombineRowBuffers"),
+        _function(source, "PreloadWaveCombineMetaInfo"),
         _function(source, "SendWaveCombineToken", template=True),
         _function(source, "CombineWaveTokenRange", template=True),
     ]
@@ -76,3 +77,4 @@ def test_actual_combine_row_pipeline_and_ub_limits(tmp_path):
     completed = subprocess.run([str(executable)], check=True, capture_output=True, text=True, timeout=120)
     assert "Combine 2/4/6/8 slots: deferred DMA, events 0..7, peer segments and tail drains passed" in completed.stdout
     assert "UB: H3584/6144/7680 fit, H8192 eight-slot rejection, original Decode6/Prefill2 passed" in completed.stdout
+    assert "strided Combine: metadata gather and source rows 1/2/3/5/24/27, holes untouched passed" in completed.stdout

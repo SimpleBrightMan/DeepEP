@@ -18,5 +18,5 @@ extern "C" void mega_moe_communication_kernel_do(uint32_t block_dim, uint32_t ub
                                                  uint8_t* x, uint8_t* x_scales, uint8_t* topk_ids,
                                                  uint8_t* topk_weights, uint8_t* y, uint8_t* expert_token_nums,
                                                  uint8_t* workspace, uint8_t* dispatch_metadata,
-                                                 uint32_t combine_buffer_count, uint32_t paired_groups, uint8_t* timer,
+                                                 uint32_t combine_buffer_count, uint32_t group_schedule, uint8_t* timer,
                                                  const uint8_t* tiling_host, uint64_t ffts_addr);

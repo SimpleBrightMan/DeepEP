@@ -36,7 +36,7 @@ static uint32_t GetSubBlockIdx()
     return subBlock;
 }
 enum class TPosition { VECIN, VECCALC };
-enum class HardEvent { MTE2_MTE3, MTE3_MTE2, MTE2_V, V_MTE3 };
+enum class HardEvent { MTE2_MTE3, MTE3_MTE2, MTE2_V, V_MTE3, MTE2_S };
 struct Job {
     std::function<bool()> ready;
     std::function<void()> run;
@@ -45,9 +45,9 @@ struct Engine {
     std::vector<uint8_t> ub = std::vector<uint8_t>(256U * 1024U, 0xcd);
     std::array<std::vector<uint8_t>, 16> destinations;
     std::array<std::deque<Job>, 2> queue;
-    std::array<std::array<uint32_t, 8>, 4> issued{};
-    std::array<std::array<uint32_t, 8>, 4> consumed{};
-    std::array<std::array<uint32_t, 8>, 4> signaled{};
+    std::array<std::array<uint32_t, 8>, 5> issued{};
+    std::array<std::array<uint32_t, 8>, 5> consumed{};
+    std::array<std::array<uint32_t, 8>, 5> signaled{};
     uint32_t copies = 0U;
     uint32_t writes = 0U;
     uint32_t overlap = 0U;
@@ -133,6 +133,32 @@ struct DataCopyExtParams {
     uint32_t dstStride;
     uint32_t reserved;
 };
+struct DataCopyParams {
+    uint16_t blockCount;
+    uint16_t blockLen;
+    uint16_t srcStride;
+    uint16_t dstStride;
+};
+template <typename T>
+void DataCopy(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count)
+{
+    Require(count * sizeof(T) <= dst.length);
+    engine->queue[0].push_back({[] { return true; }, [=] { std::memcpy(dst.bytes, src.bytes, count * sizeof(T)); }});
+}
+template <typename T>
+void DataCopy(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyParams params)
+{
+    Require(params.blockCount > 0U && params.blockLen > 0U);
+    const uint32_t bytes = params.blockLen * 32U;
+    const uint32_t dstStep = bytes + params.dstStride * 32U;
+    const uint32_t srcStep = bytes + params.srcStride * 32U;
+    Require((params.blockCount - 1U) * dstStep + bytes <= dst.length);
+    engine->queue[0].push_back({[] { return true; },
+                                [=] {
+                                    for (uint32_t block = 0U; block < params.blockCount; ++block)
+                                        std::memcpy(dst.bytes + block * dstStep, src.bytes + block * srcStep, bytes);
+                                }});
+}
 template <typename T>
 struct DataCopyPadExtParams {
     bool enabled;
@@ -160,7 +186,7 @@ template <HardEvent Event>
 void SetFlag(TEventID id)
 {
     constexpr size_t type = static_cast<size_t>(Event);
-    constexpr size_t pipe = Event == HardEvent::MTE2_MTE3 ? 0U : 1U;
+    constexpr size_t pipe = Event == HardEvent::MTE2_MTE3 || Event == HardEvent::MTE2_S ? 0U : 1U;
     Require(id >= 0 && id <= 7);
     const auto generation = ++engine->issued[type][id];
     engine->queue[pipe].push_back({[] { return true; }, [=] { engine->signaled[type][id] = generation; }});
@@ -173,7 +199,11 @@ void WaitFlag(TEventID id)
     Require(id >= 0 && id <= 7);
     const auto generation = ++engine->consumed[type][id];
     Require(generation <= engine->issued[type][id]);
-    engine->queue[pipe].push_back({[=] { return engine->signaled[type][id] >= generation; }, [] {}});
+    if constexpr (Event == HardEvent::MTE2_S) {
+        while (engine->signaled[type][id] < generation) Require(engine->Advance());
+    } else {
+        engine->queue[pipe].push_back({[=] { return engine->signaled[type][id] >= generation; }, [] {}});
+    }
 }
 }  // namespace AscendC
 
@@ -205,6 +235,9 @@ struct Params {
     struct Tiling {
         uint32_t topK = 8U;
     }* tilingData;
+    struct {
+        GM_ADDR metaInfoPtr;
+    } workspaceInfo;
 };
 struct AscendTimerDevice {
     void AuditTransfer(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t)
@@ -273,7 +306,7 @@ static void CheckBuffers(uint32_t hidden, uint32_t count, uint32_t bs)
     subBlock = 1U;
 }
 
-static void CheckPipeline(uint32_t hidden, uint32_t slots, uint32_t policy)
+static void CheckPipeline(uint32_t hidden, uint32_t slots, uint32_t policy, uint32_t stride = 1U)
 {
     Engine state;
     state.policy = policy;
@@ -284,18 +317,22 @@ static void CheckPipeline(uint32_t hidden, uint32_t slots, uint32_t policy)
     const auto buffers = InitTokenCombineSliceBuffers(common, scratch);
     constexpr uint32_t rows = 43U;
     const uint32_t rowBytes = hidden * sizeof(bfloat16_t);
-    std::vector<uint8_t> input(rows * rowBytes);
-    for (uint32_t row = 0U; row < rows; ++row) {
+    const uint32_t physicalRows = (rows - 1U) * stride + 1U;
+    std::vector<uint8_t> input(physicalRows * rowBytes);
+    std::vector<int32_t> metadata(physicalRows * META_INFO_SIZE, -1);
+    for (uint32_t row = 0U; row < physicalRows; ++row) {
         for (uint32_t byte = 0U; byte < rowBytes; ++byte)
             input[row * rowBytes + byte] = static_cast<uint8_t>(row * 29U + byte * 7U);
-        scratch.metaInfoTensor.SetValue(row * META_INFO_SIZE + RANK_ID, static_cast<int32_t>((row * 7U + 3U) % 16U));
-        scratch.metaInfoTensor.SetValue(row * META_INFO_SIZE + TOKEN_ID, static_cast<int32_t>(row / 8U));
-        scratch.metaInfoTensor.SetValue(row * META_INFO_SIZE + TOPK_INDEX, static_cast<int32_t>(row % 8U));
+        if (row % stride != 0U) continue;
+        const uint32_t selected = row / stride;
+        metadata[row * META_INFO_SIZE + RANK_ID] = static_cast<int32_t>((selected * 7U + 3U) % 16U);
+        metadata[row * META_INFO_SIZE + TOKEN_ID] = static_cast<int32_t>(selected / 8U);
+        metadata[row * META_INFO_SIZE + TOPK_INDEX] = static_cast<int32_t>(selected % 8U);
     }
     for (auto& peer : state.destinations) peer.assign(rows * rowBytes, 0xa5);
     std::array<uint8_t, 1> peerBase{};
     Params::Tiling tiling;
-    Params params{{peerBase.data(), peerBase.data()}, &tiling};
+    Params params{{peerBase.data(), peerBase.data()}, &tiling, {reinterpret_cast<GM_ADDR>(metadata.data())}};
     // Multiple slices share the UB but each drains and restarts. Segment cuts
     // deliberately fall inside the first-use region and on ring wraparound.
     for (uint32_t total : {0U, 1U, slots - 1U, slots, slots + 1U, 29U, rows}) {
@@ -303,8 +340,9 @@ static void CheckPipeline(uint32_t hidden, uint32_t slots, uint32_t policy)
         uint32_t sequence = 0U, done = 0U;
         for (uint32_t chunk : {0U, 1U, 2U, 7U, 3U, rows}) {
             const uint32_t take = std::min(chunk, total - done);
-            CombineWaveTokenRange<COMBINE_NO_QUANT>(common, buffers, scratch, params, input.data(), done, take, done,
-                                                    sequence);
+            PreloadWaveCombineMetaInfo(params, scratch, done * stride, take, done, stride);
+            CombineWaveTokenRange<COMBINE_NO_QUANT>(common, buffers, scratch, params, input.data(), done * stride, take,
+                                                    done, sequence, stride);
             done += take;
             Require(sequence == done);
         }
@@ -320,7 +358,14 @@ static void CheckPipeline(uint32_t hidden, uint32_t slots, uint32_t policy)
         state.Finish();
         for (uint32_t row = 0U; row < total; ++row) {
             const auto& peer = state.destinations[(row * 7U + 3U) % 16U];
-            Require(std::memcmp(peer.data() + row * rowBytes, input.data() + row * rowBytes, rowBytes) == 0);
+            Require(std::memcmp(peer.data() + row * rowBytes, input.data() + row * stride * rowBytes, rowBytes) == 0);
+        }
+        for (uint32_t peer = 0U; peer < 16U; ++peer) {
+            for (uint32_t row = 0U; row < rows; ++row) {
+                if (row < total && (row * 7U + 3U) % 16U == peer) continue;
+                const auto first = state.destinations[peer].begin() + row * rowBytes;
+                Require(std::all_of(first, first + rowBytes, [](uint8_t value) { return value == 0xa5; }));
+            }
         }
         // Ready-scan storage immediately follows the allowed row ring and must
         // remain untouched even when all eight slots are live.
@@ -350,7 +395,11 @@ int main()
             for (uint32_t policy = 0U; policy < 3U; ++policy) CheckPipeline(hidden, slots, policy);
         }
     for (uint32_t slots : {2U, 4U, 6U}) CheckBuffers(8192U, slots, 4096U);
+    for (uint32_t stride : {2U, 3U, 5U, 24U, 27U})
+        for (uint32_t slots : {2U, 4U, 6U, 8U})
+            for (uint32_t policy = 0U; policy < 3U; ++policy) CheckPipeline(3584U, slots, policy, stride);
     for (uint32_t bs : {1U, 256U, 257U, 2048U, 4096U, 8192U}) CheckBuffers(3584U, 0U, bs);
     std::cout << "Combine 2/4/6/8 slots: deferred DMA, events 0..7, peer segments and tail drains passed\n";
     std::cout << "UB: H3584/6144/7680 fit, H8192 eight-slot rejection, original Decode6/Prefill2 passed\n";
+    std::cout << "strided Combine: metadata gather and source rows 1/2/3/5/24/27, holes untouched passed\n";
 }

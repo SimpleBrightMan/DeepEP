@@ -532,9 +532,12 @@ void Plan::prepare_communication(torch::Tensor combine_payload, bool metadata_dm
                 ", combine_buffer_count=", combine_buffer_count);
     const char* group_order = std::getenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER");
     TORCH_CHECK(group_order == nullptr || std::strcmp(group_order, "reverse") == 0 ||
-                    std::strcmp(group_order, "paired-xor") == 0,
-                "DEEPEP_MEGAMOE_COMM_GROUP_ORDER must be reverse or paired-xor");
-    const bool paired_groups = group_order != nullptr && std::strcmp(group_order, "paired-xor") == 0;
+                    std::strcmp(group_order, "paired-xor") == 0 || std::strcmp(group_order, "alltoall") == 0,
+                "DEEPEP_MEGAMOE_COMM_GROUP_ORDER must be reverse, paired-xor or alltoall");
+    TORCH_CHECK(metadata_dma || group_order == nullptr || std::strcmp(group_order, "alltoall") != 0,
+                "alltoall communication scheduling requires DMA metadata mode");
+    const bool alltoall = metadata_dma && (tiling_.dispatchIntraCores > 0U || tiling_.combineIntraCores > 0U);
+    const bool paired_groups = !metadata_dma && group_order != nullptr && std::strcmp(group_order, "paired-xor") == 0;
     TORCH_CHECK(!paired_groups || (tiling_.dispatchIntraCores >= 1U && tiling_.dispatchIntraCores <= 27U &&
                                    tiling_.combineIntraCores >= 1U && tiling_.combineIntraCores <= 27U),
                 "paired-xor requires Dispatch and Combine INTRA core counts in [1,27]");
@@ -575,7 +578,7 @@ void Plan::prepare_communication(torch::Tensor combine_payload, bool metadata_dm
     c10_npu::NPUCachingAllocator::recordStream(combine_payload.storage().data_ptr(), stream);
     c10_npu::NPUCachingAllocator::recordStream(workspace_.storage().data_ptr(), stream);
     communication_combine_buffer_count_ = combine_buffer_count;
-    communication_paired_groups_ = paired_groups;
+    communication_group_schedule_ = alltoall ? 2U : paired_groups ? 1U : 0U;
     communication_rows_ = rows;
 }
 
@@ -630,7 +633,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::communication_forward(torch::Tens
                                      ptr(x_scales), ptr(topk_ids), ptr(topk_weights), ptr(y), ptr(counts),
                                      ptr(workspace_),
                                      communication_metadata_.defined() ? ptr(communication_metadata_) : nullptr,
-                                     communication_combine_buffer_count_, communication_paired_groups_ ? 1U : 0U,
+                                     communication_combine_buffer_count_, communication_group_schedule_,
                                      timer ? ptr(*timer) : nullptr, reinterpret_cast<const uint8_t*>(&tiling_), ffts_);
     for (const auto* tensor : {&x, &x_scales, &topk_ids, &topk_weights, &y, &counts, &workspace_, &context_}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);

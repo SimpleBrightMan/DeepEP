@@ -49,6 +49,7 @@ struct TokenDispatchScratch {
     // its scalar metadata path. The table outlives every measured launch.
     GM_ADDR dmaMetadataInput = nullptr;
     bool pairedGroups = false;
+    bool alltoall = false;
     AscendTimerDevice* commTimer = nullptr;
     AscendTimerDevice* auditTimer = nullptr;
     uint32_t auditExpert = 0;
@@ -84,6 +85,7 @@ struct DispatchRouteSegment {
     int32_t dstRow;
     uint32_t indexOffset;
     int32_t rowCount;
+    uint32_t stride = 1U;
 };
 
 struct DispatchRouteBatch {
@@ -216,7 +218,8 @@ template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPref
 __aicore__ inline void CopyTokensAndMetaForDispatch(const TokenDispatchConfig& context, const Params& params,
                                                     GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
                                                     int32_t rowDstOffset, int32_t remoteRankIdx, int32_t copyStartIdx,
-                                                    int32_t copyNum, DispatchCopyProgress& progress)
+                                                    int32_t copyNum, DispatchCopyProgress& progress,
+                                                    uint32_t rowStride = 1U)
 {
     const MegaMoeDispatchBufferConfig& bufferConfig = context.bufferConfig;
     int32_t bufferCount = bufferConfig.bufferCount;
@@ -232,10 +235,11 @@ __aicore__ inline void CopyTokensAndMetaForDispatch(const TokenDispatchConfig& c
             progress.pendingRow = -1;
         }
         int32_t issueBufferIdx = progress.issuedRows % bufferCount;
-        int32_t topkIndex = scratch.validTopkIndexTensor.GetValue(copyStartIdx + issueIdx);
+        const int32_t rowOffset = issueIdx * static_cast<int32_t>(rowStride);
+        int32_t topkIndex = scratch.validTopkIndexTensor.GetValue(copyStartIdx + rowOffset);
         if (scratch.auditTimer != nullptr) {
             scratch.auditTimer->AuditTransfer(
-                0U, scratch.auditExpert, static_cast<uint32_t>(rowDstOffset + issueIdx) - scratch.auditExpertGlobalRow,
+                0U, scratch.auditExpert, static_cast<uint32_t>(rowDstOffset + rowOffset) - scratch.auditExpertGlobalRow,
                 static_cast<uint32_t>(remoteRankIdx),
                 static_cast<uint32_t>(topkIndex) / static_cast<uint32_t>(params.tilingData->topK),
                 static_cast<uint32_t>(topkIndex) % static_cast<uint32_t>(params.tilingData->topK));
@@ -251,7 +255,7 @@ __aicore__ inline void CopyTokensAndMetaForDispatch(const TokenDispatchConfig& c
             StoreDispatchTokenAndMetaInfo<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
                 context, params, scratch, (progress.issuedRows - 1U) % bufferCount, progress.pendingRow);
         }
-        progress.pendingRow = rowDstOffset + issueIdx;
+        progress.pendingRow = rowDstOffset + rowOffset;
         ++progress.issuedRows;
     }
 }
@@ -283,7 +287,8 @@ __aicore__ inline void DrainDispatchCopyBuffers(const TokenDispatchConfig& conte
 // 发布一个 source-rank 段覆盖到的 GMM1 tile ready 计数。
 __aicore__ inline void PublishGmm1TileReady(const MoeSyncWorkspaceLayout& syncLayout, const Params& params,
                                             uint32_t localExpertId, int32_t gmm1TileRowCount,
-                                            int32_t segmentExpertRowBegin, int32_t segmentExpertRowEnd)
+                                            int32_t segmentExpertRowBegin, int32_t segmentExpertRowEnd,
+                                            uint32_t rowStride = 1U)
 {
     if (segmentExpertRowBegin >= segmentExpertRowEnd) {
         return;
@@ -300,7 +305,14 @@ __aicore__ inline void PublishGmm1TileReady(const MoeSyncWorkspaceLayout& syncLa
         int32_t overlapRowBegin =
             segmentExpertRowBegin > tileExpertRowBegin ? segmentExpertRowBegin : tileExpertRowBegin;
         int32_t overlapRowEnd = segmentExpertRowEnd < tileExpertRowEnd ? segmentExpertRowEnd : tileExpertRowEnd;
-        AtomicAdd(gmm1TileReadyCount + static_cast<int64_t>(tileIdx) * INT_CACHELINE, overlapRowEnd - overlapRowBegin);
+        // Cyclic ownership contributes only selected rows, never the holes in
+        // its bounding interval. Keep one counter update per covered tile.
+        const int32_t stride = static_cast<int32_t>(rowStride);
+        const int32_t firstOrdinal = (overlapRowBegin - segmentExpertRowBegin + stride - 1) / stride;
+        const int32_t endOrdinal = (overlapRowEnd - segmentExpertRowBegin + stride - 1) / stride;
+        if (endOrdinal > firstOrdinal) {
+            AtomicAdd(gmm1TileReadyCount + static_cast<int64_t>(tileIdx) * INT_CACHELINE, endOrdinal - firstOrdinal);
+        }
     }
 }
 
@@ -318,7 +330,7 @@ __aicore__ inline void FlushDispatchRouteBatch(const TokenDispatchConfig& contex
         const auto& segment = batch.segments[i];
         CopyTokensAndMetaForDispatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
             context, params, winRankAddr, scratch, segment.dstRow, segment.sourceRank, segment.indexOffset,
-            segment.rowCount, progress);
+            segment.rowCount, progress, segment.stride);
     }
     batch.count = 0U;
     batch.usedItems = 0U;
@@ -335,7 +347,7 @@ __aicore__ inline int32_t DispatchRankTokens(const TokenDispatchConfig& context,
                                              int32_t expertGlobalRowBegin, uint32_t remoteRankIdx,
                                              int32_t destinationRowBegin, int32_t segmentMatchOrdinalBegin,
                                              int32_t segmentMatchOrdinalEnd, DispatchRouteBatch& batch,
-                                             DispatchCopyProgress& progress)
+                                             DispatchCopyProgress& progress, uint32_t rowStride = 1U)
 {
     constexpr uint32_t itemsPerBlock = ALIGN_32 / sizeof(int32_t);
     if (scratch.auditTimer != nullptr) {
@@ -344,11 +356,16 @@ __aicore__ inline int32_t DispatchRankTokens(const TokenDispatchConfig& context,
     }
     const uint32_t capacity = static_cast<uint32_t>(context.bufferConfig.routeItemsPerBatch);
     int32_t processed = 0;
-    const int32_t rowCount = segmentMatchOrdinalEnd - segmentMatchOrdinalBegin;
+    const int32_t rowCount = (segmentMatchOrdinalEnd - segmentMatchOrdinalBegin + static_cast<int32_t>(rowStride) - 1) /
+                             static_cast<int32_t>(rowStride);
     while (processed < rowCount) {
         const uint32_t remaining = static_cast<uint32_t>(rowCount - processed);
-        const uint32_t take = remaining < capacity ? remaining : capacity;
-        const uint32_t padded = Ops::Base::CeilAlign(take, itemsPerBlock);
+        const uint32_t maxRows = 1U + (capacity - 1U) / rowStride;
+        const uint32_t take = remaining < maxRows ? remaining : maxRows;
+        // Route records are int32, so load the bounded contiguous index span.
+        // Payload GETs and destination stores still touch selected rows only.
+        const uint32_t indexSpan = (take - 1U) * rowStride + 1U;
+        const uint32_t padded = Ops::Base::CeilAlign(indexSpan, itemsPerBlock);
         if (batch.count == MAX_DISPATCH_BUFFER_COUNT || batch.usedItems + padded > capacity) {
             FlushDispatchRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, winRankAddr,
                                                                                          scratch, batch, progress);
@@ -358,11 +375,13 @@ __aicore__ inline int32_t DispatchRankTokens(const TokenDispatchConfig& context,
         GlobalTensor<int32_t> remoteRouteIndexGlobal;
         remoteRouteIndexGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(
             params.peermemInfo.maskRecvPtr + slotOffset +
-            static_cast<uint64_t>(segmentMatchOrdinalBegin + processed) * sizeof(int32_t)));
+            (static_cast<uint64_t>(segmentMatchOrdinalBegin) + static_cast<uint64_t>(processed) * rowStride) *
+                sizeof(int32_t)));
         DataCopyPad(scratch.validTopkIndexTensor[batch.usedItems], remoteRouteIndexGlobal,
-                    {1U, take * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-        batch.segments[batch.count++] = {remoteRankIdx, expertGlobalRowBegin + destinationRowBegin + processed,
-                                         batch.usedItems, static_cast<int32_t>(take)};
+                    {1U, indexSpan * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+        batch.segments[batch.count++] = {
+            remoteRankIdx, expertGlobalRowBegin + destinationRowBegin + processed * static_cast<int32_t>(rowStride),
+            batch.usedItems, static_cast<int32_t>(take), rowStride};
         batch.usedItems += padded;
         processed += static_cast<int32_t>(take);
     }
@@ -463,14 +482,14 @@ __aicore__ inline CommOwnedSegments PlanCommSplitSlice(const MoeStageCommonConfi
                                                        const TokenDispatchScratch<ActivationType>& scratch,
                                                        uint32_t expert, uint32_t sliceBegin, uint32_t sliceEnd,
                                                        uint32_t physicalCore, uint32_t intraCores, uint64_t rotation,
-                                                       bool pairedGroups = false)
+                                                       bool pairedGroups = false, bool alltoall = false)
 {
     CommPeerSegment peers[COMM_SPLIT_PEERS];
     DispatchPeerCounts counts{scratch.cumsumInfoTensor, expert * common.worldSize};
     BuildCommPeerSegments(counts, common.rankId, params.tilingData->dispatchRanksPerNode, sliceBegin, sliceEnd,
                           common.tokenNum > W4A8_SMALL_BATCH_MAX_TOKENS, peers);
     return SelectCommOwnedSegments(peers, common.rankId, physicalCore, params.tilingData->aicNum, intraCores, rotation,
-                                   pairedGroups);
+                                   pairedGroups, alltoall);
 }
 
 // Each worker owns disjoint source segments, not one continuous output range.
@@ -492,7 +511,7 @@ __aicore__ inline void DispatchCommSplitSlice(const TokenDispatchConfig& context
     const uint32_t expertGlobal = static_cast<uint32_t>(range.begin.globalTokenIndex) - first;
     const auto owned = PlanCommSplitSlice(common, params, scratch, expert, first, first + rows, physicalCore,
                                           params.tilingData->dispatchIntraCores, range.begin.globalTokenIndex + wave,
-                                          scratch.pairedGroups);
+                                          scratch.pairedGroups, scratch.alltoall);
     timer.SetCommunicationRows(expert, first, owned.rows);
     if (owned.rows == 0U) return;
     const auto type = physicalCore < params.tilingData->dispatchIntraCores ? AscendTimer::AIV_DISPATCH_INTRA
@@ -508,16 +527,17 @@ __aicore__ inline void DispatchCommSplitSlice(const TokenDispatchConfig& context
         DispatchRankTokens<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
             context, common, params, winRankAddr, scratch, expert, static_cast<int32_t>(expertGlobal), segment.peer,
             static_cast<int32_t>(segment.rowBegin), static_cast<int32_t>(segment.sourceBegin),
-            static_cast<int32_t>(segment.sourceBegin + segment.count), batch, progress);
+            static_cast<int32_t>(segment.sourceBegin + (segment.count - 1U) * segment.stride + 1U), batch, progress,
+            segment.stride);
     }
     FlushDispatchRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, winRankAddr, scratch,
                                                                                  batch, progress);
     DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch, progress);
     for (uint32_t i = 0U; i < owned.count; ++i) {
         const auto& segment = owned.segments[i];
-        PublishGmm1TileReady(syncLayout, params, expert, static_cast<int32_t>(PipelineTileM),
-                             static_cast<int32_t>(segment.rowBegin),
-                             static_cast<int32_t>(segment.rowBegin + segment.count));
+        PublishGmm1TileReady(
+            syncLayout, params, expert, static_cast<int32_t>(PipelineTileM), static_cast<int32_t>(segment.rowBegin),
+            static_cast<int32_t>(segment.rowBegin + (segment.count - 1U) * segment.stride + 1U), segment.stride);
     }
     timer.EndSpan(type);
     timer.ClearSlice();

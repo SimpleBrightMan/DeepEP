@@ -199,21 +199,13 @@ def parse_args(argv=None):
 def run(args, config, group):
     import numpy as np
     import torch
-    from .api import SymmBuffer, communication_forward
+    from .api import SymmBuffer, _communication_schedule, communication_forward
     from .comm_report import rank_report, read_events, read_transfers, summarize, timer_rank_report, write_rank_detail
     from .timer.breakdown import compact_events, rank_breakdown, write_breakdown
     from .validation import collective_check
 
     rank, world = group.rank(), group.size()
-    group_order = os.environ.get("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "reverse")
-    if group_order not in ("reverse", "paired-xor"):
-        raise ValueError("DEEPEP_MEGAMOE_COMM_GROUP_ORDER must be reverse or paired-xor")
-    dispatch_intra = int(os.environ.get("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "0"))
-    combine_intra = int(os.environ.get("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES", "0"))
-    if not all(0 <= value <= 27 for value in (dispatch_intra, combine_intra)):
-        raise ValueError("Communication INTRA core counts must be 0 (original) or 1..27")
-    if group_order == "paired-xor" and (dispatch_intra == 0 or combine_intra == 0):
-        raise ValueError("paired-xor requires Dispatch and Combine INTRA core counts each in 1..27")
+    group_order, dispatch_intra, combine_intra = _communication_schedule(args.dispatch_metadata_mode)
     schedule = dict(group_order=group_order, dispatch_intra=dispatch_intra, combine_intra=combine_intra)
     if world != 16 or int(os.environ["LOCAL_WORLD_SIZE"]) != 16:
         raise ValueError("Communication simulator requires one EP16 machine")

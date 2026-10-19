@@ -9,13 +9,14 @@ namespace MegaMoeImpl {
 constexpr uint32_t COMM_SPLIT_PEERS = 16U;
 constexpr uint32_t COMM_SPLIT_GROUP_SIZE = 4U;
 
-// A source ordinal and an unchanged expert-local destination interval.
+// A source ordinal and unchanged expert-local destination rows.
 // Keeping both coordinates makes Dispatch and the reverse Combine share one plan.
 struct CommPeerSegment {
     uint32_t peer = 0U;
     uint32_t sourceBegin = 0U;
     uint32_t rowBegin = 0U;
     uint32_t count = 0U;
+    uint32_t stride = 1U;
 };
 
 struct CommOwnedSegments {
@@ -68,7 +69,7 @@ __aicore__ inline void BuildCommPeerSegments(const Counts& counts, uint32_t rank
 __aicore__ inline CommOwnedSegments SelectCommOwnedSegments(const CommPeerSegment* peers, uint32_t rank,
                                                             uint32_t physicalCore, uint32_t totalCores,
                                                             uint32_t intraCores, uint64_t rotation,
-                                                            bool pairedGroups = false)
+                                                            bool pairedGroups = false, bool alltoall = false)
 {
     CommOwnedSegments owned{};
     const bool intra = physicalCore < intraCores;
@@ -78,6 +79,29 @@ __aicore__ inline CommOwnedSegments SelectCommOwnedSegments(const CommPeerSegmen
     }
     const uint32_t worker = intra ? physicalCore : physicalCore - intraCores;
     const uint32_t ownGroup = rank / COMM_SPLIT_GROUP_SIZE;
+    if (alltoall && !intra) {
+        // Match case10's peer-major, cyclic token ownership. Each worker visits
+        // the same +1/+2/+3 group order and rank-relative peer order. Carry the
+        // actual peer row counts instead of assuming equal n; retain the slice
+        // rotation so short-slice remainders do not always select the same cores.
+        uint64_t prefix = rotation;
+        for (uint32_t offset = 1U; offset < COMM_SPLIT_PEERS / COMM_SPLIT_GROUP_SIZE; ++offset) {
+            const uint32_t group = (ownGroup + offset) % (COMM_SPLIT_PEERS / COMM_SPLIT_GROUP_SIZE);
+            for (uint32_t lane = 0U; lane < COMM_SPLIT_GROUP_SIZE; ++lane) {
+                const uint32_t peer = group * COMM_SPLIT_GROUP_SIZE + (rank + lane) % COMM_SPLIT_GROUP_SIZE;
+                const auto& segment = peers[peer];
+                const uint32_t firstRow = (worker + workers - static_cast<uint32_t>(prefix % workers)) % workers;
+                if (firstRow < segment.count) {
+                    const uint32_t count = 1U + (segment.count - firstRow - 1U) / workers;
+                    owned.segments[owned.count++] = {peer, segment.sourceBegin + firstRow, segment.rowBegin + firstRow,
+                                                     count, workers};
+                    owned.rows += count;
+                }
+                prefix += segment.count;
+            }
+        }
+        return owned;
+    }
     const uint32_t first = intra ? 0U : 1U;
     const uint32_t end = intra ? 1U : COMM_SPLIT_PEERS / COMM_SPLIT_GROUP_SIZE;
     for (uint32_t phase = first; phase < end; ++phase) {

@@ -61,6 +61,30 @@ def _check_fp4_weight_format(weight, name):
         )
 
 
+def _communication_schedule(dispatch_metadata_mode):
+    """Resolve the actual replay schedule from metadata mode and explicit core splits."""
+    if dispatch_metadata_mode not in ("dma", "scalar"):
+        raise ValueError("dispatch_metadata_mode must be 'dma' or 'scalar'")
+    requested = os.environ.get("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "reverse")
+    if requested not in ("reverse", "paired-xor", "alltoall"):
+        raise ValueError("DEEPEP_MEGAMOE_COMM_GROUP_ORDER must be reverse, paired-xor or alltoall")
+    counts = []
+    for name in ("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES"):
+        value = os.environ.get(name, "0")
+        if not value.isascii() or not value.isdecimal() or not 0 <= int(value) <= 27:
+            raise ValueError("Communication INTRA core counts must be 0 (original) or 1..27")
+        counts.append(int(value))
+    if dispatch_metadata_mode == "dma":
+        order = "alltoall" if any(counts) else "reverse"
+    else:
+        if requested == "alltoall":
+            raise ValueError("alltoall group order requires dispatch_metadata_mode='dma'")
+        if requested == "paired-xor" and not all(counts):
+            raise ValueError("paired-xor requires Dispatch and Combine INTRA core counts in [1,27]")
+        order = requested
+    return order, *counts
+
+
 class SymmBuffer:
     """Collective resource owner. All ranks construct/call/destroy in the same order.
 
@@ -237,9 +261,9 @@ class SymmBuffer:
         in dma mode; scalar mode retains the original per-token scalar writes.
         combine_buffer_count selects 2, 4, 6 or 8 row slots for replay's BF16 Combine;
         the aligned rows must fit the 120 KiB Combine payload UB region.
-        DEEPEP_MEGAMOE_COMM_GROUP_ORDER=paired-xor selects soft XOR group pairing
-        with configurable INTRA core counts in [1,27] for both stages; remaining
-        cores handle CROSS traffic. Peer payload and full
+        DMA with either stage split selects the all-to-all cross-group schedule
+        for every split stage; unsplit stages keep original ownership. Scalar
+        metadata retains reverse or paired-xor ordering. Peer payload and full
         MegaMoE are unchanged. No matrix weights are allocated or used.
         All ranks call together with the same settings.
         """
@@ -251,23 +275,14 @@ class SymmBuffer:
         error = None
         try:
             extension = _extension()
-            if getattr(extension, "communication_replay_protocol", None) != 6:
-                raise RuntimeError("Rebuild and reinstall this branch to enable eight-slot Combine replay")
-            if dispatch_metadata_mode not in ("dma", "scalar"):
-                raise ValueError("dispatch_metadata_mode must be 'dma' or 'scalar'")
+            if getattr(extension, "communication_replay_protocol", None) != 7:
+                raise RuntimeError("Rebuild and reinstall this branch to enable the DMA all-to-all schedule")
             if type(combine_buffer_count) is not int or combine_buffer_count not in (2, 4, 6, 8):
                 raise ValueError("combine_buffer_count must be an integer: 2, 4, 6 or 8")
             combine_row_bytes = ((self.hidden * 2 + 31) // 32) * 32
             if combine_row_bytes * combine_buffer_count > 120 * 1024:
                 raise ValueError("Combine BF16 row slots exceed the 120 KiB payload UB region; use fewer slots")
-            group_order = os.environ.get("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "reverse")
-            if group_order not in ("reverse", "paired-xor"):
-                raise ValueError("DEEPEP_MEGAMOE_COMM_GROUP_ORDER must be reverse or paired-xor")
-            if group_order == "paired-xor":
-                for name in ("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES"):
-                    value = os.environ.get(name, "")
-                    if not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= 27:
-                        raise ValueError("paired-xor requires Dispatch and Combine INTRA core counts in [1,27]")
+            group_order, _, _ = _communication_schedule(dispatch_metadata_mode)
             if (
                 self.group.size() != 16
                 or self.num_shared_experts != 0
@@ -308,7 +323,13 @@ class SymmBuffer:
                     self._plan.prepare_communication(
                         combine_payload, dispatch_metadata_mode == "dma", combine_buffer_count
                     )
-                self._communication_route = (bs, self.topk_idx, self.topk_idx._version, group_order)
+                self._communication_route = (
+                    bs,
+                    self.topk_idx,
+                    self.topk_idx._version,
+                    group_order,
+                    dispatch_metadata_mode,
+                )
             except Exception as failure:
                 error = str(failure)
             collective_check(
@@ -661,14 +682,14 @@ def communication_forward(sym_buffer: SymmBuffer, *, bs: int, timer: Tensor | No
         prepared = b._communication_route
         if prepared is None or prepared[0] != bs or prepared[1] is not b.topk_idx or prepared[2] != b.topk_idx._version:
             raise RuntimeError("Call prepare_communication again after changing BS, routing or running full MegaMoE")
-        if os.environ.get("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "reverse") != prepared[3]:
-            raise RuntimeError("Call prepare_communication again after changing communication group order")
         current_split = (
             os.environ.get("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES"),
             os.environ.get("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES"),
         )
         if current_split != b._comm_core_environment:
             raise ValueError("Communication core environment changed; create a fresh SymmBuffer/process")
+        if _communication_schedule(prepared[4])[0] != prepared[3]:
+            raise RuntimeError("Call prepare_communication again after changing communication group order")
         if any(t.requires_grad for t in (b.x, b.x_sf, b.topk_weights, out) if t is not None):
             raise NotImplementedError("Communication replay is inference-only")
         tensors = (b.x, b.x_sf, b.topk_idx, b.topk_weights, timer)

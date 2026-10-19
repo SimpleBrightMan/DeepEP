@@ -247,6 +247,7 @@ struct WaveCombineScratch {
     // Only the compute-disabled entry overrides the original BS-based policy.
     uint32_t rowBufferCountOverride = 0U;
     bool pairedGroups = false;
+    bool alltoall = false;
     AscendTimerDevice* auditTimer = nullptr;
     uint32_t auditExpert = 0;
     uint32_t auditRowBase = 0;
@@ -408,7 +409,8 @@ __aicore__ inline void DrainCombineRowBuffers(uint32_t& issuedRowCount, uint32_t
 
 // 加载一段连续 wave Combine token 的 metadata。
 __aicore__ inline void PreloadWaveCombineMetaInfo(const Params& params, WaveCombineScratch& scratch,
-                                                  uint64_t gmTokenOffset, uint32_t tokenCount, uint32_t ubTokenOffset)
+                                                  uint64_t gmTokenOffset, uint32_t tokenCount, uint32_t ubTokenOffset,
+                                                  uint32_t rowStride = 1U)
 {
     if (tokenCount == 0U) {
         return;
@@ -416,7 +418,15 @@ __aicore__ inline void PreloadWaveCombineMetaInfo(const Params& params, WaveComb
     LocalTensor<int32_t> metaInfoUb = scratch.metaInfoTensor[ubTokenOffset * META_INFO_SIZE];
     GlobalTensor<int32_t> metaInfoGm;
     metaInfoGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr));
-    DataCopy(metaInfoUb, metaInfoGm[gmTokenOffset * META_INFO_SIZE], tokenCount * META_INFO_SIZE);
+    if (rowStride == 1U) {
+        DataCopy(metaInfoUb, metaInfoGm[gmTokenOffset * META_INFO_SIZE], tokenCount * META_INFO_SIZE);
+    } else {
+        // Each metadata record is one 32B block. Gather only this worker's
+        // records into dense UB; no payload rows or destination layout change.
+        static_assert(META_INFO_SIZE * sizeof(int32_t) == ALIGN_32, "metadata must occupy one DMA block");
+        DataCopyParams copyParams{static_cast<uint16_t>(tokenCount), 1U, static_cast<uint16_t>(rowStride - 1U), 0U};
+        DataCopy(metaInfoUb, metaInfoGm[gmTokenOffset * META_INFO_SIZE], copyParams);
+    }
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
 }
@@ -469,7 +479,8 @@ template <uint8_t CombineMode>
 __aicore__ inline void CombineWaveTokenRange(const MoeStageCommonConfig& common,
                                              const WaveCombineBufferConfig& bufferConfig, WaveCombineScratch& scratch,
                                              const Params& params, GM_ADDR gmm2OutGlobal, uint32_t tokenStart,
-                                             uint32_t tokenCount, uint32_t metaInfoUbTokenOffset, uint32_t& rowSequence)
+                                             uint32_t tokenCount, uint32_t metaInfoUbTokenOffset, uint32_t& rowSequence,
+                                             uint32_t rowStride = 1U)
 {
     if constexpr (g_coreType == AIC) {
         return;
@@ -490,14 +501,14 @@ __aicore__ inline void CombineWaveTokenRange(const MoeStageCommonConfig& common,
         LocalTensor<int32_t> tokenMetaInfo =
             scratch.metaInfoTensor[(metaInfoUbTokenOffset + tokenIdxInSlice) * META_INFO_SIZE];
         SendWaveCombineToken<CombineMode, false>(common, bufferConfig, scratch, params, gmm2OutGm, gmRemoteBaseOffset,
-                                                 tokenStart + tokenIdxInSlice, tokenMetaInfo, slot);
+                                                 tokenStart + tokenIdxInSlice * rowStride, tokenMetaInfo, slot);
     }
     for (; tokenIdxInSlice < tokenCount; ++tokenIdxInSlice, ++rowSequence) {
         uint32_t slot = rowSequence % rowBufferCount;
         LocalTensor<int32_t> tokenMetaInfo =
             scratch.metaInfoTensor[(metaInfoUbTokenOffset + tokenIdxInSlice) * META_INFO_SIZE];
         SendWaveCombineToken<CombineMode, true>(common, bufferConfig, scratch, params, gmm2OutGm, gmRemoteBaseOffset,
-                                                tokenStart + tokenIdxInSlice, tokenMetaInfo, slot);
+                                                tokenStart + tokenIdxInSlice * rowStride, tokenMetaInfo, slot);
     }
 }
 
@@ -1239,9 +1250,10 @@ __aicore__ inline void RunCommSplitCombineSlice(const MoeStageCommonConfig& comm
         for (uint32_t done = 0U; done < segment.count;) {
             uint32_t count = segment.count - done;
             count = count < WAVE_COMBINE_META_INFO_TOKEN_CAPACITY ? count : WAVE_COMBINE_META_INFO_TOKEN_CAPACITY;
-            PreloadWaveCombineMetaInfo(params, scratch, expertGlobal + segment.rowBegin + done, count, 0U);
-            CombineWaveTokenRange<COMBINE_NO_QUANT>(common, buffers, scratch, params, output, segment.rowBegin + done,
-                                                    count, 0U, sequence);
+            const uint32_t row = segment.rowBegin + done * segment.stride;
+            PreloadWaveCombineMetaInfo(params, scratch, expertGlobal + row, count, 0U, segment.stride);
+            CombineWaveTokenRange<COMBINE_NO_QUANT>(common, buffers, scratch, params, output, row, count, 0U, sequence,
+                                                    segment.stride);
             // Metadata is consumed by Scalar while issuing each row's address.
             // Only row slots remain in flight; preloading the next metadata
             // chunk cannot overwrite the UB data used by those MTE3 operations.

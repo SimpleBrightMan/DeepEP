@@ -39,7 +39,8 @@ def test_plan_does_not_touch_devices_or_create_output(tmp_path, capsys):
 def test_paired_plan_is_one_fixed_pair_per_bs_without_baseline_or_selection():
     args = sweep.parse_args(["--mode", "paired-groups", "--no-validation"])
     planned = sweep.plan(args)
-    assert planned["mode"] == "paired-groups" and planned["group_order"] == "paired-xor"
+    assert planned["mode"] == "paired-groups" and planned["group_order"] == "alltoall"
+    assert planned["requested_group_order"] == "paired-xor" and planned["baseline_group_order"] == "reverse"
     assert planned["case_launches_per_bs"] == 1 and planned["total_case_launches"] == 3
     assert planned["fixed_pair"] == [12, 12] and planned["combine_fixed"]
     assert planned["dispatch_intra_candidates"] == planned["combine_intra_candidates"] == [12]
@@ -47,16 +48,17 @@ def test_paired_plan_is_one_fixed_pair_per_bs_without_baseline_or_selection():
     assert not any("baseline" in stage or "confirmation" in stage for stage in planned["stages"])
     assert planned["combine_buffer_count"] == 2 and planned["dispatch_metadata_mode"] == "dma"
     env = sweep.candidate_environment((12, 12), {sweep.ENV_GROUP_ORDER: "reverse"}, group_order="paired-xor")
-    assert env[sweep.ENV_GROUP_ORDER] == "paired-xor"
+    assert env[sweep.ENV_GROUP_ORDER] == "alltoall"
     assert env[sweep.ENV_DISPATCH] == env[sweep.ENV_COMBINE] == "12"
     alternate = sweep.candidate_environment((10, 12), group_order="paired-xor")
     assert alternate[sweep.ENV_DISPATCH] == "10" and alternate[sweep.ENV_COMBINE] == "12"
     with pytest.raises(ValueError, match="1..27"):
-        sweep.candidate_environment((0, 12), group_order="paired-xor")
+        sweep.candidate_environment((0, 12), group_order="paired-xor", dispatch_metadata_mode="scalar")
 
 
 @pytest.mark.parametrize("order", ["paired-xor", "reverse"])
-def test_group_plan_preserves_requested_pair_order_without_selection(order):
+@pytest.mark.parametrize("metadata_mode", ["dma", "scalar"])
+def test_group_plan_preserves_requested_pair_order_without_selection(order, metadata_mode):
     args = sweep.parse_args(
         [
             "--mode",
@@ -65,16 +67,19 @@ def test_group_plan_preserves_requested_pair_order_without_selection(order):
             "12,4,6",
             "--group-order",
             order,
+            "--dispatch-metadata-mode",
+            metadata_mode,
         ]
     )
     planned = sweep.plan(args)
-    assert planned["group_order"] == order
+    effective = "alltoall" if metadata_mode == "dma" else order
+    assert planned["group_order"] == effective and planned["requested_group_order"] == order
     assert planned["case_launches_per_bs"] == 3 and planned["total_case_launches"] == 9
     assert planned["group_pairs"] == [[12, 12], [4, 4], [6, 6]]
     assert planned["dispatch_intra_candidates"] == planned["combine_intra_candidates"] == [12, 4, 6]
     assert planned["fixed_pair"] is None and not planned["combine_fixed"]
     assert planned["selection"] is None and len(planned["stages"]) == 1
-    assert f"order={order}" in planned["stages"][0]
+    assert f"order={effective}" in planned["stages"][0]
 
 
 @pytest.mark.parametrize("mode", ["baseline", "dispatch", "staged", "fullgrid"])
@@ -128,7 +133,7 @@ def test_group_plan_dry_run_does_not_create_output(tmp_path, capsys):
         ]
     )
     planned = json.loads(capsys.readouterr().out)
-    assert planned["total_case_launches"] == 3 and planned["group_order"] == "reverse"
+    assert planned["total_case_launches"] == 3 and planned["group_order"] == "alltoall"
     assert planned["group_pairs"] == [[12, 12], [4, 4], [6, 6]]
     assert not target.exists()
 
@@ -138,10 +143,10 @@ def test_group_order_rejects_unknown_value():
         sweep.parse_args(["--mode", "paired-groups", "--group-order", "random"])
 
 
-@pytest.mark.parametrize("pair", [None, (0, 4), (4, 0), (28, 4), (4, -1), (4,), (True, 4)])
+@pytest.mark.parametrize("pair", [(0, 4), (4, 0), (28, 4), (4, -1), (4,), (True, 4)])
 def test_paired_environment_rejects_invalid_cohort_counts(pair):
     with pytest.raises(ValueError, match="1..27"):
-        sweep.candidate_environment(pair, group_order="paired-xor")
+        sweep.candidate_environment(pair, group_order="paired-xor", dispatch_metadata_mode="scalar")
 
 
 @pytest.mark.parametrize(
@@ -193,17 +198,18 @@ def test_paired_driver_launches_exactly_three_fixed_cases_and_no_baseline(tmp_pa
     assert all(item["stage"] == "paired_groups" for item in records)
     for argv, launch in launches:
         assert "deep_ep_experimental.megamoe.comm_benchmark" in argv and "--no-validation" in argv
-        assert launch["environment"][sweep.ENV_GROUP_ORDER] == "paired-xor"
+        assert launch["environment"][sweep.ENV_GROUP_ORDER] == "alltoall"
         assert launch["environment"][sweep.ENV_DISPATCH] == launch["environment"][sweep.ENV_COMBINE] == "12"
     for _, _, _, options in reads:
         assert options == dict(
-            validate=False, dispatch_metadata_mode="dma", combine_buffer_count=6, group_order="paired-xor"
+            validate=False, dispatch_metadata_mode="dma", combine_buffer_count=6, group_order="alltoall"
         )
     assert not list((tmp_path / "run").rglob("baseline"))
 
 
 @pytest.mark.parametrize("order", ["paired-xor", "reverse"])
-def test_group_driver_runs_each_requested_pair_in_order_per_bs(tmp_path, monkeypatch, order):
+@pytest.mark.parametrize("metadata_mode", ["dma", "scalar"])
+def test_group_driver_runs_each_requested_pair_in_order_per_bs(tmp_path, monkeypatch, order, metadata_mode):
     monkeypatch.setattr(sweep, "os", SimpleNamespace(name="posix", environ={sweep.ENV_GROUP_ORDER: "paired-xor"}))
     monkeypatch.setattr(sweep.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="", stderr=""))
     launches, reads, gaps, selections = [], [], [], []
@@ -227,6 +233,8 @@ def test_group_driver_runs_each_requested_pair_in_order_per_bs(tmp_path, monkeyp
             "12,4,6",
             "--group-order",
             order,
+            "--dispatch-metadata-mode",
+            metadata_mode,
             "--no-validation",
             "--combine-buffer-count",
             "6",
@@ -237,11 +245,12 @@ def test_group_driver_runs_each_requested_pair_in_order_per_bs(tmp_path, monkeyp
     expected = [(bs, (n, n)) for bs in (2048, 4096) for n in (12, 4, 6)]
     assert [(bs, pair) for _, bs, pair, _ in reads] == expected
     assert len(launches) == 6 and gaps == [2.0] * 5 and not selections
+    effective = "alltoall" if metadata_mode == "dma" else order
     for (argv, launch), (output, bs, pair, options) in zip(launches, reads):
         assert output.name == f"paired_groups_d{pair[0]}_c{pair[1]}"
-        assert options["group_order"] == order and options["combine_buffer_count"] == 6 and not options["validate"]
+        assert options["group_order"] == effective and options["combine_buffer_count"] == 6 and not options["validate"]
         assert launch["environment"][sweep.ENV_DISPATCH] == launch["environment"][sweep.ENV_COMBINE] == str(pair[0])
-        assert launch["environment"].get(sweep.ENV_GROUP_ORDER, "reverse") == order
+        assert launch["environment"].get(sweep.ENV_GROUP_ORDER, "reverse") == effective
         assert "deep_ep_experimental.megamoe.comm_benchmark" in argv
     assert not list((tmp_path / "run").rglob("baseline"))
 
@@ -403,7 +412,7 @@ def test_original_environment_cleared_and_pair_command(tmp_path):
     assert pair[sweep.ENV_DISPATCH] == "12" and pair[sweep.ENV_COMBINE] == "7"
     assert pair["LD_LIBRARY_PATH"] == "/sdk/lib"
     assert pair["PYTHON_EXEC"] == sys.executable
-    assert sweep.ENV_GROUP_ORDER not in pair
+    assert pair[sweep.ENV_GROUP_ORDER] == "alltoall"
     args = sweep.parse_args([])
     command = sweep.command(args, tmp_path / "model.json", tmp_path / "test", (12, 7), tmp_path / "base")
     assert "--no-timer-raw" in command and "deep_ep_experimental.megamoe.comm_benchmark" in command
@@ -418,6 +427,23 @@ def test_original_environment_cleared_and_pair_command(tmp_path):
     assert "--comm-report" in reference_command
     dispatch_only = sweep.candidate_environment((10, 0), inherited)
     assert dispatch_only[sweep.ENV_DISPATCH] == "10" and dispatch_only[sweep.ENV_COMBINE] == "0"
+
+
+@pytest.mark.parametrize("pair", [None, (0, 0), (4, 0), (0, 4), (4, 6)])
+@pytest.mark.parametrize("requested", ["reverse", "paired-xor", "alltoall"])
+def test_dma_environment_and_api_agree_on_actual_schedule(pair, requested, monkeypatch):
+    from deep_ep_experimental.megamoe.api import _communication_schedule
+
+    inherited = {sweep.ENV_DISPATCH: "12", sweep.ENV_COMBINE: "12", sweep.ENV_GROUP_ORDER: "paired-xor"}
+    environment = sweep.candidate_environment(pair, inherited, group_order=requested)
+    for name in (sweep.ENV_DISPATCH, sweep.ENV_COMBINE, sweep.ENV_GROUP_ORDER):
+        monkeypatch.delenv(name, raising=False)
+        if name in environment:
+            monkeypatch.setenv(name, environment[name])
+    expected = "alltoall" if pair and any(pair) else "reverse"
+    actual, dispatch, combine = _communication_schedule("dma")
+    assert environment.get(sweep.ENV_GROUP_ORDER, "reverse") == actual == expected
+    assert (dispatch, combine) == (pair or (0, 0))
 
 
 def test_selection_uses_slowest_rank_not_fastest():
@@ -445,7 +471,7 @@ def test_staged_search_retains_first_stage_winner_outside_combine_candidates(tmp
         assert validate
         assert dispatch_metadata_mode == "dma"
         assert combine_buffer_count == 2
-        assert group_order == "reverse"
+        assert group_order == ("alltoall" if pair else "reverse")
         return dict(pair=list(pair) if pair else None, passed=True, comm_kernel_rank_max_mean_us=durations[pair])
 
     monkeypatch.setattr(sweep, "read_case", read)
@@ -484,7 +510,7 @@ def test_dispatch_only_keeps_combine_fixed_through_scan_and_confirmation(tmp_pat
         assert validate
         assert dispatch_metadata_mode == "dma"
         assert combine_buffer_count == 2
-        assert group_order == "reverse"
+        assert group_order == ("alltoall" if pair else "reverse")
         return dict(pair=list(pair) if pair else None, passed=True, comm_kernel_rank_max_mean_us=durations[pair])
 
     monkeypatch.setattr(sweep, "read_case", read)
@@ -689,7 +715,7 @@ def test_case_reader_rejects_combine_slot_mismatch_in_summary(tmp_path):
         sweep.read_case(tmp_path, 2048, None, validate=False, combine_buffer_count=4)
 
 
-@pytest.mark.parametrize("recorded", ["reverse", "paired-xor", None])
+@pytest.mark.parametrize("recorded", ["reverse", "paired-xor", "alltoall", None])
 def test_case_reader_checks_requested_group_order_and_legacy_means_reverse(tmp_path, recorded):
     write_case_fixture(tmp_path, (12, 12), validate=False, group_order=recorded)
     actual = recorded or "reverse"

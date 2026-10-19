@@ -56,7 +56,7 @@ private:
     // replay alone uses these local GM records to DMA Dispatch metadata.
     torch::Tensor communication_metadata_;
     uint32_t communication_combine_buffer_count_ = 2U;
-    bool communication_paired_groups_ = false;
+    uint32_t communication_group_schedule_ = 0U;
     uint64_t ffts_;
     int64_t communication_rows_ = 0;
     bool communication_completed_ = false;
