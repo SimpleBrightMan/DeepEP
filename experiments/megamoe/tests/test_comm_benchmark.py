@@ -86,8 +86,16 @@ def test_initial_simulator_rejects_unsupported_shape_before_importing_torch(tmp_
         bench.parse_args(["--config", str(path), "--output-dir", str(tmp_path / "output")])
 
 
-@pytest.mark.parametrize("options,expected_mode", [([], "dma"), (["--dispatch-metadata-mode", "scalar"], "scalar")])
-def test_benchmark_metadata_mode_defaults_to_dma_and_accepts_scalar(tmp_path, options, expected_mode):
+@pytest.mark.parametrize(
+    "options,expected_mode,combine_count",
+    [
+        ([], "dma", 2),
+        (["--dispatch-metadata-mode", "scalar"], "scalar", 2),
+        (["--combine-buffer-count", "4"], "dma", 4),
+        (["--combine-buffer-count", "6"], "dma", 6),
+    ],
+)
+def test_benchmark_metadata_and_combine_options(tmp_path, options, expected_mode, combine_count):
     config = dict(
         schema_version=1,
         model=dict(hidden=3584, intermediate_hidden=1280, num_experts=384, num_topk=8, num_shared_experts=0),
@@ -100,3 +108,19 @@ def test_benchmark_metadata_mode_defaults_to_dma_and_accepts_scalar(tmp_path, op
     path.write_text(json.dumps(config))
     args, _ = bench.parse_args(["--config", str(path), "--output-dir", str(tmp_path / "output"), *options])
     assert args.dispatch_metadata_mode == expected_mode
+    assert args.combine_buffer_count == combine_count
+
+
+@pytest.mark.parametrize("count", ["0", "1", "3", "5", "8"])
+def test_benchmark_rejects_unsupported_combine_slot_count_before_loading_config(tmp_path, count):
+    with pytest.raises(SystemExit):
+        bench.parse_args(
+            [
+                "--config",
+                str(tmp_path / "unused.json"),
+                "--output-dir",
+                str(tmp_path),
+                "--combine-buffer-count",
+                count,
+            ]
+        )

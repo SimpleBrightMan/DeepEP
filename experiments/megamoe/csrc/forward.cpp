@@ -516,13 +516,15 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     return {y, expert_tokens};
 }
 
-void Plan::prepare_communication(torch::Tensor combine_payload, bool metadata_dma)
+void Plan::prepare_communication(torch::Tensor combine_payload, bool metadata_dma, uint32_t combine_buffer_count)
 {
     communication_rows_ = 0;
     communication_completed_ = false;
     // Previous raw launches recorded the tensor on their stream, so replacing
     // it here cannot recycle its storage while those launches still use it.
     communication_metadata_ = torch::Tensor();
+    TORCH_CHECK(combine_buffer_count == 2U || combine_buffer_count == 4U || combine_buffer_count == 6U,
+                "combine_buffer_count must be 2, 4 or 6");
     TORCH_CHECK(tiling_.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 &&
                     tiling_.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT && tiling_.sharedExpertNum == 0U &&
                     tiling_.epWorldSize == 16U && platform_.aic == 28U &&
@@ -559,6 +561,7 @@ void Plan::prepare_communication(torch::Tensor combine_payload, bool metadata_dm
                                              ACL_MEMCPY_DEVICE_TO_DEVICE, stream.stream()));
     c10_npu::NPUCachingAllocator::recordStream(combine_payload.storage().data_ptr(), stream);
     c10_npu::NPUCachingAllocator::recordStream(workspace_.storage().data_ptr(), stream);
+    communication_combine_buffer_count_ = combine_buffer_count;
     communication_rows_ = rows;
 }
 
@@ -609,11 +612,11 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::communication_forward(torch::Tens
         }
     }
     auto ptr = [](const torch::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
-    mega_moe_communication_kernel_do(platform_.block_dim, platform_.ub, stream.stream(), ptr(context_), ptr(x),
-                                     ptr(x_scales), ptr(topk_ids), ptr(topk_weights), ptr(y), ptr(counts),
-                                     ptr(workspace_),
-                                     communication_metadata_.defined() ? ptr(communication_metadata_) : nullptr,
-                                     timer ? ptr(*timer) : nullptr, reinterpret_cast<const uint8_t*>(&tiling_), ffts_);
+    mega_moe_communication_kernel_do(
+        platform_.block_dim, platform_.ub, stream.stream(), ptr(context_), ptr(x), ptr(x_scales), ptr(topk_ids),
+        ptr(topk_weights), ptr(y), ptr(counts), ptr(workspace_),
+        communication_metadata_.defined() ? ptr(communication_metadata_) : nullptr, communication_combine_buffer_count_,
+        timer ? ptr(*timer) : nullptr, reinterpret_cast<const uint8_t*>(&tiling_), ffts_);
     for (const auto* tensor : {&x, &x_scales, &topk_ids, &topk_weights, &y, &counts, &workspace_, &context_}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }

@@ -141,6 +141,13 @@ def parse_args(argv=None):
         help="Dispatch metadata via local GM DMA, or original scalar stores for comparison",
     )
     parser.add_argument(
+        "--combine-buffer-count",
+        type=int,
+        choices=(2, 4, 6),
+        default=2,
+        help="Communication-only Prefill Combine pipeline slots; original production count is 2",
+    )
+    parser.add_argument(
         "--no-validation", action="store_true", help="Measure communication only; skip payload checks and task audit"
     )
     args = parser.parse_args(argv)
@@ -168,7 +175,7 @@ def run(args, config, group):
         group,
         "communication-only configuration",
         None,
-        (config, args.no_timer_raw, args.no_validation, args.dispatch_metadata_mode),
+        (config, args.no_timer_raw, args.no_validation, args.dispatch_metadata_mode, args.combine_buffer_count),
     )
     rank_dir = args.output_dir / f"rank_{rank}"
     error = None
@@ -186,6 +193,7 @@ def run(args, config, group):
         workload="communication_only",
         validation="skipped" if args.no_validation else "strict",
         dispatch_metadata_mode=args.dispatch_metadata_mode,
+        combine_buffer_count=args.combine_buffer_count,
         ep_size=world,
         rank=rank,
         local_rank=int(os.environ["LOCAL_RANK"]),
@@ -222,6 +230,7 @@ def run(args, config, group):
             bs,
             combine_payload=payload,
             dispatch_metadata_mode=args.dispatch_metadata_mode,
+            combine_buffer_count=args.combine_buffer_count,
         )
         torch.npu.synchronize()
         del payload, data, scales
@@ -319,18 +328,21 @@ def run(args, config, group):
                 transfers=transfers,
             )
         report["dispatch_metadata_mode"] = args.dispatch_metadata_mode
+        report["combine_buffer_count"] = args.combine_buffer_count
         report = write_rank_detail(report, timer_dir)
         reports = group.all_gather(report, f"communication bandwidth report BS={bs}")
         if rank == 0:
             summary = summarize(reports, require_validation=not args.no_validation)
             summary["workload"] = "communication_only"
             summary["dispatch_metadata_mode"] = args.dispatch_metadata_mode
+            summary["combine_buffer_count"] = args.combine_buffer_count
             (timer_dir / "communication.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
             validation_status = (
                 "validation skipped" if args.no_validation else "Dispatch/Combine payload and wave/core audit passed"
             )
             print(
                 f"[COMM_ONLY] BS={bs} dispatch_metadata_mode={args.dispatch_metadata_mode} "
+                f"combine_buffer_count={args.combine_buffer_count} "
                 f"kernel rank-max-mean={profile['rank_max_mean_us']:.3f}us; "
                 f"{validation_status}; no GMM executed",
                 flush=True,

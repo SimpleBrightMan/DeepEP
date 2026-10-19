@@ -34,7 +34,8 @@ public:
 
     // Experimental communication replay uses the same workspace and tiling as
     // forward, with precomputed BF16 expert rows instead of GMM execution.
-    void prepare_communication(torch::Tensor combine_payload, bool metadata_dma = true);
+    void prepare_communication(torch::Tensor combine_payload, bool metadata_dma = true,
+                               uint32_t combine_buffer_count = 2U);
     std::tuple<torch::Tensor, torch::Tensor> communication_forward(torch::Tensor x, torch::Tensor x_scales,
                                                                    torch::Tensor topk_ids, torch::Tensor topk_weights,
                                                                    c10::optional<torch::Tensor> timer,
@@ -54,6 +55,7 @@ private:
     // Read-only [source rank, token*topK+slot, 8] identity rows; communication
     // replay alone uses these local GM records to DMA Dispatch metadata.
     torch::Tensor communication_metadata_;
+    uint32_t communication_combine_buffer_count_ = 2U;
     uint64_t ffts_;
     int64_t communication_rows_ = 0;
     bool communication_completed_ = false;

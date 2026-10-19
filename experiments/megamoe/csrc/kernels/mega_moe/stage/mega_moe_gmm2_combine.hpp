@@ -244,6 +244,8 @@ struct WaveCombineBufferConfig {
 };
 
 struct WaveCombineScratch {
+    // Only the compute-disabled entry overrides the original BS-based policy.
+    uint32_t rowBufferCountOverride = 0U;
     AscendTimerDevice* auditTimer = nullptr;
     uint32_t auditExpert = 0;
     uint32_t auditRowBase = 0;
@@ -314,6 +316,27 @@ __aicore__ inline WaveCombineBufferConfig InitWaveCombineBuffers(const MoeStageC
             LocalTensor<float>(TPosition::VECIN, WAVE_COMBINE_UB_BASE + rowRingBytes, bufferConfig.quantTempElements);
     }
     return bufferConfig;
+}
+
+// Keep the same UB base and per-row pipeline for every replay depth. Only the
+// number of existing slots changes; no task, peer, drain or timer is reordered.
+__aicore__ inline WaveCombineBufferConfig InitTokenCombineSliceBuffers(const MoeStageCommonConfig& common,
+                                                                       WaveCombineScratch& scratch)
+{
+    if (scratch.rowBufferCountOverride == 6U) {
+        return InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 6U>(common, scratch);
+    }
+    if (scratch.rowBufferCountOverride == 4U) {
+        return InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 4U>(common, scratch);
+    }
+    if (scratch.rowBufferCountOverride == 2U) {
+        return InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 2U>(common, scratch);
+    }
+    // Full MegaMoE leaves the override at zero: Decode keeps six slots and
+    // Prefill keeps two. The host validates replay requests before launching.
+    return common.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS
+               ? InitWaveCombineBuffers<COMBINE_NO_QUANT>(common, scratch)
+               : InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 2U>(common, scratch);
 }
 
 // 默认由 AIV1 复用既有配置，仅为 AIV0 绑定最终 Combine 的 UB 视图。steady Wave 使用较小行环，
@@ -1201,9 +1224,7 @@ __aicore__ inline void RunCommSplitCombineSlice(const MoeStageCommonConfig& comm
 {
     if (owned.rows == 0U) return;
     scratch.auditRowBase = 0U;
-    auto buffers = common.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS
-                       ? InitWaveCombineBuffers<COMBINE_NO_QUANT>(common, scratch)
-                       : InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 2U>(common, scratch);
+    auto buffers = InitTokenCombineSliceBuffers(common, scratch);
     const auto type = physicalCore < params.tilingData->combineIntraCores ? AscendTimer::AIV_COMBINE_INTRA
                                                                           : AscendTimer::AIV_COMBINE_CROSS;
     timer.SetSlice(state.expertIdx, rowStart, owned.rows);
@@ -1248,11 +1269,9 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
     if (owned.count == 0U) {
         return;
     }
-    // 按实际单卡 BS 选择，不能用专家 slice 行数：Prefill 恢复两槽以限制并发搬运，Decode 保留六槽。
-    // AIV1 任务不抢占；Dispatch/Combine 均排空后才交还 UB 和事件 0..5。
-    auto buffers = common.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS
-                       ? InitWaveCombineBuffers<COMBINE_NO_QUANT>(common, scratch)
-                       : InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 2U>(common, scratch);
+    // Full MegaMoE uses its BS policy; compute-disabled experiments may select
+    // 2/4/6 slots. Task boundaries and the existing drain of events 0..5 stay.
+    auto buffers = InitTokenCombineSliceBuffers(common, scratch);
     GM_ADDR sliceOutput =
         params.workspaceInfo.gmm2MmadResPtr + globalRowStart * common.tokenHiddenDim * sizeof(bfloat16_t);
     uint32_t rowSequence = 0U;

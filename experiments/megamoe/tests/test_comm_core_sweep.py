@@ -29,6 +29,7 @@ def test_plan_does_not_touch_devices_or_create_output(tmp_path, capsys):
     assert planned["total_case_launches"] == 1
     assert planned["mode"] == "baseline"
     assert planned["dispatch_metadata_mode"] == "dma"
+    assert planned["combine_buffer_count"] == 2
     assert planned["combine_intra_candidates"] == []
     assert planned["model"]["num_topk"] == 8
     assert not planned["global_optimum_guaranteed"]
@@ -78,6 +79,21 @@ def test_performance_only_plan_and_child_command(tmp_path, capsys):
     assert "--no-validation" in command
     assert "deep_ep_experimental.megamoe.comm_benchmark" in command
     assert command[command.index("--dispatch-metadata-mode") + 1] == "dma"
+    assert command[command.index("--combine-buffer-count") + 1] == "2"
+
+
+@pytest.mark.parametrize("count", [2, 4, 6])
+def test_combine_buffer_count_reaches_child_and_never_changes_full_reference(tmp_path, count):
+    args = sweep.parse_args(["--combine-buffer-count", str(count), "--no-validation"])
+    planned = sweep.plan(args)
+    assert planned["combine_buffer_count"] == count and planned["dispatch_metadata_mode"] == "dma"
+    command = sweep.command(args, tmp_path / "config", tmp_path / "out", None, tmp_path)
+    assert command[command.index("--combine-buffer-count") + 1] == str(count)
+    assert "--no-validation" in command
+    args.no_validation = False
+    full = sweep.command(args, tmp_path / "config", tmp_path / "full", None, tmp_path, full_reference=True)
+    assert "--combine-buffer-count" not in full
+    assert "--dispatch-metadata-mode" not in full
 
 
 def test_scalar_metadata_mode_is_explicit_and_does_not_change_full_reference(tmp_path):
@@ -149,6 +165,9 @@ def test_full_reference_rejects_incomparable_manifest_before_comparing_timers(tm
         ("--case-gap-seconds", "61"),
         ("--shmem-port-policy", "invalid"),
         ("--dispatch-metadata-mode", "invalid"),
+        ("--combine-buffer-count", "0"),
+        ("--combine-buffer-count", "3"),
+        ("--combine-buffer-count", "8"),
     ],
 )
 def test_reject_invalid_scan(option, value):
@@ -199,9 +218,10 @@ def test_staged_search_retains_first_stage_winner_outside_combine_candidates(tmp
     monkeypatch.setattr(sweep, "write_summary", lambda path, plan, records, chosen: selections.extend(chosen))
     durations = {None: 200, (2, 12): 90, (4, 12): 100, (2, 2): 150, (2, 4): 130}
 
-    def read(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma"):
+    def read(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", combine_buffer_count=2):
         assert validate
         assert dispatch_metadata_mode == "dma"
+        assert combine_buffer_count == 2
         return dict(pair=list(pair) if pair else None, passed=True, comm_kernel_rank_max_mean_us=durations[pair])
 
     monkeypatch.setattr(sweep, "read_case", read)
@@ -234,9 +254,10 @@ def test_dispatch_only_keeps_combine_fixed_through_scan_and_confirmation(tmp_pat
     monkeypatch.setattr(sweep, "write_summary", lambda path, plan, records, chosen: selections.extend(chosen))
     durations = {None: 200, (10, 7): 120, (12, 7): 110, (16, 7): 130, (20, 7): 125}
 
-    def read(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma"):
+    def read(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", combine_buffer_count=2):
         assert validate
         assert dispatch_metadata_mode == "dma"
+        assert combine_buffer_count == 2
         return dict(pair=list(pair) if pair else None, passed=True, comm_kernel_rank_max_mean_us=durations[pair])
 
     monkeypatch.setattr(sweep, "read_case", read)
@@ -328,7 +349,7 @@ def test_execute_waits_and_records_exit_without_masking_child_failure(tmp_path, 
     assert records[-1]["event"] == "torchrun_exit" and records[-1]["returncode"] == status
 
 
-def write_case_fixture(tmp_path, pair, *, validate=True, metadata_mode="dma"):
+def write_case_fixture(tmp_path, pair, *, validate=True, metadata_mode="dma", combine_buffer_count=2):
     bs = 2048
     for rank in range(16):
         directory = tmp_path / f"rank_{rank}"
@@ -351,6 +372,8 @@ def write_case_fixture(tmp_path, pair, *, validate=True, metadata_mode="dma"):
             manifest["validation"] = "skipped"
         if metadata_mode is not None:
             manifest["dispatch_metadata_mode"] = metadata_mode
+        if combine_buffer_count is not None:
+            manifest["combine_buffer_count"] = combine_buffer_count
         (directory / "manifest.json").write_text(json.dumps(manifest))
     rank0 = tmp_path / "rank_0" / f"bs_{bs}"
     rank0.mkdir()
@@ -377,6 +400,8 @@ def write_case_fixture(tmp_path, pair, *, validate=True, metadata_mode="dma"):
     )
     if metadata_mode is not None:
         communication["dispatch_metadata_mode"] = metadata_mode
+    if combine_buffer_count is not None:
+        communication["combine_buffer_count"] = combine_buffer_count
     if not validate:
         communication["validation"] = dict(strict_wave_core=False, status="skipped")
         for record in communication["ranks"]:
@@ -402,6 +427,25 @@ def test_case_reader_rejects_metadata_mode_mismatch_in_summary(tmp_path):
     (timer / "communication.json").write_text(json.dumps(communication))
     with pytest.raises(ValueError, match="report metadata mode"):
         sweep.read_case(tmp_path, 2048, None, validate=False)
+
+
+@pytest.mark.parametrize("recorded", [2, 4, 6, None])
+def test_case_reader_checks_requested_combine_slots_and_legacy_means_two(tmp_path, recorded):
+    write_case_fixture(tmp_path, None, validate=False, combine_buffer_count=recorded)
+    actual = recorded or 2
+    report = sweep.read_case(tmp_path, 2048, None, validate=False, combine_buffer_count=actual)
+    assert report["combine_buffer_count"] == actual
+    other = 4 if actual == 2 else 2
+    with pytest.raises(ValueError, match="manifest"):
+        sweep.read_case(tmp_path, 2048, None, validate=False, combine_buffer_count=other)
+
+
+def test_case_reader_rejects_combine_slot_mismatch_in_summary(tmp_path):
+    _, timer, communication, _ = write_case_fixture(tmp_path, None, validate=False, combine_buffer_count=4)
+    communication["combine_buffer_count"] = 6
+    (timer / "communication.json").write_text(json.dumps(communication))
+    with pytest.raises(ValueError, match="report Combine buffer count"):
+        sweep.read_case(tmp_path, 2048, None, validate=False, combine_buffer_count=4)
 
 
 @pytest.mark.parametrize("pair", [None, (12, 0), (12, 12)])
@@ -508,15 +552,27 @@ def test_performance_only_runs_all_bs_without_reference_or_validation(tmp_path, 
     monkeypatch.setattr(sweep, "print_case", lambda item: None)
     monkeypatch.setattr(sweep, "write_summary", lambda *a: None)
 
-    def read(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma"):
+    def read(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", combine_buffer_count=2):
         assert dispatch_metadata_mode == "dma"
+        assert combine_buffer_count == 6
         reads.append((bs, pair, validate))
         return dict(bs=bs, pair=pair, passed=True, validation="skipped")
 
     monkeypatch.setattr(sweep, "read_case", read)
-    sweep.main(["--no-validation", "--output-dir", str(tmp_path / "run"), "--case-gap-seconds", "0"])
+    sweep.main(
+        [
+            "--no-validation",
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--case-gap-seconds",
+            "0",
+            "--combine-buffer-count",
+            "6",
+        ]
+    )
     assert reads == [(2048, None, False), (4096, None, False), (8192, None, False)]
     assert len(launches) == 3 and all("--no-validation" in command for command in launches)
+    assert all(command[command.index("--combine-buffer-count") + 1] == "6" for command in launches)
     assert all("deep_ep_experimental.megamoe.benchmark" not in command for command in launches)
     assert "COMPLETED_VALIDATION_SKIPPED" in capsys.readouterr().out
 
@@ -552,6 +608,7 @@ def test_summary_and_console_keep_dispatch_combine_independent(tmp_path, capsys)
             bs=2048,
             stage="baseline" if pair is None else "dispatch",
             dispatch_metadata_mode="dma",
+            combine_buffer_count=4,
             pair=pair,
             output_dir=str(tmp_path / ("baseline" if pair is None else "candidate")),
             comm_kernel_rank_max_mean_us=2400.0,
@@ -566,6 +623,7 @@ def test_summary_and_console_keep_dispatch_combine_independent(tmp_path, capsys)
         rows = list(csv.DictReader(stream))
     assert len(rows) == 2
     assert all(row["dispatch_metadata_mode"] == "dma" for row in rows)
+    assert all(row["combine_buffer_count"] == "4" for row in rows)
     assert all(row["DISPATCH_GBps"] == "70.0" and row["COMBINE_GBps"] == "130.0" for row in rows)
     assert rows[0]["dispatch_intra"] == "0" and rows[0]["dispatch_cross"] == ""
     assert rows[1]["combine_intra"] == "0" and rows[1]["combine_cross"] == ""
@@ -573,6 +631,7 @@ def test_summary_and_console_keep_dispatch_combine_independent(tmp_path, capsys)
     printed = capsys.readouterr().out
     assert "D=10/18 C=original" in printed
     assert "dispatch_metadata_mode=dma" in printed
+    assert "combine_buffer_count=4" in printed
     assert "[BW] DISPATCH" in printed and "[BW] COMBINE" in printed
     assert "all 28 core communication times / 28" in printed
     assert "wave envelopes" not in printed

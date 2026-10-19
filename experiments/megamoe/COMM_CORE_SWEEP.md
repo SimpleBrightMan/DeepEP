@@ -58,8 +58,30 @@ Dispatch 通过 MTE2 把对应表项读到 UB，然后随 token/scale 一起由 
 表的生成与准备在 timer-off profiler 和普通 timer 调用之前完成，表读取包含在通信计时内。
 
 两种模式沿用相同 Wave、每核任务、槽位数量、ready 协议和 Dispatch/Combine timer 边界。
-Combine 搬运实现保持原样。批量读取路由索引所需 `MTE2_S`、slice ready 同步和槽位复用等待仍保留；本实验不代表去除了全部 scalar 依赖。
+默认 Combine 仍为原 2 槽；下面的独立开关可测试 4/6 槽。批量读取路由索引所需 `MTE2_S`、slice ready 同步和槽位复用等待仍保留；metadata 实验不代表去除了全部 scalar 依赖。
 `plan.json`、rank manifest、详细通信报告、`summary.json` / `summary.csv` 和控制台均记录 `dispatch_metadata_mode`，防止结果混淆。
+
+## Combine 流水槽位实验
+
+`--combine-buffer-count {2,4,6}` 只改变通信模拟的 Prefill Combine 流水槽位，默认 2。
+完整 MegaMoE 及 `--run-full-reference` 仍按原策略使用 2 槽；Dispatch metadata 默认仍为 DMA，Dispatch 槽位和核心任务分配不受此开关影响。
+Wave、每核 token 任务和传输字节数、ready 协议、两类通信 timer 边界保持原定义。
+增加槽位扩大可同时在途的 Combine 搬运数量，是否改善带宽需要实测，不能由槽位数直接推断。
+
+重新编译安装一次后，在同一构建下循环测试 2/4/6 槽，每个槽位跑 BS2048/4096/8192：
+
+```bash
+for slots in 2 4 6; do
+  python3 experiments/megamoe/scripts/comm_core_sweep.py \
+    --mode baseline --bs-values 2048,4096,8192 \
+    --dispatch-metadata-mode dma --combine-buffer-count "$slots" \
+    --no-validation --keep-raw-timers || break
+done
+```
+
+每轮自动创建独立结果目录，不画图。控制台和 plan、manifest、详细报告、汇总 JSON/CSV 均记录 `combine_buffer_count`。
+输出仍分别给出 Dispatch、Combine 的带宽和通信 kernel 总耗时；以相同 BS 的三种槽位结果比较。
+省略 `combine_buffer_count` 字段的旧报告按原 2 槽读取，不能作为 4/6 槽结果接受。
 
 ## 可选的解耦验收
 
@@ -117,7 +139,7 @@ python3 experiments/megamoe/scripts/comm_core_sweep.py \
 
 `0` 或不设置表示该阶段原调度；`1..27` 表示 INTRA 核数，CROSS 为 `28-INTRA`。
 例如 Dispatch=10 时 AIV1 0..9 负责 INTRA，10..27 负责 CROSS。跨组按本组−1、本组−2、本组−3 处理，组切换不添加全卡屏障或排空流水。
-保留生产槽位策略：Prefill Dispatch 通常 6 槽，Prefill Combine 2 槽。
+Prefill Dispatch 保留生产槽位策略（通常 6 槽）；通信模拟的 Combine 默认为原 2 槽，可用 `--combine-buffer-count 4` 或 `6` 做独立实验。
 默认模式为 baseline，扫描必须显式选 dispatch；仍保留显式 `--mode staged` / `--mode fullgrid`。
 候选选择标准为 timer-off **通信 kernel** 的每轮最慢 rank 耗时均值，最优候选在新进程中复测。
 这个时间输出为 `COMM-KERNEL`，包含路由准备、Dispatch、Combine 与 Unpermute，不再标为完整算子 E2E。

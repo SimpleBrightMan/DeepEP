@@ -67,6 +67,13 @@ def parse_args(argv=None):
         default="dma",
         help="Communication-only Dispatch metadata implementation; full reference stays scalar",
     )
+    parser.add_argument(
+        "--combine-buffer-count",
+        type=int,
+        choices=(2, 4, 6),
+        default=2,
+        help="Communication-only Prefill Combine pipeline slots; full reference retains its original policy",
+    )
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--timeout", type=int, default=3600, help="Seconds per fresh torchrun case")
@@ -188,6 +195,7 @@ def plan(args):
         validation="skipped" if args.no_validation else "strict",
         mode=args.mode,
         dispatch_metadata_mode=args.dispatch_metadata_mode,
+        combine_buffer_count=args.combine_buffer_count,
         ep_size=16,
         physical_aiv1_workers=28,
         bs_values=args.bs_values,
@@ -217,7 +225,7 @@ def plan(args):
             if args.no_validation
             else "Every case checks Dispatch bytes/scales/metadata and Combine output against independent synthetic payload expectations.",
             "No weights, GMM1, SwiGLU or GMM2 run in communication-only cases; synthetic GMM2 rows are prepared once before timing.",
-            "Dispatch and Combine keep production slot policies (Prefill Combine has two slots).",
+            f"Dispatch keeps its production slot policy; communication-only Prefill Combine uses {args.combine_buffer_count} slots (original: 2).",
             "Dispatch metadata DMA adds one local 32-byte read per row; remote payload bytes and task ownership are unchanged.",
             "Full MegaMoE reference retains original scalar Dispatch metadata; metadata modes need not match for optional task/timing comparisons.",
             "Combine=0 means original Combine ownership; Dispatch experiments can leave Combine unchanged.",
@@ -310,6 +318,7 @@ def command(args, config_path, output, pair, baseline, *, full_reference=False):
         ]
     else:
         result += ["--dispatch-metadata-mode", args.dispatch_metadata_mode]
+        result += ["--combine-buffer-count", str(args.combine_buffer_count)]
         if args.no_validation:
             result.append("--no-validation")
     if not args.keep_raw_timers:
@@ -346,7 +355,7 @@ def execute(argv, *, cwd, environment, logfile, timeout):
         raise RuntimeError(f"Case exited with status {code}; inspect {logfile}")
 
 
-def read_case(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma"):
+def read_case(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", combine_buffer_count=2):
     expected_environment = {ENV_DISPATCH: str(pair[0]) if pair else None, ENV_COMBINE: str(pair[1]) if pair else None}
     builds = []
     for rank in range(16):
@@ -362,6 +371,7 @@ def read_case(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma"):
             or manifest["config"]["bs_values"] != [bs]
             or manifest.get("validation", "strict") != ("strict" if validate else "skipped")
             or manifest.get("dispatch_metadata_mode", "scalar") != dispatch_metadata_mode
+            or manifest.get("combine_buffer_count", 2) != combine_buffer_count
         ):
             raise ValueError("Benchmark manifest does not match the requested case")
         builds.append(manifest["build"])
@@ -392,6 +402,7 @@ def read_case(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma"):
         passed=True,
         validation="strict" if validate else "skipped",
         dispatch_metadata_mode=dispatch_metadata_mode,
+        combine_buffer_count=combine_buffer_count,
         comm_kernel_rank_max_mean_us=slowest,
         comm_kernel_rank_min_mean_us=statistics.mean(min(values) for values in zip(*per_rank)),
         comm_kernel_all_ranks_mean_us=statistics.mean(v for row in per_rank for v in row),
@@ -404,6 +415,8 @@ def read_case(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma"):
     )
     if report["communication"].get("dispatch_metadata_mode", "scalar") != dispatch_metadata_mode:
         raise ValueError("Communication report metadata mode does not match the requested case")
+    if report["communication"].get("combine_buffer_count", 2) != combine_buffer_count:
+        raise ValueError("Communication report Combine buffer count does not match the requested case")
     if sorted(r["rank"] for r in report["communication"]["ranks"]) != list(range(16)):
         raise ValueError("Missing communication ranks")
     if report["communication"].get("schema_version") != 2:
@@ -508,6 +521,7 @@ def write_summary(path, launch_plan, records, selections):
             "bs",
             "stage",
             "dispatch_metadata_mode",
+            "combine_buffer_count",
             "dispatch_intra",
             "dispatch_cross",
             "combine_intra",
@@ -534,6 +548,7 @@ def write_summary(path, launch_plan, records, selections):
                 )
             }
             row["dispatch_metadata_mode"] = item.get("dispatch_metadata_mode", "scalar")
+            row["combine_buffer_count"] = item.get("combine_buffer_count", 2)
             if pair:
                 row.update(
                     dispatch_intra=pair[0],
@@ -567,6 +582,7 @@ def print_case(item):
     )
     print(
         f"[CASE] BS={item['bs']} {label} dispatch_metadata_mode={item.get('dispatch_metadata_mode', 'scalar')} "
+        f"combine_buffer_count={item.get('combine_buffer_count', 2)} "
         f"COMM-KERNEL rank-max-mean={item['comm_kernel_rank_max_mean_us']:.3f}us "
         f"rank-min-mean={item['comm_kernel_rank_min_mean_us']:.3f}us (timer off; {validation})",
         flush=True,
@@ -663,6 +679,7 @@ def main(argv=None):
                     pair,
                     validate=not args.no_validation,
                     dispatch_metadata_mode=args.dispatch_metadata_mode,
+                    combine_buffer_count=args.combine_buffer_count,
                 ),
                 stage=stage,
             )

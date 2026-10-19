@@ -78,9 +78,10 @@ def mocked_run(monkeypatch, tmp_path):
             self.topk_idx = Tensor(np.zeros((bs, topk), dtype=np.int32))
             self.topk_weights = Tensor(np.zeros((bs, topk), dtype=np.float32))
 
-        def prepare_communication(self, bs, *, combine_payload, dispatch_metadata_mode):
+        def prepare_communication(self, bs, *, combine_payload, dispatch_metadata_mode, combine_buffer_count):
             state.prepared_rows = combine_payload.data.shape[0]
             state.dispatch_metadata_mode = dispatch_metadata_mode
+            state.combine_buffer_count = combine_buffer_count
             assert bs == 8
 
         def allocate_timer(self, *, audit=False):
@@ -162,6 +163,7 @@ def mocked_run(monkeypatch, tmp_path):
         no_timer_raw=False,
         no_validation=True,
         dispatch_metadata_mode="dma",
+        combine_buffer_count=2,
     )
     config = dict(
         model=dict(hidden=64, intermediate_hidden=128, num_experts=32, num_topk=8, num_shared_experts=0),
@@ -174,9 +176,16 @@ def mocked_run(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("metadata_mode", ["dma", "scalar"])
-def test_performance_only_run_skips_all_validation_and_writes_real_reports(mocked_run, capsys, metadata_mode):
+@pytest.mark.parametrize("combine_buffer_count", [2, 4, 6])
+def test_performance_only_run_skips_all_validation_and_writes_real_reports(
+    mocked_run,
+    capsys,
+    metadata_mode,
+    combine_buffer_count,
+):
     run = mocked_run
     run.args.dispatch_metadata_mode = metadata_mode
+    run.args.combine_buffer_count = combine_buffer_count
     bench.run(run.args, run.config, run.group)
     state, output = run.state, run.args.output_dir
     assert state.forbidden == []
@@ -185,6 +194,7 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(mocke
     assert state.calls == [False, False, False, False, False, True]
     assert state.prepared_rows == 64
     assert state.dispatch_metadata_mode == metadata_mode
+    assert state.combine_buffer_count == combine_buffer_count
     assert state.destroyed and state.closed
     assert not list(output.rglob("*accuracy*"))
     assert not list(output.rglob("*audit*"))
@@ -193,6 +203,7 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(mocke
     manifest = json.loads((output / "rank_0/manifest.json").read_text())
     assert manifest["workload"] == "communication_only" and manifest["validation"] == "skipped"
     assert manifest["dispatch_metadata_mode"] == metadata_mode
+    assert manifest["combine_buffer_count"] == combine_buffer_count
     profile = json.loads((output / "rank_0/bs_8/profiling.json").read_text())
     assert profile["metric"] == "communication_only_kernel_duration_us"
     assert profile["rank_max_mean_us"] == 19.0
@@ -204,12 +215,14 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(mocke
     assert "_transfers" not in detail
     assert detail["validation"]["status"] == "skipped"
     assert detail["dispatch_metadata_mode"] == metadata_mode
+    assert detail["combine_buffer_count"] == combine_buffer_count
     assert detail["validation"]["accounting"] == "timer_row_counts"
     assert [wave["operation"] for wave in detail["waves"]] == ["DISPATCH", "COMBINE"]
     assert all(len(wave["cores"]) == 28 for wave in detail["waves"])
     summary = json.loads((timer_dir / "communication.json").read_text())
     assert summary["validation"] == dict(strict_wave_core=False, status="skipped")
     assert summary["dispatch_metadata_mode"] == metadata_mode
+    assert summary["combine_buffer_count"] == combine_buffer_count
     assert len(summary["ranks"]) == 16
     for operation, mean_core_us in (("DISPATCH", 1.0), ("COMBINE", 2.0)):
         measured = detail["operations"][operation]
@@ -217,7 +230,9 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(mocke
         assert measured["rows"] == 64 and measured["bytes"] == expected_bytes
         assert measured["mean_core_us"] == mean_core_us
         assert summary["operations"][operation]["gbps_per_card_mean"] == expected_bytes / mean_core_us / 1000
-    assert "validation skipped; no GMM executed" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "validation skipped; no GMM executed" in printed
+    assert f"combine_buffer_count={combine_buffer_count}" in printed
 
 
 def test_strict_run_still_calls_oracle_before_timing(mocked_run):

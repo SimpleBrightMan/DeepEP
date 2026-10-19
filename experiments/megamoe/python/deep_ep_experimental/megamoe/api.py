@@ -228,15 +228,16 @@ class SymmBuffer:
         return self._plan.workspace_bytes if self._plan is not None else 0
 
     def prepare_communication(
-        self, bs: int, *, combine_payload: Tensor, dispatch_metadata_mode: str = "dma"
+        self, bs: int, *, combine_payload: Tensor, dispatch_metadata_mode: str = "dma", combine_buffer_count: int = 2
     ) -> SymmBuffer:
         """Prepare a balanced Prefill communication replay, outside timed launches.
 
         combine_payload contains synthetic BF16 expert-major rows that replace
         GMM2's output. Dispatch metadata uses a read-only local GM identity table
         in dma mode; scalar mode retains the original per-token scalar writes.
-        Task ownership, peer payload and Combine are unchanged. No matrix weights
-        are allocated or used. All ranks call this together with the same mode.
+        combine_buffer_count selects 2, 4 or 6 row slots for replay's BF16 Combine.
+        Task ownership, peer payload and full MegaMoE are unchanged. No matrix
+        weights are allocated or used. All ranks call together with the same settings.
         """
         import numpy as np
         import torch
@@ -246,10 +247,12 @@ class SymmBuffer:
         error = None
         try:
             extension = _extension()
-            if getattr(extension, "communication_replay_protocol", None) != 2:
-                raise RuntimeError("Rebuild and reinstall this branch to enable Dispatch metadata DMA replay")
+            if getattr(extension, "communication_replay_protocol", None) != 3:
+                raise RuntimeError("Rebuild and reinstall this branch to enable configurable Combine buffers in replay")
             if dispatch_metadata_mode not in ("dma", "scalar"):
                 raise ValueError("dispatch_metadata_mode must be 'dma' or 'scalar'")
+            if type(combine_buffer_count) is not int or combine_buffer_count not in (2, 4, 6):
+                raise ValueError("combine_buffer_count must be an integer: 2, 4 or 6")
             if (
                 self.group.size() != 16
                 or self.num_shared_experts != 0
@@ -274,7 +277,12 @@ class SymmBuffer:
                 raise ValueError("Communication replay requires the repository's exact rank-first balanced routing")
         except Exception as failure:
             error = str(failure)
-        collective_check(self.group, "communication preparation inputs", error, (bs, dispatch_metadata_mode))
+        collective_check(
+            self.group,
+            "communication preparation inputs",
+            error,
+            None if error else (bs, dispatch_metadata_mode, combine_buffer_count),
+        )
         self.prepare(bs)
         with self._lock:
             runtime = self._runtime
@@ -282,11 +290,18 @@ class SymmBuffer:
                 runtime.ensure_alive()
                 runtime.stream.wait_stream(npu_api().current_stream(runtime.device))
                 with npu_api().stream(runtime.stream):
-                    self._plan.prepare_communication(combine_payload, dispatch_metadata_mode == "dma")
+                    self._plan.prepare_communication(
+                        combine_payload, dispatch_metadata_mode == "dma", combine_buffer_count
+                    )
                 self._communication_route = (bs, self.topk_idx, self.topk_idx._version)
             except Exception as failure:
                 error = str(failure)
-            collective_check(self.group, "communication payload preparation", error, (bs, dispatch_metadata_mode))
+            collective_check(
+                self.group,
+                "communication payload preparation",
+                error,
+                (bs, dispatch_metadata_mode, combine_buffer_count),
+            )
         return self
 
     def communication_snapshot(self, rows: int) -> dict[str, Tensor]:

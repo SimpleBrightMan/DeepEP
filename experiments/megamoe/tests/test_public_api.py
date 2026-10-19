@@ -195,13 +195,13 @@ def replay_backend(backend):
     b.group.rank = lambda: 0
     b.num_experts = 32
     backend.ext.small_batch_max_tokens = 1
-    backend.ext.communication_replay_protocol = 2
+    backend.ext.communication_replay_protocol = 3
     route = np.arange(17 * b.num_topk)
     b.topk_idx.data[:] = ((route % 16) * 2 + (route // 16) % 2).reshape(17, b.num_topk)
     events = backend.events
 
-    def prepare(plan, payload, metadata_dma):
-        events.append(("prepare_comm", payload, metadata_dma))
+    def prepare(plan, payload, metadata_dma, combine_buffer_count):
+        events.append(("prepare_comm", payload, metadata_dma, combine_buffer_count))
 
     def forward(plan, data, scales, ids, weights, timer, out):
         events.append(("comm_launch", timer))
@@ -237,6 +237,7 @@ def test_communication_replay_without_weight_arguments_and_snapshot_stream_lifet
     assert all(tensor.streams == [b._runtime.stream] for tensor in snapshot.values())
     assert sum(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple)) == 1
     assert next(event for event in backend.events if isinstance(event, tuple) and event[0] == "prepare_comm")[2] is True
+    assert next(event for event in backend.events if isinstance(event, tuple) and event[0] == "prepare_comm")[3] == 2
     assert sum(event[0] == "comm_launch" for event in backend.events if isinstance(event, tuple)) == 2
     assert not any(event[0] == "launch" for event in backend.events if isinstance(event, tuple))
 
@@ -261,8 +262,8 @@ def test_communication_metadata_mode_must_match_all_ranks(backend, monkeypatch):
 
     def gather(output, value, **kwargs):
         output[:] = [value] * 2
-        if value == (None, (17, "dma")):
-            output[1] = (None, (17, "scalar"))
+        if value == (None, (17, "dma", 2)):
+            output[1] = (None, (17, "scalar", 2))
 
     monkeypatch.setattr(backend.dist, "all_gather_object", gather)
     with pytest.raises(ValueError, match="communication preparation inputs: ranks disagree"):
@@ -270,13 +271,54 @@ def test_communication_metadata_mode_must_match_all_ranks(backend, monkeypatch):
     assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
 
 
-@pytest.mark.parametrize("protocol", [None, 1])
+@pytest.mark.parametrize("protocol", [None, 1, 2])
 def test_communication_metadata_rejects_stale_extension_protocol(backend, protocol):
     payload = replay_backend(backend)
     backend.ext.communication_replay_protocol = protocol
     with pytest.raises(ValueError, match="Rebuild and reinstall"):
         backend.buffer.prepare_communication(17, combine_payload=payload)
     assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
+
+
+@pytest.mark.parametrize("count", [2, 4, 6])
+def test_communication_combine_buffer_count(backend, count):
+    payload = replay_backend(backend)
+    backend.buffer.prepare_communication(17, combine_payload=payload, combine_buffer_count=count)
+    event = next(event for event in backend.events if isinstance(event, tuple) and event[0] == "prepare_comm")
+    assert event[3] == count
+
+
+@pytest.mark.parametrize("count", [True, False, 2.0, 4.0, 6.0, "2", None, 0, 1, 3, 5, 7, -2, np.int64(2)])
+def test_communication_combine_buffer_count_rejects_invalid(backend, count):
+    payload = replay_backend(backend)
+    with pytest.raises(ValueError, match="combine_buffer_count must be an integer"):
+        backend.buffer.prepare_communication(17, combine_payload=payload, combine_buffer_count=count)
+    assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
+
+
+def test_communication_combine_buffer_count_must_match_all_ranks(backend, monkeypatch):
+    payload = replay_backend(backend)
+
+    def gather(output, value, **kwargs):
+        output[:] = [value] * 2
+        if value == (None, (17, "dma", 2)):
+            output[1] = (None, (17, "dma", 4))
+
+    monkeypatch.setattr(backend.dist, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="communication preparation inputs: ranks disagree"):
+        backend.buffer.prepare_communication(17, combine_payload=payload)
+    assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
+
+
+def test_communication_combine_buffer_count_changes_on_repreparation(backend):
+    payload = replay_backend(backend)
+    out = Tensor(np.zeros((17, 1024)), "bfloat16")
+    for count in (6, 2, 4):
+        backend.buffer.prepare_communication(17, combine_payload=payload, combine_buffer_count=count)
+        api.communication_forward(backend.buffer, bs=17, out=out)
+    prepared = [event[3] for event in backend.events if isinstance(event, tuple) and event[0] == "prepare_comm"]
+    assert prepared == [6, 2, 4]
+    assert sum(event[0] == "comm_launch" for event in backend.events if isinstance(event, tuple)) == 3
 
 
 @pytest.mark.parametrize("change", ["route_version", "route_replaced", "bs", "full_operator"])
