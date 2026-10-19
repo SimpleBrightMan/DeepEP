@@ -110,6 +110,7 @@ def test_initial_simulator_rejects_unsupported_shape_before_importing_torch(tmp_
         (["--dispatch-metadata-mode", "scalar"], "scalar", 2),
         (["--combine-buffer-count", "4"], "dma", 4),
         (["--combine-buffer-count", "6"], "dma", 6),
+        (["--combine-buffer-count", "8"], "dma", 8),
     ],
 )
 def test_benchmark_metadata_and_combine_options(tmp_path, options, expected_mode, combine_count):
@@ -128,7 +129,7 @@ def test_benchmark_metadata_and_combine_options(tmp_path, options, expected_mode
     assert args.combine_buffer_count == combine_count
 
 
-@pytest.mark.parametrize("count", ["0", "1", "3", "5", "8"])
+@pytest.mark.parametrize("count", ["0", "1", "3", "5", "7", "9", "10"])
 def test_benchmark_rejects_unsupported_combine_slot_count_before_loading_config(tmp_path, count):
     with pytest.raises(SystemExit):
         bench.parse_args(

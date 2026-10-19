@@ -179,7 +179,7 @@ def mocked_run(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("metadata_mode", ["dma", "scalar"])
-@pytest.mark.parametrize("combine_buffer_count", [2, 4, 6])
+@pytest.mark.parametrize("combine_buffer_count", [2, 4, 6, 8])
 @pytest.mark.parametrize("group_order", ["reverse", "paired-xor"])
 def test_performance_only_run_skips_all_validation_and_writes_real_reports(
     mocked_run,

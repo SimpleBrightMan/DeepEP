@@ -293,7 +293,7 @@ def test_performance_only_plan_and_child_command(tmp_path, capsys):
     assert command[command.index("--combine-buffer-count") + 1] == "2"
 
 
-@pytest.mark.parametrize("count", [2, 4, 6])
+@pytest.mark.parametrize("count", [2, 4, 6, 8])
 def test_combine_buffer_count_reaches_child_and_never_changes_full_reference(tmp_path, count):
     args = sweep.parse_args(["--combine-buffer-count", str(count), "--no-validation"])
     planned = sweep.plan(args)
@@ -380,7 +380,8 @@ def test_full_reference_rejects_incomparable_manifest_before_comparing_timers(tm
         ("--dispatch-metadata-mode", "invalid"),
         ("--combine-buffer-count", "0"),
         ("--combine-buffer-count", "3"),
-        ("--combine-buffer-count", "8"),
+        ("--combine-buffer-count", "7"),
+        ("--combine-buffer-count", "9"),
     ],
 )
 def test_reject_invalid_scan(option, value):
@@ -669,7 +670,7 @@ def test_case_reader_rejects_metadata_mode_mismatch_in_summary(tmp_path):
         sweep.read_case(tmp_path, 2048, None, validate=False)
 
 
-@pytest.mark.parametrize("recorded", [2, 4, 6, None])
+@pytest.mark.parametrize("recorded", [2, 4, 6, 8, None])
 def test_case_reader_checks_requested_combine_slots_and_legacy_means_two(tmp_path, recorded):
     write_case_fixture(tmp_path, None, validate=False, combine_buffer_count=recorded)
     actual = recorded or 2

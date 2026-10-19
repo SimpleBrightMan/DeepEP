@@ -258,10 +258,6 @@ struct WaveCombineScratch {
 constexpr uint32_t WAVE_COMBINE_MIN_ROW_BUFFER_COUNT = 2U;
 constexpr uint32_t WAVE_COMBINE_STEADY_ROW_BUFFER_COUNT = 1U;
 constexpr uint32_t WAVE_COMBINE_MAX_ROW_BUFFER_COUNT = 6U;
-constexpr uint32_t WAVE_COMBINE_UB_BASE = 64U * 1024U;
-// [64 KiB, 184 KiB) is dedicated to the Combine row ring and quant scratch.
-// The ready scan starts at 184 KiB, so adaptive row buffers must stay below it.
-constexpr uint32_t WAVE_COMBINE_UB_LIMIT = 184U * 1024U;
 constexpr uint32_t WAVE_COMBINE_META_INFO_TOKEN_CAPACITY = 1536U;
 
 // 非 layered 路径统一使用的 Combine 行环。常规 Wave 只有 AIV1 建立并使用这些 UB 视图；
@@ -270,8 +266,10 @@ template <uint8_t CombineMode, bool IncludeAiv0 = false, uint32_t MaxRowBufferCo
 __aicore__ inline WaveCombineBufferConfig InitWaveCombineBuffers(const MoeStageCommonConfig& common,
                                                                  WaveCombineScratch& scratch)
 {
-    static_assert(MaxRowBufferCount > 0U && MaxRowBufferCount <= WAVE_COMBINE_MAX_ROW_BUFFER_COUNT,
+    static_assert(MaxRowBufferCount > 0U && MaxRowBufferCount <= WAVE_COMBINE_REPLAY_MAX_ROW_BUFFER_COUNT,
                   "invalid Combine row buffer count");
+    static_assert(CombineMode == COMBINE_NO_QUANT || MaxRowBufferCount <= WAVE_COMBINE_MAX_ROW_BUFFER_COUNT,
+                  "eight-slot Combine is only supported by non-quantized communication replay");
     WaveCombineBufferConfig bufferConfig{};
     if constexpr (g_coreType == AIC) {
         return bufferConfig;
@@ -324,6 +322,9 @@ __aicore__ inline WaveCombineBufferConfig InitWaveCombineBuffers(const MoeStageC
 __aicore__ inline WaveCombineBufferConfig InitTokenCombineSliceBuffers(const MoeStageCommonConfig& common,
                                                                        WaveCombineScratch& scratch)
 {
+    if (scratch.rowBufferCountOverride == 8U) {
+        return InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 8U>(common, scratch);
+    }
     if (scratch.rowBufferCountOverride == 6U) {
         return InitWaveCombineBuffers<COMBINE_NO_QUANT, false, 6U>(common, scratch);
     }
@@ -1271,7 +1272,7 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
         return;
     }
     // Full MegaMoE uses its BS policy; compute-disabled experiments may select
-    // 2/4/6 slots. Task boundaries and the existing drain of events 0..5 stay.
+    // 2/4/6/8 slots. Task boundaries and draining the active row events stay.
     auto buffers = InitTokenCombineSliceBuffers(common, scratch);
     GM_ADDR sliceOutput =
         params.workspaceInfo.gmm2MmadResPtr + globalRowStart * common.tokenHiddenDim * sizeof(bfloat16_t);

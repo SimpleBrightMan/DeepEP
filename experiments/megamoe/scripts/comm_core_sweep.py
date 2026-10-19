@@ -80,7 +80,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--combine-buffer-count",
         type=int,
-        choices=(2, 4, 6),
+        choices=(2, 4, 6, 8),
         default=2,
         help="Communication-only Prefill Combine pipeline slots; full reference retains its original policy",
     )

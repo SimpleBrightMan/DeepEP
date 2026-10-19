@@ -524,8 +524,12 @@ void Plan::prepare_communication(torch::Tensor combine_payload, bool metadata_dm
     // Previous raw launches recorded the tensor on their stream, so replacing
     // it here cannot recycle its storage while those launches still use it.
     communication_metadata_ = torch::Tensor();
-    TORCH_CHECK(combine_buffer_count == 2U || combine_buffer_count == 4U || combine_buffer_count == 6U,
-                "combine_buffer_count must be 2, 4 or 6");
+    TORCH_CHECK(combine_buffer_count == 2U || combine_buffer_count == 4U || combine_buffer_count == 6U ||
+                    combine_buffer_count == 8U,
+                "combine_buffer_count must be 2, 4, 6 or 8");
+    TORCH_CHECK(MegaMoeImpl::CombineReplayRowRingFits(tiling_.h, combine_buffer_count),
+                "Combine row ring exceeds its 120 KiB UB budget: hidden=", tiling_.h,
+                ", combine_buffer_count=", combine_buffer_count);
     const char* group_order = std::getenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER");
     TORCH_CHECK(group_order == nullptr || std::strcmp(group_order, "reverse") == 0 ||
                     std::strcmp(group_order, "paired-xor") == 0,

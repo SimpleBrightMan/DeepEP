@@ -63,15 +63,18 @@ Dispatch 通过 MTE2 把对应表项读到 UB，然后随 token/scale 一起由 
 
 ## Combine 流水槽位实验
 
-`--combine-buffer-count {2,4,6}` 只改变通信模拟的 Prefill Combine 流水槽位，默认 2。
+`--combine-buffer-count {2,4,6,8}` 只改变通信模拟的 Prefill Combine 流水槽位，默认 2。
 完整 MegaMoE 及 `--run-full-reference` 仍按原策略使用 2 槽；Dispatch metadata 默认仍为 DMA，Dispatch 槽位和核心任务分配不受此开关影响。
+本次新增 8 槽选项；上一版 Combine metadata 批量预取已撤销，仍使用原逐 peer 段的 metadata 读取与等待。Dispatch 实现不改。
 Wave、每核 token 任务和传输字节数、ready 协议、两类通信 timer 边界保持原定义。
 增加槽位扩大可同时在途的 Combine 搬运数量，是否改善带宽需要实测，不能由槽位数直接推断。
+BF16 payload 的 UB 空间为 120 KiB，必须满足 `align_up(H*2, 32) * slots <= 120*1024`；H3584 的 8 槽需要 56 KiB，H7680 的 8 槽恰好占满，H8192 的 8 槽会在准备阶段报错，应减少槽位。
+本次 Python/native 通信协议升级为 6，必须完整重新编译安装；旧二进制会提示重建。
 
-重新编译安装一次后，在同一构建下循环测试 2/4/6 槽，每个槽位跑 BS2048/4096/8192：
+重新编译安装一次后，在同一构建下循环测试 2/4/6/8 槽，每个槽位跑 BS2048/4096/8192：
 
 ```bash
-for slots in 2 4 6; do
+for slots in 2 4 6 8; do
   python3 experiments/megamoe/scripts/comm_core_sweep.py \
     --mode baseline --bs-values 2048,4096,8192 \
     --dispatch-metadata-mode dma --combine-buffer-count "$slots" \
@@ -80,8 +83,9 @@ done
 ```
 
 每轮自动创建独立结果目录，不画图。控制台和 plan、manifest、详细报告、汇总 JSON/CSV 均记录 `combine_buffer_count`。
-输出仍分别给出 Dispatch、Combine 的带宽和通信 kernel 总耗时；以相同 BS 的三种槽位结果比较。
-省略 `combine_buffer_count` 字段的旧报告按原 2 槽读取，不能作为 4/6 槽结果接受。
+输出仍分别给出 Dispatch、Combine 的带宽和通信 kernel 总耗时；以相同 BS 的四种槽位结果比较。
+控制台当前 GB/s 仍使用平均核时归一化口径，不是真实链路带宽；本次不改统计实现，主要比较 timer-off `COMM-KERNEL rank-max-mean` 和原始 timer。
+省略 `combine_buffer_count` 字段的旧报告按原 2 槽读取，不能作为 4/6/8 槽结果接受。
 
 ## 配对组轮转与核心配比控制实验
 
@@ -103,12 +107,13 @@ INTRA 包含本卡和同组其它三卡；`--group-order paired-xor` 为默认�
 同一 kernel 内 INTRA 与 CROSS 并发；保留每 Wave 的 token 集合、搬运字节和现有 timer 边界，核心归属按所选配比重新划分。
 组内任务继续采用余数轮转均分，避免无法整除的余数一直落在固定核心。
 
-更新并按前文重新编译后运行（显式使用当前要测试的 Combine 6 槽）：
+更新并按前文重新编译后运行（保持已测的 4/24 配比、XOR 顺序、Dispatch DMA，仅将 Combine 从 6 槽改为 8 槽；CLI 默认配比仍为 12/16）：
 
 ```bash
 python3 experiments/megamoe/scripts/comm_core_sweep.py \
   --mode paired-groups --bs-values 2048,4096,8192 \
-  --dispatch-metadata-mode dma --combine-buffer-count 6 \
+  --group-intra-cores 4 --group-order paired-xor \
+  --dispatch-metadata-mode dma --combine-buffer-count 8 \
   --no-validation --keep-raw-timers
 ```
 
@@ -196,7 +201,7 @@ python3 experiments/megamoe/scripts/comm_core_sweep.py \
 
 普通扫描中，`0` 或不设置表示该阶段原调度；`1..27` 表示 INTRA 核数，CROSS 为 `28-INTRA`。
 例如 Dispatch=10 时 AIV1 0..9 负责 INTRA，10..27 负责 CROSS。跨组按本组−1、本组−2、本组−3 处理，组切换不添加全卡屏障或排空流水。
-Prefill Dispatch 保留生产槽位策略（通常 6 槽）；通信模拟的 Combine 默认为原 2 槽，可用 `--combine-buffer-count 4` 或 `6` 做独立实验。
+Prefill Dispatch 保留生产槽位策略（通常 6 槽）；通信模拟的 Combine 默认为原 2 槽，可用 `--combine-buffer-count 4`、`6` 或 `8` 做独立实验。
 默认模式为 baseline，扫描必须显式选 dispatch；仍保留显式 `--mode staged` / `--mode fullgrid`。
 候选选择标准为 timer-off **通信 kernel** 的每轮最慢 rank 耗时均值，最优候选在新进程中复测。
 这个时间输出为 `COMM-KERNEL`，包含路由准备、Dispatch、Combine 与 Unpermute，不再标为完整算子 E2E。

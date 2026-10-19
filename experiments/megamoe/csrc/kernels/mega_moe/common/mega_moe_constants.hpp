@@ -75,6 +75,20 @@ constexpr int64_t E5M2_QUANT = 3U;
 constexpr int64_t E2M1_QUANT = 5U;
 constexpr int64_t OVERFLOW_MODE_CTRL = 60U;
 constexpr uint8_t COMBINE_NO_QUANT = 0;
+// Communication replay may use all eight row-event IDs. Full MegaMoE keeps
+// its existing six-slot maximum and BS-based policy.
+constexpr uint32_t WAVE_COMBINE_REPLAY_MAX_ROW_BUFFER_COUNT = 8U;
+constexpr uint32_t WAVE_COMBINE_UB_BASE = 64U * 1024U;
+// The ready scan begins at 184 KiB; the row ring must end before it.
+constexpr uint32_t WAVE_COMBINE_UB_LIMIT = 184U * 1024U;
+
+// Host-side check for the non-quantized BF16 replay row ring.
+constexpr bool CombineReplayRowRingFits(uint32_t hidden, uint32_t rowBufferCount)
+{
+    const uint64_t rowStrideBytes = (static_cast<uint64_t>(hidden) * 2U + 31U) / 32U * 32U;
+    return rowStrideBytes * rowBufferCount <= WAVE_COMBINE_UB_LIMIT - WAVE_COMBINE_UB_BASE;
+}
+
 constexpr uint8_t MXFP8_E4M3_COMM_QUANT = 4;
 constexpr uint32_t META_INFO_SIZE = 8U;
 constexpr uint8_t GROUPED_MATMUL_MODE_GENERAL = 0U;

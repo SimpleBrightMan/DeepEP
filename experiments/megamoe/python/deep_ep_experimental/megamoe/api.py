@@ -235,7 +235,8 @@ class SymmBuffer:
         combine_payload contains synthetic BF16 expert-major rows that replace
         GMM2's output. Dispatch metadata uses a read-only local GM identity table
         in dma mode; scalar mode retains the original per-token scalar writes.
-        combine_buffer_count selects 2, 4 or 6 row slots for replay's BF16 Combine.
+        combine_buffer_count selects 2, 4, 6 or 8 row slots for replay's BF16 Combine;
+        the aligned rows must fit the 120 KiB Combine payload UB region.
         DEEPEP_MEGAMOE_COMM_GROUP_ORDER=paired-xor selects soft XOR group pairing
         with configurable INTRA core counts in [1,27] for both stages; remaining
         cores handle CROSS traffic. Peer payload and full
@@ -250,12 +251,15 @@ class SymmBuffer:
         error = None
         try:
             extension = _extension()
-            if getattr(extension, "communication_replay_protocol", None) != 5:
-                raise RuntimeError("Rebuild and reinstall this branch to enable variable paired-group core counts")
+            if getattr(extension, "communication_replay_protocol", None) != 6:
+                raise RuntimeError("Rebuild and reinstall this branch to enable eight-slot Combine replay")
             if dispatch_metadata_mode not in ("dma", "scalar"):
                 raise ValueError("dispatch_metadata_mode must be 'dma' or 'scalar'")
-            if type(combine_buffer_count) is not int or combine_buffer_count not in (2, 4, 6):
-                raise ValueError("combine_buffer_count must be an integer: 2, 4 or 6")
+            if type(combine_buffer_count) is not int or combine_buffer_count not in (2, 4, 6, 8):
+                raise ValueError("combine_buffer_count must be an integer: 2, 4, 6 or 8")
+            combine_row_bytes = ((self.hidden * 2 + 31) // 32) * 32
+            if combine_row_bytes * combine_buffer_count > 120 * 1024:
+                raise ValueError("Combine BF16 row slots exceed the 120 KiB payload UB region; use fewer slots")
             group_order = os.environ.get("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "reverse")
             if group_order not in ("reverse", "paired-xor"):
                 raise ValueError("DEEPEP_MEGAMOE_COMM_GROUP_ORDER must be reverse or paired-xor")
