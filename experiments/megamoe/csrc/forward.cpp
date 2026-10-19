@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 
 #include <acl/acl.h>
@@ -525,6 +526,13 @@ void Plan::prepare_communication(torch::Tensor combine_payload, bool metadata_dm
     communication_metadata_ = torch::Tensor();
     TORCH_CHECK(combine_buffer_count == 2U || combine_buffer_count == 4U || combine_buffer_count == 6U,
                 "combine_buffer_count must be 2, 4 or 6");
+    const char* group_order = std::getenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER");
+    TORCH_CHECK(group_order == nullptr || std::strcmp(group_order, "reverse") == 0 ||
+                    std::strcmp(group_order, "paired-xor") == 0,
+                "DEEPEP_MEGAMOE_COMM_GROUP_ORDER must be reverse or paired-xor");
+    const bool paired_groups = group_order != nullptr && std::strcmp(group_order, "paired-xor") == 0;
+    TORCH_CHECK(!paired_groups || (tiling_.dispatchIntraCores == 12U && tiling_.combineIntraCores == 12U),
+                "paired-xor requires Dispatch and Combine to use 12 INTRA and 16 CROSS workers");
     TORCH_CHECK(tiling_.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 &&
                     tiling_.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT && tiling_.sharedExpertNum == 0U &&
                     tiling_.epWorldSize == 16U && platform_.aic == 28U &&
@@ -562,6 +570,7 @@ void Plan::prepare_communication(torch::Tensor combine_payload, bool metadata_dm
     c10_npu::NPUCachingAllocator::recordStream(combine_payload.storage().data_ptr(), stream);
     c10_npu::NPUCachingAllocator::recordStream(workspace_.storage().data_ptr(), stream);
     communication_combine_buffer_count_ = combine_buffer_count;
+    communication_paired_groups_ = paired_groups;
     communication_rows_ = rows;
 }
 
@@ -612,11 +621,12 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::communication_forward(torch::Tens
         }
     }
     auto ptr = [](const torch::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
-    mega_moe_communication_kernel_do(
-        platform_.block_dim, platform_.ub, stream.stream(), ptr(context_), ptr(x), ptr(x_scales), ptr(topk_ids),
-        ptr(topk_weights), ptr(y), ptr(counts), ptr(workspace_),
-        communication_metadata_.defined() ? ptr(communication_metadata_) : nullptr, communication_combine_buffer_count_,
-        timer ? ptr(*timer) : nullptr, reinterpret_cast<const uint8_t*>(&tiling_), ffts_);
+    mega_moe_communication_kernel_do(platform_.block_dim, platform_.ub, stream.stream(), ptr(context_), ptr(x),
+                                     ptr(x_scales), ptr(topk_ids), ptr(topk_weights), ptr(y), ptr(counts),
+                                     ptr(workspace_),
+                                     communication_metadata_.defined() ? ptr(communication_metadata_) : nullptr,
+                                     communication_combine_buffer_count_, communication_paired_groups_ ? 1U : 0U,
+                                     timer ? ptr(*timer) : nullptr, reinterpret_cast<const uint8_t*>(&tiling_), ffts_);
     for (const auto* tensor : {&x, &x_scales, &topk_ids, &topk_weights, &y, &counts, &workspace_, &context_}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }

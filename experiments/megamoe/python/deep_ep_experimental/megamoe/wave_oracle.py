@@ -84,7 +84,18 @@ def _balanced_owners(rows, workers, rotation):
     return result
 
 
-def plan(bs, hidden, intermediate, experts, topk, rank, dispatch_intra=0, combine_intra=0, ranks_per_node=16):
+def plan(
+    bs,
+    hidden,
+    intermediate,
+    experts,
+    topk,
+    rank,
+    dispatch_intra=0,
+    combine_intra=0,
+    ranks_per_node=16,
+    group_order="reverse",
+):
     """Enumerate exact row/token identities and expected ownership in every wave.
 
     The peer-balanced layout first allocates a slice from round-robin peer
@@ -93,6 +104,10 @@ def plan(bs, hidden, intermediate, experts, topk, rank, dispatch_intra=0, combin
     """
     if any(type(n) is not int or not 0 <= n < CORES for n in (dispatch_intra, combine_intra)):
         raise ValueError("INTRA core counts must be 0 (original) or 1..27")
+    if group_order not in ("reverse", "paired-xor"):
+        raise ValueError("group_order must be reverse or paired-xor")
+    if group_order == "paired-xor" and (dispatch_intra, combine_intra) != (12, 12):
+        raise ValueError("paired-xor requires EP16 with dispatch_intra=combine_intra=12")
     queues = route_queues(bs, topk, experts, rank)
     budget = wave_budget(bs, hidden, intermediate)
     order = peer_order(rank, ranks_per_node)
@@ -134,7 +149,7 @@ def plan(bs, hidden, intermediate, experts, topk, rank, dispatch_intra=0, combin
                         rotation = global_row + wave
                         offsets = [0] if intra else [1, 2, 3]
                         for offset in offsets:
-                            group = (rank // 4 - offset) % 4
+                            group = (rank // 4) ^ offset if group_order == "paired-xor" else (rank // 4 - offset) % 4
                             group_rows = sorted(
                                 (identity for identity in identities if identity[1] // 4 == group),
                                 key=lambda identity: (identity[1], identity[2]),

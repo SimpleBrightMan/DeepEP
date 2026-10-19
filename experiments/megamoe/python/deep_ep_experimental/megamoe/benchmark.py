@@ -246,6 +246,7 @@ def run(args, config, group):
             name: os.environ.get(name)
             for name in ("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES")
         },
+        group_order="reverse",
     )
     (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     model = config["model"]
@@ -507,6 +508,7 @@ def run(args, config, group):
                         intermediate=model["intermediate_hidden"],
                         ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
                         transfers=transfers,
+                        group_order="reverse",
                     )
                     communication = write_rank_detail(communication, timer_dir)
                 except Exception as failure:

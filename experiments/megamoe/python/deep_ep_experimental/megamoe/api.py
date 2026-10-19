@@ -236,8 +236,10 @@ class SymmBuffer:
         GMM2's output. Dispatch metadata uses a read-only local GM identity table
         in dma mode; scalar mode retains the original per-token scalar writes.
         combine_buffer_count selects 2, 4 or 6 row slots for replay's BF16 Combine.
-        Task ownership, peer payload and full MegaMoE are unchanged. No matrix
-        weights are allocated or used. All ranks call together with the same settings.
+        DEEPEP_MEGAMOE_COMM_GROUP_ORDER=paired-xor selects soft XOR group pairing
+        with 12 INTRA / 16 CROSS workers in both stages. Peer payload and full
+        MegaMoE are unchanged. No matrix weights are allocated or used.
+        All ranks call together with the same settings.
         """
         import numpy as np
         import torch
@@ -247,12 +249,20 @@ class SymmBuffer:
         error = None
         try:
             extension = _extension()
-            if getattr(extension, "communication_replay_protocol", None) != 3:
-                raise RuntimeError("Rebuild and reinstall this branch to enable configurable Combine buffers in replay")
+            if getattr(extension, "communication_replay_protocol", None) != 4:
+                raise RuntimeError("Rebuild and reinstall this branch to enable paired-group communication replay")
             if dispatch_metadata_mode not in ("dma", "scalar"):
                 raise ValueError("dispatch_metadata_mode must be 'dma' or 'scalar'")
             if type(combine_buffer_count) is not int or combine_buffer_count not in (2, 4, 6):
                 raise ValueError("combine_buffer_count must be an integer: 2, 4 or 6")
+            group_order = os.environ.get("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "reverse")
+            if group_order not in ("reverse", "paired-xor"):
+                raise ValueError("DEEPEP_MEGAMOE_COMM_GROUP_ORDER must be reverse or paired-xor")
+            if group_order == "paired-xor" and any(
+                os.environ.get(name) != "12"
+                for name in ("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES")
+            ):
+                raise ValueError("paired-xor requires Dispatch and Combine to use 12 INTRA and 16 CROSS workers")
             if (
                 self.group.size() != 16
                 or self.num_shared_experts != 0
@@ -281,7 +291,7 @@ class SymmBuffer:
             self.group,
             "communication preparation inputs",
             error,
-            None if error else (bs, dispatch_metadata_mode, combine_buffer_count),
+            None if error else (bs, dispatch_metadata_mode, combine_buffer_count, group_order),
         )
         self.prepare(bs)
         with self._lock:
@@ -293,14 +303,14 @@ class SymmBuffer:
                     self._plan.prepare_communication(
                         combine_payload, dispatch_metadata_mode == "dma", combine_buffer_count
                     )
-                self._communication_route = (bs, self.topk_idx, self.topk_idx._version)
+                self._communication_route = (bs, self.topk_idx, self.topk_idx._version, group_order)
             except Exception as failure:
                 error = str(failure)
             collective_check(
                 self.group,
                 "communication payload preparation",
                 error,
-                (bs, dispatch_metadata_mode, combine_buffer_count),
+                (bs, dispatch_metadata_mode, combine_buffer_count, group_order),
             )
         return self
 
@@ -646,6 +656,8 @@ def communication_forward(sym_buffer: SymmBuffer, *, bs: int, timer: Tensor | No
         prepared = b._communication_route
         if prepared is None or prepared[0] != bs or prepared[1] is not b.topk_idx or prepared[2] != b.topk_idx._version:
             raise RuntimeError("Call prepare_communication again after changing BS, routing or running full MegaMoE")
+        if os.environ.get("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "reverse") != prepared[3]:
+            raise RuntimeError("Call prepare_communication again after changing communication group order")
         current_split = (
             os.environ.get("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES"),
             os.environ.get("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES"),

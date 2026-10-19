@@ -246,6 +246,7 @@ struct WaveCombineBufferConfig {
 struct WaveCombineScratch {
     // Only the compute-disabled entry overrides the original BS-based policy.
     uint32_t rowBufferCountOverride = 0U;
+    bool pairedGroups = false;
     AscendTimerDevice* auditTimer = nullptr;
     uint32_t auditExpert = 0;
     uint32_t auditRowBase = 0;

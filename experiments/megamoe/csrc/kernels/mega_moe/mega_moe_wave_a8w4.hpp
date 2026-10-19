@@ -31,7 +31,8 @@ private:
 public:
     using MegaMoeBase::Init;
     __aicore__ inline void Process();
-    __aicore__ inline void ProcessCommunication(GM_ADDR dispatchMetadata = nullptr, uint32_t combineBufferCount = 2U);
+    __aicore__ inline void ProcessCommunication(GM_ADDR dispatchMetadata = nullptr, uint32_t combineBufferCount = 2U,
+                                                bool pairedGroups = false);
 
 private:
     using QuantOutType = typename MegaMoeBase::QuantOutType;
@@ -332,10 +333,10 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     waveCombineScratch_.auditExpert = begin.expertIdx;
     if (params_.tilingData->combineIntraCores != 0U) {
         ReloadDispatchCumsumRange(commonConfig_, tokenDispatchScratch_, begin.expertIdx, begin.expertIdx);
-        const auto segments =
-            PlanCommSplitSlice(commonConfig_, params_, tokenDispatchScratch_, begin.expertIdx, begin.tokenIndexInExpert,
-                               begin.tokenIndexInExpert + rows, combineJob.jobIndex,
-                               params_.tilingData->combineIntraCores, begin.globalTokenIndex + cursor.wave);
+        const auto segments = PlanCommSplitSlice(
+            commonConfig_, params_, tokenDispatchScratch_, begin.expertIdx, begin.tokenIndexInExpert,
+            begin.tokenIndexInExpert + rows, combineJob.jobIndex, params_.tilingData->combineIntraCores,
+            begin.globalTokenIndex + cursor.wave, waveCombineScratch_.pairedGroups);
         timer_.SetCommunicationRows(begin.expertIdx, begin.tokenIndexInExpert, segments.rows);
         RunCommSplitCombineSlice(commonConfig_, params_, state, begin.tokenIndexInExpert, segments, combineJob.jobIndex,
                                  timer_, waveCombineScratch_);
@@ -688,10 +689,12 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
 
 template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessCommunication(
-    GM_ADDR dispatchMetadata, uint32_t combineBufferCount)
+    GM_ADDR dispatchMetadata, uint32_t combineBufferCount, bool pairedGroups)
 {
     tokenDispatchScratch_.dmaMetadataInput = dispatchMetadata;
+    tokenDispatchScratch_.pairedGroups = pairedGroups;
     waveCombineScratch_.rowBufferCountOverride = combineBufferCount;
+    waveCombineScratch_.pairedGroups = pairedGroups;
     this->template ProcessWave<MegaMoeA8W4Wave, true>(*this);
 }
 

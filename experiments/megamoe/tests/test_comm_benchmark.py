@@ -60,6 +60,17 @@ def test_synthetic_combine_reverse_routes_matches_direct_scatter():
     assert np.array_equal(bench.expected_output(config, rank, bs), expected)
 
 
+def test_paired_expected_payload_keeps_original_rows_and_output():
+    config, rank, bs, snapshot, expected, counts = make_payload_case()
+    original, original_counts = bench.expected_layout(config, rank, bs)
+    paired, paired_counts = bench.expected_layout(config, rank, bs, group_order="paired-xor")
+    assert np.array_equal(original, paired) and np.array_equal(original_counts, paired_counts)
+    assert np.array_equal(bench.expected_output(config, rank, bs, group_order="paired-xor"), expected)
+    assert bench.validate_payload(config, rank, bs, snapshot, expected, counts, expected, group_order="paired-xor")[
+        "passed"
+    ]
+
+
 def test_balanced_ids_equal_global_rank_first_route_stream():
     for rank in range(16):
         ids = bench.balanced_ids(rank, 2048, 384, 8)

@@ -124,9 +124,9 @@ def _transfer(record, rank):
     )
 
 
-def _measure(size, rows, durations):
+def _measure(size, rows, durations, workers=WORKERS):
     total = sum(durations)
-    mean = total / WORKERS
+    mean = total / workers
     if rows and mean <= 0:
         raise ValueError("Nonempty communication has no measured duration")
     return dict(
@@ -134,9 +134,39 @@ def _measure(size, rows, durations):
         bytes=size,
         sum_core_us=total,
         mean_core_us=mean,
-        workers=WORKERS,
+        workers=workers,
         gbps=size / mean / 1000 if mean else None,
     )
+
+
+def add_cohort_metrics(report, dispatch_intra, combine_intra):
+    """Attach cohort rates from actual per-core records, preserving total rates."""
+    if any(type(n) is not int or not 0 <= n < WORKERS for n in (dispatch_intra, combine_intra)):
+        raise ValueError("INTRA core counts must be 0 (original) or 1..27")
+    for operation, split in (("DISPATCH", dispatch_intra), ("COMBINE", combine_intra)):
+        if not split:
+            continue
+        waves = [wave for wave in report["waves"] if wave["operation"] == operation]
+        for wave in waves:
+            wave["cohorts"] = {}
+            for name, first, stop in (("INTRA", 0, split), ("CROSS", split, WORKERS)):
+                cores = [core for core in wave["cores"] if first <= core["core"] < stop]
+                wave["cohorts"][name] = _measure(
+                    sum(core["bytes"] for core in cores),
+                    sum(core["rows"] for core in cores),
+                    [core["duration_us"] for core in cores],
+                    workers=stop - first,
+                )
+        report["operations"][operation]["cohorts"] = {
+            name: _measure(
+                sum(wave["cohorts"][name]["bytes"] for wave in waves),
+                sum(wave["cohorts"][name]["rows"] for wave in waves),
+                [wave["cohorts"][name]["sum_core_us"] for wave in waves],
+                workers=workers,
+            )
+            for name, workers in (("INTRA", split), ("CROSS", WORKERS - split))
+        }
+    return report
 
 
 def rank_report(
@@ -151,6 +181,7 @@ def rank_report(
     experts=384,
     intermediate=1280,
     ranks_per_node=16,
+    group_order="reverse",
     transfers=None,
 ):
     """Validate an independent audit, then account only the measured timer call.
@@ -161,7 +192,16 @@ def rank_report(
     if transfers is None:
         raise ValueError("Strict wave/core reporting requires a separate actual-transfer audit")
     oracle = wave_oracle.plan(
-        bs, hidden, intermediate, experts, topk, rank, dispatch_intra, combine_intra, ranks_per_node
+        bs,
+        hidden,
+        intermediate,
+        experts,
+        topk,
+        rank,
+        dispatch_intra,
+        combine_intra,
+        ranks_per_node,
+        group_order=group_order,
     )
     actual = [_transfer(record, rank) for record in transfers]
     expected = oracle["transfers"]
@@ -292,7 +332,7 @@ def rank_report(
         (r.operation, r.wave, r.expert, r.row, r.source_rank, r.source_token, r.topk_slot) for r in actual
     )
     digest = hashlib.sha256(json.dumps(identities, separators=(",", ":")).encode()).hexdigest()
-    return dict(
+    report = dict(
         rank=rank,
         operations=operations,
         waves=waves,
@@ -304,12 +344,14 @@ def rank_report(
             logical_wave_sha256=digest,
             dispatch_intra=dispatch_intra,
             combine_intra=combine_intra,
+            group_order=group_order,
         ),
         _transfers=actual,
     )
+    return add_cohort_metrics(report, dispatch_intra, combine_intra)
 
 
-def timer_rank_report(events, rank, hidden):
+def timer_rank_report(events, rank, hidden, *, dispatch_intra=0, combine_intra=0):
     """Account timer-recorded rows without an audit, oracle, or payload check."""
     groups = defaultdict(list)
     for event in events:
@@ -348,7 +390,7 @@ def timer_rank_report(events, rank, hidden):
         rows = sum(wave["rows"] for wave in operation_waves)
         operations[operation] = _measure(rows * row_bytes, rows, [wave["sum_core_us"] for wave in operation_waves])
         waves.extend(operation_waves)
-    return dict(
+    report = dict(
         rank=rank,
         operations=operations,
         waves=waves,
@@ -359,6 +401,7 @@ def timer_rank_report(events, rank, hidden):
             wave_count=len(wave_ids),
         ),
     )
+    return add_cohort_metrics(report, dispatch_intra, combine_intra)
 
 
 def write_rank_detail(report, directory):
@@ -396,12 +439,30 @@ def summarize(records, *, require_validation=True):
         operations[operation] = dict(
             gbps_per_card_mean=statistics.mean(values), gbps_per_card_min=min(values), gbps_per_card_max=max(values)
         )
+        cohorts = [record["operations"][operation].get("cohorts", {}) for record in records]
+        if any(cohorts):
+            if any(set(cohort) != {"INTRA", "CROSS"} for cohort in cohorts):
+                raise ValueError(f"All ranks must report the same cohorts for {operation}")
+            operations[operation]["cohorts"] = {}
+            for name in ("INTRA", "CROSS"):
+                workers = {cohort[name]["workers"] for cohort in cohorts}
+                if len(workers) != 1:
+                    raise ValueError(f"All ranks must use the same {operation}/{name} core count")
+                values = [cohort[name]["gbps"] for cohort in cohorts]
+                if any(value is None or not math.isfinite(value) or value <= 0 for value in values):
+                    raise ValueError(f"Missing/nonpositive bandwidth for {operation}/{name}")
+                operations[operation]["cohorts"][name] = dict(
+                    workers=workers.pop(),
+                    gbps_per_card_mean=statistics.mean(values),
+                    gbps_per_card_min=min(values),
+                    gbps_per_card_max=max(values),
+                )
     validated = all(r["validation"]["strict_wave_core"] for r in records)
     if require_validation and not validated:
         raise ValueError("All ranks must pass strict actual-transfer fidelity validation")
     if not require_validation and not validated and any(r["validation"].get("status") != "skipped" for r in records):
         raise ValueError("Performance-only reports must explicitly mark validation skipped")
-    return dict(
+    summary = dict(
         schema_version=2,
         metric="one_way_payload_bytes_over_mean_28_core_summed_span_time",
         notes=[
@@ -425,3 +486,9 @@ def summarize(records, *, require_validation=True):
         validation=dict(strict_wave_core=validated, status="passed" if validated else "skipped"),
         ranks=records,
     )
+    if any("cohorts" in operation for operation in operations.values()):
+        summary["notes"].append(
+            "INTRA/CROSS cohort rates use that cohort's actual rows and bytes divided by "
+            "its summed per-core span time / assigned cohort workers, including idle cohort cores."
+        )
+    return summary

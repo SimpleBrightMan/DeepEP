@@ -62,11 +62,13 @@ __aicore__ inline void BuildCommPeerSegments(const Counts& counts, uint32_t rank
 }
 
 // Each cohort balances the concatenated rows of one physical group. Cross
-// cohorts visit own-1, own-2, own-3; a rotating prefix carries remainders across
-// groups/slices/waves. There is no communication or synchronization here.
+// cohorts visit own-1, own-2, own-3 by default. Paired groups use own XOR 1/2/3:
+// (0,1)+(2,3), (0,2)+(1,3), (0,3)+(1,2). A rotating prefix carries remainders
+// across groups/slices/waves. There is no communication or synchronization here.
 __aicore__ inline CommOwnedSegments SelectCommOwnedSegments(const CommPeerSegment* peers, uint32_t rank,
                                                             uint32_t physicalCore, uint32_t totalCores,
-                                                            uint32_t intraCores, uint64_t rotation)
+                                                            uint32_t intraCores, uint64_t rotation,
+                                                            bool pairedGroups = false)
 {
     CommOwnedSegments owned{};
     const bool intra = physicalCore < intraCores;
@@ -79,7 +81,7 @@ __aicore__ inline CommOwnedSegments SelectCommOwnedSegments(const CommPeerSegmen
     const uint32_t first = intra ? 0U : 1U;
     const uint32_t end = intra ? 1U : COMM_SPLIT_PEERS / COMM_SPLIT_GROUP_SIZE;
     for (uint32_t phase = first; phase < end; ++phase) {
-        const uint32_t group = (ownGroup + 4U - phase) % 4U;
+        const uint32_t group = intra ? ownGroup : (pairedGroups ? ownGroup ^ phase : (ownGroup + 4U - phase) % 4U);
         uint32_t rows = 0U;
         for (uint32_t lane = 0U; lane < COMM_SPLIT_GROUP_SIZE; ++lane) {
             rows += peers[group * COMM_SPLIT_GROUP_SIZE + lane].count;

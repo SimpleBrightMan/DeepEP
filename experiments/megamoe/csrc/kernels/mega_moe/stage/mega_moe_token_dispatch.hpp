@@ -48,6 +48,7 @@ struct TokenDispatchScratch {
     // Only the communication replay binds this table; full MegaMoE retains
     // its scalar metadata path. The table outlives every measured launch.
     GM_ADDR dmaMetadataInput = nullptr;
+    bool pairedGroups = false;
     AscendTimerDevice* commTimer = nullptr;
     AscendTimerDevice* auditTimer = nullptr;
     uint32_t auditExpert = 0;
@@ -461,13 +462,15 @@ template <typename ActivationType>
 __aicore__ inline CommOwnedSegments PlanCommSplitSlice(const MoeStageCommonConfig& common, const Params& params,
                                                        const TokenDispatchScratch<ActivationType>& scratch,
                                                        uint32_t expert, uint32_t sliceBegin, uint32_t sliceEnd,
-                                                       uint32_t physicalCore, uint32_t intraCores, uint64_t rotation)
+                                                       uint32_t physicalCore, uint32_t intraCores, uint64_t rotation,
+                                                       bool pairedGroups = false)
 {
     CommPeerSegment peers[COMM_SPLIT_PEERS];
     DispatchPeerCounts counts{scratch.cumsumInfoTensor, expert * common.worldSize};
     BuildCommPeerSegments(counts, common.rankId, params.tilingData->dispatchRanksPerNode, sliceBegin, sliceEnd,
                           common.tokenNum > W4A8_SMALL_BATCH_MAX_TOKENS, peers);
-    return SelectCommOwnedSegments(peers, common.rankId, physicalCore, params.tilingData->aicNum, intraCores, rotation);
+    return SelectCommOwnedSegments(peers, common.rankId, physicalCore, params.tilingData->aicNum, intraCores, rotation,
+                                   pairedGroups);
 }
 
 // Each worker owns disjoint source segments, not one continuous output range.
@@ -488,7 +491,8 @@ __aicore__ inline void DispatchCommSplitSlice(const TokenDispatchConfig& context
     const uint32_t rows = static_cast<uint32_t>(globalEnd - range.begin.globalTokenIndex);
     const uint32_t expertGlobal = static_cast<uint32_t>(range.begin.globalTokenIndex) - first;
     const auto owned = PlanCommSplitSlice(common, params, scratch, expert, first, first + rows, physicalCore,
-                                          params.tilingData->dispatchIntraCores, range.begin.globalTokenIndex + wave);
+                                          params.tilingData->dispatchIntraCores, range.begin.globalTokenIndex + wave,
+                                          scratch.pairedGroups);
     timer.SetCommunicationRows(expert, first, owned.rows);
     if (owned.rows == 0U) return;
     const auto type = physicalCore < params.tilingData->dispatchIntraCores ? AscendTimer::AIV_DISPATCH_INTRA

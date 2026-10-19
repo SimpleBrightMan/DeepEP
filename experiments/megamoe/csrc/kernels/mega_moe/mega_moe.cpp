@@ -86,8 +86,8 @@ __schedmode__(1) __global__
     __mix__(1, 2) void mega_moe_communication_kernel(GM_ADDR context, GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_ids,
                                                      GM_ADDR topk_weights, GM_ADDR y, GM_ADDR expert_token_nums,
                                                      GM_ADDR workspace, GM_ADDR dispatch_metadata,
-                                                     uint32_t combine_buffer_count, GM_ADDR timer,
-                                                     MegaMoeTilingData tiling, uint64_t ffts_addr)
+                                                     uint32_t combine_buffer_count, uint32_t paired_groups,
+                                                     GM_ADDR timer, MegaMoeTilingData tiling, uint64_t ffts_addr)
 {
 #if defined(__NPU_DEVICE__)
     InitSocState();
@@ -98,19 +98,19 @@ __schedmode__(1) __global__
         op;
     op.Init(context, x, topk_ids, topk_weights, nullptr, nullptr, nullptr, nullptr, nullptr, x_scales, nullptr, nullptr,
             nullptr, nullptr, y, expert_token_nums, workspace, &tiling, nullptr, timer);
-    op.ProcessCommunication(dispatch_metadata, combine_buffer_count);
+    op.ProcessCommunication(dispatch_metadata, combine_buffer_count, paired_groups != 0U);
 #endif
 }
 
 extern "C" __attribute__((visibility("default"))) void mega_moe_communication_kernel_do(
     uint32_t block_dim, uint32_t ub_bytes, void* stream, uint8_t* context, uint8_t* x, uint8_t* x_scales,
     uint8_t* topk_ids, uint8_t* topk_weights, uint8_t* y, uint8_t* expert_token_nums, uint8_t* workspace,
-    uint8_t* dispatch_metadata, uint32_t combine_buffer_count, uint8_t* timer, const uint8_t* tiling_host,
-    uint64_t ffts_addr)
+    uint8_t* dispatch_metadata, uint32_t combine_buffer_count, uint32_t paired_groups, uint8_t* timer,
+    const uint8_t* tiling_host, uint64_t ffts_addr)
 {
     const auto& tiling = *reinterpret_cast<const MegaMoeTilingData*>(tiling_host);
     // The native Plan API validates Prefill-only replay before this launch.
-    mega_moe_communication_kernel<<<block_dim, ub_bytes, stream>>>(context, x, x_scales, topk_ids, topk_weights, y,
-                                                                   expert_token_nums, workspace, dispatch_metadata,
-                                                                   combine_buffer_count, timer, tiling, ffts_addr);
+    mega_moe_communication_kernel<<<block_dim, ub_bytes, stream>>>(
+        context, x, x_scales, topk_ids, topk_weights, y, expert_token_nums, workspace, dispatch_metadata,
+        combine_buffer_count, paired_groups, timer, tiling, ffts_addr);
 }

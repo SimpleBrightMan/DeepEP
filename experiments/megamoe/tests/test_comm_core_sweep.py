@@ -30,9 +30,85 @@ def test_plan_does_not_touch_devices_or_create_output(tmp_path, capsys):
     assert planned["mode"] == "baseline"
     assert planned["dispatch_metadata_mode"] == "dma"
     assert planned["combine_buffer_count"] == 2
+    assert planned["group_order"] == "reverse"
     assert planned["combine_intra_candidates"] == []
     assert planned["model"]["num_topk"] == 8
     assert not planned["global_optimum_guaranteed"]
+
+
+def test_paired_plan_is_one_fixed_pair_per_bs_without_baseline_or_selection():
+    args = sweep.parse_args(["--mode", "paired-groups", "--no-validation"])
+    planned = sweep.plan(args)
+    assert planned["mode"] == "paired-groups" and planned["group_order"] == "paired-xor"
+    assert planned["case_launches_per_bs"] == 1 and planned["total_case_launches"] == 3
+    assert planned["fixed_pair"] == [12, 12] and planned["combine_fixed"]
+    assert planned["dispatch_intra_candidates"] == planned["combine_intra_candidates"] == [12]
+    assert planned["selection"] is None and len(planned["stages"]) == 1
+    assert not any("baseline" in stage or "confirmation" in stage for stage in planned["stages"])
+    assert planned["combine_buffer_count"] == 2 and planned["dispatch_metadata_mode"] == "dma"
+    env = sweep.candidate_environment((12, 12), {sweep.ENV_GROUP_ORDER: "reverse"}, group_order="paired-xor")
+    assert env[sweep.ENV_GROUP_ORDER] == "paired-xor"
+    assert env[sweep.ENV_DISPATCH] == env[sweep.ENV_COMBINE] == "12"
+    with pytest.raises(ValueError, match="fixed"):
+        sweep.candidate_environment((10, 12), group_order="paired-xor")
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--intra-cores", "10,12"],
+        ["--dispatch-intra-cores", "12"],
+        ["--combine-intra-cores", "12"],
+        ["--combine-intra", "10"],
+        ["--run-full-reference"],
+        ["--full-reference-dir", "old"],
+        ["--require-timing-match"],
+    ],
+)
+def test_paired_groups_rejects_sweeps_and_original_ownership_reference(extra):
+    with pytest.raises(SystemExit):
+        sweep.parse_args(["--mode", "paired-groups", *extra])
+
+
+def test_paired_driver_launches_exactly_three_fixed_cases_and_no_baseline(tmp_path, monkeypatch):
+    monkeypatch.setattr(sweep, "os", SimpleNamespace(name="posix", environ={sweep.ENV_GROUP_ORDER: "reverse"}))
+    monkeypatch.setattr(sweep.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="", stderr=""))
+    launches, reads, records, selections = [], [], [], []
+    monkeypatch.setattr(sweep, "execute", lambda argv, **kwargs: launches.append((argv, kwargs)))
+    monkeypatch.setattr(sweep, "print_case", records.append)
+    monkeypatch.setattr(sweep, "write_summary", lambda path, plan, cases, chosen: selections.extend(chosen))
+
+    def read(output, bs, pair, **options):
+        reads.append((output, bs, pair, options))
+        return dict(bs=bs, pair=list(pair), passed=True, validation="skipped", **options)
+
+    monkeypatch.setattr(sweep, "read_case", read)
+    sweep.main(
+        [
+            "--mode",
+            "paired-groups",
+            "--no-validation",
+            "--combine-buffer-count",
+            "6",
+            "--case-gap-seconds",
+            "0",
+            "--output-dir",
+            str(tmp_path / "run"),
+        ]
+    )
+    assert len(launches) == len(reads) == 3 and not selections
+    assert [bs for _, bs, _, _ in reads] == [2048, 4096, 8192]
+    assert all(path.name == "paired_groups_d12_c12" and pair == (12, 12) for path, _, pair, _ in reads)
+    assert all(item["stage"] == "paired_groups" for item in records)
+    for argv, launch in launches:
+        assert "deep_ep_experimental.megamoe.comm_benchmark" in argv and "--no-validation" in argv
+        assert launch["environment"][sweep.ENV_GROUP_ORDER] == "paired-xor"
+        assert launch["environment"][sweep.ENV_DISPATCH] == launch["environment"][sweep.ENV_COMBINE] == "12"
+    for _, _, _, options in reads:
+        assert options == dict(
+            validate=False, dispatch_metadata_mode="dma", combine_buffer_count=6, group_order="paired-xor"
+        )
+    assert not list((tmp_path / "run").rglob("baseline"))
 
 
 def test_staged_cached_case_and_grid_counts():
@@ -108,7 +184,7 @@ def test_scalar_metadata_mode_is_explicit_and_does_not_change_full_reference(tmp
         assert "deep_ep_experimental.megamoe.benchmark" in full
 
 
-@pytest.mark.parametrize("different", ["intermediate_hidden", "alignment", "rank", "split"])
+@pytest.mark.parametrize("different", ["intermediate_hidden", "alignment", "rank", "split", "group_order"])
 def test_full_reference_rejects_incomparable_manifest_before_comparing_timers(tmp_path, different):
     args = sweep.parse_args([])
     reference, candidate = tmp_path / "full", tmp_path / "simulation"
@@ -135,6 +211,8 @@ def test_full_reference_rejects_incomparable_manifest_before_comparing_timers(tm
         altered["config"]["alignment"]["repeats"] += 1
     elif different == "rank":
         altered["rank"] = 1
+    elif different == "group_order":
+        altered["group_order"] = "paired-xor"
     else:
         altered["comm_core_split"][sweep.ENV_DISPATCH] = "12"
     for root, value in ((reference, altered), (candidate, simulated)):
@@ -176,13 +254,20 @@ def test_reject_invalid_scan(option, value):
 
 
 def test_original_environment_cleared_and_pair_command(tmp_path):
-    inherited = {sweep.ENV_DISPATCH: "7", sweep.ENV_COMBINE: "8", "LD_LIBRARY_PATH": "/sdk/lib"}
+    inherited = {
+        sweep.ENV_DISPATCH: "7",
+        sweep.ENV_COMBINE: "8",
+        sweep.ENV_GROUP_ORDER: "paired-xor",
+        "LD_LIBRARY_PATH": "/sdk/lib",
+    }
     baseline = sweep.candidate_environment(None, inherited)
     assert sweep.ENV_DISPATCH not in baseline and sweep.ENV_COMBINE not in baseline
+    assert sweep.ENV_GROUP_ORDER not in baseline
     pair = sweep.candidate_environment((12, 7), inherited)
     assert pair[sweep.ENV_DISPATCH] == "12" and pair[sweep.ENV_COMBINE] == "7"
     assert pair["LD_LIBRARY_PATH"] == "/sdk/lib"
     assert pair["PYTHON_EXEC"] == sys.executable
+    assert sweep.ENV_GROUP_ORDER not in pair
     args = sweep.parse_args([])
     command = sweep.command(args, tmp_path / "model.json", tmp_path / "test", (12, 7), tmp_path / "base")
     assert "--no-timer-raw" in command and "deep_ep_experimental.megamoe.comm_benchmark" in command
@@ -218,10 +303,13 @@ def test_staged_search_retains_first_stage_winner_outside_combine_candidates(tmp
     monkeypatch.setattr(sweep, "write_summary", lambda path, plan, records, chosen: selections.extend(chosen))
     durations = {None: 200, (2, 12): 90, (4, 12): 100, (2, 2): 150, (2, 4): 130}
 
-    def read(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", combine_buffer_count=2):
+    def read(
+        output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", combine_buffer_count=2, group_order="reverse"
+    ):
         assert validate
         assert dispatch_metadata_mode == "dma"
         assert combine_buffer_count == 2
+        assert group_order == "reverse"
         return dict(pair=list(pair) if pair else None, passed=True, comm_kernel_rank_max_mean_us=durations[pair])
 
     monkeypatch.setattr(sweep, "read_case", read)
@@ -254,10 +342,13 @@ def test_dispatch_only_keeps_combine_fixed_through_scan_and_confirmation(tmp_pat
     monkeypatch.setattr(sweep, "write_summary", lambda path, plan, records, chosen: selections.extend(chosen))
     durations = {None: 200, (10, 7): 120, (12, 7): 110, (16, 7): 130, (20, 7): 125}
 
-    def read(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", combine_buffer_count=2):
+    def read(
+        output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", combine_buffer_count=2, group_order="reverse"
+    ):
         assert validate
         assert dispatch_metadata_mode == "dma"
         assert combine_buffer_count == 2
+        assert group_order == "reverse"
         return dict(pair=list(pair) if pair else None, passed=True, comm_kernel_rank_max_mean_us=durations[pair])
 
     monkeypatch.setattr(sweep, "read_case", read)
@@ -349,7 +440,9 @@ def test_execute_waits_and_records_exit_without_masking_child_failure(tmp_path, 
     assert records[-1]["event"] == "torchrun_exit" and records[-1]["returncode"] == status
 
 
-def write_case_fixture(tmp_path, pair, *, validate=True, metadata_mode="dma", combine_buffer_count=2):
+def write_case_fixture(
+    tmp_path, pair, *, validate=True, metadata_mode="dma", combine_buffer_count=2, group_order="reverse"
+):
     bs = 2048
     for rank in range(16):
         directory = tmp_path / f"rank_{rank}"
@@ -374,6 +467,8 @@ def write_case_fixture(tmp_path, pair, *, validate=True, metadata_mode="dma", co
             manifest["dispatch_metadata_mode"] = metadata_mode
         if combine_buffer_count is not None:
             manifest["combine_buffer_count"] = combine_buffer_count
+        if group_order is not None:
+            manifest["group_order"] = group_order
         (directory / "manifest.json").write_text(json.dumps(manifest))
     rank0 = tmp_path / "rank_0" / f"bs_{bs}"
     rank0.mkdir()
@@ -402,6 +497,14 @@ def write_case_fixture(tmp_path, pair, *, validate=True, metadata_mode="dma", co
         communication["dispatch_metadata_mode"] = metadata_mode
     if combine_buffer_count is not None:
         communication["combine_buffer_count"] = combine_buffer_count
+    if group_order is not None:
+        communication["group_order"] = group_order
+    if group_order == "paired-xor":
+        for operation in communication["operations"].values():
+            operation["cohorts"] = {
+                name: dict(workers=workers, gbps_per_card_mean=60.0, gbps_per_card_min=55.0, gbps_per_card_max=65.0)
+                for name, workers in (("INTRA", 12), ("CROSS", 16))
+            }
     if not validate:
         communication["validation"] = dict(strict_wave_core=False, status="skipped")
         for record in communication["ranks"]:
@@ -446,6 +549,60 @@ def test_case_reader_rejects_combine_slot_mismatch_in_summary(tmp_path):
     (timer / "communication.json").write_text(json.dumps(communication))
     with pytest.raises(ValueError, match="report Combine buffer count"):
         sweep.read_case(tmp_path, 2048, None, validate=False, combine_buffer_count=4)
+
+
+@pytest.mark.parametrize("recorded", ["reverse", "paired-xor", None])
+def test_case_reader_checks_requested_group_order_and_legacy_means_reverse(tmp_path, recorded):
+    write_case_fixture(tmp_path, (12, 12), validate=False, group_order=recorded)
+    actual = recorded or "reverse"
+    report = sweep.read_case(tmp_path, 2048, (12, 12), validate=False, group_order=actual)
+    assert report["group_order"] == actual
+    other = "paired-xor" if actual == "reverse" else "reverse"
+    with pytest.raises(ValueError, match="manifest"):
+        sweep.read_case(tmp_path, 2048, (12, 12), validate=False, group_order=other)
+
+
+def test_case_reader_rejects_group_order_mismatch_in_summary(tmp_path):
+    _, timer, communication, _ = write_case_fixture(tmp_path, (12, 12), validate=False, group_order="paired-xor")
+    communication["group_order"] = "reverse"
+    (timer / "communication.json").write_text(json.dumps(communication))
+    with pytest.raises(ValueError, match="report group order"):
+        sweep.read_case(tmp_path, 2048, (12, 12), validate=False, group_order="paired-xor")
+
+
+@pytest.mark.parametrize("corruption", ["missing", "workers", "bandwidth"])
+def test_paired_case_reader_requires_complete_cohort_metrics(tmp_path, corruption):
+    _, timer, communication, _ = write_case_fixture(tmp_path, (12, 12), validate=False, group_order="paired-xor")
+    dispatch = communication["operations"]["DISPATCH"]
+    if corruption == "missing":
+        dispatch.pop("cohorts")
+    elif corruption == "workers":
+        dispatch["cohorts"]["CROSS"]["workers"] = 28
+    else:
+        dispatch["cohorts"]["INTRA"]["gbps_per_card_mean"] = 0
+    (timer / "communication.json").write_text(json.dumps(communication))
+    with pytest.raises(ValueError, match="cohort"):
+        sweep.read_case(tmp_path, 2048, (12, 12), validate=False, group_order="paired-xor")
+
+
+def test_paired_cohort_console_csv_and_total_metrics_are_separate(tmp_path, capsys):
+    write_case_fixture(tmp_path, (12, 12), validate=False, group_order="paired-xor")
+    report = sweep.read_case(tmp_path, 2048, (12, 12), validate=False, group_order="paired-xor")
+    report["stage"] = "paired_groups"
+    sweep.print_case(report)
+    sweep.write_summary(tmp_path, {}, [report], [])
+    printed = capsys.readouterr().out
+    for operation in ("DISPATCH", "COMBINE"):
+        assert f"[BW] {operation} per-card mean=80.000" in printed
+        for name in ("INTRA", "CROSS"):
+            assert f"[BW] {operation} {name} per-card mean=60.000" in printed
+    assert "workers=12 (cohort payload / mean of cohort core communication times)" in printed
+    assert "workers=16 (cohort payload / mean of cohort core communication times)" in printed
+    with (tmp_path / "summary.csv").open(newline="", encoding="utf-8") as stream:
+        row = next(csv.DictReader(stream))
+    for operation in ("DISPATCH", "COMBINE"):
+        assert row[f"{operation}_GBps"] == "80.0"
+        assert row[f"{operation}_INTRA_GBps"] == row[f"{operation}_CROSS_GBps"] == "60.0"
 
 
 @pytest.mark.parametrize("pair", [None, (12, 0), (12, 12)])
@@ -552,9 +709,12 @@ def test_performance_only_runs_all_bs_without_reference_or_validation(tmp_path, 
     monkeypatch.setattr(sweep, "print_case", lambda item: None)
     monkeypatch.setattr(sweep, "write_summary", lambda *a: None)
 
-    def read(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", combine_buffer_count=2):
+    def read(
+        output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", combine_buffer_count=2, group_order="reverse"
+    ):
         assert dispatch_metadata_mode == "dma"
         assert combine_buffer_count == 6
+        assert group_order == "reverse"
         reads.append((bs, pair, validate))
         return dict(bs=bs, pair=pair, passed=True, validation="skipped")
 
@@ -609,6 +769,7 @@ def test_summary_and_console_keep_dispatch_combine_independent(tmp_path, capsys)
             stage="baseline" if pair is None else "dispatch",
             dispatch_metadata_mode="dma",
             combine_buffer_count=4,
+            group_order="reverse",
             pair=pair,
             output_dir=str(tmp_path / ("baseline" if pair is None else "candidate")),
             comm_kernel_rank_max_mean_us=2400.0,
@@ -624,6 +785,13 @@ def test_summary_and_console_keep_dispatch_combine_independent(tmp_path, capsys)
     assert len(rows) == 2
     assert all(row["dispatch_metadata_mode"] == "dma" for row in rows)
     assert all(row["combine_buffer_count"] == "4" for row in rows)
+    assert all(row["group_order"] == "reverse" for row in rows)
+    assert all(
+        row[f"{op}_{cohort}_GBps"] == ""
+        for row in rows
+        for op in ("DISPATCH", "COMBINE")
+        for cohort in ("INTRA", "CROSS")
+    )
     assert all(row["DISPATCH_GBps"] == "70.0" and row["COMBINE_GBps"] == "130.0" for row in rows)
     assert rows[0]["dispatch_intra"] == "0" and rows[0]["dispatch_cross"] == ""
     assert rows[1]["combine_intra"] == "0" and rows[1]["combine_cross"] == ""
@@ -632,6 +800,7 @@ def test_summary_and_console_keep_dispatch_combine_independent(tmp_path, capsys)
     assert "D=10/18 C=original" in printed
     assert "dispatch_metadata_mode=dma" in printed
     assert "combine_buffer_count=4" in printed
+    assert "group_order=reverse" in printed
     assert "[BW] DISPATCH" in printed and "[BW] COMBINE" in printed
     assert "all 28 core communication times / 28" in printed
     assert "wave envelopes" not in printed

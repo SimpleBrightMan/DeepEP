@@ -22,6 +22,7 @@ import uuid
 
 ENV_DISPATCH = "DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES"
 ENV_COMBINE = "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES"
+ENV_GROUP_ORDER = "DEEPEP_MEGAMOE_COMM_GROUP_ORDER"
 DEFAULT_CORES = "2,4,6,7,8,10,12,16,20,24,26"
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -56,9 +57,9 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--mode",
-        choices=("baseline", "dispatch", "staged", "fullgrid"),
+        choices=("baseline", "paired-groups", "dispatch", "staged", "fullgrid"),
         default="baseline",
-        help="Default: original production schedule only; explicitly select dispatch for a Dispatch sweep",
+        help="Original schedule by default; paired-groups runs fixed 12 INTRA / 16 CROSS once per BS",
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument(
@@ -119,6 +120,7 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--plan", action="store_true", help="No build, device access, process launch or output files")
     args = parser.parse_args(argv)
+    args.group_order = "paired-xor" if args.mode == "paired-groups" else "reverse"
     try:
         args.bs_values = integers(args.bs_values, 65536, "BS")
         args.dispatch_cores = integers(args.dispatch_intra_cores or args.intra_cores, 27, "Dispatch cores")
@@ -137,6 +139,20 @@ def parse_args(argv=None):
         parser.error("Combine candidates require explicit staged/fullgrid mode")
     if args.mode == "baseline" and args.initial_combine_intra != 0:
         parser.error("Baseline mode uses the original Dispatch and Combine schedules; select dispatch for experiments")
+    if args.mode == "paired-groups":
+        if (
+            args.intra_cores not in (DEFAULT_CORES, "12")
+            or args.dispatch_intra_cores is not None
+            or args.combine_intra_cores is not None
+            or args.initial_combine_intra not in (0, 12)
+        ):
+            parser.error("paired-groups fixes Dispatch and Combine to 12 INTRA / 16 CROSS; no core sweep options")
+        if args.run_full_reference or args.full_reference_dir or args.require_timing_match:
+            parser.error(
+                "paired-groups changes core ownership and cannot use the original-schedule reference comparison"
+            )
+        args.dispatch_cores = args.combine_cores = [12]
+        args.initial_combine_intra = 12
     if min(args.iters, args.timeout, args.alignment_rows, args.alignment_cols, args.alignment_repeats) < 1:
         parser.error("Iterations, timeout and alignment dimensions/repeats must be positive")
     if not math.isfinite(args.case_gap_seconds) or not 0 <= args.case_gap_seconds <= 60:
@@ -171,6 +187,9 @@ def plan(args):
     if args.mode == "baseline":
         candidates = 0
         stages = [f"communication-only original schedule + {validation_stage}"]
+    elif args.mode == "paired-groups":
+        candidates = 0
+        stages = [f"fixed Dispatch/Combine 12 INTRA / 16 CROSS paired XOR order + {validation_stage}"]
     elif args.mode == "dispatch":
         candidates = len(args.dispatch_cores)
         sweep_stage = "Dispatch sweep with Combine fixed; no Combine sweep"
@@ -182,18 +201,19 @@ def plan(args):
             len(args.dispatch_cores) + len(args.combine_cores) - int(args.initial_combine_intra in args.combine_cores)
         )
         sweep_stage = "Dispatch sweep with Combine fixed, then Combine sweep with best Dispatch"
-    if args.mode != "baseline":
+    if args.mode not in ("baseline", "paired-groups"):
         stages = [
             f"communication-only original schedule baseline + {validation_stage}",
             sweep_stage,
             "fresh-process confirmation of selected pair",
         ]
-    case_launches = (1 if args.mode == "baseline" else candidates + 2) + int(args.run_full_reference)
+    case_launches = (1 if args.mode in ("baseline", "paired-groups") else candidates + 2) + int(args.run_full_reference)
     return dict(
         schema_version=3,
         workload="communication_only",
         validation="skipped" if args.no_validation else "strict",
         mode=args.mode,
+        group_order=args.group_order,
         dispatch_metadata_mode=args.dispatch_metadata_mode,
         combine_buffer_count=args.combine_buffer_count,
         ep_size=16,
@@ -201,13 +221,16 @@ def plan(args):
         bs_values=args.bs_values,
         dispatch_intra_candidates=[] if args.mode == "baseline" else args.dispatch_cores,
         combine_intra_candidates=[] if args.mode == "baseline" else args.combine_cores,
-        combine_fixed=args.mode == "dispatch",
+        combine_fixed=args.mode in ("dispatch", "paired-groups"),
+        fixed_pair=[12, 12] if args.mode == "paired-groups" else None,
         initial_combine_intra=args.initial_combine_intra,
         shmem_port_policy=args.shmem_port_policy,
         case_gap_seconds=args.case_gap_seconds,
         case_launches_per_bs=case_launches,
         total_case_launches=len(args.bs_values) * case_launches,
-        selection="minimum timer-off communication-only mean(per-round maximum rank kernel duration)",
+        selection=None
+        if args.mode == "paired-groups"
+        else "minimum timer-off communication-only mean(per-round maximum rank kernel duration)",
         full_reference="run"
         if args.run_full_reference
         else str(args.full_reference_dir)
@@ -225,6 +248,9 @@ def plan(args):
             if args.no_validation
             else "Every case checks Dispatch bytes/scales/metadata and Combine output against independent synthetic payload expectations.",
             "No weights, GMM1, SwiGLU or GMM2 run in communication-only cases; synthetic GMM2 rows are prepared once before timing.",
+            "Paired groups use own_group XOR phase (1,2,3), with no inter-group barrier or pipeline drain at group switches."
+            if args.mode == "paired-groups"
+            else "Split schedules use reverse cross-group order; inherited paired-group settings are cleared.",
             f"Dispatch keeps its production slot policy; communication-only Prefill Combine uses {args.combine_buffer_count} slots (original: 2).",
             "Dispatch metadata DMA adds one local 32-byte read per row; remote payload bytes and task ownership are unchanged.",
             "Full MegaMoE reference retains original scalar Dispatch metadata; metadata modes need not match for optional task/timing comparisons.",
@@ -240,12 +266,16 @@ def plan(args):
     )
 
 
-def candidate_environment(pair, base=None):
+def candidate_environment(pair, base=None, *, group_order="reverse"):
     environment = dict(os.environ if base is None else base)
-    for name in (ENV_DISPATCH, ENV_COMBINE):
+    if group_order not in ("reverse", "paired-xor") or (group_order == "paired-xor" and pair != (12, 12)):
+        raise ValueError("paired-xor requires the fixed Dispatch/Combine pair (12,12)")
+    for name in (ENV_DISPATCH, ENV_COMBINE, ENV_GROUP_ORDER):
         environment.pop(name, None)
     if pair is not None:
         environment[ENV_DISPATCH], environment[ENV_COMBINE] = map(str, pair)
+    if group_order == "paired-xor":
+        environment[ENV_GROUP_ORDER] = group_order
     environment.setdefault("OMP_NUM_THREADS", "1")
     environment["PYTHON_EXEC"] = sys.executable
     return environment
@@ -336,6 +366,7 @@ def execute(argv, *, cwd, environment, logfile, timeout):
                     shmem_endpoint=environment.get("DEEPEP_SHMEM_ENDPOINT"),
                     worker_python=environment.get("PYTHON_EXEC"),
                     comm_split={k: environment.get(k) for k in (ENV_DISPATCH, ENV_COMBINE)},
+                    group_order=environment.get(ENV_GROUP_ORDER, "reverse"),
                 )
             )
             + "\n"
@@ -355,7 +386,9 @@ def execute(argv, *, cwd, environment, logfile, timeout):
         raise RuntimeError(f"Case exited with status {code}; inspect {logfile}")
 
 
-def read_case(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", combine_buffer_count=2):
+def read_case(
+    output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", combine_buffer_count=2, group_order="reverse"
+):
     expected_environment = {ENV_DISPATCH: str(pair[0]) if pair else None, ENV_COMBINE: str(pair[1]) if pair else None}
     builds = []
     for rank in range(16):
@@ -372,6 +405,7 @@ def read_case(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", 
             or manifest.get("validation", "strict") != ("strict" if validate else "skipped")
             or manifest.get("dispatch_metadata_mode", "scalar") != dispatch_metadata_mode
             or manifest.get("combine_buffer_count", 2) != combine_buffer_count
+            or manifest.get("group_order", "reverse") != group_order
         ):
             raise ValueError("Benchmark manifest does not match the requested case")
         builds.append(manifest["build"])
@@ -403,6 +437,7 @@ def read_case(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", 
         validation="strict" if validate else "skipped",
         dispatch_metadata_mode=dispatch_metadata_mode,
         combine_buffer_count=combine_buffer_count,
+        group_order=group_order,
         comm_kernel_rank_max_mean_us=slowest,
         comm_kernel_rank_min_mean_us=statistics.mean(min(values) for values in zip(*per_rank)),
         comm_kernel_all_ranks_mean_us=statistics.mean(v for row in per_rank for v in row),
@@ -417,6 +452,8 @@ def read_case(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", 
         raise ValueError("Communication report metadata mode does not match the requested case")
     if report["communication"].get("combine_buffer_count", 2) != combine_buffer_count:
         raise ValueError("Communication report Combine buffer count does not match the requested case")
+    if report["communication"].get("group_order", "reverse") != group_order:
+        raise ValueError("Communication report group order does not match the requested case")
     if sorted(r["rank"] for r in report["communication"]["ranks"]) != list(range(16)):
         raise ValueError("Missing communication ranks")
     if report["communication"].get("schema_version") != 2:
@@ -442,6 +479,17 @@ def read_case(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma", 
             for key in ("gbps_per_card_mean", "gbps_per_card_min", "gbps_per_card_max")
         ):
             raise ValueError("Nonfinite/nonpositive communication bandwidth")
+        if group_order == "paired-xor":
+            cohorts = value.get("cohorts", {})
+            if set(cohorts) != {"INTRA", "CROSS"}:
+                raise ValueError("Paired-group report must contain separate INTRA/CROSS cohort bandwidths")
+            for name, workers in (("INTRA", 12), ("CROSS", 16)):
+                cohort = cohorts[name]
+                if cohort.get("workers") != workers or any(
+                    not 0 < cohort.get(key, 0) < float("inf")
+                    for key in ("gbps_per_card_mean", "gbps_per_card_min", "gbps_per_card_max")
+                ):
+                    raise ValueError("Invalid paired-group cohort worker count or bandwidth")
     if validate:
         timer_comparison = json.loads((rank0 / "timer_accuracy.json").read_text(encoding="utf-8"))
         if sorted(r["rank"] for r in timer_comparison) != list(range(16)) or not all(
@@ -475,6 +523,8 @@ def compare_reference(args, reference, candidate, bs, destination):
             or manifest.get("timer_ranks") != list(range(16))
             or simulated.get("timer_ranks") != list(range(16))
             or simulated.get("workload") != "communication_only"
+            or manifest.get("group_order", "reverse") != "reverse"
+            or simulated.get("group_order", "reverse") != "reverse"
             or bs not in manifest.get("config", {}).get("bs_values", [])
             or manifest.get("config", {}).get("model") != simulated["config"]["model"]
             or manifest.get("config", {}).get("alignment") != simulated["config"].get("alignment")
@@ -520,6 +570,7 @@ def write_summary(path, launch_plan, records, selections):
         fields = [
             "bs",
             "stage",
+            "group_order",
             "dispatch_metadata_mode",
             "combine_buffer_count",
             "dispatch_intra",
@@ -531,6 +582,10 @@ def write_summary(path, launch_plan, records, selections):
             "comm_kernel_all_ranks_mean_us",
             "DISPATCH_GBps",
             "COMBINE_GBps",
+            "DISPATCH_INTRA_GBps",
+            "DISPATCH_CROSS_GBps",
+            "COMBINE_INTRA_GBps",
+            "COMBINE_CROSS_GBps",
             "communication_report",
         ]
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -549,6 +604,7 @@ def write_summary(path, launch_plan, records, selections):
             }
             row["dispatch_metadata_mode"] = item.get("dispatch_metadata_mode", "scalar")
             row["combine_buffer_count"] = item.get("combine_buffer_count", 2)
+            row["group_order"] = item.get("group_order", "reverse")
             if pair:
                 row.update(
                     dispatch_intra=pair[0],
@@ -564,6 +620,9 @@ def write_summary(path, launch_plan, records, selections):
                     for name, value in item["communication"]["operations"].items()
                 }
             )
+            for operation, value in item["communication"]["operations"].items():
+                for cohort, measured in value.get("cohorts", {}).items():
+                    row[f"{operation}_{cohort}_GBps"] = measured["gbps_per_card_mean"]
             row["communication_report"] = str(
                 Path(item["output_dir"]) / f"bs_{item['bs']}" / "timer" / "communication.json"
             )
@@ -583,6 +642,7 @@ def print_case(item):
     print(
         f"[CASE] BS={item['bs']} {label} dispatch_metadata_mode={item.get('dispatch_metadata_mode', 'scalar')} "
         f"combine_buffer_count={item.get('combine_buffer_count', 2)} "
+        f"group_order={item.get('group_order', 'reverse')} "
         f"COMM-KERNEL rank-max-mean={item['comm_kernel_rank_max_mean_us']:.3f}us "
         f"rank-min-mean={item['comm_kernel_rank_min_mean_us']:.3f}us (timer off; {validation})",
         flush=True,
@@ -595,6 +655,13 @@ def print_case(item):
                 "(operation payload / (sum of all 28 core communication times / 28))",
                 flush=True,
             )
+            for cohort, measured in value.get("cohorts", {}).items():
+                print(
+                    f"[BW] {family} {cohort} per-card mean={measured['gbps_per_card_mean']:.3f} "
+                    f"rank-min/max={measured['gbps_per_card_min']:.3f}/{measured['gbps_per_card_max']:.3f} GB/s "
+                    f"workers={measured['workers']} (cohort payload / mean of cohort core communication times)",
+                    flush=True,
+                )
         detail_index = Path(item["output_dir"]) / f"bs_{item['bs']}" / "timer" / "communication.json"
         task_status = (
             "validation skipped; timer row-count accounting"
@@ -659,7 +726,7 @@ def main(argv=None):
             if launched and args.case_gap_seconds:
                 print(f"[CASE_GAP] previous torchrun exited; waiting {args.case_gap_seconds:g}s", flush=True)
                 time.sleep(args.case_gap_seconds)
-            environment = candidate_environment(pair)
+            environment = candidate_environment(pair, group_order=args.group_order)
             if args.shmem_port_policy == "fresh":
                 environment["DEEPEP_SHMEM_ENDPOINT"] = fresh_endpoint(environment, used_endpoints)
             print(f"[SHMEM_SESSION] new process group; endpoint={environment.get('DEEPEP_SHMEM_ENDPOINT')}", flush=True)
@@ -680,6 +747,7 @@ def main(argv=None):
                     validate=not args.no_validation,
                     dispatch_metadata_mode=args.dispatch_metadata_mode,
                     combine_buffer_count=args.combine_buffer_count,
+                    group_order=args.group_order,
                 ),
                 stage=stage,
             )
@@ -690,6 +758,9 @@ def main(argv=None):
             write_summary(args.output_dir, launch_plan, records, selections)
             return item
 
+        if args.mode == "paired-groups":
+            run_case((12, 12), "paired_groups")
+            continue
         original = run_case(None, "baseline")
         if full_reference is not None:
             original["full_megamoe_comparison"] = compare_reference(

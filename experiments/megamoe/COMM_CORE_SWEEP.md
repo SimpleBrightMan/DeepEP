@@ -83,6 +83,44 @@ done
 输出仍分别给出 Dispatch、Combine 的带宽和通信 kernel 总耗时；以相同 BS 的三种槽位结果比较。
 省略 `combine_buffer_count` 字段的旧报告按原 2 槽读取，不能作为 4/6 槽结果接受。
 
+## 固定 12/16 核的配对组轮转
+
+`--mode paired-groups` 每个 BS 只运行一次固定配置：Dispatch、Combine 均由 AIV1 核 0..11 处理 INTRA，核 12..27 处理 CROSS。
+INTRA 包含本卡和同组其它三卡；CROSS 按 `peer_group = own_group XOR phase`，依次 `phase=1,2,3` 处理：
+
+| 逻辑阶段 | 配对组 |
+|---|---|
+| 1 | G0↔G1，G2↔G3 |
+| 2 | G0↔G2，G1↔G3 |
+| 3 | G0↔G3，G1↔G2 |
+
+这只是各核发起通信的先后顺序，没有新增阶段全卡同步、Host 同步或切组流水排空。
+各 rank/核心可因执行速度不同进入不同逻辑阶段，因此运行时不保证严格只有两组互通。
+同一 kernel 内 INTRA 与 CROSS 并发；保留每 Wave 的 token 集合、搬运字节和现有 timer 边界，核心归属按固定 12/16 分工重新划分。
+组内任务继续采用余数轮转均分，避免无法整除的余数一直落在固定核心。
+
+更新并按前文重新编译后运行（显式使用当前要测试的 Combine 6 槽）：
+
+```bash
+python3 experiments/megamoe/scripts/comm_core_sweep.py \
+  --mode paired-groups --bs-values 2048,4096,8192 \
+  --dispatch-metadata-mode dma --combine-buffer-count 6 \
+  --no-validation --keep-raw-timers
+```
+
+每个 BS 的 case 目录为 `bs_<BS>/paired_groups_d12_c12/`；不会额外跑 baseline、扫描、选优或 confirm，不画图。
+带宽仍按 Dispatch 和 Combine 分别统计。`plan.json`、rank manifest、详细报告、汇总 JSON/CSV 及控制台记录 `group_order=paired-xor`。
+固定分工时额外输出四项分类带宽：Dispatch INTRA/CROSS、Combine INTRA/CROSS。
+INTRA 为该类字节数除以 **12 个 INTRA 核累计通信耗时的均值**，CROSS 则除以 **16 个 CROSS 核累计通信耗时的均值**；两者单位仍为 GB/s/card。
+这不是把分类时间稀释到 28 核的折算值，也不是整段 class-envelope 时间；两类带宽不能直接相加得到总带宽。
+原 Dispatch/Combine 总指标仍用全部 28 核累计通信时间的均值作分母，定义不变。
+原 baseline 核心同时承担混合拓扑任务，不生成无法从 timer 区分的分类带宽，CSV 对应列留空。
+driver 仅在此模式设置 `DEEPEP_MEGAMOE_COMM_GROUP_ORDER=paired-xor`，其它模式和完整 reference 会清除此继承变量，保持原 reverse 顺序。
+旧报告缺少 `group_order` 字段时按 `reverse` 解释，不能作为 paired-xor 结果接受。
+
+`--mode baseline` 仍保留原 28 核分工；`--combine-buffer-count` 的全局默认仍为 2。
+paired-groups 不接受核心扫描或原算子时间比较参数；需要数据/逐任务验收时移除 `--no-validation` 即可，验收使用对应 paired-xor oracle。
+
 ## 可选的解耦验收
 
 下面命令在每个 BS 先跑本分支完整 MegaMoE，再跑通信模拟，最后比较每核时间；它不是只跑 main 原算子。
@@ -137,7 +175,7 @@ python3 experiments/megamoe/scripts/comm_core_sweep.py \
   --intra-cores 10,12,16,20 --combine-intra 0
 ```
 
-`0` 或不设置表示该阶段原调度；`1..27` 表示 INTRA 核数，CROSS 为 `28-INTRA`。
+普通扫描中，`0` 或不设置表示该阶段原调度；`1..27` 表示 INTRA 核数，CROSS 为 `28-INTRA`。
 例如 Dispatch=10 时 AIV1 0..9 负责 INTRA，10..27 负责 CROSS。跨组按本组−1、本组−2、本组−3 处理，组切换不添加全卡屏障或排空流水。
 Prefill Dispatch 保留生产槽位策略（通常 6 槽）；通信模拟的 Combine 默认为原 2 槽，可用 `--combine-buffer-count 4` 或 `6` 做独立实验。
 默认模式为 baseline，扫描必须显式选 dispatch；仍保留显式 `--mode staged` / `--mode fullgrid`。

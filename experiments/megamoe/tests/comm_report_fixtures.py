@@ -22,7 +22,17 @@ class SparseNumpyTimer:
         return np.int64(self.values.get(index, 0))
 
 
-def capture(bs=16, rank=0, dispatch_intra=0, combine_intra=0, hidden=3584, intermediate=1280, experts=384, topk=8):
+def capture(
+    bs=16,
+    rank=0,
+    dispatch_intra=0,
+    combine_intra=0,
+    hidden=3584,
+    intermediate=1280,
+    experts=384,
+    topk=8,
+    group_order="reverse",
+):
     spec = dict(
         bs=bs,
         hidden=hidden,
@@ -32,6 +42,7 @@ def capture(bs=16, rank=0, dispatch_intra=0, combine_intra=0, hidden=3584, inter
         rank=rank,
         dispatch_intra=dispatch_intra,
         combine_intra=combine_intra,
+        group_order=group_order,
     )
     plan = wave_oracle.plan(**spec)
     measured, audit = SparseNumpyTimer(), SparseNumpyTimer(audit=True)

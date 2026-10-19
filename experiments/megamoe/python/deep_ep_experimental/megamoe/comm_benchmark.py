@@ -49,7 +49,7 @@ def balanced_ids(rank, bs, experts, topk, world=16):
     )
 
 
-def expected_layout(config, rank, bs):
+def expected_layout(config, rank, bs, *, group_order="reverse"):
     """Independent balanced-route oracle; never reads device metadata to build expectations."""
     import numpy as np
     from .wave_oracle import plan, route_queues
@@ -59,7 +59,18 @@ def expected_layout(config, rank, bs):
     counts = np.array([sum(map(len, peers)) for peers in queues], dtype=np.int32)
     offsets = np.concatenate(([0], np.cumsum(counts, dtype=np.int64)))
     mapping = np.full((int(offsets[-1]), 3), -1, dtype=np.int32)
-    schedule = plan(bs, model["hidden"], model["intermediate_hidden"], model["num_experts"], model["num_topk"], rank)
+    cohort = 12 if group_order == "paired-xor" else 0
+    schedule = plan(
+        bs,
+        model["hidden"],
+        model["intermediate_hidden"],
+        model["num_experts"],
+        model["num_topk"],
+        rank,
+        dispatch_intra=cohort,
+        combine_intra=cohort,
+        group_order=group_order,
+    )
     for item in schedule["transfers"]:
         if item.operation == "DISPATCH":
             mapping[int(offsets[item.expert]) + item.row] = item.source_rank, item.source_token, item.topk_slot
@@ -68,7 +79,7 @@ def expected_layout(config, rank, bs):
     return mapping, counts
 
 
-def expected_output(config, rank, bs):
+def expected_output(config, rank, bs, *, group_order="reverse"):
     """Reverse all destination maps, then weight/reduce the synthetic expert outputs."""
     import numpy as np
     from .reference import bf16
@@ -77,7 +88,7 @@ def expected_output(config, rank, bs):
     sums = np.zeros((bs, 5), dtype=np.int64)
     seen = np.zeros((bs, model["num_topk"]), dtype=np.int32)
     for destination in range(16):
-        mapping, _ = expected_layout(config, destination, bs)
+        mapping, _ = expected_layout(config, destination, bs, group_order=group_order)
         rows = np.flatnonzero(mapping[:, 0] == rank)
         tokens, slots = mapping[rows, 1], mapping[rows, 2]
         values = ((rows[:, None] >> (np.arange(5) * 5)) & 31) + destination * 2
@@ -88,11 +99,11 @@ def expected_output(config, rank, bs):
     return bf16(sums[:, np.arange(model["hidden"]) % 5].astype(np.float32) / model["num_topk"])
 
 
-def validate_payload(config, rank, bs, snapshot, output, counts, expected):
+def validate_payload(config, rank, bs, snapshot, output, counts, expected, *, group_order="reverse"):
     """Check every copied token/scale, route identity, expert count and reduced element."""
     import numpy as np
 
-    mapping, expected_counts = expected_layout(config, rank, bs)
+    mapping, expected_counts = expected_layout(config, rank, bs, group_order=group_order)
     rows, hidden = len(mapping), config["model"]["hidden"]
     data, scales, metadata = (snapshot[name] for name in ("data", "scales", "metadata"))
     if data.shape != (rows, hidden) or scales.shape != (rows, hidden // 32) or metadata.shape != (rows, 8):
@@ -169,13 +180,23 @@ def run(args, config, group):
     from .validation import collective_check
 
     rank, world = group.rank(), group.size()
+    group_order = os.environ.get("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "reverse")
+    if group_order not in ("reverse", "paired-xor"):
+        raise ValueError("DEEPEP_MEGAMOE_COMM_GROUP_ORDER must be reverse or paired-xor")
     if world != 16 or int(os.environ["LOCAL_WORLD_SIZE"]) != 16:
         raise ValueError("Communication simulator requires one EP16 machine")
     collective_check(
         group,
         "communication-only configuration",
         None,
-        (config, args.no_timer_raw, args.no_validation, args.dispatch_metadata_mode, args.combine_buffer_count),
+        (
+            config,
+            args.no_timer_raw,
+            args.no_validation,
+            args.dispatch_metadata_mode,
+            args.combine_buffer_count,
+            group_order,
+        ),
     )
     rank_dir = args.output_dir / f"rank_{rank}"
     error = None
@@ -194,6 +215,7 @@ def run(args, config, group):
         validation="skipped" if args.no_validation else "strict",
         dispatch_metadata_mode=args.dispatch_metadata_mode,
         combine_buffer_count=args.combine_buffer_count,
+        group_order=group_order,
         ep_size=world,
         rank=rank,
         local_rank=int(os.environ["LOCAL_RANK"]),
@@ -234,7 +256,7 @@ def run(args, config, group):
         )
         torch.npu.synchronize()
         del payload, data, scales
-        expected = None if args.no_validation else expected_output(config, rank, bs)
+        expected = None if args.no_validation else expected_output(config, rank, bs, group_order=group_order)
         result = torch.empty((bs, model["hidden"]), device="npu", dtype=torch.bfloat16)
         counts = None
 
@@ -266,7 +288,9 @@ def run(args, config, group):
                 for name, value in snapshot.items()
             }
             actual = result.float().cpu().numpy()
-            report = validate_payload(config, rank, bs, arrays, actual, counts.cpu().numpy(), expected)
+            report = validate_payload(
+                config, rank, bs, arrays, actual, counts.cpu().numpy(), expected, group_order=group_order
+            )
             report["timer_off_output_equal"] = bool(np.array_equal(actual, uninstrumented))
             report["passed"] &= report["timer_off_output_equal"]
             reports = group.all_gather(report, f"communication payload {label} BS={bs}")
@@ -300,7 +324,13 @@ def run(args, config, group):
             write_breakdown(breakdowns, timer_dir, f"communication only BS={bs}")
 
         if args.no_validation:
-            report = timer_rank_report(events, rank, model["hidden"])
+            report = timer_rank_report(
+                events,
+                rank,
+                model["hidden"],
+                dispatch_intra=int(os.environ.get("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "0")),
+                combine_intra=int(os.environ.get("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES", "0")),
+            )
         else:
             # Audit writes occur in a separate invocation; they never enter measured bandwidth.
             audit = buffer.allocate_timer(audit=True)
@@ -326,9 +356,11 @@ def run(args, config, group):
                 intermediate=model["intermediate_hidden"],
                 ranks_per_node=16,
                 transfers=transfers,
+                group_order=group_order,
             )
         report["dispatch_metadata_mode"] = args.dispatch_metadata_mode
         report["combine_buffer_count"] = args.combine_buffer_count
+        report["group_order"] = group_order
         report = write_rank_detail(report, timer_dir)
         reports = group.all_gather(report, f"communication bandwidth report BS={bs}")
         if rank == 0:
@@ -336,6 +368,7 @@ def run(args, config, group):
             summary["workload"] = "communication_only"
             summary["dispatch_metadata_mode"] = args.dispatch_metadata_mode
             summary["combine_buffer_count"] = args.combine_buffer_count
+            summary["group_order"] = group_order
             (timer_dir / "communication.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
             validation_status = (
                 "validation skipped" if args.no_validation else "Dispatch/Combine payload and wave/core audit passed"
@@ -343,6 +376,7 @@ def run(args, config, group):
             print(
                 f"[COMM_ONLY] BS={bs} dispatch_metadata_mode={args.dispatch_metadata_mode} "
                 f"combine_buffer_count={args.combine_buffer_count} "
+                f"group_order={group_order} "
                 f"kernel rank-max-mean={profile['rank_max_mean_us']:.3f}us; "
                 f"{validation_status}; no GMM executed",
                 flush=True,

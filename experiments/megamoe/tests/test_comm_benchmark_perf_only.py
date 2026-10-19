@@ -158,6 +158,9 @@ def mocked_run(monkeypatch, tmp_path):
     monkeypatch.setattr(bench, "files", lambda _package: tmp_path)
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "16")
     monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.delenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", raising=False)
+    monkeypatch.delenv("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", raising=False)
+    monkeypatch.delenv("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES", raising=False)
     args = SimpleNamespace(
         output_dir=tmp_path / "run",
         no_timer_raw=False,
@@ -177,15 +180,22 @@ def mocked_run(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("metadata_mode", ["dma", "scalar"])
 @pytest.mark.parametrize("combine_buffer_count", [2, 4, 6])
+@pytest.mark.parametrize("group_order", ["reverse", "paired-xor"])
 def test_performance_only_run_skips_all_validation_and_writes_real_reports(
     mocked_run,
     capsys,
     metadata_mode,
     combine_buffer_count,
+    group_order,
+    monkeypatch,
 ):
     run = mocked_run
     run.args.dispatch_metadata_mode = metadata_mode
     run.args.combine_buffer_count = combine_buffer_count
+    monkeypatch.setenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", group_order)
+    if group_order == "paired-xor":
+        monkeypatch.setenv("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "12")
+        monkeypatch.setenv("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES", "12")
     bench.run(run.args, run.config, run.group)
     state, output = run.state, run.args.output_dir
     assert state.forbidden == []
@@ -204,6 +214,7 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(
     assert manifest["workload"] == "communication_only" and manifest["validation"] == "skipped"
     assert manifest["dispatch_metadata_mode"] == metadata_mode
     assert manifest["combine_buffer_count"] == combine_buffer_count
+    assert manifest["group_order"] == group_order
     profile = json.loads((output / "rank_0/bs_8/profiling.json").read_text())
     assert profile["metric"] == "communication_only_kernel_duration_us"
     assert profile["rank_max_mean_us"] == 19.0
@@ -216,6 +227,7 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(
     assert detail["validation"]["status"] == "skipped"
     assert detail["dispatch_metadata_mode"] == metadata_mode
     assert detail["combine_buffer_count"] == combine_buffer_count
+    assert detail["group_order"] == group_order
     assert detail["validation"]["accounting"] == "timer_row_counts"
     assert [wave["operation"] for wave in detail["waves"]] == ["DISPATCH", "COMBINE"]
     assert all(len(wave["cores"]) == 28 for wave in detail["waves"])
@@ -223,6 +235,7 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(
     assert summary["validation"] == dict(strict_wave_core=False, status="skipped")
     assert summary["dispatch_metadata_mode"] == metadata_mode
     assert summary["combine_buffer_count"] == combine_buffer_count
+    assert summary["group_order"] == group_order
     assert len(summary["ranks"]) == 16
     for operation, mean_core_us in (("DISPATCH", 1.0), ("COMBINE", 2.0)):
         measured = detail["operations"][operation]
@@ -230,9 +243,18 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(
         assert measured["rows"] == 64 and measured["bytes"] == expected_bytes
         assert measured["mean_core_us"] == mean_core_us
         assert summary["operations"][operation]["gbps_per_card_mean"] == expected_bytes / mean_core_us / 1000
+        if group_order == "paired-xor":
+            for name, workers in (("INTRA", 12), ("CROSS", 16)):
+                cohort = measured["cohorts"][name]
+                assert cohort["workers"] == workers and cohort["rows"] == 32
+                assert cohort["mean_core_us"] == mean_core_us
+                assert summary["operations"][operation]["cohorts"][name]["gbps_per_card_mean"] == cohort["gbps"]
+        else:
+            assert "cohorts" not in measured and "cohorts" not in summary["operations"][operation]
     printed = capsys.readouterr().out
     assert "validation skipped; no GMM executed" in printed
     assert f"combine_buffer_count={combine_buffer_count}" in printed
+    assert f"group_order={group_order}" in printed
 
 
 def test_strict_run_still_calls_oracle_before_timing(mocked_run):

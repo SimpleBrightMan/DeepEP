@@ -91,8 +91,16 @@ class Tensor:
 
 
 @pytest.fixture
-def backend(monkeypatch):
+def backend(monkeypatch, request):
     events = []
+    for name in (
+        "DEEPEP_MEGAMOE_COMM_GROUP_ORDER",
+        "DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES",
+        "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in getattr(request, "param", {}).items():
+        monkeypatch.setenv(name, value)
 
     class Group:
         def size(self):
@@ -195,7 +203,7 @@ def replay_backend(backend):
     b.group.rank = lambda: 0
     b.num_experts = 32
     backend.ext.small_batch_max_tokens = 1
-    backend.ext.communication_replay_protocol = 3
+    backend.ext.communication_replay_protocol = 4
     route = np.arange(17 * b.num_topk)
     b.topk_idx.data[:] = ((route % 16) * 2 + (route // 16) % 2).reshape(17, b.num_topk)
     events = backend.events
@@ -262,8 +270,8 @@ def test_communication_metadata_mode_must_match_all_ranks(backend, monkeypatch):
 
     def gather(output, value, **kwargs):
         output[:] = [value] * 2
-        if value == (None, (17, "dma", 2)):
-            output[1] = (None, (17, "scalar", 2))
+        if value == (None, (17, "dma", 2, "reverse")):
+            output[1] = (None, (17, "scalar", 2, "reverse"))
 
     monkeypatch.setattr(backend.dist, "all_gather_object", gather)
     with pytest.raises(ValueError, match="communication preparation inputs: ranks disagree"):
@@ -271,7 +279,7 @@ def test_communication_metadata_mode_must_match_all_ranks(backend, monkeypatch):
     assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
 
 
-@pytest.mark.parametrize("protocol", [None, 1, 2])
+@pytest.mark.parametrize("protocol", [None, 1, 2, 3])
 def test_communication_metadata_rejects_stale_extension_protocol(backend, protocol):
     payload = replay_backend(backend)
     backend.ext.communication_replay_protocol = protocol
@@ -301,8 +309,8 @@ def test_communication_combine_buffer_count_must_match_all_ranks(backend, monkey
 
     def gather(output, value, **kwargs):
         output[:] = [value] * 2
-        if value == (None, (17, "dma", 2)):
-            output[1] = (None, (17, "dma", 4))
+        if value == (None, (17, "dma", 2, "reverse")):
+            output[1] = (None, (17, "dma", 4, "reverse"))
 
     monkeypatch.setattr(backend.dist, "all_gather_object", gather)
     with pytest.raises(ValueError, match="communication preparation inputs: ranks disagree"):
@@ -319,6 +327,114 @@ def test_communication_combine_buffer_count_changes_on_repreparation(backend):
     prepared = [event[3] for event in backend.events if isinstance(event, tuple) and event[0] == "prepare_comm"]
     assert prepared == [6, 2, 4]
     assert sum(event[0] == "comm_launch" for event in backend.events if isinstance(event, tuple)) == 3
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        {"DEEPEP_MEGAMOE_COMM_GROUP_ORDER": "reverse"},
+        {
+            "DEEPEP_MEGAMOE_COMM_GROUP_ORDER": "paired-xor",
+            "DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES": "12",
+            "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES": "12",
+        },
+    ],
+    indirect=True,
+)
+def test_communication_group_order_is_collectively_prepared(backend, monkeypatch, request):
+    payload = replay_backend(backend)
+    expected_order = request.node.callspec.params["backend"]["DEEPEP_MEGAMOE_COMM_GROUP_ORDER"]
+    signatures = []
+
+    def gather(output, value, **kwargs):
+        output[:] = [value] * 2
+        signatures.append(value)
+
+    monkeypatch.setattr(backend.dist, "all_gather_object", gather)
+    backend.buffer.prepare_communication(17, combine_payload=payload, combine_buffer_count=6)
+    assert signatures.count((None, (17, "dma", 6, expected_order))) == 2
+    prepared = [event for event in backend.events if isinstance(event, tuple) and event[0] == "prepare_comm"]
+    assert len(prepared) == 1 and prepared[0][2:] == (True, 6)
+    out = Tensor(np.zeros((17, 1024)), "bfloat16")
+    api.communication_forward(backend.buffer, bs=17, out=out)
+    assert any(event[0] == "comm_launch" for event in backend.events if isinstance(event, tuple))
+
+
+@pytest.mark.parametrize("order", ["", "xor", "paired", "PAIRED-XOR", " reverse", "reverse "])
+def test_communication_rejects_invalid_or_empty_group_order(backend, monkeypatch, order):
+    payload = replay_backend(backend)
+    monkeypatch.setenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", order)
+    with pytest.raises(ValueError, match="DEEPEP_MEGAMOE_COMM_GROUP_ORDER must be reverse or paired-xor"):
+        backend.buffer.prepare_communication(17, combine_payload=payload)
+    assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
+
+
+@pytest.mark.parametrize(
+    "dispatch,combine",
+    [
+        (None, None),
+        ("12", None),
+        (None, "12"),
+        ("10", "12"),
+        ("12", "16"),
+        ("0", "0"),
+        ("012", "12"),
+        ("12", "12 "),
+        ("", "12"),
+    ],
+)
+def test_paired_groups_requires_both_exact_twelve_core_settings(backend, monkeypatch, dispatch, combine):
+    payload = replay_backend(backend)
+    monkeypatch.setenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "paired-xor")
+    for name, value in (
+        ("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", dispatch),
+        ("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES", combine),
+    ):
+        if value is not None:
+            monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match="paired-xor requires Dispatch and Combine to use 12 INTRA and 16 CROSS"):
+        backend.buffer.prepare_communication(17, combine_payload=payload)
+    assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
+
+
+def test_communication_group_order_must_match_all_ranks(backend, monkeypatch):
+    payload = replay_backend(backend)
+
+    def gather(output, value, **kwargs):
+        output[:] = [value] * 2
+        if value == (None, (17, "dma", 2, "reverse")):
+            output[1] = (None, (17, "dma", 2, "paired-xor"))
+
+    monkeypatch.setattr(backend.dist, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="communication preparation inputs: ranks disagree"):
+        backend.buffer.prepare_communication(17, combine_payload=payload)
+    assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        {
+            "DEEPEP_MEGAMOE_COMM_GROUP_ORDER": "paired-xor",
+            "DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES": "12",
+            "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES": "12",
+        }
+    ],
+    indirect=True,
+)
+def test_communication_group_order_change_requires_repreparation(backend, monkeypatch):
+    payload = replay_backend(backend)
+    buffer = backend.buffer
+    buffer.prepare_communication(17, combine_payload=payload)
+    monkeypatch.setenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "reverse")
+    with pytest.raises(RuntimeError, match="prepare_communication again after changing communication group order"):
+        api.communication_forward(buffer, bs=17)
+    assert not any(event[0] == "comm_launch" for event in backend.events if isinstance(event, tuple))
+    buffer.prepare_communication(17, combine_payload=payload)
+    out = Tensor(np.zeros((17, 1024)), "bfloat16")
+    api.communication_forward(buffer, bs=17, out=out)
+    assert sum(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple)) == 2
+    assert sum(event[0] == "comm_launch" for event in backend.events if isinstance(event, tuple)) == 1
 
 
 @pytest.mark.parametrize("change", ["route_version", "route_replaced", "bs", "full_operator"])
