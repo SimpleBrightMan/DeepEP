@@ -33,7 +33,9 @@ EP8、H7168/I3072/E384/topk6、无共享专家、FP8/FP4，真实通信，timer-
 
 CPU3独立trace轮，rank0前六组均值：GMM1 ISSUE累计650.028→641.480us，GMM2 303.313→302.643us；最后GMM2 ISSUE相对本组首GMM1开始1037.399→1028.533us。与收益主要落在GMM1供数接续相容。ISSUE不是纯MAC时间；不能把其他角色累计变化相加或认为改变了SwiGLU算术。
 
-此轮A-only被动timer开销0.606%；master−0.102%属于测量波动。没有新增设备timer或同步。配对分核PMU另行记录，未有结果前不声称MTE2计数下降或缓存miss减少。
+此轮A-only被动timer开销0.606%；master−0.102%属于测量波动。没有新增设备timer或同步。
+
+柜05配对分核PipeUtilization已完成：device0、block0/15/16/31、每角色40条记录，按本核duration换算。AIC MTE2等效时间865.413→762.942us，Scalar434.862→447.556us，MAC953.340→950.239us，MTE1 610.660→611.111us；AIV0 Vector约415us不变。MTE2下降102us不意味着端到端省102us；实际普通性能改善12.6us，不能相加流水时间。未采新的Memory/L2组，不能声称物理流量或cache miss减少。
 
 仍未证明追平DS。本候选仅回收约1%耗时，不能把历史DS节点的绝对耗时拼到新节点上。
 
@@ -45,4 +47,4 @@ CPU3独立trace轮，rank0前六组均值：GMM1 ISSUE累计650.028→641.480us�
 python3 experiments/megamoe/scripts/batch_launch.py --ep-size 8 --bs-values 1024 --no-timer
 ```
 
-默认即性能模式；去掉`--no-timer`按原脚本保存流水。实验原始结果保存在本地工作区`outputs/bs1024-master-1019/cpu3/`，后续柜05补测另目录保存；完整逐项说明见报告分支`codex/megamoe-bs1024-master-1019`的`analysis/bs1024-master-1019/FRONTEND_EXPERIMENTS.md`。
+默认即性能模式；去掉`--no-timer`按原脚本保存流水。实验原始结果保存在本地工作区`outputs/bs1024-master-1019/cpu3/`与`cpu5r05/`；完整逐项说明见报告分支`codex/megamoe-bs1024-master-1019`的`analysis/bs1024-master-1019/FRONTEND_EXPERIMENTS.md`。
