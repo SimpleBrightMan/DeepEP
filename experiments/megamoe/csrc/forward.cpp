@@ -367,6 +367,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     // A real GMM call overwrites the replay payload prepared in this workspace.
     communication_rows_ = 0;
     communication_completed_ = false;
+    communication_metadata_ = torch::Tensor();
     CheckTensor(x, 2, "x");
     CheckTensor(topk_ids, 2, "topk_ids");
     CheckTensor(topk_weights, 2, "topk_weights");
@@ -515,10 +516,13 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     return {y, expert_tokens};
 }
 
-void Plan::prepare_communication(torch::Tensor combine_payload)
+void Plan::prepare_communication(torch::Tensor combine_payload, bool metadata_dma)
 {
     communication_rows_ = 0;
     communication_completed_ = false;
+    // Previous raw launches recorded the tensor on their stream, so replacing
+    // it here cannot recycle its storage while those launches still use it.
+    communication_metadata_ = torch::Tensor();
     TORCH_CHECK(tiling_.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 &&
                     tiling_.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT && tiling_.sharedExpertNum == 0U &&
                     tiling_.epWorldSize == 16U && platform_.aic == 28U &&
@@ -531,6 +535,25 @@ void Plan::prepare_communication(torch::Tensor combine_payload)
                 "combine_payload must be BF16 [BS*topK,H] on the plan NPU; replay requires balanced routing");
     const MegaMoeImpl::WorkspaceInfo info(static_cast<uint8_t*>(workspace_.data_ptr()), &tiling_);
     const auto stream = c10_npu::getCurrentNPUStream();
+    if (metadata_dma) {
+        auto identities = torch::zeros({tiling_.epWorldSize, rows, 8},
+                                       torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
+        int32_t* values = identities.data_ptr<int32_t>();
+        for (int64_t rank = 0; rank < tiling_.epWorldSize; ++rank) {
+            for (int64_t token = 0; token < tiling_.bs; ++token) {
+                for (int64_t slot = 0; slot < tiling_.topK; ++slot) {
+                    const int64_t offset = ((rank * rows) + token * tiling_.topK + slot) * 8;
+                    values[offset] = static_cast<int32_t>(rank);
+                    values[offset + 1] = static_cast<int32_t>(token);
+                    values[offset + 2] = static_cast<int32_t>(slot);
+                }
+            }
+        }
+        // Blocking host-to-device copy owns the staging lifetime. Preparation
+        // runs outside measured launches, and the table never uses peer memory.
+        communication_metadata_ = identities.to(workspace_.options().dtype(torch::kInt32), false, true);
+        c10_npu::NPUCachingAllocator::recordStream(communication_metadata_.storage().data_ptr(), stream);
+    }
     const size_t bytes = static_cast<size_t>(combine_payload.numel()) * sizeof(at::BFloat16);
     ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpyAsync(info.gmm2MmadResPtr, bytes, combine_payload.data_ptr(), bytes,
                                              ACL_MEMCPY_DEVICE_TO_DEVICE, stream.stream()));
@@ -588,12 +611,16 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::communication_forward(torch::Tens
     auto ptr = [](const torch::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
     mega_moe_communication_kernel_do(platform_.block_dim, platform_.ub, stream.stream(), ptr(context_), ptr(x),
                                      ptr(x_scales), ptr(topk_ids), ptr(topk_weights), ptr(y), ptr(counts),
-                                     ptr(workspace_), timer ? ptr(*timer) : nullptr,
-                                     reinterpret_cast<const uint8_t*>(&tiling_), ffts_);
+                                     ptr(workspace_),
+                                     communication_metadata_.defined() ? ptr(communication_metadata_) : nullptr,
+                                     timer ? ptr(*timer) : nullptr, reinterpret_cast<const uint8_t*>(&tiling_), ffts_);
     for (const auto* tensor : {&x, &x_scales, &topk_ids, &topk_weights, &y, &counts, &workspace_, &context_}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }
     if (timer) c10_npu::NPUCachingAllocator::recordStream(timer->storage().data_ptr(), stream);
+    if (communication_metadata_.defined()) {
+        c10_npu::NPUCachingAllocator::recordStream(communication_metadata_.storage().data_ptr(), stream);
+    }
     communication_completed_ = true;
     return {y, counts};
 }

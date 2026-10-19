@@ -28,6 +28,7 @@ def test_plan_does_not_touch_devices_or_create_output(tmp_path, capsys):
     assert not target.exists()
     assert planned["total_case_launches"] == 1
     assert planned["mode"] == "baseline"
+    assert planned["dispatch_metadata_mode"] == "dma"
     assert planned["combine_intra_candidates"] == []
     assert planned["model"]["num_topk"] == 8
     assert not planned["global_optimum_guaranteed"]
@@ -76,6 +77,19 @@ def test_performance_only_plan_and_child_command(tmp_path, capsys):
     command = sweep.command(args, tmp_path / "config", target, None, target)
     assert "--no-validation" in command
     assert "deep_ep_experimental.megamoe.comm_benchmark" in command
+    assert command[command.index("--dispatch-metadata-mode") + 1] == "dma"
+
+
+def test_scalar_metadata_mode_is_explicit_and_does_not_change_full_reference(tmp_path):
+    args = sweep.parse_args(["--dispatch-metadata-mode", "scalar"])
+    assert sweep.plan(args)["dispatch_metadata_mode"] == "scalar"
+    command = sweep.command(args, tmp_path / "config", tmp_path / "out", None, tmp_path)
+    assert command[command.index("--dispatch-metadata-mode") + 1] == "scalar"
+    for mode in ("dma", "scalar"):
+        args.dispatch_metadata_mode = mode
+        full = sweep.command(args, tmp_path / "config", tmp_path / "full", None, tmp_path, full_reference=True)
+        assert "--dispatch-metadata-mode" not in full
+        assert "deep_ep_experimental.megamoe.benchmark" in full
 
 
 @pytest.mark.parametrize("different", ["intermediate_hidden", "alignment", "rank", "split"])
@@ -134,6 +148,7 @@ def test_full_reference_rejects_incomparable_manifest_before_comparing_timers(tm
         ("--case-gap-seconds", "nan"),
         ("--case-gap-seconds", "61"),
         ("--shmem-port-policy", "invalid"),
+        ("--dispatch-metadata-mode", "invalid"),
     ],
 )
 def test_reject_invalid_scan(option, value):
@@ -184,8 +199,9 @@ def test_staged_search_retains_first_stage_winner_outside_combine_candidates(tmp
     monkeypatch.setattr(sweep, "write_summary", lambda path, plan, records, chosen: selections.extend(chosen))
     durations = {None: 200, (2, 12): 90, (4, 12): 100, (2, 2): 150, (2, 4): 130}
 
-    def read(output, bs, pair, *, validate=True):
+    def read(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma"):
         assert validate
+        assert dispatch_metadata_mode == "dma"
         return dict(pair=list(pair) if pair else None, passed=True, comm_kernel_rank_max_mean_us=durations[pair])
 
     monkeypatch.setattr(sweep, "read_case", read)
@@ -218,8 +234,9 @@ def test_dispatch_only_keeps_combine_fixed_through_scan_and_confirmation(tmp_pat
     monkeypatch.setattr(sweep, "write_summary", lambda path, plan, records, chosen: selections.extend(chosen))
     durations = {None: 200, (10, 7): 120, (12, 7): 110, (16, 7): 130, (20, 7): 125}
 
-    def read(output, bs, pair, *, validate=True):
+    def read(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma"):
         assert validate
+        assert dispatch_metadata_mode == "dma"
         return dict(pair=list(pair) if pair else None, passed=True, comm_kernel_rank_max_mean_us=durations[pair])
 
     monkeypatch.setattr(sweep, "read_case", read)
@@ -311,7 +328,7 @@ def test_execute_waits_and_records_exit_without_masking_child_failure(tmp_path, 
     assert records[-1]["event"] == "torchrun_exit" and records[-1]["returncode"] == status
 
 
-def write_case_fixture(tmp_path, pair, *, validate=True):
+def write_case_fixture(tmp_path, pair, *, validate=True, metadata_mode="dma"):
     bs = 2048
     for rank in range(16):
         directory = tmp_path / f"rank_{rank}"
@@ -332,6 +349,8 @@ def write_case_fixture(tmp_path, pair, *, validate=True):
         )
         if not validate:
             manifest["validation"] = "skipped"
+        if metadata_mode is not None:
+            manifest["dispatch_metadata_mode"] = metadata_mode
         (directory / "manifest.json").write_text(json.dumps(manifest))
     rank0 = tmp_path / "rank_0" / f"bs_{bs}"
     rank0.mkdir()
@@ -356,12 +375,33 @@ def write_case_fixture(tmp_path, pair, *, validate=True):
             for operation in ("DISPATCH", "COMBINE")
         },
     )
+    if metadata_mode is not None:
+        communication["dispatch_metadata_mode"] = metadata_mode
     if not validate:
         communication["validation"] = dict(strict_wave_core=False, status="skipped")
         for record in communication["ranks"]:
             record["validation"] = dict(strict_wave_core=False, status="skipped", accounting="timer_row_counts")
     (timer / "communication.json").write_text(json.dumps(communication))
     return rank0, timer, communication, checks
+
+
+@pytest.mark.parametrize("recorded", ["dma", "scalar", None])
+def test_case_reader_checks_requested_metadata_mode_and_legacy_means_scalar(tmp_path, recorded):
+    write_case_fixture(tmp_path, None, validate=False, metadata_mode=recorded)
+    actual = recorded or "scalar"
+    report = sweep.read_case(tmp_path, 2048, None, validate=False, dispatch_metadata_mode=actual)
+    assert report["dispatch_metadata_mode"] == actual
+    opposite = "scalar" if actual == "dma" else "dma"
+    with pytest.raises(ValueError, match="manifest"):
+        sweep.read_case(tmp_path, 2048, None, validate=False, dispatch_metadata_mode=opposite)
+
+
+def test_case_reader_rejects_metadata_mode_mismatch_in_summary(tmp_path):
+    _, timer, communication, _ = write_case_fixture(tmp_path, None, validate=False)
+    communication["dispatch_metadata_mode"] = "scalar"
+    (timer / "communication.json").write_text(json.dumps(communication))
+    with pytest.raises(ValueError, match="report metadata mode"):
+        sweep.read_case(tmp_path, 2048, None, validate=False)
 
 
 @pytest.mark.parametrize("pair", [None, (12, 0), (12, 12)])
@@ -426,6 +466,7 @@ def test_performance_reader_accepts_real_timer_accounting_summary(tmp_path):
         measured = comm_report.timer_rank_report(events, rank, 3584)
         records.append(comm_report.write_rank_detail(measured, timer))
     actual = comm_report.summarize(records, require_validation=False)
+    actual["dispatch_metadata_mode"] = "dma"
     (timer / "communication.json").write_text(json.dumps(actual))
     loaded = sweep.read_case(tmp_path, 2048, None, validate=False)
     assert loaded["communication"]["operations"] == actual["operations"]
@@ -467,7 +508,8 @@ def test_performance_only_runs_all_bs_without_reference_or_validation(tmp_path, 
     monkeypatch.setattr(sweep, "print_case", lambda item: None)
     monkeypatch.setattr(sweep, "write_summary", lambda *a: None)
 
-    def read(output, bs, pair, *, validate=True):
+    def read(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma"):
+        assert dispatch_metadata_mode == "dma"
         reads.append((bs, pair, validate))
         return dict(bs=bs, pair=pair, passed=True, validation="skipped")
 
@@ -509,6 +551,7 @@ def test_summary_and_console_keep_dispatch_combine_independent(tmp_path, capsys)
         dict(
             bs=2048,
             stage="baseline" if pair is None else "dispatch",
+            dispatch_metadata_mode="dma",
             pair=pair,
             output_dir=str(tmp_path / ("baseline" if pair is None else "candidate")),
             comm_kernel_rank_max_mean_us=2400.0,
@@ -522,12 +565,14 @@ def test_summary_and_console_keep_dispatch_combine_independent(tmp_path, capsys)
     with (tmp_path / "summary.csv").open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
     assert len(rows) == 2
+    assert all(row["dispatch_metadata_mode"] == "dma" for row in rows)
     assert all(row["DISPATCH_GBps"] == "70.0" and row["COMBINE_GBps"] == "130.0" for row in rows)
     assert rows[0]["dispatch_intra"] == "0" and rows[0]["dispatch_cross"] == ""
     assert rows[1]["combine_intra"] == "0" and rows[1]["combine_cross"] == ""
     sweep.print_case(cases[1])
     printed = capsys.readouterr().out
     assert "D=10/18 C=original" in printed
+    assert "dispatch_metadata_mode=dma" in printed
     assert "[BW] DISPATCH" in printed and "[BW] COMBINE" in printed
     assert "all 28 core communication times / 28" in printed
     assert "wave envelopes" not in printed

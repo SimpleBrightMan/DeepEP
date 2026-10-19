@@ -24,6 +24,7 @@
 #include "../common/ascend_timer_v2_device.hpp"
 #include "mega_moe_token_quant.hpp"
 #include "mega_moe_count_arrival.hpp"
+#include "mega_moe_dispatch_metadata_dma.hpp"
 
 namespace MegaMoeImpl {
 
@@ -44,6 +45,9 @@ struct TokenDispatchConfig {
 
 template <typename ActivationType>
 struct TokenDispatchScratch {
+    // Only the communication replay binds this table; full MegaMoE retains
+    // its scalar metadata path. The table outlives every measured launch.
+    GM_ADDR dmaMetadataInput = nullptr;
     AscendTimerDevice* commTimer = nullptr;
     AscendTimerDevice* auditTimer = nullptr;
     uint32_t auditExpert = 0;
@@ -125,6 +129,19 @@ __aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
     int32_t tokenIndex = topkIndex / static_cast<int32_t>(params.tilingData->topK);
     uint64_t remoteCopyOffset =
         static_cast<uint64_t>(tokenIndex) * static_cast<uint64_t>(context.quantTokenScaleAlignBytes);
+    if constexpr (!TopkWeightsPrefetch) {
+        if (scratch.dmaMetadataInput != nullptr) {
+            GlobalTensor<int32_t> metadataInput;
+            metadataInput.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(scratch.dmaMetadataInput));
+            uint64_t metadataRow =
+                static_cast<uint64_t>(remoteRankIdx) * params.tilingData->bs * params.tilingData->topK +
+                static_cast<uint32_t>(topkIndex);
+            FetchDispatchTokenWithDmaMetadata<IsBufferReuse>(
+                copyTmpTensor, remoteRankGlobalTensor, remoteCopyOffset, context.quantTokenScaleAlignBytes,
+                scratch.metaInfoTensor[bufferIdx * INT32_PER_256B], metadataInput, metadataRow, bufferIdx);
+            return;
+        }
+    }
     if constexpr (IsBufferReuse) {
         WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
     }
@@ -159,6 +176,15 @@ __aicore__ inline void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
     scaleRevGlobalTensor.SetGlobalBuffer(
         reinterpret_cast<__gm__ QuantScaleType*>(params.workspaceInfo.dispatchRevScalePtr));
     metaInfoGlobalTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr));
+    if constexpr (!TopkWeightsPrefetch) {
+        if (scratch.dmaMetadataInput != nullptr) {
+            StoreDispatchTokenWithDmaMetadata(
+                tokenRevGlobalTensor, scaleRevGlobalTensor, metaInfoGlobalTensor,
+                GetDispatchCopyBuffer(context, scratch, bufferIdx), scratch.metaInfoTensor[bufferIdx * INT32_PER_256B],
+                context.quantTokenAlignBytes, scratch.revTokenElemCnt, scratch.revScaleElemCnt, copyIdx, bufferIdx);
+            return;
+        }
+    }
     TEventID eventId = static_cast<TEventID>(bufferIdx);
     WaitFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
     LocalTensor<ActivationType> tokenScaleBuffer = GetDispatchCopyBuffer(context, scratch, bufferIdx);
@@ -241,6 +267,12 @@ __aicore__ inline void DrainDispatchCopyBuffers(const TokenDispatchConfig& conte
     }
     uint32_t used = progress.issuedRows < bufferCount ? progress.issuedRows : bufferCount;
     for (uint32_t bufferIdx = 0U; bufferIdx < used; ++bufferIdx) {
+        if constexpr (!TopkWeightsPrefetch) {
+            if (scratch.dmaMetadataInput != nullptr) {
+                DrainDispatchMetadataDmaSlot(static_cast<int32_t>(bufferIdx));
+                continue;
+            }
+        }
         TEventID eventId = static_cast<TEventID>(bufferIdx);
         WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
         WaitFlag<AscendC::HardEvent::MTE3_S>(eventId);

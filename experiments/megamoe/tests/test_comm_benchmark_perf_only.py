@@ -78,8 +78,9 @@ def mocked_run(monkeypatch, tmp_path):
             self.topk_idx = Tensor(np.zeros((bs, topk), dtype=np.int32))
             self.topk_weights = Tensor(np.zeros((bs, topk), dtype=np.float32))
 
-        def prepare_communication(self, bs, *, combine_payload):
+        def prepare_communication(self, bs, *, combine_payload, dispatch_metadata_mode):
             state.prepared_rows = combine_payload.data.shape[0]
+            state.dispatch_metadata_mode = dispatch_metadata_mode
             assert bs == 8
 
         def allocate_timer(self, *, audit=False):
@@ -156,7 +157,12 @@ def mocked_run(monkeypatch, tmp_path):
     monkeypatch.setattr(bench, "files", lambda _package: tmp_path)
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "16")
     monkeypatch.setenv("LOCAL_RANK", "0")
-    args = SimpleNamespace(output_dir=tmp_path / "run", no_timer_raw=False, no_validation=True)
+    args = SimpleNamespace(
+        output_dir=tmp_path / "run",
+        no_timer_raw=False,
+        no_validation=True,
+        dispatch_metadata_mode="dma",
+    )
     config = dict(
         model=dict(hidden=64, intermediate_hidden=128, num_experts=32, num_topk=8, num_shared_experts=0),
         bs_values=[8],
@@ -167,8 +173,10 @@ def mocked_run(monkeypatch, tmp_path):
     return SimpleNamespace(args=args, config=config, group=Group(), state=state)
 
 
-def test_performance_only_run_skips_all_validation_and_writes_real_reports(mocked_run, capsys):
+@pytest.mark.parametrize("metadata_mode", ["dma", "scalar"])
+def test_performance_only_run_skips_all_validation_and_writes_real_reports(mocked_run, capsys, metadata_mode):
     run = mocked_run
+    run.args.dispatch_metadata_mode = metadata_mode
     bench.run(run.args, run.config, run.group)
     state, output = run.state, run.args.output_dir
     assert state.forbidden == []
@@ -176,6 +184,7 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(mocke
     assert state.cpu_reads == ["timer"]
     assert state.calls == [False, False, False, False, False, True]
     assert state.prepared_rows == 64
+    assert state.dispatch_metadata_mode == metadata_mode
     assert state.destroyed and state.closed
     assert not list(output.rglob("*accuracy*"))
     assert not list(output.rglob("*audit*"))
@@ -183,6 +192,7 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(mocke
 
     manifest = json.loads((output / "rank_0/manifest.json").read_text())
     assert manifest["workload"] == "communication_only" and manifest["validation"] == "skipped"
+    assert manifest["dispatch_metadata_mode"] == metadata_mode
     profile = json.loads((output / "rank_0/bs_8/profiling.json").read_text())
     assert profile["metric"] == "communication_only_kernel_duration_us"
     assert profile["rank_max_mean_us"] == 19.0
@@ -193,11 +203,13 @@ def test_performance_only_run_skips_all_validation_and_writes_real_reports(mocke
     detail = json.loads((timer_dir / "rank_00_communication.json").read_text())
     assert "_transfers" not in detail
     assert detail["validation"]["status"] == "skipped"
+    assert detail["dispatch_metadata_mode"] == metadata_mode
     assert detail["validation"]["accounting"] == "timer_row_counts"
     assert [wave["operation"] for wave in detail["waves"]] == ["DISPATCH", "COMBINE"]
     assert all(len(wave["cores"]) == 28 for wave in detail["waves"])
     summary = json.loads((timer_dir / "communication.json").read_text())
     assert summary["validation"] == dict(strict_wave_core=False, status="skipped")
+    assert summary["dispatch_metadata_mode"] == metadata_mode
     assert len(summary["ranks"]) == 16
     for operation, mean_core_us in (("DISPATCH", 1.0), ("COMBINE", 2.0)):
         measured = detail["operations"][operation]

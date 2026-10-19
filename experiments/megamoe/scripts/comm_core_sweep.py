@@ -61,6 +61,12 @@ def parse_args(argv=None):
         help="Default: original production schedule only; explicitly select dispatch for a Dispatch sweep",
     )
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument(
+        "--dispatch-metadata-mode",
+        choices=("dma", "scalar"),
+        default="dma",
+        help="Communication-only Dispatch metadata implementation; full reference stays scalar",
+    )
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--timeout", type=int, default=3600, help="Seconds per fresh torchrun case")
@@ -181,6 +187,7 @@ def plan(args):
         workload="communication_only",
         validation="skipped" if args.no_validation else "strict",
         mode=args.mode,
+        dispatch_metadata_mode=args.dispatch_metadata_mode,
         ep_size=16,
         physical_aiv1_workers=28,
         bs_values=args.bs_values,
@@ -211,6 +218,8 @@ def plan(args):
             else "Every case checks Dispatch bytes/scales/metadata and Combine output against independent synthetic payload expectations.",
             "No weights, GMM1, SwiGLU or GMM2 run in communication-only cases; synthetic GMM2 rows are prepared once before timing.",
             "Dispatch and Combine keep production slot policies (Prefill Combine has two slots).",
+            "Dispatch metadata DMA adds one local 32-byte read per row; remote payload bytes and task ownership are unchanged.",
+            "Full MegaMoE reference retains original scalar Dispatch metadata; metadata modes need not match for optional task/timing comparisons.",
             "Combine=0 means original Combine ownership; Dispatch experiments can leave Combine unchanged.",
             "Timer structure and complete rank/profile reports are still checked; no task or full-operator timing comparison runs."
             if args.no_validation
@@ -299,8 +308,10 @@ def command(args, config_path, output, pair, baseline, *, full_reference=False):
             "0-15",
             "--comm-report",
         ]
-    elif args.no_validation:
-        result.append("--no-validation")
+    else:
+        result += ["--dispatch-metadata-mode", args.dispatch_metadata_mode]
+        if args.no_validation:
+            result.append("--no-validation")
     if not args.keep_raw_timers:
         result.append("--no-timer-raw")
     return result
@@ -335,7 +346,7 @@ def execute(argv, *, cwd, environment, logfile, timeout):
         raise RuntimeError(f"Case exited with status {code}; inspect {logfile}")
 
 
-def read_case(output, bs, pair, *, validate=True):
+def read_case(output, bs, pair, *, validate=True, dispatch_metadata_mode="dma"):
     expected_environment = {ENV_DISPATCH: str(pair[0]) if pair else None, ENV_COMBINE: str(pair[1]) if pair else None}
     builds = []
     for rank in range(16):
@@ -350,6 +361,7 @@ def read_case(output, bs, pair, *, validate=True):
             or manifest["comm_core_split"] != expected_environment
             or manifest["config"]["bs_values"] != [bs]
             or manifest.get("validation", "strict") != ("strict" if validate else "skipped")
+            or manifest.get("dispatch_metadata_mode", "scalar") != dispatch_metadata_mode
         ):
             raise ValueError("Benchmark manifest does not match the requested case")
         builds.append(manifest["build"])
@@ -379,6 +391,7 @@ def read_case(output, bs, pair, *, validate=True):
         output_dir=str(output),
         passed=True,
         validation="strict" if validate else "skipped",
+        dispatch_metadata_mode=dispatch_metadata_mode,
         comm_kernel_rank_max_mean_us=slowest,
         comm_kernel_rank_min_mean_us=statistics.mean(min(values) for values in zip(*per_rank)),
         comm_kernel_all_ranks_mean_us=statistics.mean(v for row in per_rank for v in row),
@@ -389,6 +402,8 @@ def read_case(output, bs, pair, *, validate=True):
     report["communication"] = json.loads(
         (output / f"bs_{bs}" / "timer" / "communication.json").read_text(encoding="utf-8")
     )
+    if report["communication"].get("dispatch_metadata_mode", "scalar") != dispatch_metadata_mode:
+        raise ValueError("Communication report metadata mode does not match the requested case")
     if sorted(r["rank"] for r in report["communication"]["ranks"]) != list(range(16)):
         raise ValueError("Missing communication ranks")
     if report["communication"].get("schema_version") != 2:
@@ -492,6 +507,7 @@ def write_summary(path, launch_plan, records, selections):
         fields = [
             "bs",
             "stage",
+            "dispatch_metadata_mode",
             "dispatch_intra",
             "dispatch_cross",
             "combine_intra",
@@ -517,6 +533,7 @@ def write_summary(path, launch_plan, records, selections):
                     "comm_kernel_all_ranks_mean_us",
                 )
             }
+            row["dispatch_metadata_mode"] = item.get("dispatch_metadata_mode", "scalar")
             if pair:
                 row.update(
                     dispatch_intra=pair[0],
@@ -549,7 +566,8 @@ def print_case(item):
         "validation skipped" if item.get("validation") == "skipped" else "independent payload verification passed"
     )
     print(
-        f"[CASE] BS={item['bs']} {label} COMM-KERNEL rank-max-mean={item['comm_kernel_rank_max_mean_us']:.3f}us "
+        f"[CASE] BS={item['bs']} {label} dispatch_metadata_mode={item.get('dispatch_metadata_mode', 'scalar')} "
+        f"COMM-KERNEL rank-max-mean={item['comm_kernel_rank_max_mean_us']:.3f}us "
         f"rank-min-mean={item['comm_kernel_rank_min_mean_us']:.3f}us (timer off; {validation})",
         flush=True,
     )
@@ -638,7 +656,16 @@ def main(argv=None):
                 timeout=args.timeout,
             )
             launched = True
-            item = dict(read_case(output, bs, pair, validate=not args.no_validation), stage=stage)
+            item = dict(
+                read_case(
+                    output,
+                    bs,
+                    pair,
+                    validate=not args.no_validation,
+                    dispatch_metadata_mode=args.dispatch_metadata_mode,
+                ),
+                stage=stage,
+            )
             records.append(item)
             if pair is not None:
                 cached[pair] = item

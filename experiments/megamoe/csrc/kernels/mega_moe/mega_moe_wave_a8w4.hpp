@@ -31,7 +31,7 @@ private:
 public:
     using MegaMoeBase::Init;
     __aicore__ inline void Process();
-    __aicore__ inline void ProcessCommunication();
+    __aicore__ inline void ProcessCommunication(GM_ADDR dispatchMetadata = nullptr);
 
 private:
     using QuantOutType = typename MegaMoeBase::QuantOutType;
@@ -687,8 +687,9 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
 }
 
 template <TemplateMegaMoeA8W4WaveTypeClass>
-__aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessCommunication()
+__aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessCommunication(GM_ADDR dispatchMetadata)
 {
+    tokenDispatchScratch_.dmaMetadataInput = dispatchMetadata;
     this->template ProcessWave<MegaMoeA8W4Wave, true>(*this);
 }
 

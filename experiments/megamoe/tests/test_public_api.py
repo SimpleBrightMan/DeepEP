@@ -195,13 +195,13 @@ def replay_backend(backend):
     b.group.rank = lambda: 0
     b.num_experts = 32
     backend.ext.small_batch_max_tokens = 1
-    backend.ext.communication_replay_protocol = 1
+    backend.ext.communication_replay_protocol = 2
     route = np.arange(17 * b.num_topk)
     b.topk_idx.data[:] = ((route % 16) * 2 + (route // 16) % 2).reshape(17, b.num_topk)
     events = backend.events
 
-    def prepare(plan, payload):
-        events.append(("prepare_comm", payload))
+    def prepare(plan, payload, metadata_dma):
+        events.append(("prepare_comm", payload, metadata_dma))
 
     def forward(plan, data, scales, ids, weights, timer, out):
         events.append(("comm_launch", timer))
@@ -236,8 +236,47 @@ def test_communication_replay_without_weight_arguments_and_snapshot_stream_lifet
     assert set(snapshot) == {"data", "scales", "metadata"}
     assert all(tensor.streams == [b._runtime.stream] for tensor in snapshot.values())
     assert sum(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple)) == 1
+    assert next(event for event in backend.events if isinstance(event, tuple) and event[0] == "prepare_comm")[2] is True
     assert sum(event[0] == "comm_launch" for event in backend.events if isinstance(event, tuple)) == 2
     assert not any(event[0] == "launch" for event in backend.events if isinstance(event, tuple))
+
+
+def test_communication_metadata_scalar_mode(backend):
+    payload = replay_backend(backend)
+    backend.buffer.prepare_communication(17, combine_payload=payload, dispatch_metadata_mode="scalar")
+    assert (
+        next(event for event in backend.events if isinstance(event, tuple) and event[0] == "prepare_comm")[2] is False
+    )
+
+
+def test_communication_metadata_rejects_unknown_mode(backend):
+    payload = replay_backend(backend)
+    with pytest.raises(ValueError, match="dispatch_metadata_mode must be"):
+        backend.buffer.prepare_communication(17, combine_payload=payload, dispatch_metadata_mode="invalid")
+    assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
+
+
+def test_communication_metadata_mode_must_match_all_ranks(backend, monkeypatch):
+    payload = replay_backend(backend)
+
+    def gather(output, value, **kwargs):
+        output[:] = [value] * 2
+        if value == (None, (17, "dma")):
+            output[1] = (None, (17, "scalar"))
+
+    monkeypatch.setattr(backend.dist, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="communication preparation inputs: ranks disagree"):
+        backend.buffer.prepare_communication(17, combine_payload=payload)
+    assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
+
+
+@pytest.mark.parametrize("protocol", [None, 1])
+def test_communication_metadata_rejects_stale_extension_protocol(backend, protocol):
+    payload = replay_backend(backend)
+    backend.ext.communication_replay_protocol = protocol
+    with pytest.raises(ValueError, match="Rebuild and reinstall"):
+        backend.buffer.prepare_communication(17, combine_payload=payload)
+    assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
 
 
 @pytest.mark.parametrize("change", ["route_version", "route_replaced", "bs", "full_operator"])

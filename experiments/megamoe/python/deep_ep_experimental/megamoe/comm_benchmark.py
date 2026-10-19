@@ -135,6 +135,12 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--no-timer-raw", action="store_true")
     parser.add_argument(
+        "--dispatch-metadata-mode",
+        choices=("dma", "scalar"),
+        default="dma",
+        help="Dispatch metadata via local GM DMA, or original scalar stores for comparison",
+    )
+    parser.add_argument(
         "--no-validation", action="store_true", help="Measure communication only; skip payload checks and task audit"
     )
     args = parser.parse_args(argv)
@@ -158,7 +164,12 @@ def run(args, config, group):
     rank, world = group.rank(), group.size()
     if world != 16 or int(os.environ["LOCAL_WORLD_SIZE"]) != 16:
         raise ValueError("Communication simulator requires one EP16 machine")
-    collective_check(group, "communication-only configuration", None, (config, args.no_timer_raw, args.no_validation))
+    collective_check(
+        group,
+        "communication-only configuration",
+        None,
+        (config, args.no_timer_raw, args.no_validation, args.dispatch_metadata_mode),
+    )
     rank_dir = args.output_dir / f"rank_{rank}"
     error = None
     try:
@@ -174,6 +185,7 @@ def run(args, config, group):
         routing="balanced",
         workload="communication_only",
         validation="skipped" if args.no_validation else "strict",
+        dispatch_metadata_mode=args.dispatch_metadata_mode,
         ep_size=world,
         rank=rank,
         local_rank=int(os.environ["LOCAL_RANK"]),
@@ -206,7 +218,11 @@ def run(args, config, group):
         for begin in range(0, rows, 512):
             end = min(rows, begin + 512)
             payload[begin:end].copy_(torch.from_numpy(synthetic_payload(rank, np.arange(begin, end), model["hidden"])))
-        buffer.prepare_communication(bs, combine_payload=payload)
+        buffer.prepare_communication(
+            bs,
+            combine_payload=payload,
+            dispatch_metadata_mode=args.dispatch_metadata_mode,
+        )
         torch.npu.synchronize()
         del payload, data, scales
         expected = None if args.no_validation else expected_output(config, rank, bs)
@@ -302,17 +318,20 @@ def run(args, config, group):
                 ranks_per_node=16,
                 transfers=transfers,
             )
+        report["dispatch_metadata_mode"] = args.dispatch_metadata_mode
         report = write_rank_detail(report, timer_dir)
         reports = group.all_gather(report, f"communication bandwidth report BS={bs}")
         if rank == 0:
             summary = summarize(reports, require_validation=not args.no_validation)
             summary["workload"] = "communication_only"
+            summary["dispatch_metadata_mode"] = args.dispatch_metadata_mode
             (timer_dir / "communication.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
             validation_status = (
                 "validation skipped" if args.no_validation else "Dispatch/Combine payload and wave/core audit passed"
             )
             print(
-                f"[COMM_ONLY] BS={bs} kernel rank-max-mean={profile['rank_max_mean_us']:.3f}us; "
+                f"[COMM_ONLY] BS={bs} dispatch_metadata_mode={args.dispatch_metadata_mode} "
+                f"kernel rank-max-mean={profile['rank_max_mean_us']:.3f}us; "
                 f"{validation_status}; no GMM executed",
                 flush=True,
             )

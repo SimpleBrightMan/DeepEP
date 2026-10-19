@@ -84,3 +84,19 @@ def test_initial_simulator_rejects_unsupported_shape_before_importing_torch(tmp_
     path.write_text(json.dumps(config))
     with pytest.raises(SystemExit):
         bench.parse_args(["--config", str(path), "--output-dir", str(tmp_path / "output")])
+
+
+@pytest.mark.parametrize("options,expected_mode", [([], "dma"), (["--dispatch-metadata-mode", "scalar"], "scalar")])
+def test_benchmark_metadata_mode_defaults_to_dma_and_accepts_scalar(tmp_path, options, expected_mode):
+    config = dict(
+        schema_version=1,
+        model=dict(hidden=3584, intermediate_hidden=1280, num_experts=384, num_topk=8, num_shared_experts=0),
+        bs_values=[2048],
+        warmup=0,
+        iters=1,
+        seed=42,
+    )
+    path = tmp_path / "model.json"
+    path.write_text(json.dumps(config))
+    args, _ = bench.parse_args(["--config", str(path), "--output-dir", str(tmp_path / "output"), *options])
+    assert args.dispatch_metadata_mode == expected_mode

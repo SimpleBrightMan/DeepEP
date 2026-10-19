@@ -28,6 +28,13 @@ export LD_LIBRARY_PATH="${SHMEM_ROOT:-$PWD/third-party/shmem/install/shmem}/lib:
 # 仅运行通信模拟，保留 timer 原始文件；不做数据/逐 token 核对或完整算子时间对比。
 python3 experiments/megamoe/scripts/comm_core_sweep.py \
   --mode baseline --bs-values 2048,4096,8192 \
+  --dispatch-metadata-mode dma \
+  --no-validation --keep-raw-timers
+
+# 同一构建的原 scalar metadata 对照，保持任务、槽位及其它参数相同。
+python3 experiments/megamoe/scripts/comm_core_sweep.py \
+  --mode baseline --bs-values 2048,4096,8192 \
+  --dispatch-metadata-mode scalar \
   --no-validation --keep-raw-timers
 ```
 
@@ -38,6 +45,22 @@ python3 experiments/megamoe/scripts/comm_core_sweep.py \
 报告标记 `validation=skipped`，保留每 Wave/每核时间和行数，不生成逐 token 审计 CSV。
 需要流水图时，可对结果内 `bs_<BS>/baseline/bs_<BS>/timer/` 运行 `python3 -m deep_ep_experimental.megamoe.timer /实际timer目录 --ranks 0-15`。
 
+## Dispatch metadata DMA 实验
+
+通信模拟默认 `--dispatch-metadata-mode dma`，`scalar` 保留原逐 token metadata 写法供同构建对照。
+此开关只作用于通信实验；完整 MegaMoE 算子和 `--run-full-reference` 仍使用原 scalar metadata 路径。
+`baseline` 指原核心任务分配；metadata 算法由该独立开关指定。
+
+DMA 模式在计时前生成本地 GM 只读身份表，每行 32B，含源 rank、源 token、TopK 槽位。
+Dispatch 通过 MTE2 把对应表项读到 UB，然后随 token/scale 一起由 MTE3 写入原 metadata 位置，去掉逐 token scalar metadata 写入及其 MTE3→S 等待。
+每卡表大小为 `EP × BS × TopK × 32`：BS2048/4096/8192 分别为 8/16/32 MiB。
+每个 dispatch token 额外读取 32B **本地** GM，不增加跨卡通信 payload；带宽分子保持原定义。
+表的生成与准备在 timer-off profiler 和普通 timer 调用之前完成，表读取包含在通信计时内。
+
+两种模式沿用相同 Wave、每核任务、槽位数量、ready 协议和 Dispatch/Combine timer 边界。
+Combine 搬运实现保持原样。批量读取路由索引所需 `MTE2_S`、slice ready 同步和槽位复用等待仍保留；本实验不代表去除了全部 scalar 依赖。
+`plan.json`、rank manifest、详细通信报告、`summary.json` / `summary.csv` 和控制台均记录 `dispatch_metadata_mode`，防止结果混淆。
+
 ## 可选的解耦验收
 
 下面命令在每个 BS 先跑本分支完整 MegaMoE，再跑通信模拟，最后比较每核时间；它不是只跑 main 原算子。
@@ -46,10 +69,12 @@ python3 experiments/megamoe/scripts/comm_core_sweep.py \
 ```bash
 python3 experiments/megamoe/scripts/comm_core_sweep.py \
   --mode baseline --bs-values 2048,4096,8192 \
+  --dispatch-metadata-mode scalar \
   --run-full-reference --timing-rtol 0.10 --require-timing-match
 ```
 
 验收与 `--no-validation` 互斥；无需每轮性能实验都执行验收。
+上例显式选择 scalar 以对照原通信路径；也可用 DMA 对照完整算子，比较器不要求 metadata 模式相同，仍按相同任务与指定时间容差比较。
 
 `--timing-rtol 0.10` 表示 10% 相对容差，可增加 `--timing-atol-us`。
 对每个 rank、每个核、每种通信分别检验：
@@ -69,6 +94,7 @@ abs(simulated_core_total_us - full_megamoe_core_total_us)
 ```bash
 python3 experiments/megamoe/scripts/comm_core_sweep.py \
   --mode baseline --bs-values 2048,4096,8192 \
+  --dispatch-metadata-mode scalar \
   --full-reference-dir /path/to/full-megamoe-run \
   --timing-rtol 0.10 --require-timing-match
 ```
