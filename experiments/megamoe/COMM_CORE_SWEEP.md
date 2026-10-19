@@ -41,7 +41,8 @@ python3 experiments/megamoe/scripts/comm_core_sweep.py \
 `--mode baseline` 清除继承的 Dispatch / Combine 分核变量，使用原任务分配。
 不加 `--run-full-reference` 时只运行通信模拟，适合后续快速实验。
 `--no-validation` 跳过 CPU Golden、数据 snapshot、逐 token audit 和任务一致性核对，仍采集 timer-off kernel 耗时和普通 timer。
-带宽分子来自普通 timer 中实际记录的行数，分母为全部 28 个 AIV1 的通信累计时间均值；Dispatch、Combine 分开计算。
+当前 GB/s 指标的分子来自普通 timer 中实际记录的行数，分母为全部 28 个 AIV1 的通信累计时间均值；Dispatch、Combine 分开计算。
+这是历史的平均核时归一化指标，不是真实链路带宽，也不等于按通信首尾时间跨度计算的有效带宽。比较优化效果以 timer-off 通信 kernel 耗时为主，结合原始 timer 检查瓶颈；本轮不修改统计实现。
 报告标记 `validation=skipped`，保留每 Wave/每核时间和行数，不生成逐 token 审计 CSV。
 需要流水图时，可对结果内 `bs_<BS>/baseline/bs_<BS>/timer/` 运行 `python3 -m deep_ep_experimental.megamoe.timer /实际timer目录 --ranks 0-15`。
 
@@ -83,6 +84,30 @@ done
 输出仍分别给出 Dispatch、Combine 的带宽和通信 kernel 总耗时；以相同 BS 的三种槽位结果比较。
 省略 `combine_buffer_count` 字段的旧报告按原 2 槽读取，不能作为 4/6 槽结果接受。
 
+## 分核 Combine metadata 批量预取
+
+共享的 `RunCommSplitCombineSlice` 路径默认合并同一 slice 内、本核心负责的各 peer 段 metadata 预取，每批最多 1536 行。
+先下发这一批各段的 metadata MTE2 搬运，再统一执行一次 `MTE2_S`，随后依原段顺序消费 metadata 并发起 payload PUT；不足一批的尾部使用实际行数。
+不同 peer 段仍可对应不同 GM 地址，不要求它们在 GM 连续。优化减少原先逐 peer 段等待 metadata 的次数，保留每批 metadata 就绪所需的 scalar 同步，不代表消除了全部 scalar 依赖。
+
+此优化自动用于设置了 Combine INTRA 核数的分核路径，没有新增 CLI 开关；完整 MegaMoE 若显式开启 Combine 分核，同样采用此优化。
+原有 peer/组顺序、每 Wave 每核的 token 任务及字节数、ready 协议和 timer 边界保持不变，也不增加全卡同步或切组排空。
+Combine 槽位仍由 `--combine-buffer-count` 控制：全局默认保持 2，下面的测试显式使用 6 槽；本次 metadata 优化不改变所选槽位数量。
+非分核 `baseline` 及未开启 Combine 分核的完整 MegaMoE 路径不改；默认完整算子与 `--run-full-reference` 保持未开启 Combine 分核的行为。
+
+重新编译安装后，用当前已测的 4/24、XOR、Dispatch DMA、Combine 6 槽配置跑三个 BS：
+
+```bash
+python3 experiments/megamoe/scripts/comm_core_sweep.py \
+  --mode paired-groups --bs-values 2048,4096,8192 \
+  --group-intra-cores 4 --group-order paired-xor \
+  --dispatch-metadata-mode dma --combine-buffer-count 6 \
+  --no-validation --keep-raw-timers
+```
+
+每个 BS 只跑一个 `paired_groups_d4_c4` case，不做数据核对或完整算子时间对比，保留原始 timer。
+与更新前相同命令的结果比较 timer-off `COMM-KERNEL rank-max-mean`，再检查 Combine 各核的累计时间和尾部；控制台旧 GB/s 指标只作为既有口径记录，不据此宣称链路峰值提升。
+
 ## 配对组轮转与核心配比控制实验
 
 `--mode paired-groups` 默认每个 BS 运行一次 12/16 配置：Dispatch、Combine 均由 AIV1 核 0..11 处理 INTRA，核 12..27 处理 CROSS。
@@ -103,11 +128,12 @@ INTRA 包含本卡和同组其它三卡；`--group-order paired-xor` 为默认�
 同一 kernel 内 INTRA 与 CROSS 并发；保留每 Wave 的 token 集合、搬运字节和现有 timer 边界，核心归属按所选配比重新划分。
 组内任务继续采用余数轮转均分，避免无法整除的余数一直落在固定核心。
 
-更新并按前文重新编译后运行（显式使用当前要测试的 Combine 6 槽）：
+更新并按前文重新编译后运行（显式选择当前已测的 4/24 配比、XOR 顺序和 Combine 6 槽；CLI 默认配比仍为 12/16）：
 
 ```bash
 python3 experiments/megamoe/scripts/comm_core_sweep.py \
   --mode paired-groups --bs-values 2048,4096,8192 \
+  --group-intra-cores 4 --group-order paired-xor \
   --dispatch-metadata-mode dma --combine-buffer-count 6 \
   --no-validation --keep-raw-timers
 ```
@@ -129,7 +155,7 @@ done
 带宽仍按 Dispatch 和 Combine 分别统计。`plan.json`、rank manifest、详细报告、汇总 JSON/CSV 及控制台记录实际 `group_order`。
 固定分工时额外输出四项分类带宽：Dispatch INTRA/CROSS、Combine INTRA/CROSS。
 INTRA 为该类字节数除以 **N 个 INTRA 核累计通信耗时的均值**，CROSS 则除以 **28−N 个 CROSS 核累计通信耗时的均值**；两者单位仍为 GB/s/card，控制台同时显示 workers。
-这不是把分类时间稀释到 28 核的折算值，也不是整段 class-envelope 时间；两类带宽不能直接相加得到总带宽。
+这是分类的平均核时归一化指标，不是整段 class-envelope 时间，也不是真实链路带宽；两类指标不能直接相加得到总带宽。
 原 Dispatch/Combine 总指标仍用全部 28 核累计通信时间的均值作分母，定义不变。
 原 baseline 核心同时承担混合拓扑任务，不生成无法从 timer 区分的分类带宽，CSV 对应列留空。
 driver 在选择 paired-xor 时设置 `DEEPEP_MEGAMOE_COMM_GROUP_ORDER=paired-xor`；选择 reverse、其它模式及完整 reference 都清除此继承变量，保持原 reverse 顺序。
@@ -222,7 +248,8 @@ CPU Wave oracle 检查原生产 Wave 预算、专家切片、逻辑核轮转和�
 
 ## Dispatch 与 Combine 独立带宽
 
-每个 rank 分别计算两类带宽：
+本节记录当前实现保留的历史 GB/s 公式。它使用平均核时而非实际通信完成跨度，因此只表示归一化指标，不应用来判断物理链路利用率；本轮没有把报表切换为新的时间口径。
+每个 rank 分别计算两类指标：
 
 ```text
 core_time[op, core] = 该核所有 Wave 的 op 通信 slice 时间之和

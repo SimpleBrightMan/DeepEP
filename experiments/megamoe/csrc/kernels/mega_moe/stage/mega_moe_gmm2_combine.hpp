@@ -405,8 +405,9 @@ __aicore__ inline void DrainCombineRowBuffers(uint32_t& issuedRowCount, uint32_t
     issuedRowCount = 0U;
 }
 
-// 加载一段连续 wave Combine token 的 metadata。
-__aicore__ inline void PreloadWaveCombineMetaInfo(const Params& params, WaveCombineScratch& scratch,
+// Enqueue only: callers may pack several peer segments into disjoint UB ranges
+// before the one MTE2 -> Scalar wait that makes the whole batch readable.
+__aicore__ inline void EnqueueWaveCombineMetaInfo(const Params& params, WaveCombineScratch& scratch,
                                                   uint64_t gmTokenOffset, uint32_t tokenCount, uint32_t ubTokenOffset)
 {
     if (tokenCount == 0U) {
@@ -416,6 +417,16 @@ __aicore__ inline void PreloadWaveCombineMetaInfo(const Params& params, WaveComb
     GlobalTensor<int32_t> metaInfoGm;
     metaInfoGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr));
     DataCopy(metaInfoUb, metaInfoGm[gmTokenOffset * META_INFO_SIZE], tokenCount * META_INFO_SIZE);
+}
+
+// Keep the existing single-range behavior for unsplit/full MegaMoE callers.
+__aicore__ inline void PreloadWaveCombineMetaInfo(const Params& params, WaveCombineScratch& scratch,
+                                                  uint64_t gmTokenOffset, uint32_t tokenCount, uint32_t ubTokenOffset)
+{
+    if (tokenCount == 0U) {
+        return;
+    }
+    EnqueueWaveCombineMetaInfo(params, scratch, gmTokenOffset, tokenCount, ubTokenOffset);
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
 }
@@ -1233,19 +1244,46 @@ __aicore__ inline void RunCommSplitCombineSlice(const MoeStageCommonConfig& comm
     const uint64_t expertGlobal = static_cast<uint64_t>(state.globalTokenStartIndex);
     GM_ADDR output = params.workspaceInfo.gmm2MmadResPtr + expertGlobal * common.tokenHiddenDim * sizeof(bfloat16_t);
     uint32_t sequence = 0U;
-    for (uint32_t i = 0U; i < owned.count; ++i) {
-        const auto& segment = owned.segments[i];
-        for (uint32_t done = 0U; done < segment.count;) {
-            uint32_t count = segment.count - done;
-            count = count < WAVE_COMBINE_META_INFO_TOKEN_CAPACITY ? count : WAVE_COMBINE_META_INFO_TOKEN_CAPACITY;
-            PreloadWaveCombineMetaInfo(params, scratch, expertGlobal + segment.rowBegin + done, count, 0U);
-            CombineWaveTokenRange<COMBINE_NO_QUANT>(common, buffers, scratch, params, output, segment.rowBegin + done,
-                                                    count, 0U, sequence);
-            // Metadata is consumed by Scalar while issuing each row's address.
-            // Only row slots remain in flight; preloading the next metadata
-            // chunk cannot overwrite the UB data used by those MTE3 operations.
-            done += count;
+    uint32_t segmentIndex = 0U;
+    uint32_t segmentOffset = 0U;
+    while (segmentIndex < owned.count) {
+        const uint32_t firstSegment = segmentIndex;
+        const uint32_t firstOffset = segmentOffset;
+        uint32_t batchRows = 0U;
+        while (segmentIndex < owned.count && batchRows < WAVE_COMBINE_META_INFO_TOKEN_CAPACITY) {
+            const auto& segment = owned.segments[segmentIndex];
+            const uint32_t available = WAVE_COMBINE_META_INFO_TOKEN_CAPACITY - batchRows;
+            const uint32_t remaining = segment.count - segmentOffset;
+            const uint32_t count = remaining < available ? remaining : available;
+            EnqueueWaveCombineMetaInfo(params, scratch, expertGlobal + segment.rowBegin + segmentOffset, count,
+                                       batchRows);
+            batchRows += count;
+            segmentOffset += count;
+            if (segmentOffset == segment.count) {
+                ++segmentIndex;
+                segmentOffset = 0U;
+            }
         }
+        if (batchRows == 0U) continue;
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+
+        // Replay exactly the same rows and peer order, with metadata packed at
+        // consecutive UB offsets. A capacity boundary may split a peer segment.
+        uint32_t metadataOffset = 0U;
+        for (uint32_t i = firstSegment; metadataOffset < batchRows; ++i) {
+            const auto& segment = owned.segments[i];
+            const uint32_t offset = i == firstSegment ? firstOffset : 0U;
+            const uint32_t remaining = segment.count - offset;
+            const uint32_t available = batchRows - metadataOffset;
+            const uint32_t count = remaining < available ? remaining : available;
+            CombineWaveTokenRange<COMBINE_NO_QUANT>(common, buffers, scratch, params, output, segment.rowBegin + offset,
+                                                    count, metadataOffset, sequence);
+            metadataOffset += count;
+        }
+        // Scalar has consumed this batch's metadata when issuing the row
+        // addresses. In-flight MTE3 stores use the separate row ring, so the
+        // metadata UB can be reused without draining slots at batch boundaries.
     }
     DrainCombineRowBuffers(sequence, buffers.rowBufferCount);
     timer.EndSpan(type);
