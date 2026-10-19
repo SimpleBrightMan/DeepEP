@@ -47,8 +47,8 @@ public:
             dynamicCounts_[typeId] = 0;
         }
         if (Enabled()) {
-            WriteValue(AscendTimer::TIMER_SCHEMA_OFFSET + coreId_, AscendTimer::TIMER_SCHEMA_VERSION);
-            WriteValue(AscendTimer::TIMER_COMPLETION_OFFSET + coreId_, 0);
+            PublishStamp(AscendTimer::TIMER_SCHEMA_OFFSET, AscendTimer::TIMER_SCHEMA_VERSION);
+            PublishStamp(AscendTimer::TIMER_COMPLETION_OFFSET, 0);
         }
     }
 
@@ -267,7 +267,8 @@ public:
             int32_t index = AscendTimer::N_TIMING_COUNTER + coreId_ * AscendTimer::DYNAMIC_ITER_PER_CORE_ALIGN + typeId;
             WriteValue(index, dynamicCounts_[typeId]);
         }
-        WriteValue(AscendTimer::TIMER_COMPLETION_OFFSET + coreId_, 1);
+        PublishStamp(AscendTimer::TIMER_SCHEMA_OFFSET, AscendTimer::TIMER_SCHEMA_VERSION);
+        PublishStamp(AscendTimer::TIMER_COMPLETION_OFFSET, 1);
     }
 
 private:
@@ -338,6 +339,18 @@ private:
         AscendC::GlobalTensor<int64_t> timer;
         timer.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(timerAddr_));
         timer(index) = value;
+    }
+
+    __aicore__ inline void PublishStamp(int32_t base, int64_t value) const
+    {
+        const int32_t index = base + coreId_ * AscendTimer::TIMER_STAMP_STRIDE;
+        AscendC::GlobalTensor<int64_t> stamp;
+        stamp.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(timerAddr_) + index);
+        stamp(0) = value;
+        // Flush only this core's private line, at Init/FlushDynamicCounts.
+        // No additional cache operation is inserted into token pipelines.
+        AscendC::DataCacheCleanAndInvalid<int64_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                          AscendC::DcciDst::CACHELINE_OUT>(stamp);
     }
 
     __aicore__ inline void WriteWave(int timingId, int64_t waveId)

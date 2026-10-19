@@ -112,9 +112,13 @@ COMM 条覆盖完整通信函数，包括地址计算、metadata 和完成等待
 
 保留原 timer 事件并增加外层 `AIV_DISPATCH_COMM`/`AIV_COMBINE_COMM`，避免与内部条重复计数。
 每核版本和完成标记用于拒绝旧 schema 或不完整采样。原始 trace 仍可用来查看逐 Wave、逐核心行为。
+timer schema v2 将版本/完成标记改为每核独立的 128 字节槽，并在初始化和结束时显式写回，
+避免多个 scalar writer 共用缓存行覆盖彼此的标记。更新此修复后需要重编 wheel 和重新采集；
+不放行缺失标记的旧数据，不在逐 token 的流水中增加写回或等待。
 
 ## 本次验证
 
 2026-10-19：在 Linux aarch64、CANN 9.2.0 B080、Python 3.12 的环境中，
 `megamoe_ext`（Host 扩展及开启 timer 的设备核）编译通过，扩展加载检查通过，
-MegaMoE 主机侧回归 254 项通过。未进行 NPU 数值或性能测试。
+MegaMoE 主机侧回归 255 项通过（含独立 scalar cache 写回的 timer 标记回归）。
+Native/Python timer schema v2 与 buffer 大小一致；未进行 NPU 数值或性能测试。

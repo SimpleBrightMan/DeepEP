@@ -50,10 +50,11 @@ TASK_METADATA_SIZE = N_CORE_COUNT * len(DYNAMIC_NAMES) * MAX_DYNAMIC_ITER * 2
 NO_WAVE = -1
 WAVE_ID_OFFSET = TASK_METADATA_OFFSET + TASK_METADATA_SIZE
 WAVE_ID_PER_CORE = (len(FIXED_NAMES) + len(DYNAMIC_NAMES) * MAX_DYNAMIC_ITER + 15) // 16 * 16
-TIMER_SCHEMA_VERSION = 1
+TIMER_SCHEMA_VERSION = 2
+TIMER_STAMP_STRIDE = 16  # int64 words; isolate scalar writers in 128-byte slots.
 TIMER_SCHEMA_OFFSET = WAVE_ID_OFFSET + WAVE_ID_PER_CORE * N_CORE_COUNT
-TIMER_COMPLETION_OFFSET = TIMER_SCHEMA_OFFSET + N_CORE_COUNT
-TOTAL_BUFFER_SIZE = TIMER_COMPLETION_OFFSET + N_CORE_COUNT
+TIMER_COMPLETION_OFFSET = TIMER_SCHEMA_OFFSET + N_CORE_COUNT * TIMER_STAMP_STRIDE
+TOTAL_BUFFER_SIZE = TIMER_COMPLETION_OFFSET + N_CORE_COUNT * TIMER_STAMP_STRIDE
 
 
 def validate_timer_schema(raw, required_cores=()):
@@ -62,8 +63,8 @@ def validate_timer_schema(raw, required_cores=()):
         raise ValueError("Timer size differs from the installed schema; rebuild and recollect")
     written = set()
     for core in range(N_CORE_COUNT):
-        version = int(raw[TIMER_SCHEMA_OFFSET + core])
-        complete = int(raw[TIMER_COMPLETION_OFFSET + core])
+        version = int(raw[TIMER_SCHEMA_OFFSET + core * TIMER_STAMP_STRIDE])
+        complete = int(raw[TIMER_COMPLETION_OFFSET + core * TIMER_STAMP_STRIDE])
         if version == complete == 0:
             counts = raw[
                 N_TIMING_COUNTER + core * DYNAMIC_ITER_PER_CORE : N_TIMING_COUNTER

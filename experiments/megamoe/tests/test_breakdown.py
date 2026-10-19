@@ -67,8 +67,8 @@ def test_raw_fast_path_matches_csv_breakdown(tmp_path):
             raw[p.N_TIMING_COUNTER + core * p.DYNAMIC_ITER_PER_CORE + kind] = 1
         offset = core * p.COUNTERS_PER_CORE + slot * 2
         raw[offset : offset + 2] = item["start_cycle"], item["end_cycle"]
-        raw[p.TIMER_SCHEMA_OFFSET + core] = p.TIMER_SCHEMA_VERSION
-        raw[p.TIMER_COMPLETION_OFFSET + core] = 1
+        raw[p.TIMER_SCHEMA_OFFSET + (core) * p.TIMER_STAMP_STRIDE] = p.TIMER_SCHEMA_VERSION
+        raw[p.TIMER_COMPLETION_OFFSET + (core) * p.TIMER_STAMP_STRIDE] = 1
     raw.flush()
     direct = rank_breakdown(compact_events(raw, 0), 0)
     parsed = tmp_path / "parsed.csv"

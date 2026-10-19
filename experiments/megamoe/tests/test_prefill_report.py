@@ -52,8 +52,8 @@ class SparseRaw(dict):
 def raw_timer():
     raw = SparseRaw()
     for core in range(28):
-        raw[p.TIMER_SCHEMA_OFFSET + core * 3 + 2] = p.TIMER_SCHEMA_VERSION
-        raw[p.TIMER_COMPLETION_OFFSET + core * 3 + 2] = 1
+        raw[p.TIMER_SCHEMA_OFFSET + (core * 3 + 2) * p.TIMER_STAMP_STRIDE] = p.TIMER_SCHEMA_VERSION
+        raw[p.TIMER_COMPLETION_OFFSET + (core * 3 + 2) * p.TIMER_STAMP_STRIDE] = 1
     return raw
 
 
@@ -74,8 +74,8 @@ def put_event(raw, value, family=None, hardware=None, tile=-1):
     raw[metadata + 1] = ((tile + 1) << 32) | value["row_count"]
     raw[p.WAVE_ID_OFFSET + hardware * p.WAVE_ID_PER_CORE + slot] = value["wave"]
     raw[counter] += 1
-    raw[p.TIMER_SCHEMA_OFFSET + hardware] = p.TIMER_SCHEMA_VERSION
-    raw[p.TIMER_COMPLETION_OFFSET + hardware] = 1
+    raw[p.TIMER_SCHEMA_OFFSET + (hardware) * p.TIMER_STAMP_STRIDE] = p.TIMER_SCHEMA_VERSION
+    raw[p.TIMER_COMPLETION_OFFSET + (hardware) * p.TIMER_STAMP_STRIDE] = 1
 
 
 def test_union_merges_cross_core_cross_wave_overlap_and_keeps_uncovered_gaps():
@@ -196,13 +196,17 @@ def test_raw_protocol_rejects_stale_incomplete_and_invalid_records(mutation):
     raw = raw_timer()
     put_event(raw, event())
     if mutation == "old_schema":
-        raw[p.TIMER_SCHEMA_OFFSET + 2] = 99
+        raw[p.TIMER_SCHEMA_OFFSET + (2) * p.TIMER_STAMP_STRIDE] = 99
     elif mutation == "incomplete":
-        raw[p.TIMER_COMPLETION_OFFSET + 2] = 0
+        raw[p.TIMER_COMPLETION_OFFSET + (2) * p.TIMER_STAMP_STRIDE] = 0
     elif mutation == "missing_worker":
-        raw[p.TIMER_SCHEMA_OFFSET + 83] = raw[p.TIMER_COMPLETION_OFFSET + 83] = 0
+        raw[p.TIMER_SCHEMA_OFFSET + (83) * p.TIMER_STAMP_STRIDE] = raw[
+            p.TIMER_COMPLETION_OFFSET + (83) * p.TIMER_STAMP_STRIDE
+        ] = 0
     elif mutation == "no_stamp":
-        raw[p.TIMER_SCHEMA_OFFSET + 2] = raw[p.TIMER_COMPLETION_OFFSET + 2] = 0
+        raw[p.TIMER_SCHEMA_OFFSET + (2) * p.TIMER_STAMP_STRIDE] = raw[
+            p.TIMER_COMPLETION_OFFSET + (2) * p.TIMER_STAMP_STRIDE
+        ] = 0
     elif mutation == "overflow":
         raw[p.N_TIMING_COUNTER + 2 * p.DYNAMIC_ITER_PER_CORE + p.DYNAMIC_NAMES.index("AIV_DISPATCH_COMM")] = (
             p.MAX_DYNAMIC_ITER + 1

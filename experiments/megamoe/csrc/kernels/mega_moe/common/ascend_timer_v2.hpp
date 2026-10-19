@@ -64,11 +64,13 @@ static constexpr int NO_WAVE = -1;
 static constexpr int WAVE_ID_OFFSET = TASK_METADATA_OFFSET + TASK_METADATA_SIZE;
 static constexpr int WAVE_ID_PER_CORE_ALIGN = (N_TIMING_ITEM_PER_CORE + 15) / 16 * 16;
 static constexpr int WAVE_ID_TOTAL_SIZE = WAVE_ID_PER_CORE_ALIGN * N_CORE_COUNT;
-// Each physical core stamps initialization and successful count publication.
-static constexpr int TIMER_SCHEMA_VERSION = 1;
+// Scalar stores are cached: never let different cores own words in one line.
+// Match the 128-byte core alignment already used by the timing regions.
+static constexpr int TIMER_SCHEMA_VERSION = 2;
+static constexpr int TIMER_STAMP_STRIDE = 16;  // int64 words, 128 bytes per core
 static constexpr int TIMER_SCHEMA_OFFSET = WAVE_ID_OFFSET + WAVE_ID_TOTAL_SIZE;
-static constexpr int TIMER_COMPLETION_OFFSET = TIMER_SCHEMA_OFFSET + N_CORE_COUNT;
-static constexpr int TOTAL_BUFFER_SIZE = TIMER_COMPLETION_OFFSET + N_CORE_COUNT;
+static constexpr int TIMER_COMPLETION_OFFSET = TIMER_SCHEMA_OFFSET + N_CORE_COUNT * TIMER_STAMP_STRIDE;
+static constexpr int TOTAL_BUFFER_SIZE = TIMER_COMPLETION_OFFSET + N_CORE_COUNT * TIMER_STAMP_STRIDE;
 
 }  // namespace AscendTimer
 
