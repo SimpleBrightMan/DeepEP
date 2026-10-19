@@ -41,7 +41,9 @@ def load_reports(directory: Path):
 
 
 def selected_ms(case):
-    """Use the baseline-corrected host wall clock when selected, else NPU events."""
+    """Use device cycle span when available, else baseline-corrected host, else event."""
+    if case.get("timing") == "device":
+        return float(case["device_median_ms"]), float(case["device_min_ms"])
     if case.get("timing") == "host":
         return (
             float(case.get("host_net_median_ms", case.get("host_median_ms", case["median_ms"]))),
@@ -80,6 +82,8 @@ def aggregate(reports):
                 "bandwidth_gbps": plan.bandwidth_gbps(payload, max_ms),
                 "mean_rank_bandwidth_gbps": plan.bandwidth_gbps(payload, mean_ms),
                 "per_destination_gbps": plan.bandwidth_gbps(payload, max_ms) / int(item["case"]["peers"]),
+                "core_busy_max_ms": item["case"].get("core_busy_max_ms"),
+                "core_busy_mean_ms": item["case"].get("core_busy_mean_ms"),
                 "rank_medians_ms": {str(rank): ms for rank, ms in sorted(item["rank_medians"].items())},
             }
         )
@@ -122,6 +126,8 @@ def write_outputs(args, reports, cases):
                 "bandwidth_gbps",
                 "mean_rank_bandwidth_gbps",
                 "per_destination_gbps",
+                "core_busy_max_ms",
+                "core_busy_mean_ms",
             ],
         )
         writer.writeheader()
@@ -136,8 +142,11 @@ def write_outputs(args, reports, cases):
         f"timing={selected_timing}, checked={summary['checked']}.",
         "",
         "Timing: " + (
-            "automatic per-case selection (event when it agrees with host, otherwise launch-subtracted host); "
-            "see the timing column in summary.csv."
+            "per-AIV GetSystemCycle timestamps (1000 cycles/us); bandwidth uses the slowest AIV's busy time, "
+            "and core_busy_max_ms is that AIV's median busy interval."
+            if selected_timing == "device"
+            else "automatic per-case selection (device when valid, otherwise event/host); see the timing column "
+            "in summary.csv."
             if selected_timing == "mixed"
             else "launch-subtracted host wall clock around a device-wide synchronize."
             if selected_timing == "host"

@@ -22,7 +22,7 @@ constexpr uint32_t kMaxTokenBytes = 64U * 1024U;
 constexpr uint32_t kMaxTokens = 16384U;
 constexpr uint32_t kMaxCores = 64U;
 
-uint8_t* tensor_pointer(py::handle tensor, const std::vector<int64_t>& shape, int device)
+uint8_t* tensor_pointer(py::handle tensor, const std::vector<int64_t>& shape, int device, const char* dtype)
 {
     auto torch = py::module_::import("torch");
     if (!torch.attr("is_tensor")(tensor).cast<bool>()) {
@@ -31,8 +31,7 @@ uint8_t* tensor_pointer(py::handle tensor, const std::vector<int64_t>& shape, in
     auto obj = py::reinterpret_borrow<py::object>(tensor);
     if (obj.attr("device").attr("type").cast<std::string>() != "npu" ||
         obj.attr("device").attr("index").cast<int>() != device || !obj.attr("is_contiguous")().cast<bool>() ||
-        obj.attr("shape").cast<std::vector<int64_t>>() != shape ||
-        !obj.attr("dtype").is(torch.attr("uint8"))) {
+        obj.attr("shape").cast<std::vector<int64_t>>() != shape || !obj.attr("dtype").is(torch.attr(dtype))) {
         throw std::invalid_argument("All-to-All tensor shape, dtype, device or contiguity mismatch");
     }
     return reinterpret_cast<uint8_t*>(obj.attr("data_ptr")().cast<uintptr_t>());
@@ -78,7 +77,7 @@ void bind_alltoall(py::module_& module)
     module.def(
         "alltoall",
         [](Session& session, py::object send, uint32_t tokens, uint32_t token_bytes, uint32_t group, uint32_t mode,
-           uint32_t cores, uintptr_t stream_address) {
+           uint32_t cores, uintptr_t stream_address, py::object timing) {
             const uint32_t world = static_cast<uint32_t>(session.world());
             if (session.closed()) throw std::invalid_argument("All-to-All requires a live runtime");
             if (group == 0U || world % group != 0U || mode > 3U || cores == 0U || cores > kMaxCores) {
@@ -89,13 +88,17 @@ void bind_alltoall(py::module_& module)
                 throw std::invalid_argument("All-to-All payload exceeds the symmetric workspace");
             }
             if (stream_address == 0) throw std::invalid_argument("All-to-All requires a valid NPU stream");
-            auto* input = tensor_pointer(send, {world, tokens, token_bytes}, current_device());
+            auto* input = tensor_pointer(send, {world, tokens, token_bytes}, current_device(), "uint8");
             auto* workspace = static_cast<uint8_t*>(session.workspace());
-            alltoall_mte_kernel_do(reinterpret_cast<void*>(stream_address), input, workspace, session.rank(), world,
-                                   group, token_bytes, tokens, mode, cores);
+            uint8_t* timing_pointer = nullptr;
+            if (!timing.is_none()) {
+                timing_pointer = tensor_pointer(timing, {static_cast<int64_t>(cores), 4}, current_device(), "int64");
+            }
+            alltoall_mte_kernel_do(reinterpret_cast<void*>(stream_address), input, workspace, timing_pointer,
+                                   session.rank(), world, group, token_bytes, tokens, mode, cores);
         },
         py::arg("session"), py::arg("send"), py::arg("tokens"), py::arg("token_bytes"), py::arg("group"),
-        py::arg("mode"), py::arg("cores"), py::arg("stream"));
+        py::arg("mode"), py::arg("cores"), py::arg("stream"), py::arg("timing") = py::none());
     module.def(
         "alltoall_drain",
         [](Session& session, py::object out, uint32_t tokens, uint32_t token_bytes, uint32_t cores,
@@ -108,7 +111,7 @@ void bind_alltoall(py::module_& module)
                 throw std::invalid_argument("All-to-All payload exceeds the symmetric workspace");
             }
             if (stream_address == 0) throw std::invalid_argument("All-to-All drain requires a valid NPU stream");
-            auto* output = tensor_pointer(out, {world, tokens, token_bytes}, current_device());
+            auto* output = tensor_pointer(out, {world, tokens, token_bytes}, current_device(), "uint8");
             alltoall_mte_drain_kernel_do(reinterpret_cast<void*>(stream_address),
                                          static_cast<uint8_t*>(session.workspace()), output, needed, cores);
         },

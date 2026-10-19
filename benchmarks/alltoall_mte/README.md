@@ -184,33 +184,37 @@ python -m benchmarks.alltoall_mte.summarize \
   全流程：`local` / `intra` / `inter` / `full` 四种 scope 均执行，`alltoall_drain`
   回读后逐字节校验通过。
 - 同机 8 rank、`tokens=1024,2048,4096`、`token_bytes=3584`、`group_size=4` 的
-  sanity 结果（`warmup=2`、`iters=5`，check 全部通过）：
+  device-timing sanity 结果（`warmup=1`、`iters=3`，check 全部通过）：
 
   | tokens/pair | 本卡内 (GB/s) | 组内下行 (GB/s) | 组间下行 (GB/s) | 全量 (GB/s) |
   | ---: | ---: | ---: | ---: | ---: |
-  | 1024 | 85.44 | 93.55 | 117.40 | 249.18 |
-  | 2048 | 192.42 | 101.09 | 133.73 | 260.31 |
-  | 4096 | 295.64 | 103.01 | 136.88 | 271.32 |
+  | 1024 | 3183.01 | 107.96 | 141.24 | 282.44 |
+  | 2048 | 3865.21 | 106.61 | 140.39 | 281.46 |
+  | 4096 | 4194.30 | 105.45 | 140.87 | 279.77 |
 
-  该结果来自单节点 8 卡（2 个 4 卡组）、SHMEM MTE 路径，**不是目标 16 卡单机
-  的结论**；它只证明 `3584B` 下 `1024/2048/4096` 的真实 payload 路径、逐字节
-  check、计时和汇总链路可用。该节点上组内/组间每个目的地的稳定份额约
-  `31–34 GB/s`；`1024` 的 `本卡内` 受固定开销影响明显，不能按线性外推。
+  该结果来自单节点 8 卡（2 个 4 卡组）、SHMEM MTE 路径、**device 计时**，
+  **不是目标 16 卡单机的结论**；它只证明 `3584B` 下 `1024/2048/4096` 的真实
+  payload 路径、逐字节 check、per-AIV 计时和汇总链路可用。该节点上组内/组间
+  每个目的地的稳定份额约 `35 GB/s`；`本卡内` 是 GM→UB→GM 数据路径，不经过
+  网络，所以是 TB/s 量级，不能用它去和组间带宽直接相加。
   目标机器请以第 3.1 节命令生成的 `summary.md` 为准。
 - 未在 2×8 节点上跑 16 rank 的正式带宽：目标机器是单机 16 卡，跨节点数字不可
   迁移。
 
 ### 计时与口径
 
-- 默认 `--timing auto`：同时记录 `torch.npu.Event` 的 kernel delta 和
-  `torch.npu.synchronize()` 前后的 host wall clock。event 正常时主表用 event
-  （只覆盖 kernel 流执行）；只要该 rank 有任意一个 case 的 event 出现亚微秒级
-  “物理不可能”值或大于 host 墙钟，就对该 rank 的**所有 case** 统一改用
-  **launch-overhead 扣除后的 host 时间**，保证同一张表的列口径一致，并在 rank
-  日志打印 `WARNING event timer is implausible` 和 `selected timing=host`。
-- `--timing event` 强制使用 NPU event；`--timing host` 强制使用 host 时间。
-  每个 rank JSON 同时保留 `times_ms`（event）、`host_times_ms`（原始 host）和
-  `host_net_times_ms`（扣除最小 All-to-All 调用开销），便于复核。
+- 默认 `--timing auto`，首选 **device**：每个 AIV 在 kernel 内用
+  `AscendC::GetSystemCycle()` 记录自己的 `[start, end, bytes]`，通过 MTE3 写回
+  `timing[cores,4]`。换算与 MegaMoE `AscendTimer` 一致：**1000 cycles = 1 us**。
+  主表带宽 = 总 payload / **最慢 AIV 的 busy 时间**；rank JSON 同时保留
+  `core_busy_median_ms` / `core_bytes`，可以看到每个核心的实际负载和耗时。
+- 不直接使用 `max(end) - min(start)`：不同 AIV 的 cycle 计数基地址不保证一致，
+  跨核相减会出现虚假的几百微秒跨度；`end - start` 是每个核自己的区间，端口间可比。
+- device 计时无效（有核心没写回、或 payload 字节数不匹配）时才回退：先 event，
+  event 出现亚微秒级“物理不可能”值或大于 host 墙钟时再用 **launch-overhead
+  扣除后的 host 时间**。同一 rank 的全部 case 统一切换，保证列口径一致。
+- `--timing device` / `event` / `host` 可强制指定；每个 rank JSON 保留
+  `device_times_ms`、`times_ms`、`host_times_ms`、`host_net_times_ms` 四组原始样本。
 - 每次采样前所有 rank 调 `Runtime.barrier()` 并做设备级同步；采样后再次同步，
   避免上一轮流量叠到下一轮。
 - 每个 case 取该 rank 的**中位数**；跨 rank 取**最大值**作为主表时间
@@ -220,9 +224,10 @@ python -m benchmarks.alltoall_mte.summarize \
 - `full` 包含本卡，因此其带宽不等于 `local + intra + inter` 的简单相加；它用于
   交叉校验和给 MegaMoE 全量 dispatch 提供参照。
 
-> 如果主表出现 `TB/s` 级明显不可能的数字，先看 rank 日志里的
-> `event=... host=... host_net=... table=...`。event 计时在新 SDK/新机型上可能
-> 不可靠，此时直接用 `--timing host` 重跑；`auto` 只会对明显异常的 case 回退。
+> device 计时是 **kernel 数据路径时间**，不含 host 侧 launch/同步；因此小 payload
+> 的 `本卡内` 会明显高于 event/host 口径（本卡 copy 不经过网络，数据路径很短）。
+> 比较时请使用同一 `timing` 口径。若主表出现 `TB/s` 级且明显违反链路能力的结果，
+> 先看 rank 日志的 `core_valid` 和 `core_max`，再用 `--timing host` 交叉确认。
 
 ## 5. 正确性检查
 

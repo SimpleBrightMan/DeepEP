@@ -22,6 +22,9 @@ import numpy as np
 
 from . import plan
 
+# MegaMoE's AscendTimer uses 1000 system cycles per microsecond.
+CYCLE_PER_MS = 1_000_000.0
+
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -41,9 +44,9 @@ def parse_args(argv=None):
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument(
         "--timing",
-        choices=("event", "host", "auto"),
+        choices=("device", "event", "host", "auto"),
         default="auto",
-        help="event = NPU event delta; host = launch-subtracted wall clock; auto = event unless the two disagree",
+        help="device = per-AIV GetSystemCycle timestamps; event = NPU event; host = wall clock; auto picks the best",
     )
     parser.add_argument("--capacity-mib", type=int, default=0, help="0 = derive from the largest payload")
     parser.add_argument("--timeout", type=int, default=300)
@@ -98,11 +101,13 @@ def timed_case(native, runtime, send, tokens: int, token_bytes: int, group: int,
 
     stream = runtime.stream
     stream_address = stream.npu_stream
+    timing = torch.zeros((cores, 4), dtype=torch.int64, device=send.device)
     for _ in range(warmup):
-        native.alltoall(runtime.native, send, tokens, token_bytes, group, mode, cores, stream_address)
+        native.alltoall(runtime.native, send, tokens, token_bytes, group, mode, cores, stream_address, timing)
     stream.synchronize()
     samples = []
     for _ in range(iters):
+        timing = torch.zeros((cores, 4), dtype=torch.int64, device=send.device)
         runtime.barrier()
         # A device-wide sync makes the host timer independent of which stream
         # the kernel actually landed on. This is the cross-check for the event
@@ -112,16 +117,29 @@ def timed_case(native, runtime, send, tokens: int, token_bytes: int, group: int,
         end = torch.npu.Event(enable_timing=True)
         begin_ns = time.perf_counter_ns()
         start.record(stream)
-        native.alltoall(runtime.native, send, tokens, token_bytes, group, mode, cores, stream_address)
+        native.alltoall(runtime.native, send, tokens, token_bytes, group, mode, cores, stream_address, timing)
         end.record(stream)
         torch.npu.synchronize()
         host_ms = (time.perf_counter_ns() - begin_ns) / 1e6
         end.synchronize()
+        records = timing.cpu().numpy()
+        starts, ends, counts = records[:, 0], records[:, 1], records[:, 2]
+        valid = (ends > starts) & (starts > 0)
+        core_busy_ms = np.zeros(cores, dtype=np.float64)
+        core_busy_ms[valid] = (ends[valid] - starts[valid]) / CYCLE_PER_MS
+        # AIV cycle counters are not guaranteed to share a base across cores;
+        # per-core busy time is the portable measurement. The slowest core is
+        # the kernel's critical path for a balanced strided task split.
+        device_ms = float(core_busy_ms.max()) if np.any(valid) else 0.0
         samples.append(
             {
                 "event_ms": float(start.elapsed_time(end)),
                 "host_ms": host_ms,
                 "host_net_ms": max(0.0, host_ms - overhead_ms),
+                "device_ms": device_ms,
+                "core_busy_ms": core_busy_ms.tolist(),
+                "core_bytes": counts.tolist(),
+                "core_valid": int(np.count_nonzero(valid)),
             }
         )
     runtime.barrier()
@@ -208,9 +226,15 @@ def run(args):
                 event_samples = [sample["event_ms"] for sample in samples]
                 host_samples = [sample["host_ms"] for sample in samples]
                 host_net_samples = [sample["host_net_ms"] for sample in samples]
+                device_samples = [sample["device_ms"] for sample in samples]
                 event_median = statistics.median(event_samples)
                 host_median = statistics.median(host_samples)
                 host_net_median = statistics.median(host_net_samples)
+                device_median = statistics.median(device_samples)
+                core_busy_medians = [
+                    statistics.median(sample["core_busy_ms"][core] for sample in samples) for core in range(args.cores)
+                ]
+                core_bytes = samples[-1]["core_bytes"]
                 timing_name = "event"
                 results.append(
                     {
@@ -222,18 +246,26 @@ def run(args):
                         "times_ms": event_samples,
                         "host_times_ms": host_samples,
                         "host_net_times_ms": host_net_samples,
+                        "device_times_ms": device_samples,
                         "median_ms": event_median,
                         "host_median_ms": host_median,
                         "host_net_median_ms": host_net_median,
+                        "device_median_ms": device_median,
                         "min_ms": min(event_samples),
                         "host_min_ms": min(host_samples),
                         "host_net_min_ms": min(host_net_samples),
+                        "device_min_ms": min(device_samples),
+                        "core_busy_median_ms": core_busy_medians,
+                        "core_busy_max_ms": max(core_busy_medians),
+                        "core_busy_mean_ms": statistics.fmean(core_busy_medians),
+                        "core_bytes": core_bytes,
+                        "core_valid": samples[-1]["core_valid"],
                     }
                 )
                 print(
                     f"[rank {args.rank}] tokens={tokens} mode={mode} peers={len(peers)} "
-                    f"event={event_median:.3f} ms host={host_median:.3f} ms "
-                    f"host_net={host_net_median:.3f} ms",
+                    f"device={device_median:.3f} ms event={event_median:.3f} ms host={host_median:.3f} ms "
+                    f"host_net={host_net_median:.3f} ms core_max={max(core_busy_medians):.3f} ms",
                     flush=True,
                 )
                 if event_median < 1e-3 or (host_median > 0 and event_median > host_median):
@@ -245,19 +277,29 @@ def run(args):
             del send
 
         # Pick one timing source for the whole rank so columns remain
-        # comparable. Event timing is preferred; if any case is physically
-        # implausible (sub-microsecond or larger than the host call), use the
-        # launch-subtracted host clock for every case.
+        # comparable. Device cycle timestamps are preferred. Event timing is
+        # the second choice, and the launch-subtracted host clock is the final
+        # fallback on SDKs where both device and event timestamps are broken.
+        device_ok = bool(results) and all(
+            case["device_median_ms"] > 0 and int(case.get("core_valid", 0)) >= max(1, args.cores // 2)
+            for case in results
+        )
+        use_device = args.timing == "device"
         use_host = args.timing == "host"
         if args.timing == "auto":
-            use_host = any(
-                case["median_ms"] < 1e-3 or
-                (case["host_median_ms"] > 0 and case["median_ms"] > case["host_median_ms"])
-                for case in results
-            )
+            use_device = device_ok
+            if not use_device:
+                use_host = any(
+                    case["median_ms"] < 1e-3 or
+                    (case["host_median_ms"] > 0 and case["median_ms"] > case["host_median_ms"])
+                    for case in results
+                )
+        if args.timing == "device" and not device_ok:
+            raise RuntimeError("device cycle timing did not cover every core and payload byte")
         for case in results:
-            case["timing"] = "host" if use_host else "event"
-        print(f"[rank {args.rank}] selected timing={'host' if use_host else 'event'}", flush=True)
+            case["timing"] = "device" if use_device else "host" if use_host else "event"
+        selected = "device" if use_device else "host" if use_host else "event"
+        print(f"[rank {args.rank}] selected timing={selected}", flush=True)
 
         report = {
             "schema": 1,

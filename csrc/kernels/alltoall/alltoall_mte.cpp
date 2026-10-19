@@ -58,8 +58,8 @@ __aicore__ inline void StoreTile(__gm__ uint8_t* destination, LocalTensor<uint8_
 }  // namespace
 
 extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void alltoall_mte_kernel(
-    GM_ADDR send, GM_ADDR workspace, uint32_t rank, uint32_t world, uint32_t group, uint32_t token_bytes,
-    uint32_t tokens, uint32_t mode, uint32_t num_cores)
+    GM_ADDR send, GM_ADDR workspace, GM_ADDR timing, uint32_t rank, uint32_t world, uint32_t group,
+    uint32_t token_bytes, uint32_t tokens, uint32_t mode, uint32_t num_cores)
 {
 #if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
     util_set_ffts_config(0U);
@@ -101,6 +101,8 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void alltoall_mte
         SetFlag<HardEvent::MTE3_MTE2>(static_cast<TEventID>(slot));
     }
 
+    const uint64_t start_cycle = GetSystemCycle();
+    uint64_t bytes_done = 0U;
     const uint64_t chunks = (region + kTileBytes - 1U) / kTileBytes;
     const uint64_t total = uint64_t(peer_count) * chunks;
     uint32_t slot = 0U;
@@ -119,12 +121,28 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void alltoall_mte
         WaitFlag<HardEvent::MTE2_MTE3>(event);
         StoreTile(bases[peer_index] + offset, bank, bytes);
         SetFlag<HardEvent::MTE3_MTE2>(event);
+        bytes_done += bytes;
         slot = (slot + 1U) % kBuffers;
     }
     for (uint32_t pending = 0U; pending < kBuffers; ++pending) {
         WaitFlag<HardEvent::MTE3_MTE2>(static_cast<TEventID>(pending));
     }
     aclshmemx_mte_quiet();
+    const uint64_t end_cycle = GetSystemCycle();
+    if (timing != nullptr) {
+        auto record = ub.ReinterpretCast<uint64_t>();
+        record.SetValue(0U, start_cycle);
+        record.SetValue(1U, end_cycle);
+        record.SetValue(2U, bytes_done);
+        record.SetValue(3U, 0U);
+        SetFlag<HardEvent::S_MTE3>(EVENT_ID3);
+        WaitFlag<HardEvent::S_MTE3>(EVENT_ID3);
+        GlobalTensor<uint64_t> timing_gm;
+        timing_gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(timing) + uint64_t(core) * 4U);
+        DataCopyPad(timing_gm, record, DataCopyExtParams(1U, 32U, 0U, 0U, 0U));
+        SetFlag<HardEvent::MTE3_S>(EVENT_ID3);
+        WaitFlag<HardEvent::MTE3_S>(EVENT_ID3);
+    }
 #endif
 }
 
@@ -169,12 +187,12 @@ extern "C" [[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void alltoall_mte
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void alltoall_mte_kernel_do(void* stream, uint8_t* send, uint8_t* workspace,
-                                                            uint32_t rank, uint32_t world, uint32_t group,
-                                                            uint32_t token_bytes, uint32_t tokens, uint32_t mode,
-                                                            uint32_t num_cores)
+                                                            uint8_t* timing, uint32_t rank, uint32_t world,
+                                                            uint32_t group, uint32_t token_bytes, uint32_t tokens,
+                                                            uint32_t mode, uint32_t num_cores)
 {
     alltoall_mte_kernel<<<num_cores, ASCEND_DEEPEP_KERNEL_LAUNCH_UB(kUbBytes), stream>>>(
-        send, workspace, rank, world, group, token_bytes, tokens, mode, num_cores);
+        send, workspace, timing, rank, world, group, token_bytes, tokens, mode, num_cores);
 }
 
 extern "C" ASCEND_DEEPEP_EXPORT void alltoall_mte_drain_kernel_do(void* stream, uint8_t* workspace, uint8_t* out,
