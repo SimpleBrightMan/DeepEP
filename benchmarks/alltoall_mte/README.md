@@ -202,16 +202,27 @@ python -m benchmarks.alltoall_mte.summarize \
 
 ### 计时与口径
 
-- 计时使用 `torch.npu.Event` 记录在 `Runtime.stream` 上，事件区间只覆盖
-  `alltoall` kernel 的流执行，不包含 Python 参数检查、`barrier` 和结果落盘。
-- 每次采样前所有 rank 调 `Runtime.barrier()`；采样后再次 barrier，避免上一轮
-  流量叠到下一轮。
+- 默认 `--timing auto`：同时记录 `torch.npu.Event` 的 kernel delta 和
+  `torch.npu.synchronize()` 前后的 host wall clock。event 正常时主表用 event
+  （只覆盖 kernel 流执行）；只要该 rank 有任意一个 case 的 event 出现亚微秒级
+  “物理不可能”值或大于 host 墙钟，就对该 rank 的**所有 case** 统一改用
+  **launch-overhead 扣除后的 host 时间**，保证同一张表的列口径一致，并在 rank
+  日志打印 `WARNING event timer is implausible` 和 `selected timing=host`。
+- `--timing event` 强制使用 NPU event；`--timing host` 强制使用 host 时间。
+  每个 rank JSON 同时保留 `times_ms`（event）、`host_times_ms`（原始 host）和
+  `host_net_times_ms`（扣除最小 All-to-All 调用开销），便于复核。
+- 每次采样前所有 rank 调 `Runtime.barrier()` 并做设备级同步；采样后再次同步，
+  避免上一轮流量叠到下一轮。
 - 每个 case 取该 rank 的**中位数**；跨 rank 取**最大值**作为主表时间
   （最慢 rank 的带宽），同时保留 mean/min 和中位数原始样本到 `summary.json`。
 - `本卡内` 是 GM→UB→GM 的本卡 copy，`组内/组间` 是 MTE3 远端写；所有口径都按
   **发送 payload 字节数**计，不把接收侧读取或协议头算进去。
 - `full` 包含本卡，因此其带宽不等于 `local + intra + inter` 的简单相加；它用于
   交叉校验和给 MegaMoE 全量 dispatch 提供参照。
+
+> 如果主表出现 `TB/s` 级明显不可能的数字，先看 rank 日志里的
+> `event=... host=... host_net=... table=...`。event 计时在新 SDK/新机型上可能
+> 不可靠，此时直接用 `--timing host` 重跑；`auto` 只会对明显异常的 case 回退。
 
 ## 5. 正确性检查
 

@@ -65,6 +65,16 @@ void bind_alltoall(py::module_& module)
                    return required_bytes(world, tokens, token_bytes);
                },
                py::arg("world"), py::arg("tokens"), py::arg("token_bytes"));
+    module.def("alltoall_peers_ready", [](Session& session) {
+        const int world = session.world();
+        auto* workspace = static_cast<uint8_t*>(session.workspace());
+        for (int peer = 0; peer < world; ++peer) {
+            if (peer != session.rank() && aclshmem_ptr(workspace, peer) == nullptr) {
+                return false;
+            }
+        }
+        return true;
+    });
     module.def(
         "alltoall",
         [](Session& session, py::object send, uint32_t tokens, uint32_t token_bytes, uint32_t group, uint32_t mode,
@@ -81,12 +91,6 @@ void bind_alltoall(py::module_& module)
             if (stream_address == 0) throw std::invalid_argument("All-to-All requires a valid NPU stream");
             auto* input = tensor_pointer(send, {world, tokens, token_bytes}, current_device());
             auto* workspace = static_cast<uint8_t*>(session.workspace());
-            for (uint32_t peer = 0U; peer < world; ++peer) {
-                if (peer != static_cast<uint32_t>(session.rank()) &&
-                    aclshmem_ptr(workspace, static_cast<int>(peer)) == nullptr) {
-                    throw std::runtime_error("All-to-All peer is not reachable through the MTE mapping");
-                }
-            }
             alltoall_mte_kernel_do(reinterpret_cast<void*>(stream_address), input, workspace, session.rank(), world,
                                    group, token_bytes, tokens, mode, cores);
         },

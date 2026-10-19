@@ -39,6 +39,12 @@ def parse_args(argv=None):
     parser.add_argument("--cores", type=int, default=64, help="AIV cores used by the copy kernel")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)
+    parser.add_argument(
+        "--timing",
+        choices=("event", "host", "auto"),
+        default="auto",
+        help="event = NPU event delta; host = launch-subtracted wall clock; auto = event unless the two disagree",
+    )
     parser.add_argument("--capacity-mib", type=int, default=0, help="0 = derive from the largest payload")
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -68,8 +74,26 @@ def make_send(rank: int, world: int, tokens: int, token_bytes: int, device: int)
     return torch.from_numpy(host).to(f"npu:{device}")
 
 
+def measure_launch_overhead(native, runtime, world: int, group: int, cores: int, device: int,
+                            samples: int = 5) -> float:
+    """Median host cost of a minimal All-to-All call plus device-wide sync."""
+    import torch
+
+    send = torch.zeros((world, 1, 32), dtype=torch.uint8, device=f"npu:{device}")
+    values = []
+    for _ in range(samples):
+        runtime.barrier()
+        torch.npu.synchronize()
+        begin_ns = time.perf_counter_ns()
+        native.alltoall(runtime.native, send, 1, 32, group, 3, cores, runtime.stream.npu_stream)
+        torch.npu.synchronize()
+        values.append((time.perf_counter_ns() - begin_ns) / 1e6)
+    runtime.barrier()
+    return statistics.median(values)
+
+
 def timed_case(native, runtime, send, tokens: int, token_bytes: int, group: int, mode: int, cores: int,
-               warmup: int, iters: int):
+               warmup: int, iters: int, overhead_ms: float):
     import torch
 
     stream = runtime.stream
@@ -80,13 +104,26 @@ def timed_case(native, runtime, send, tokens: int, token_bytes: int, group: int,
     samples = []
     for _ in range(iters):
         runtime.barrier()
+        # A device-wide sync makes the host timer independent of which stream
+        # the kernel actually landed on. This is the cross-check for the event
+        # timer on SDKs where stream handles or event timestamps differ.
+        torch.npu.synchronize()
         start = torch.npu.Event(enable_timing=True)
         end = torch.npu.Event(enable_timing=True)
+        begin_ns = time.perf_counter_ns()
         start.record(stream)
         native.alltoall(runtime.native, send, tokens, token_bytes, group, mode, cores, stream_address)
         end.record(stream)
+        torch.npu.synchronize()
+        host_ms = (time.perf_counter_ns() - begin_ns) / 1e6
         end.synchronize()
-        samples.append(float(start.elapsed_time(end)))
+        samples.append(
+            {
+                "event_ms": float(start.elapsed_time(end)),
+                "host_ms": host_ms,
+                "host_net_ms": max(0.0, host_ms - overhead_ms),
+            }
+        )
     runtime.barrier()
     return samples
 
@@ -149,6 +186,11 @@ def run(args):
     try:
         runtime = Runtime(None, capacity, timeout=args.timeout, rank=args.rank, world_size=args.world_size)
         runtime.barrier()
+        if not native.alltoall_peers_ready(runtime.native):
+            raise RuntimeError("All-to-All peers are not reachable through the MTE mapping")
+        overhead_ms = measure_launch_overhead(native, runtime, args.world_size, args.group_size, args.cores,
+                                              args.device)
+        print(f"[rank {args.rank}] host launch+sync overhead={overhead_ms:.3f} ms", flush=True)
         results = []
         for tokens in tokens_list:
             send = make_send(args.rank, args.world_size, tokens, args.token_bytes, args.device)
@@ -162,24 +204,61 @@ def run(args):
                 if not peers:
                     continue
                 samples = timed_case(native, runtime, send, tokens, args.token_bytes, args.group_size,
-                                     plan.MODES.index(mode), args.cores, args.warmup, args.iters)
+                                     plan.MODES.index(mode), args.cores, args.warmup, args.iters, overhead_ms)
+                event_samples = [sample["event_ms"] for sample in samples]
+                host_samples = [sample["host_ms"] for sample in samples]
+                host_net_samples = [sample["host_net_ms"] for sample in samples]
+                event_median = statistics.median(event_samples)
+                host_median = statistics.median(host_samples)
+                host_net_median = statistics.median(host_net_samples)
+                timing_name = "event"
                 results.append(
                     {
                         "tokens": tokens,
                         "mode": mode,
                         "peers": len(peers),
                         "bytes": plan.payload_bytes(tokens, args.token_bytes, len(peers)),
-                        "times_ms": samples,
-                        "median_ms": statistics.median(samples),
-                        "min_ms": min(samples),
+                        "timing": timing_name,
+                        "times_ms": event_samples,
+                        "host_times_ms": host_samples,
+                        "host_net_times_ms": host_net_samples,
+                        "median_ms": event_median,
+                        "host_median_ms": host_median,
+                        "host_net_median_ms": host_net_median,
+                        "min_ms": min(event_samples),
+                        "host_min_ms": min(host_samples),
+                        "host_net_min_ms": min(host_net_samples),
                     }
                 )
                 print(
                     f"[rank {args.rank}] tokens={tokens} mode={mode} peers={len(peers)} "
-                    f"median={statistics.median(samples):.3f} ms",
+                    f"event={event_median:.3f} ms host={host_median:.3f} ms "
+                    f"host_net={host_net_median:.3f} ms",
                     flush=True,
                 )
+                if event_median < 1e-3 or (host_median > 0 and event_median > host_median):
+                    print(
+                        f"[rank {args.rank}] WARNING event timer is implausible for this case "
+                        f"(event={event_median:.6f} ms host={host_median:.3f} ms); using host",
+                        flush=True,
+                    )
             del send
+
+        # Pick one timing source for the whole rank so columns remain
+        # comparable. Event timing is preferred; if any case is physically
+        # implausible (sub-microsecond or larger than the host call), use the
+        # launch-subtracted host clock for every case.
+        use_host = args.timing == "host"
+        if args.timing == "auto":
+            use_host = any(
+                case["median_ms"] < 1e-3 or
+                (case["host_median_ms"] > 0 and case["median_ms"] > case["host_median_ms"])
+                for case in results
+            )
+        for case in results:
+            case["timing"] = "host" if use_host else "event"
+        print(f"[rank {args.rank}] selected timing={'host' if use_host else 'event'}", flush=True)
+
         report = {
             "schema": 1,
             "rank": args.rank,
@@ -191,6 +270,8 @@ def run(args):
             "cores": args.cores,
             "warmup": args.warmup,
             "iters": args.iters,
+            "timing": args.timing,
+            "launch_overhead_ms": overhead_ms,
             "checked": not args.no_check,
             "elapsed_s": time.time() - started,
             "cases": results,
