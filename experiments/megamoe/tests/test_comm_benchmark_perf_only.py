@@ -264,3 +264,23 @@ def test_strict_run_still_calls_oracle_before_timing(mocked_run):
         bench.run(run.args, run.config, run.group)
     assert run.state.forbidden == ["expected_output"]
     assert run.state.timer_allocations == []
+
+
+@pytest.mark.parametrize("dispatch,combine", [(4, 4), (6, 6), (1, 27), (4, 6)])
+def test_strict_run_passes_actual_paired_split_to_payload_oracle(mocked_run, monkeypatch, dispatch, combine):
+    run = mocked_run
+    run.args.no_validation = False
+    monkeypatch.setenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "paired-xor")
+    monkeypatch.setenv("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", str(dispatch))
+    monkeypatch.setenv("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES", str(combine))
+    observed = []
+
+    def expected(_config, _rank, _bs, **schedule):
+        observed.append(schedule)
+        raise RuntimeError("payload oracle reached")
+
+    monkeypatch.setattr(bench, "expected_output", expected)
+    with pytest.raises(RuntimeError, match="payload oracle reached"):
+        bench.run(run.args, run.config, run.group)
+    assert observed == [dict(group_order="paired-xor", dispatch_intra=dispatch, combine_intra=combine)]
+    assert run.state.timer_allocations == []

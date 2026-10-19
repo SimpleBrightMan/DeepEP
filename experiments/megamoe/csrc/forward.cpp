@@ -531,8 +531,9 @@ void Plan::prepare_communication(torch::Tensor combine_payload, bool metadata_dm
                     std::strcmp(group_order, "paired-xor") == 0,
                 "DEEPEP_MEGAMOE_COMM_GROUP_ORDER must be reverse or paired-xor");
     const bool paired_groups = group_order != nullptr && std::strcmp(group_order, "paired-xor") == 0;
-    TORCH_CHECK(!paired_groups || (tiling_.dispatchIntraCores == 12U && tiling_.combineIntraCores == 12U),
-                "paired-xor requires Dispatch and Combine to use 12 INTRA and 16 CROSS workers");
+    TORCH_CHECK(!paired_groups || (tiling_.dispatchIntraCores >= 1U && tiling_.dispatchIntraCores <= 27U &&
+                                   tiling_.combineIntraCores >= 1U && tiling_.combineIntraCores <= 27U),
+                "paired-xor requires Dispatch and Combine INTRA core counts in [1,27]");
     TORCH_CHECK(tiling_.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 &&
                     tiling_.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT && tiling_.sharedExpertNum == 0U &&
                     tiling_.epWorldSize == 16U && platform_.aic == 28U &&

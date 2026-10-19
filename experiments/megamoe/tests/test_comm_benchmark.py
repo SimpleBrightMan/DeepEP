@@ -60,15 +60,21 @@ def test_synthetic_combine_reverse_routes_matches_direct_scatter():
     assert np.array_equal(bench.expected_output(config, rank, bs), expected)
 
 
-def test_paired_expected_payload_keeps_original_rows_and_output():
+@pytest.mark.parametrize("dispatch,combine", [(4, 4), (6, 6), (12, 12), (1, 27), (27, 1), (4, 6)])
+def test_paired_expected_payload_keeps_original_rows_and_output(dispatch, combine):
     config, rank, bs, snapshot, expected, counts = make_payload_case()
+    schedule = dict(group_order="paired-xor", dispatch_intra=dispatch, combine_intra=combine)
     original, original_counts = bench.expected_layout(config, rank, bs)
-    paired, paired_counts = bench.expected_layout(config, rank, bs, group_order="paired-xor")
+    paired, paired_counts = bench.expected_layout(config, rank, bs, **schedule)
     assert np.array_equal(original, paired) and np.array_equal(original_counts, paired_counts)
-    assert np.array_equal(bench.expected_output(config, rank, bs, group_order="paired-xor"), expected)
-    assert bench.validate_payload(config, rank, bs, snapshot, expected, counts, expected, group_order="paired-xor")[
-        "passed"
-    ]
+    assert np.array_equal(bench.expected_output(config, rank, bs, **schedule), expected)
+    assert bench.validate_payload(config, rank, bs, snapshot, expected, counts, expected, **schedule)["passed"]
+
+
+def test_payload_oracle_does_not_replace_invalid_paired_split_with_twelve():
+    config = small_config()
+    with pytest.raises(ValueError, match="each in 1..27"):
+        bench.expected_layout(config, 0, 8, group_order="paired-xor", dispatch_intra=0, combine_intra=4)
 
 
 def test_balanced_ids_equal_global_rank_first_route_stream():

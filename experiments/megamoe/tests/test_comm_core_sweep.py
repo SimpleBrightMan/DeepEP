@@ -49,8 +49,99 @@ def test_paired_plan_is_one_fixed_pair_per_bs_without_baseline_or_selection():
     env = sweep.candidate_environment((12, 12), {sweep.ENV_GROUP_ORDER: "reverse"}, group_order="paired-xor")
     assert env[sweep.ENV_GROUP_ORDER] == "paired-xor"
     assert env[sweep.ENV_DISPATCH] == env[sweep.ENV_COMBINE] == "12"
-    with pytest.raises(ValueError, match="fixed"):
-        sweep.candidate_environment((10, 12), group_order="paired-xor")
+    alternate = sweep.candidate_environment((10, 12), group_order="paired-xor")
+    assert alternate[sweep.ENV_DISPATCH] == "10" and alternate[sweep.ENV_COMBINE] == "12"
+    with pytest.raises(ValueError, match="1..27"):
+        sweep.candidate_environment((0, 12), group_order="paired-xor")
+
+
+@pytest.mark.parametrize("order", ["paired-xor", "reverse"])
+def test_group_plan_preserves_requested_pair_order_without_selection(order):
+    args = sweep.parse_args(
+        [
+            "--mode",
+            "paired-groups",
+            "--group-intra-cores",
+            "12,4,6",
+            "--group-order",
+            order,
+        ]
+    )
+    planned = sweep.plan(args)
+    assert planned["group_order"] == order
+    assert planned["case_launches_per_bs"] == 3 and planned["total_case_launches"] == 9
+    assert planned["group_pairs"] == [[12, 12], [4, 4], [6, 6]]
+    assert planned["dispatch_intra_candidates"] == planned["combine_intra_candidates"] == [12, 4, 6]
+    assert planned["fixed_pair"] is None and not planned["combine_fixed"]
+    assert planned["selection"] is None and len(planned["stages"]) == 1
+    assert f"order={order}" in planned["stages"][0]
+
+
+@pytest.mark.parametrize("mode", ["baseline", "dispatch", "staged", "fullgrid"])
+@pytest.mark.parametrize("option,value", [("--group-intra-cores", "12"), ("--group-order", "reverse")])
+def test_group_controls_are_only_accepted_in_paired_groups_mode(mode, option, value):
+    with pytest.raises(SystemExit):
+        sweep.parse_args(["--mode", mode, option, value])
+
+
+@pytest.mark.parametrize("value", ["", "0", "28", "12,12", "4,0", "4,x"])
+def test_group_core_list_rejects_invalid_values(value):
+    with pytest.raises(SystemExit):
+        sweep.parse_args(["--mode", "paired-groups", "--group-intra-cores", value])
+
+
+@pytest.mark.parametrize(
+    "old_option,value",
+    [
+        ("--intra-cores", "12"),
+        ("--dispatch-intra-cores", "12"),
+        ("--combine-intra-cores", "12"),
+        ("--combine-intra", "12"),
+        ("--initial-combine-intra", "0"),
+    ],
+)
+def test_new_group_core_list_rejects_mixed_legacy_core_options(old_option, value):
+    with pytest.raises(SystemExit):
+        sweep.parse_args(["--mode", "paired-groups", "--group-intra-cores", "12,4,6", old_option, value])
+
+
+def test_legacy_twelve_core_group_invocation_still_works():
+    args = sweep.parse_args(["--mode", "paired-groups", "--intra-cores", "12"])
+    assert args.group_cores == [12] and args.group_order == "paired-xor"
+
+
+def test_group_plan_dry_run_does_not_create_output(tmp_path, capsys):
+    target = tmp_path / "not-created"
+    sweep.main(
+        [
+            "--plan",
+            "--mode",
+            "paired-groups",
+            "--bs-values",
+            "4096",
+            "--group-intra-cores",
+            "12,4,6",
+            "--group-order",
+            "reverse",
+            "--output-dir",
+            str(target),
+        ]
+    )
+    planned = json.loads(capsys.readouterr().out)
+    assert planned["total_case_launches"] == 3 and planned["group_order"] == "reverse"
+    assert planned["group_pairs"] == [[12, 12], [4, 4], [6, 6]]
+    assert not target.exists()
+
+
+def test_group_order_rejects_unknown_value():
+    with pytest.raises(SystemExit):
+        sweep.parse_args(["--mode", "paired-groups", "--group-order", "random"])
+
+
+@pytest.mark.parametrize("pair", [None, (0, 4), (4, 0), (28, 4), (4, -1), (4,), (True, 4)])
+def test_paired_environment_rejects_invalid_cohort_counts(pair):
+    with pytest.raises(ValueError, match="1..27"):
+        sweep.candidate_environment(pair, group_order="paired-xor")
 
 
 @pytest.mark.parametrize(
@@ -108,6 +199,50 @@ def test_paired_driver_launches_exactly_three_fixed_cases_and_no_baseline(tmp_pa
         assert options == dict(
             validate=False, dispatch_metadata_mode="dma", combine_buffer_count=6, group_order="paired-xor"
         )
+    assert not list((tmp_path / "run").rglob("baseline"))
+
+
+@pytest.mark.parametrize("order", ["paired-xor", "reverse"])
+def test_group_driver_runs_each_requested_pair_in_order_per_bs(tmp_path, monkeypatch, order):
+    monkeypatch.setattr(sweep, "os", SimpleNamespace(name="posix", environ={sweep.ENV_GROUP_ORDER: "paired-xor"}))
+    monkeypatch.setattr(sweep.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="", stderr=""))
+    launches, reads, gaps, selections = [], [], [], []
+    monkeypatch.setattr(sweep, "execute", lambda argv, **kwargs: launches.append((argv, kwargs)))
+    monkeypatch.setattr(sweep, "print_case", lambda item: None)
+    monkeypatch.setattr(sweep, "write_summary", lambda path, plan, cases, chosen: selections.extend(chosen))
+    monkeypatch.setattr(sweep.time, "sleep", gaps.append)
+
+    def read(output, bs, pair, **options):
+        reads.append((output, bs, pair, options))
+        return dict(bs=bs, pair=list(pair), passed=True, validation="skipped", **options)
+
+    monkeypatch.setattr(sweep, "read_case", read)
+    sweep.main(
+        [
+            "--mode",
+            "paired-groups",
+            "--bs-values",
+            "2048,4096",
+            "--group-intra-cores",
+            "12,4,6",
+            "--group-order",
+            order,
+            "--no-validation",
+            "--combine-buffer-count",
+            "6",
+            "--output-dir",
+            str(tmp_path / "run"),
+        ]
+    )
+    expected = [(bs, (n, n)) for bs in (2048, 4096) for n in (12, 4, 6)]
+    assert [(bs, pair) for _, bs, pair, _ in reads] == expected
+    assert len(launches) == 6 and gaps == [2.0] * 5 and not selections
+    for (argv, launch), (output, bs, pair, options) in zip(launches, reads):
+        assert output.name == f"paired_groups_d{pair[0]}_c{pair[1]}"
+        assert options["group_order"] == order and options["combine_buffer_count"] == 6 and not options["validate"]
+        assert launch["environment"][sweep.ENV_DISPATCH] == launch["environment"][sweep.ENV_COMBINE] == str(pair[0])
+        assert launch["environment"].get(sweep.ENV_GROUP_ORDER, "reverse") == order
+        assert "deep_ep_experimental.megamoe.comm_benchmark" in argv
     assert not list((tmp_path / "run").rglob("baseline"))
 
 
@@ -499,12 +634,14 @@ def write_case_fixture(
         communication["combine_buffer_count"] = combine_buffer_count
     if group_order is not None:
         communication["group_order"] = group_order
-    if group_order == "paired-xor":
-        for operation in communication["operations"].values():
-            operation["cohorts"] = {
-                name: dict(workers=workers, gbps_per_card_mean=60.0, gbps_per_card_min=55.0, gbps_per_card_max=65.0)
-                for name, workers in (("INTRA", 12), ("CROSS", 16))
-            }
+    if pair:
+        for index, operation in enumerate(communication["operations"].values()):
+            intra = pair[index]
+            if intra:
+                operation["cohorts"] = {
+                    name: dict(workers=workers, gbps_per_card_mean=60.0, gbps_per_card_min=55.0, gbps_per_card_max=65.0)
+                    for name, workers in (("INTRA", intra), ("CROSS", 28 - intra))
+                }
     if not validate:
         communication["validation"] = dict(strict_wave_core=False, status="skipped")
         for record in communication["ranks"]:
@@ -571,8 +708,9 @@ def test_case_reader_rejects_group_order_mismatch_in_summary(tmp_path):
 
 
 @pytest.mark.parametrize("corruption", ["missing", "workers", "bandwidth"])
-def test_paired_case_reader_requires_complete_cohort_metrics(tmp_path, corruption):
-    _, timer, communication, _ = write_case_fixture(tmp_path, (12, 12), validate=False, group_order="paired-xor")
+@pytest.mark.parametrize("order", ["paired-xor", "reverse"])
+def test_paired_case_reader_requires_complete_cohort_metrics(tmp_path, corruption, order):
+    _, timer, communication, _ = write_case_fixture(tmp_path, (12, 12), validate=False, group_order=order)
     dispatch = communication["operations"]["DISPATCH"]
     if corruption == "missing":
         dispatch.pop("cohorts")
@@ -582,7 +720,21 @@ def test_paired_case_reader_requires_complete_cohort_metrics(tmp_path, corruptio
         dispatch["cohorts"]["INTRA"]["gbps_per_card_mean"] = 0
     (timer / "communication.json").write_text(json.dumps(communication))
     with pytest.raises(ValueError, match="cohort"):
-        sweep.read_case(tmp_path, 2048, (12, 12), validate=False, group_order="paired-xor")
+        sweep.read_case(tmp_path, 2048, (12, 12), validate=False, group_order=order)
+
+
+@pytest.mark.parametrize("order", ["paired-xor", "reverse"])
+@pytest.mark.parametrize("pair", [(4, 4), (6, 6), (1, 27), (27, 1)])
+def test_group_reader_uses_each_operation_actual_worker_split(tmp_path, order, pair):
+    _, timer, communication, _ = write_case_fixture(tmp_path, pair, validate=False, group_order=order)
+    report = sweep.read_case(tmp_path, 2048, pair, validate=False, group_order=order)
+    for operation, intra in zip(("DISPATCH", "COMBINE"), pair):
+        cohorts = report["communication"]["operations"][operation]["cohorts"]
+        assert cohorts["INTRA"]["workers"] == intra and cohorts["CROSS"]["workers"] == 28 - intra
+    communication["operations"]["COMBINE"]["cohorts"]["CROSS"]["workers"] = 16
+    (timer / "communication.json").write_text(json.dumps(communication))
+    with pytest.raises(ValueError, match="cohort worker count"):
+        sweep.read_case(tmp_path, 2048, pair, validate=False, group_order=order)
 
 
 def test_paired_cohort_console_csv_and_total_metrics_are_separate(tmp_path, capsys):

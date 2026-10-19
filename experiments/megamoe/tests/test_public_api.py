@@ -203,7 +203,7 @@ def replay_backend(backend):
     b.group.rank = lambda: 0
     b.num_experts = 32
     backend.ext.small_batch_max_tokens = 1
-    backend.ext.communication_replay_protocol = 4
+    backend.ext.communication_replay_protocol = 5
     route = np.arange(17 * b.num_topk)
     b.topk_idx.data[:] = ((route % 16) * 2 + (route // 16) % 2).reshape(17, b.num_topk)
     events = backend.events
@@ -279,7 +279,7 @@ def test_communication_metadata_mode_must_match_all_ranks(backend, monkeypatch):
     assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
 
 
-@pytest.mark.parametrize("protocol", [None, 1, 2, 3])
+@pytest.mark.parametrize("protocol", [None, 1, 2, 3, 4])
 def test_communication_metadata_rejects_stale_extension_protocol(backend, protocol):
     payload = replay_backend(backend)
     backend.ext.communication_replay_protocol = protocol
@@ -333,11 +333,14 @@ def test_communication_combine_buffer_count_changes_on_repreparation(backend):
     "backend",
     [
         {"DEEPEP_MEGAMOE_COMM_GROUP_ORDER": "reverse"},
-        {
-            "DEEPEP_MEGAMOE_COMM_GROUP_ORDER": "paired-xor",
-            "DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES": "12",
-            "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES": "12",
-        },
+        *[
+            {
+                "DEEPEP_MEGAMOE_COMM_GROUP_ORDER": "paired-xor",
+                "DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES": dispatch,
+                "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES": combine,
+            }
+            for dispatch, combine in (("4", "4"), ("6", "6"), ("12", "12"), ("1", "27"), ("27", "1"), ("012", "6"))
+        ],
     ],
     indirect=True,
 )
@@ -375,15 +378,26 @@ def test_communication_rejects_invalid_or_empty_group_order(backend, monkeypatch
         (None, None),
         ("12", None),
         (None, "12"),
-        ("10", "12"),
-        ("12", "16"),
-        ("0", "0"),
-        ("012", "12"),
+        ("0", "12"),
+        ("12", "0"),
+        ("-1", "12"),
+        ("12", "-1"),
+        ("28", "12"),
+        ("12", "28"),
+        ("4.0", "12"),
+        ("12", "6.0"),
+        ("true", "12"),
+        ("12", "none"),
+        ("１２", "12"),
+        ("12", "١٢"),
+        ("+4", "12"),
+        (" 12", "12"),
         ("12", "12 "),
         ("", "12"),
+        ("12", ""),
     ],
 )
-def test_paired_groups_requires_both_exact_twelve_core_settings(backend, monkeypatch, dispatch, combine):
+def test_paired_groups_requires_valid_intra_core_settings(backend, monkeypatch, dispatch, combine):
     payload = replay_backend(backend)
     monkeypatch.setenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "paired-xor")
     for name, value in (
@@ -392,9 +406,53 @@ def test_paired_groups_requires_both_exact_twelve_core_settings(backend, monkeyp
     ):
         if value is not None:
             monkeypatch.setenv(name, value)
-    with pytest.raises(ValueError, match="paired-xor requires Dispatch and Combine to use 12 INTRA and 16 CROSS"):
+    with pytest.raises(ValueError, match=r"paired-xor requires Dispatch and Combine INTRA core counts in \[1,27\]"):
         backend.buffer.prepare_communication(17, combine_payload=payload)
     assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
+
+
+@pytest.mark.parametrize("changed_index", [-2, -1])
+def test_communication_core_counts_must_match_all_ranks(backend, monkeypatch, changed_index):
+    monkeypatch.setenv("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "paired-xor")
+    monkeypatch.setenv("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "4")
+    monkeypatch.setenv("DEEPEP_MEGAMOE_COMBINE_INTRA_CORES", "6")
+
+    def gather(output, value, **kwargs):
+        error, signature = value
+        remote = list(signature)
+        remote[changed_index] = "12"
+        output[:] = [value, (error, tuple(remote))]
+
+    monkeypatch.setattr(backend.dist, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="configuration: ranks disagree"):
+        api.SymmBuffer(type(backend.buffer.group)(), 4, 17, 2, 1024, 256)
+    assert not any(event[0] == "prepare_comm" for event in backend.events if isinstance(event, tuple))
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        {
+            "DEEPEP_MEGAMOE_COMM_GROUP_ORDER": "paired-xor",
+            "DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES": "4",
+            "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES": "6",
+        }
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize("stage", ["DISPATCH", "COMBINE"])
+@pytest.mark.parametrize("value", [None, "12"])
+def test_communication_replay_rejects_changed_core_counts_after_preparation(backend, monkeypatch, stage, value):
+    payload = replay_backend(backend)
+    backend.buffer.prepare_communication(17, combine_payload=payload)
+    name = f"DEEPEP_MEGAMOE_{stage}_INTRA_CORES"
+    if value is None:
+        monkeypatch.delenv(name)
+    else:
+        monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match="Communication core environment changed"):
+        api.communication_forward(backend.buffer, bs=17)
+    assert not any(event[0] == "comm_launch" for event in backend.events if isinstance(event, tuple))
 
 
 def test_communication_group_order_must_match_all_ranks(backend, monkeypatch):

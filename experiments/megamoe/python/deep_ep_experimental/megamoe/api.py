@@ -237,7 +237,8 @@ class SymmBuffer:
         in dma mode; scalar mode retains the original per-token scalar writes.
         combine_buffer_count selects 2, 4 or 6 row slots for replay's BF16 Combine.
         DEEPEP_MEGAMOE_COMM_GROUP_ORDER=paired-xor selects soft XOR group pairing
-        with 12 INTRA / 16 CROSS workers in both stages. Peer payload and full
+        with configurable INTRA core counts in [1,27] for both stages; remaining
+        cores handle CROSS traffic. Peer payload and full
         MegaMoE are unchanged. No matrix weights are allocated or used.
         All ranks call together with the same settings.
         """
@@ -249,8 +250,8 @@ class SymmBuffer:
         error = None
         try:
             extension = _extension()
-            if getattr(extension, "communication_replay_protocol", None) != 4:
-                raise RuntimeError("Rebuild and reinstall this branch to enable paired-group communication replay")
+            if getattr(extension, "communication_replay_protocol", None) != 5:
+                raise RuntimeError("Rebuild and reinstall this branch to enable variable paired-group core counts")
             if dispatch_metadata_mode not in ("dma", "scalar"):
                 raise ValueError("dispatch_metadata_mode must be 'dma' or 'scalar'")
             if type(combine_buffer_count) is not int or combine_buffer_count not in (2, 4, 6):
@@ -258,11 +259,11 @@ class SymmBuffer:
             group_order = os.environ.get("DEEPEP_MEGAMOE_COMM_GROUP_ORDER", "reverse")
             if group_order not in ("reverse", "paired-xor"):
                 raise ValueError("DEEPEP_MEGAMOE_COMM_GROUP_ORDER must be reverse or paired-xor")
-            if group_order == "paired-xor" and any(
-                os.environ.get(name) != "12"
-                for name in ("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES")
-            ):
-                raise ValueError("paired-xor requires Dispatch and Combine to use 12 INTRA and 16 CROSS workers")
+            if group_order == "paired-xor":
+                for name in ("DEEPEP_MEGAMOE_DISPATCH_INTRA_CORES", "DEEPEP_MEGAMOE_COMBINE_INTRA_CORES"):
+                    value = os.environ.get(name, "")
+                    if not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= 27:
+                        raise ValueError("paired-xor requires Dispatch and Combine INTRA core counts in [1,27]")
             if (
                 self.group.size() != 16
                 or self.num_shared_experts != 0

@@ -47,6 +47,7 @@ def test_comm_split_route_ready_inverse_oracle(tmp_path):
     assert "7680 independent route/ready/inverse cases, all 27 splits passed" in completed.stdout
     assert "paired-xor: 7680 varied cases" in completed.stdout
     assert "BS2048/4096/8192 EP16 slices, exact order/owners/ready/inverse passed" in completed.stdout
+    assert "paired-xor: all 27 splits checked for each balanced EP16 slice" in completed.stdout
 
 
 def test_actual_timer_writer_audit_isolation_and_nested_spans(tmp_path):

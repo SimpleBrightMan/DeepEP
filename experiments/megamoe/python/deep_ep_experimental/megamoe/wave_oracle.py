@@ -106,8 +106,8 @@ def plan(
         raise ValueError("INTRA core counts must be 0 (original) or 1..27")
     if group_order not in ("reverse", "paired-xor"):
         raise ValueError("group_order must be reverse or paired-xor")
-    if group_order == "paired-xor" and (dispatch_intra, combine_intra) != (12, 12):
-        raise ValueError("paired-xor requires EP16 with dispatch_intra=combine_intra=12")
+    if group_order == "paired-xor" and (dispatch_intra == 0 or combine_intra == 0):
+        raise ValueError("paired-xor requires EP16 with dispatch_intra and combine_intra each in 1..27")
     queues = route_queues(bs, topk, experts, rank)
     budget = wave_budget(bs, hidden, intermediate)
     order = peer_order(rank, ranks_per_node)

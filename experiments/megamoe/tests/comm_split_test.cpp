@@ -63,14 +63,24 @@ static std::vector<Identity> Reference(const Counts& counts, uint32_t rank, uint
 }
 
 static void Check(const Counts& counts, uint32_t rank, uint32_t ranksPerNode, uint32_t begin, uint32_t end,
-                  bool balanced, uint64_t rotation, bool paired = false)
+                  bool balanced, uint64_t rotation, bool paired = false, uint32_t pairedIntra = 12U)
 {
     const auto reference = Reference(counts, rank, ranksPerNode, begin, end, balanced);
     CommPeerSegment peers[16];
     BuildCommPeerSegments(counts, rank, ranksPerNode, begin, end, balanced, peers);
     // Explicit matchings provide an oracle independent of the device XOR.
     constexpr uint32_t partners[4][4] = {{0, 1, 2, 3}, {1, 0, 3, 2}, {2, 3, 0, 1}, {3, 2, 1, 0}};
-    for (uint32_t intra = paired ? 12U : 1U; intra < (paired ? 13U : 28U); ++intra) {
+    std::array<std::vector<uint32_t>, 4> groupedRows;
+    if (paired) {
+        for (uint32_t peer = 0; peer < 16; ++peer)
+            for (uint32_t index = 0; index < reference.size(); ++index)
+                if (reference[index].first == peer) groupedRows[peer / 4].push_back(begin + index);
+    }
+    // pairedIntra=0 exercises every legal cohort split with the same route
+    // enumeration, avoiding redundant source-queue construction per split.
+    const uint32_t firstSplit = paired && pairedIntra ? pairedIntra : 1U;
+    const uint32_t lastSplit = paired && pairedIntra ? pairedIntra + 1U : 28U;
+    for (uint32_t intra = firstSplit; intra < lastSplit; ++intra) {
         std::vector<uint32_t> visits(end - begin, 0U);
         std::array<std::array<uint32_t, 28>, 4> phaseRows{};
         std::array<std::vector<uint32_t>, 28> expectedOwned;
@@ -81,10 +91,7 @@ static void Check(const Counts& counts, uint32_t rank, uint32_t ranksPerNode, ui
                 for (uint32_t phase = local ? 0U : 1U; phase < (local ? 1U : 4U); ++phase) {
                     const uint32_t group = partners[rank / 4][phase];
                     Require(partners[group][phase] == rank / 4);
-                    std::vector<uint32_t> groupRows;
-                    for (uint32_t peer = group * 4; peer < (group + 1) * 4; ++peer)
-                        for (uint32_t index = 0; index < reference.size(); ++index)
-                            if (reference[index].first == peer) groupRows.push_back(begin + index);
+                    const auto& groupRows = groupedRows[group];
                     uint32_t cursor = 0;
                     for (uint32_t logical = 0; logical < workers; ++logical) {
                         const uint32_t count = groupRows.size() / workers + (logical < groupRows.size() % workers);
@@ -172,7 +179,8 @@ int main()
                         Check(counts, rank, ranksPerNode, begin, end, balanced,
                               static_cast<uint64_t>(cases) * 8192U + (cases % 59));
                         Check(counts, rank, ranksPerNode, begin, end, balanced,
-                              static_cast<uint64_t>(cases) * 8192U + (cases % 59), true);
+                              static_cast<uint64_t>(cases) * 8192U + (cases % 59), true,
+                              rank % 4 == 0 && ranksPerNode == 16 && balanced ? 0U : 12U);
                         ++cases;
                         ++pairedCases;
                     }
@@ -201,7 +209,7 @@ int main()
                         ++wave;
                     }
                     const uint32_t count = std::min(total - begin, (12U - usedGroups) * 256U);
-                    Check(counts, rank, 16U, begin, begin + count, true, globalRow + wave, true);
+                    Check(counts, rank, 16U, begin, begin + count, true, globalRow + wave, true, 0U);
                     begin += count;
                     globalRow += count;
                     usedGroups += (count + 255U) / 256U;
@@ -213,4 +221,5 @@ int main()
     }
     std::cout << "paired-xor: " << pairedCases << " varied cases and " << balancedCases
               << " BS2048/4096/8192 EP16 slices, exact order/owners/ready/inverse passed\n";
+    std::cout << "paired-xor: all 27 splits checked for each balanced EP16 slice\n";
 }

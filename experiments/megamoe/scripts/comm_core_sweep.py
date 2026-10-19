@@ -59,7 +59,16 @@ def parse_args(argv=None):
         "--mode",
         choices=("baseline", "paired-groups", "dispatch", "staged", "fullgrid"),
         default="baseline",
-        help="Original schedule by default; paired-groups runs fixed 12 INTRA / 16 CROSS once per BS",
+        help="Original schedule by default; paired-groups runs requested group configurations without baseline or selection",
+    )
+    parser.add_argument(
+        "--group-intra-cores",
+        help="paired-groups only: ordered INTRA counts shared by Dispatch/Combine, e.g. 12,4,6 (default: 12)",
+    )
+    parser.add_argument(
+        "--group-order",
+        choices=("paired-xor", "reverse"),
+        help="paired-groups only: cross-group ordering (default: paired-xor)",
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument(
@@ -120,7 +129,12 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--plan", action="store_true", help="No build, device access, process launch or output files")
     args = parser.parse_args(argv)
-    args.group_order = "paired-xor" if args.mode == "paired-groups" else "reverse"
+    explicit_options = {
+        arg.split("=", 1)[0] for arg in (sys.argv[1:] if argv is None else argv) if arg.startswith("--")
+    }
+    if args.mode != "paired-groups" and (args.group_intra_cores is not None or args.group_order is not None):
+        parser.error("--group-intra-cores and --group-order require --mode paired-groups")
+    args.group_order = (args.group_order or "paired-xor") if args.mode == "paired-groups" else "reverse"
     try:
         args.bs_values = integers(args.bs_values, 65536, "BS")
         args.dispatch_cores = integers(args.dispatch_intra_cores or args.intra_cores, 27, "Dispatch cores")
@@ -140,19 +154,36 @@ def parse_args(argv=None):
     if args.mode == "baseline" and args.initial_combine_intra != 0:
         parser.error("Baseline mode uses the original Dispatch and Combine schedules; select dispatch for experiments")
     if args.mode == "paired-groups":
+        legacy_core_options = {
+            "--intra-cores",
+            "--dispatch-intra-cores",
+            "--combine-intra-cores",
+            "--combine-intra",
+            "--initial-combine-intra",
+        }
+        if args.group_intra_cores is not None and explicit_options & legacy_core_options:
+            parser.error("--group-intra-cores cannot be mixed with legacy core-sweep options")
         if (
             args.intra_cores not in (DEFAULT_CORES, "12")
             or args.dispatch_intra_cores is not None
             or args.combine_intra_cores is not None
             or args.initial_combine_intra not in (0, 12)
         ):
-            parser.error("paired-groups fixes Dispatch and Combine to 12 INTRA / 16 CROSS; no core sweep options")
+            parser.error(
+                "Use --group-intra-cores for paired-groups; legacy options only accept the original 12/16 setting"
+            )
         if args.run_full_reference or args.full_reference_dir or args.require_timing_match:
             parser.error(
                 "paired-groups changes core ownership and cannot use the original-schedule reference comparison"
             )
-        args.dispatch_cores = args.combine_cores = [12]
-        args.initial_combine_intra = 12
+        try:
+            args.group_cores = integers(
+                "12" if args.group_intra_cores is None else args.group_intra_cores, 27, "Group INTRA cores"
+            )
+        except argparse.ArgumentTypeError as error:
+            parser.error(str(error))
+        args.dispatch_cores = args.combine_cores = args.group_cores
+        args.initial_combine_intra = args.group_cores[0]
     if min(args.iters, args.timeout, args.alignment_rows, args.alignment_cols, args.alignment_repeats) < 1:
         parser.error("Iterations, timeout and alignment dimensions/repeats must be positive")
     if not math.isfinite(args.case_gap_seconds) or not 0 <= args.case_gap_seconds <= 60:
@@ -188,8 +219,10 @@ def plan(args):
         candidates = 0
         stages = [f"communication-only original schedule + {validation_stage}"]
     elif args.mode == "paired-groups":
-        candidates = 0
-        stages = [f"fixed Dispatch/Combine 12 INTRA / 16 CROSS paired XOR order + {validation_stage}"]
+        candidates = len(args.group_cores)
+        stages = [
+            f"Dispatch/Combine matched INTRA counts {args.group_cores}, order={args.group_order} + {validation_stage}"
+        ]
     elif args.mode == "dispatch":
         candidates = len(args.dispatch_cores)
         sweep_stage = "Dispatch sweep with Combine fixed; no Combine sweep"
@@ -207,7 +240,9 @@ def plan(args):
             sweep_stage,
             "fresh-process confirmation of selected pair",
         ]
-    case_launches = (1 if args.mode in ("baseline", "paired-groups") else candidates + 2) + int(args.run_full_reference)
+    case_launches = (
+        1 if args.mode == "baseline" else candidates if args.mode == "paired-groups" else candidates + 2
+    ) + int(args.run_full_reference)
     return dict(
         schema_version=3,
         workload="communication_only",
@@ -221,8 +256,9 @@ def plan(args):
         bs_values=args.bs_values,
         dispatch_intra_candidates=[] if args.mode == "baseline" else args.dispatch_cores,
         combine_intra_candidates=[] if args.mode == "baseline" else args.combine_cores,
-        combine_fixed=args.mode in ("dispatch", "paired-groups"),
-        fixed_pair=[12, 12] if args.mode == "paired-groups" else None,
+        combine_fixed=args.mode == "dispatch" or (args.mode == "paired-groups" and len(args.group_cores) == 1),
+        fixed_pair=[args.group_cores[0]] * 2 if args.mode == "paired-groups" and len(args.group_cores) == 1 else None,
+        group_pairs=[[cores, cores] for cores in args.group_cores] if args.mode == "paired-groups" else [],
         initial_combine_intra=args.initial_combine_intra,
         shmem_port_policy=args.shmem_port_policy,
         case_gap_seconds=args.case_gap_seconds,
@@ -249,7 +285,7 @@ def plan(args):
             else "Every case checks Dispatch bytes/scales/metadata and Combine output against independent synthetic payload expectations.",
             "No weights, GMM1, SwiGLU or GMM2 run in communication-only cases; synthetic GMM2 rows are prepared once before timing.",
             "Paired groups use own_group XOR phase (1,2,3), with no inter-group barrier or pipeline drain at group switches."
-            if args.mode == "paired-groups"
+            if args.group_order == "paired-xor"
             else "Split schedules use reverse cross-group order; inherited paired-group settings are cleared.",
             f"Dispatch keeps its production slot policy; communication-only Prefill Combine uses {args.combine_buffer_count} slots (original: 2).",
             "Dispatch metadata DMA adds one local 32-byte read per row; remote payload bytes and task ownership are unchanged.",
@@ -268,8 +304,12 @@ def plan(args):
 
 def candidate_environment(pair, base=None, *, group_order="reverse"):
     environment = dict(os.environ if base is None else base)
-    if group_order not in ("reverse", "paired-xor") or (group_order == "paired-xor" and pair != (12, 12)):
-        raise ValueError("paired-xor requires the fixed Dispatch/Combine pair (12,12)")
+    if group_order not in ("reverse", "paired-xor"):
+        raise ValueError("Group order must be reverse or paired-xor")
+    if group_order == "paired-xor" and (
+        pair is None or len(pair) != 2 or any(type(n) is not int or not 1 <= n <= 27 for n in pair)
+    ):
+        raise ValueError("paired-xor requires Dispatch/Combine INTRA counts in 1..27")
     for name in (ENV_DISPATCH, ENV_COMBINE, ENV_GROUP_ORDER):
         environment.pop(name, None)
     if pair is not None:
@@ -473,23 +513,24 @@ def read_case(
         raise ValueError("Expected explicit validation-skipped timer-row accounting for every rank")
     if set(report["communication"].get("operations", {})) != {"DISPATCH", "COMBINE"}:
         raise ValueError("Expected separate Dispatch and Combine mean-core-time bandwidth reports")
-    for value in report["communication"]["operations"].values():
+    for operation, value in report["communication"]["operations"].items():
         if any(
             not 0 < value[key] < float("inf")
             for key in ("gbps_per_card_mean", "gbps_per_card_min", "gbps_per_card_max")
         ):
             raise ValueError("Nonfinite/nonpositive communication bandwidth")
-        if group_order == "paired-xor":
+        intra_workers = pair[0 if operation == "DISPATCH" else 1] if pair else 0
+        if intra_workers:
             cohorts = value.get("cohorts", {})
             if set(cohorts) != {"INTRA", "CROSS"}:
-                raise ValueError("Paired-group report must contain separate INTRA/CROSS cohort bandwidths")
-            for name, workers in (("INTRA", 12), ("CROSS", 16)):
+                raise ValueError("Split-group report must contain separate INTRA/CROSS cohort bandwidths")
+            for name, workers in (("INTRA", intra_workers), ("CROSS", 28 - intra_workers)):
                 cohort = cohorts[name]
                 if cohort.get("workers") != workers or any(
                     not 0 < cohort.get(key, 0) < float("inf")
                     for key in ("gbps_per_card_mean", "gbps_per_card_min", "gbps_per_card_max")
                 ):
-                    raise ValueError("Invalid paired-group cohort worker count or bandwidth")
+                    raise ValueError("Invalid split-group cohort worker count or bandwidth")
     if validate:
         timer_comparison = json.loads((rank0 / "timer_accuracy.json").read_text(encoding="utf-8"))
         if sorted(r["rank"] for r in timer_comparison) != list(range(16)) or not all(
@@ -759,7 +800,8 @@ def main(argv=None):
             return item
 
         if args.mode == "paired-groups":
-            run_case((12, 12), "paired_groups")
+            for cores in args.group_cores:
+                run_case((cores, cores), "paired_groups")
             continue
         original = run_case(None, "baseline")
         if full_reference is not None:

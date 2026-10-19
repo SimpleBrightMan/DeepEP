@@ -83,10 +83,13 @@ done
 输出仍分别给出 Dispatch、Combine 的带宽和通信 kernel 总耗时；以相同 BS 的三种槽位结果比较。
 省略 `combine_buffer_count` 字段的旧报告按原 2 槽读取，不能作为 4/6 槽结果接受。
 
-## 固定 12/16 核的配对组轮转
+## 配对组轮转与核心配比控制实验
 
-`--mode paired-groups` 每个 BS 只运行一次固定配置：Dispatch、Combine 均由 AIV1 核 0..11 处理 INTRA，核 12..27 处理 CROSS。
-INTRA 包含本卡和同组其它三卡；CROSS 按 `peer_group = own_group XOR phase`，依次 `phase=1,2,3` 处理：
+`--mode paired-groups` 默认每个 BS 运行一次 12/16 配置：Dispatch、Combine 均由 AIV1 核 0..11 处理 INTRA，核 12..27 处理 CROSS。
+可用 `--group-intra-cores 12,4,6` 按列出的顺序运行三种配置；Dispatch、Combine 的 INTRA 核数同时取该值，CROSS 为 `28-INTRA`。
+每种配置各运行一次，不增加 baseline、选优或 confirm。核心数取不同的整数 `1..27`，两种通信分别按各自任务量做均分。
+
+INTRA 包含本卡和同组其它三卡；`--group-order paired-xor` 为默认顺序，CROSS 按 `peer_group = own_group XOR phase`，依次 `phase=1,2,3` 处理：
 
 | 逻辑阶段 | 配对组 |
 |---|---|
@@ -96,7 +99,8 @@ INTRA 包含本卡和同组其它三卡；CROSS 按 `peer_group = own_group XOR 
 
 这只是各核发起通信的先后顺序，没有新增阶段全卡同步、Host 同步或切组流水排空。
 各 rank/核心可因执行速度不同进入不同逻辑阶段，因此运行时不保证严格只有两组互通。
-同一 kernel 内 INTRA 与 CROSS 并发；保留每 Wave 的 token 集合、搬运字节和现有 timer 边界，核心归属按固定 12/16 分工重新划分。
+`--group-order reverse` 则使用原错峰顺序 `(own_group-phase+4)%4`；可在相同配比下对比两种顺序。
+同一 kernel 内 INTRA 与 CROSS 并发；保留每 Wave 的 token 集合、搬运字节和现有 timer 边界，核心归属按所选配比重新划分。
 组内任务继续采用余数轮转均分，避免无法整除的余数一直落在固定核心。
 
 更新并按前文重新编译后运行（显式使用当前要测试的 Combine 6 槽）：
@@ -108,18 +112,33 @@ python3 experiments/megamoe/scripts/comm_core_sweep.py \
   --no-validation --keep-raw-timers
 ```
 
-每个 BS 的 case 目录为 `bs_<BS>/paired_groups_d12_c12/`；不会额外跑 baseline、扫描、选优或 confirm，不画图。
-带宽仍按 Dispatch 和 Combine 分别统计。`plan.json`、rank manifest、详细报告、汇总 JSON/CSV 及控制台记录 `group_order=paired-xor`。
+针对 BS4096，一次编译后做两种组顺序 × 12/4/6 INTRA 核的控制实验：
+
+```bash
+for order in paired-xor reverse; do
+  python3 experiments/megamoe/scripts/comm_core_sweep.py \
+    --mode paired-groups --bs-values 4096 \
+    --group-intra-cores 12,4,6 --group-order "$order" \
+    --dispatch-metadata-mode dma --combine-buffer-count 6 \
+    --no-validation --keep-raw-timers || break
+done
+```
+
+总计六个 case，每种组顺序自动生成一个独立结果根目录；case 路径为 `bs_<BS>/paired_groups_d<N>_c<N>/`，例如 `paired_groups_d4_c4`。
+添加 `--plan` 可只打印顺序和 case 数量，不访问设备、不创建文件。没有绘图步骤。
+带宽仍按 Dispatch 和 Combine 分别统计。`plan.json`、rank manifest、详细报告、汇总 JSON/CSV 及控制台记录实际 `group_order`。
 固定分工时额外输出四项分类带宽：Dispatch INTRA/CROSS、Combine INTRA/CROSS。
-INTRA 为该类字节数除以 **12 个 INTRA 核累计通信耗时的均值**，CROSS 则除以 **16 个 CROSS 核累计通信耗时的均值**；两者单位仍为 GB/s/card。
+INTRA 为该类字节数除以 **N 个 INTRA 核累计通信耗时的均值**，CROSS 则除以 **28−N 个 CROSS 核累计通信耗时的均值**；两者单位仍为 GB/s/card，控制台同时显示 workers。
 这不是把分类时间稀释到 28 核的折算值，也不是整段 class-envelope 时间；两类带宽不能直接相加得到总带宽。
 原 Dispatch/Combine 总指标仍用全部 28 核累计通信时间的均值作分母，定义不变。
 原 baseline 核心同时承担混合拓扑任务，不生成无法从 timer 区分的分类带宽，CSV 对应列留空。
-driver 仅在此模式设置 `DEEPEP_MEGAMOE_COMM_GROUP_ORDER=paired-xor`，其它模式和完整 reference 会清除此继承变量，保持原 reverse 顺序。
+driver 在选择 paired-xor 时设置 `DEEPEP_MEGAMOE_COMM_GROUP_ORDER=paired-xor`；选择 reverse、其它模式及完整 reference 都清除此继承变量，保持原 reverse 顺序。
 旧报告缺少 `group_order` 字段时按 `reverse` 解释，不能作为 paired-xor 结果接受。
 
 `--mode baseline` 仍保留原 28 核分工；`--combine-buffer-count` 的全局默认仍为 2。
-paired-groups 不接受核心扫描或原算子时间比较参数；需要数据/逐任务验收时移除 `--no-validation` 即可，验收使用对应 paired-xor oracle。
+`--group-intra-cores`、`--group-order` 仅用于 paired-groups；新的配比列表不能与旧 `--intra-cores` / Dispatch / Combine 扫描参数混用。
+旧的 `--mode paired-groups --intra-cores 12` 仍兼容默认 12/16 配置。
+paired-groups 不接受原算子时间比较参数；需要数据/逐任务验收时移除 `--no-validation` 即可，验收使用相同配比和组顺序的 oracle。
 
 ## 可选的解耦验收
 
