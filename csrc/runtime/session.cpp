@@ -14,6 +14,8 @@
 #include "host/init/shmem_host_init.h"
 #include "host/mem/shmem_host_heap.h"
 #include "host/data_plane/shmem_host_cc.h"
+#include "host/shmem_host_def.h"
+#include "host_device/shmem_common_types.h"
 #include <limits>
 
 namespace deepep {
@@ -25,6 +27,36 @@ void check(int status, const char* operation)
     if (status != 0) {
         throw std::runtime_error(std::string(operation) + " failed (status=" + std::to_string(status) + ")");
     }
+}
+
+std::string megamoe_urma_topology_error(int rank, int world)
+{
+    // The pinned SDK exports this host state and its layout in an installed
+    // header. aclshmem_ptr alone is insufficient: the SDK fills peer addresses
+    // even when the corresponding peer has only UDMA reachability, not MTE.
+    const auto* state = static_cast<const aclshmem_device_host_state_t*>(dlsym(RTLD_DEFAULT, "g_state"));
+    if (state == nullptr)
+        return "MegaMoE URMA cannot verify MTE reachability: SHMEM lacks the pinned SDK's g_state symbol";
+    if (state->mype != rank || state->npes != world)
+        return "MegaMoE URMA cannot verify MTE reachability: SHMEM host state rank/world mismatch";
+    std::string missing;
+    std::string missing_udma;
+    for (int peer = 0; peer < world; ++peer) {
+        if (peer != rank && (state->topo_list[peer] & ACLSHMEM_TRANSPORT_MTE) == 0) {
+            if (!missing.empty()) missing += ",";
+            missing += std::to_string(peer);
+        }
+        if (peer != rank && (state->topo_list[peer] & ACLSHMEM_TRANSPORT_UDMA) == 0) {
+            if (!missing_udma.empty()) missing_udma += ",";
+            missing_udma += std::to_string(peer);
+        }
+    }
+    if (!missing.empty())
+        return "MegaMoE URMA rank=" + std::to_string(rank) + " has peers without MTE mappings: " + missing +
+               "; all EP16 peers must share an MTE-accessible UB domain for completion signals";
+    if (!missing_udma.empty())
+        return "MegaMoE URMA rank=" + std::to_string(rank) + " has peers without UDMA transport: " + missing_udma;
+    return {};
 }
 }  // namespace
 
@@ -38,7 +70,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
                  bool megamoe, bool mpi, bool combine_only, bool use_1g_huge_pages, bool megamoe_urma)
 {
     if (megamoe_urma && (!megamoe || !udma || size != 16 || mpi || combine_only || use_1g_huge_pages))
-        throw std::invalid_argument("MegaMoE URMA requires its dedicated single-node EP16 runtime");
+        throw std::invalid_argument("MegaMoE URMA requires its dedicated EP16 runtime");
     if (combine_only && (!udma || megamoe)) throw std::invalid_argument("Combine-only requires UDMA");
     if (use_1g_huge_pages && (!udma || megamoe))
         throw std::invalid_argument("1 GiB huge pages require the Elastic UDMA runtime");
@@ -163,10 +195,12 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
         }
         check(aclrtMemset(workspace_, allocation_bytes, 0, allocation_bytes), "aclrtMemset");
         if (megamoe_urma) {
-            // Bootstrap-only collective: every remote ready/handshake slot is
-            // initialized before any rank may launch its first PUT kernel.
-            // Subsequent invocations retain these flags and advance epochs.
-            aclshmem_barrier_all();
+            // Do not enter a device barrier before every rank has agreed that
+            // MTE signals are reachable. Python gathers this result through
+            // TCPStore after construction, also rendezvousing all memsets.
+            // A topology rejection retains the runtime until process exit:
+            // per-rank constructor cleanup/finalize could strand other ranks.
+            megamoe_urma_topology_error_ = deepep::megamoe_urma_topology_error(rank, size);
         }
         bytes_ = bytes;
         allocation_bytes_ = allocation_bytes;
@@ -342,6 +376,9 @@ void Session::check_context() const
     }
     if (closed_) {
         throw std::runtime_error("Runtime is closed");
+    }
+    if (!megamoe_urma_topology_error_.empty()) {
+        throw std::runtime_error(megamoe_urma_topology_error_ + "; restart the distributed job");
     }
     aclrtContext current = nullptr;
     check(aclrtGetCurrentContext(&current), "aclrtGetCurrentContext");

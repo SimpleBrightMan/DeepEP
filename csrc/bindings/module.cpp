@@ -59,6 +59,7 @@ PYBIND11_MODULE(_C, module)
         .def_property_readonly("workspace_allocation_bytes", &deepep::Session::workspace_allocation_bytes)
         .def_property_readonly("sparse_qp_enabled", &deepep::Session::sparse_qp_enabled)
         .def_property_readonly("megamoe_urma", &deepep::Session::megamoe_urma)
+        .def_property_readonly("megamoe_urma_topology_error", &deepep::Session::megamoe_urma_topology_error)
         .def_property_readonly("peer_table", &deepep::Session::peer_table);
 #ifdef DEEPEP_BUILD_MEGAMOE
     module.def(

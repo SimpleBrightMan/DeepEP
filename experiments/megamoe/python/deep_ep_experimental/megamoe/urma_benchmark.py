@@ -1,4 +1,4 @@
-"""Full URMA MegaMoE benchmark; launch with torchrun on one allocated EP16 host."""
+"""Full URMA MegaMoE benchmark; EP16, with explicit opt-in for multiple hosts."""
 
 import argparse
 from datetime import datetime, timezone
@@ -12,8 +12,8 @@ from .benchmark import inputs, load_config
 from .performance import summarize_rounds
 
 
-def summarize_metric(per_rank, metric, scope):
-    report = summarize_rounds(per_rank, 16)
+def summarize_metric(per_rank, metric, scope, ranks_per_node=16):
+    report = summarize_rounds(per_rank, ranks_per_node)
     report.update(
         metric=metric,
         measured_scope=scope,
@@ -29,6 +29,11 @@ def main():
     parser.add_argument("--bs-values", default="2048,4096,8192")
     parser.add_argument("--routing", choices=("balanced", "random", "skewed"), default="balanced")
     parser.add_argument("--cv-rows", type=int, default=256)
+    parser.add_argument(
+        "--allow-multi-host",
+        action="store_true",
+        help="Explicitly allow EP16 across hosts; requires cross-host SHMEM mapping and URMA connectivity",
+    )
     parser.add_argument(
         "--max-recv-rows", type=int, help="Per-rank capacity; default 2 * max(BS) * topk; excessive skew is rejected"
     )
@@ -85,6 +90,7 @@ def run(args, config, group):
     from .validation import collective_check
 
     rank, world = group.rank(), group.size()
+    ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", "16"))
     collective_check(
         group,
         "URMA benchmark options",
@@ -98,6 +104,8 @@ def run(args, config, group):
             args.timer_clock_mhz,
             str(args.golden_dir),
             args.check_tokens,
+            args.allow_multi_host,
+            ranks_per_node,
         ),
     )
     rank_dir = args.output_dir / f"rank_{rank}"
@@ -124,6 +132,7 @@ def run(args, config, group):
         num_max_tokens_per_rank=max(config["bs_values"]),
         cv_rows=args.cv_rows,
         max_recv_rows=args.max_recv_rows,
+        allow_multi_host=args.allow_multi_host,
     )
     if args.timer and not owner.timer_enabled:
         raise RuntimeError("--timer requires native URMA timer support in the installed wheel")
@@ -142,6 +151,9 @@ def run(args, config, group):
         config=config,
         rank=rank,
         world=world,
+        ranks_per_node=ranks_per_node,
+        allow_multi_host=args.allow_multi_host,
+        bandwidth_topology="logical contiguous rank groups of four; multi-host validation is not UBX bandwidth equivalence",
         transport="URMA PUT-only",
         remote_workers=15,
         swiglu_workers=13,
@@ -186,7 +198,7 @@ def run(args, config, group):
             route_times.append((time.perf_counter_ns() - start) / 1000)
         route_records = group.all_gather(route_times, f"URMA route samples BS={bs}")
         route_report = summarize_metric(
-            route_records, "ROUTE_PREP", "host wall time of complete route/descriptor preparation"
+            route_records, "ROUTE_PREP", "host wall time of complete route/descriptor preparation", ranks_per_node
         )
 
         # NPU event interval contains the entire native forward, including local
@@ -207,6 +219,7 @@ def run(args, config, group):
             cached_records,
             "CACHED_FORWARD",
             "NPU event interval: local expand through final weighted reduction; routes cached",
+            ranks_per_node,
         )
         received_rows = prepared.received_rows
         del prepared, cached_events
@@ -224,6 +237,7 @@ def run(args, config, group):
             full_records,
             "FULL_E2E",
             "host wall time: fresh route preparation + local expand + complete native operator + synchronize",
+            ranks_per_node,
         )
         reports = {
             "bs": bs,

@@ -2,7 +2,7 @@
 
 本实验是完整的 Prefill 算子：真实路由准备、本地展开、Dispatch、GMM1、SwiGLU/MXFP8 量化、GMM2、Combine PUT、最终同步和加权 Reduce。没有屏蔽计算，也没有使用预置 balanced 专用路由。
 
-首版范围：单机 EP16、28 个 AIC / 56 个 AIV、每个 AIV 至少 256 KiB UB、H=3584、I=1280、384 个专家、TopK=8、无共享专家、FP8 输入/FP4 权重、BS=2048/4096/8192。任意合法路由均走同一流程；超过配置接收容量的偏斜路由会在启动计算前明确报错。
+首版范围：默认单机 EP16，固定使用28个AIC / 56个AIV、每个AIV至少256 KiB UB、H=3584、I=1280、384个专家、TopK=8、无共享专家、FP8输入/FP4权重、BS=2048/4096/8192。物理核心数更多的兼容机型仍只启动这28组计算核。任意合法路由均走同一流程；超过配置接收容量的偏斜路由会在启动计算前明确报错。
 
 通信接口与固定 CV 调度参考 [ops-transformer PR11602](https://gitcode.com/cann/ops-transformer/pull/11602)（分析版本 `3ab6b8bba2cbdaf3751596c3e4b0488e1991df5f`）。计算复用本仓主线的 FP8/W4 CATLASS 和 SwiGLU 算术；返回方向改为 PUT。
 
@@ -84,6 +84,14 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib${CONDA_PREFIX:+:$CONDA_PREFIX/lib}${LD_L
 `cv_rows`首版接受128到4096之间128的整数倍。原始输入scale可以为`[BS,H/32]`或`[BS,H/64,2]`，Python在native调用前统一为后者，不改变scale内容。
 
 默认只测性能，明确打印`VALIDATION skipped`，不将其写成精度通过。如需数值对照，先按照现有CPU Golden流程生成FP8、相同config/seed/routing/BS/check-tokens的缓存，再增加`--golden-dir <目录> --check-tokens <同一数值>`。CPU路由单元测试不等于NPU数值验证。
+
+## 同UB域的双机功能验证
+
+双机8+8可在两边torchrun使用`--nnodes=2 --nproc-per-node=8`，分别设置`--node-rank=0/1`，共用可达的`--master-addr`、`--master-port`和`DEEPEP_SHMEM_ENDPOINT`，并给benchmark增加`--allow-multi-host`。API对应`UrmaBuffer(..., allow_multi_host=True)`；必须所有rank一致开启。每台的`ASCEND_RT_VISIBLE_DEVICES`只列本机8张卡。
+
+此开关仅用于同一可映射UB内存域的功能验证。初始化后按仓库固定版本SHMEM的真实topology标志检查所有peer的MTE可达性，再经Host Store做全rank就绪核验。`aclshmem_ptr`非空本身不能证明MTE可达。拓扑检查失败时中止整次作业，不进入设备通信；也不尝试在不可达域上执行设备barrier清理。普通跨机RoCE网络不满足本实现的MTE完成信号条件。
+
+不同机型跑出的耗时只证明流程能够执行，不能作为UBX性能结论；打印的本组/跨组仍按连续4个逻辑rank分组，并在manifest中注明这一口径。
 
 ## 计时和带宽
 

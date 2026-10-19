@@ -35,6 +35,12 @@ class _UrmaRuntime(Runtime):
     _megamoe = True
     _megamoe_urma = True
 
+    def __init__(self, group, capacity, timeout=120, *, allow_multi_host=False):
+        if type(allow_multi_host) is not bool:
+            raise TypeError("allow_multi_host must be bool")
+        self._megamoe_urma_multi_host = allow_multi_host
+        super().__init__(group, capacity, timeout)
+
 
 @dataclass(frozen=True)
 class PreparedUrmaRoutes:
@@ -49,7 +55,7 @@ class PreparedUrmaRoutes:
 
 
 class UrmaBuffer:
-    """Single-node EP16 resource owner, with 15 remote workers and 13 SwiGLU workers."""
+    """EP16 owner; multiple hosts require explicit opt-in on every rank."""
 
     def __init__(
         self,
@@ -64,6 +70,7 @@ class UrmaBuffer:
         cv_rows=256,
         max_recv_rows=None,
         timeout=120,
+        allow_multi_host=False,
     ):
         import torch
 
@@ -74,7 +81,9 @@ class UrmaBuffer:
             max_recv_rows = 2 * num_max_tokens_per_rank * num_topk
         try:
             if group.size() != 16:
-                raise ValueError("URMA MegaMoE currently requires EP16 on one host")
+                raise ValueError("URMA MegaMoE currently requires EP16")
+            if type(allow_multi_host) is not bool:
+                raise TypeError("allow_multi_host must be bool")
             if (hidden, intermediate_hidden, num_experts, num_topk, num_shared_experts) != (3584, 1280, 384, 8, 0):
                 raise ValueError("First URMA profile supports H3584/I1280/E384/topk8/S0 only")
             integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 2048, 8192)
@@ -98,6 +107,7 @@ class UrmaBuffer:
                 cv_rows,
                 max_recv_rows,
                 timeout,
+                allow_multi_host,
             ),
         )
         self.group = group
@@ -105,6 +115,7 @@ class UrmaBuffer:
         self.num_experts, self.num_topk = num_experts, num_topk
         self.num_max_tokens_per_rank, self.max_recv_rows = num_max_tokens_per_rank, max_recv_rows
         self.cv_rows = cv_rows
+        self.allow_multi_host = allow_multi_host
         self._device = torch.device(f"npu:{npu_api().current_device()}")
         self._lock = threading.RLock()
         self._epoch = 0
@@ -126,7 +137,7 @@ class UrmaBuffer:
         # No rank may enter collective SHMEM initialization after another rank
         # rejected the wheel/layout or failed its ordinary-device allocation.
         collective_check(group, "URMA pre-runtime allocation", error)
-        self._runtime = _UrmaRuntime(group, capacity, timeout)
+        self._runtime = _UrmaRuntime(group, capacity, timeout, allow_multi_host=allow_multi_host)
 
     @property
     def symmetric_buffer_bytes(self):

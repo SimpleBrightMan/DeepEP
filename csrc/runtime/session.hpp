@@ -106,6 +106,10 @@ public:
     {
         return megamoe_urma_;
     }
+    const std::string& megamoe_urma_topology_error() const
+    {
+        return megamoe_urma_topology_error_;
+    }
 
 private:
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
@@ -129,6 +133,7 @@ private:
     int world_ = 0;
     bool udma_ = false;
     bool megamoe_urma_ = false;
+    std::string megamoe_urma_topology_error_;
     bool combine_only_ = false;
     bool sparse_qp_enabled_ = false;
     bool peer_table_ = false;

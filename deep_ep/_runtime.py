@@ -68,6 +68,7 @@ class Runtime:
 
     _megamoe = False
     _megamoe_urma = False
+    _megamoe_urma_multi_host = False
 
     def __init__(
         self,
@@ -86,6 +87,10 @@ class Runtime:
         global _OWNER
         if self._megamoe_urma and not self._megamoe:
             raise ValueError("The MegaMoE URMA profile requires a MegaMoE runtime owner")
+        if type(self._megamoe_urma_multi_host) is not bool:
+            raise TypeError("MegaMoE URMA multi-host opt-in must be bool")
+        if self._megamoe_urma_multi_host and not self._megamoe_urma:
+            raise ValueError("Multi-host opt-in requires the dedicated MegaMoE URMA runtime profile")
         native = require_native("Runtime.__init__")
         maximum_capacity = (32 << 30) if self._megamoe_urma else (1 << 30) if self._megamoe else (1 << 63) - 1
         integer("capacity", capacity, 2 << 20, maximum_capacity)
@@ -122,6 +127,8 @@ class Runtime:
             raise ValueError("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1")
         self.bootstrap = bootstrap
         store_group = self._megamoe and isinstance(group, StoreGroup)
+        if self._megamoe_urma and not store_group:
+            raise TypeError("MegaMoE URMA requires a StoreGroup for collective MTE-domain readiness checks")
         if self._megamoe and (group is None or udma):
             raise ValueError("MegaMoE requires a ProcessGroup or StoreGroup and the MTE runtime")
         if store_group:
@@ -134,7 +141,7 @@ class Runtime:
         if self._megamoe:
             integer("world_size", size, 2, 128)
             if self._megamoe_urma and size != 16:
-                raise ValueError("MegaMoE URMA currently requires single-node EP16")
+                raise ValueError("MegaMoE URMA currently requires EP16")
             factory_name = "create_megamoe_urma_runtime" if self._megamoe_urma else "create_megamoe_runtime"
             factory = getattr(native, factory_name, None)
             if factory is None:
@@ -184,6 +191,7 @@ class Runtime:
                     + 8 * int(use_1g_huge_pages)
                     + 16 * int(debug_collectives)
                     + 32 * int(self._megamoe_urma)
+                    + 64 * int(self._megamoe_urma_multi_host)
                 )
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")
@@ -201,7 +209,8 @@ class Runtime:
                     raise ValueError("Ranks disagree on workspace capacity, timeout or bootstrap endpoint")
                 if any(value[-1] != values[0][-1] for value in values):
                     raise ValueError(
-                        "Ranks disagree on MTE/URMA runtime engines, QP configuration, page size or debug_collectives"
+                        "Ranks disagree on MTE/URMA runtime engines, QP configuration, page size, "
+                        "debug_collectives or multi-host opt-in"
                     )
                 if self._megamoe:
                     invalid_hosts = [i for i, value in enumerate(values) if value[4] == 0]
@@ -211,8 +220,11 @@ class Runtime:
                             "host identity is required before SHMEM initialization"
                         )
                     hosts = {value[4] for value in values}
-                    if self._megamoe_urma and len(hosts) != 1:
-                        raise ValueError("MegaMoE URMA requires all 16 ranks on one Linux host")
+                    if self._megamoe_urma and len(hosts) != 1 and not self._megamoe_urma_multi_host:
+                        raise ValueError(
+                            "MegaMoE URMA requires all 16 ranks on one Linux host by default; "
+                            "set allow_multi_host=True explicitly on every rank for multi-host validation"
+                        )
                     for host in hosts:
                         local = [value for value in values if value[4] == host]
                         if len({value[5] for value in local}) != 1:
@@ -246,7 +258,28 @@ class Runtime:
                 )
             )
             _OWNER = self
-            if capacity == 8 << 30 and 16 <= size <= 256:
+            if self._megamoe_urma:
+                # A non-null aclshmem_ptr can be a UDMA-only virtual address.
+                # Session reports the actual per-peer MTE topology bits after
+                # initialization and local heap memset. This host rendezvous
+                # precedes every device-domain barrier or signal operation.
+                try:
+                    topology_error = self.native.megamoe_urma_topology_error
+                    if not isinstance(topology_error, str):
+                        topology_error = "native URMA topology status must be a string"
+                except Exception as error:
+                    topology_error = f"cannot inspect native URMA MTE topology: {error}"
+                try:
+                    readiness = group.all_gather(topology_error, "URMA MTE domain readiness")
+                    failures = [f"rank={peer}: {error}" for peer, error in enumerate(readiness) if error]
+                    if failures:
+                        raise RuntimeError("URMA MTE domain is not ready: " + "; ".join(failures))
+                except Exception as error:
+                    group.abort(f"URMA MTE domain readiness: {error}")
+                    # Retain _OWNER. Finalize may itself require the broken
+                    # device domain; the launcher must terminate every worker.
+                    raise
+            if capacity == 8 << 30 and 16 <= size <= 256 and not self._megamoe_urma:
                 # LL peers must finish initialization before any payload writes.
                 self.native.barrier()
 

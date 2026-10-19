@@ -7,6 +7,7 @@
 #include <vector>
 #include <acl/acl.h>
 #include "check.hpp"
+#include "shmem.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "tiling/platform/platform_ascendc.h"
@@ -99,10 +100,22 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub);
     const uint32_t aic = platform->GetCoreNumAic();
     const uint32_t aiv = platform->GetCoreNumAiv();
-    TORCH_CHECK(aic == 28 && aiv == 56 && ub >= 256U * 1024U,
-                "URMA v1 requires 28 AIC / 56 AIV and at least 256 KiB UB");
-    platform_ = {aic, aiv, static_cast<uint32_t>(ub), platform->CalcTschBlockDim(aiv, aic, aiv),
-                 platform->GetLibApiWorkSpaceSize()};
+    TORCH_CHECK(aic >= MegaMoeUrma::kAic && aiv >= 2U * MegaMoeUrma::kAic && ub >= 256U * 1024U,
+                "URMA v1 needs at least 28 AIC / 56 AIV and 256 KiB UB; it always launches 28 AIC blocks");
+    // Physical devices may have more cores. The kernel's 28/15/13 partitions
+    // and timer storage are fixed: never launch the extra physical blocks.
+    constexpr uint32_t launch_aic = MegaMoeUrma::kAic;
+    constexpr uint32_t launch_aiv = 2U * launch_aic;
+    platform_ = {launch_aic, launch_aiv, static_cast<uint32_t>(ub),
+                 platform->CalcTschBlockDim(launch_aiv, launch_aic, launch_aiv), platform->GetLibApiWorkSpaceSize()};
+
+    TORCH_CHECK(aclshmem_my_pe() == rank && aclshmem_n_pes() == 16, "URMA plan does not match its SHMEM runtime");
+    for (int peer = 0; peer < 16; ++peer) {
+        TORCH_CHECK(aclshmem_ptr(reinterpret_cast<void*>(symmetric_address), peer) != nullptr,
+                    "URMA completion signals require an MTE-accessible symmetric window for every peer; rank=", rank,
+                    " cannot map peer=", peer,
+                    ". Multi-host testing requires one mutually accessible UB memory domain.");
+    }
 
     const auto* counts = counts_cpu.data_ptr<int64_t>();
     uint64_t peer_rows[16][16]{};

@@ -3,6 +3,8 @@
 // Link-time SDK doubles test ownership decisions, never ABI/device support.
 #include "runtime/session.hpp"
 #include "host/init/shmem_host_init.h"
+#include "host/shmem_host_def.h"
+#include "host_device/shmem_common_types.h"
 #include <cassert>
 #include <cstdlib>
 #include <stdexcept>
@@ -28,6 +30,7 @@ size_t page_granularity = 1ULL << 30;
 std::string fault;
 std::vector<std::string> physical_calls;
 bool huge_registered = false;
+aclshmem_device_host_state_t host_state;
 template <class Action>
 void fails(Action action)
 {
@@ -40,6 +43,11 @@ void fails(Action action)
     assert(failed);
 }
 }  // namespace
+extern "C" void* __wrap_dlsym(void*, const char* name)
+{
+    if (std::string(name) == "g_state" && fault != "topology-symbol") return &host_state;
+    return nullptr;
+}
 int aclrtGetCurrentContext(aclrtContext* context)
 {
     *context = current_context;
@@ -153,6 +161,13 @@ int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
     assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | (qp_count ? ACLSHMEM_DATA_OP_UDMA : 0)));
     if (init_status == 0) {
         initialized = 2;
+        host_state.mype = attr->my_pe;
+        host_state.npes = attr->n_pes;
+        for (int peer = 0; peer < attr->n_pes; ++peer)
+            host_state.topo_list[peer] = ACLSHMEM_TRANSPORT_MTE | ACLSHMEM_TRANSPORT_UDMA;
+        if (fault == "topology-udma-only") host_state.topo_list[8] = ACLSHMEM_TRANSPORT_UDMA;
+        if (fault == "topology-mte-only") host_state.topo_list[8] = ACLSHMEM_TRANSPORT_MTE;
+        if (fault == "topology-state") ++host_state.npes;
     }
     return init_status;
 }
@@ -219,9 +234,25 @@ int main(int argc, char** argv)
             auto session = create_urma();
             assert(session.megamoe_urma() && session.udma() && !session.peer_table() && !session.sparse_qp_enabled());
             assert(session.workspace_address() == reinterpret_cast<uintptr_t>(&storage));
-            assert(qp_count == 1 && allocations == 1 && memsets == 1 && barriers == 1);
+            assert(session.megamoe_urma_topology_error().empty());
+            assert(qp_count == 1 && allocations == 1 && memsets == 1 && barriers == 0);
             session.close();
             assert(frees == 1 && finalized == 1 && !deepep::Session::busy());
+        } else if (fault.rfind("topology-", 0) == 0) {
+            auto session = create_urma();
+            assert(!session.megamoe_urma_topology_error().empty());
+            if (fault == "topology-udma-only")
+                assert(session.megamoe_urma_topology_error().find("without MTE mappings: 8") != std::string::npos);
+            if (fault == "topology-mte-only")
+                assert(session.megamoe_urma_topology_error().find("without UDMA transport: 8") != std::string::npos);
+            // Caller must report through a host collective and terminate the
+            // whole job. Neither construction nor accidental use/cleanup may
+            // launch a device barrier on a partially mapped MTE domain.
+            fails([&]() { session.workspace_address(); });
+            fails([&]() { session.barrier(); });
+            fails([&]() { session.close(); });
+            assert(deepep::Session::busy() && !session.closed() && memsets == 1);
+            assert(barriers == 0 && finalized == 0 && frees == 0);
         } else {
             if (fault == "world") expected_world = 8;
             fails(create_urma);
@@ -316,6 +347,7 @@ int main(int argc, char** argv)
         assert(!session.udma() && qp_count == 0);
         assert(session.workspace_address() == reinterpret_cast<uintptr_t>(session.workspace()));
         assert(session.rank() == 0 && session.world() == 2);
+        assert(session.megamoe_urma_topology_error().empty());
         session.close();
         fails([&]() { session.workspace_address(); });
         assert(!deepep::Session::busy());

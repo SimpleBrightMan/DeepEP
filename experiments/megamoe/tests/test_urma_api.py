@@ -207,3 +207,36 @@ def test_modified_prepared_routes_abort_before_epoch_or_native_submission(monkey
         owner.forward_prepared(x, probs, w1, w2, prepared)
     assert epochs == [] and owner._epoch == 0 and len(aborts) == 1
     owner._runtime.closed = True
+
+
+@pytest.mark.parametrize("allow", [False, True])
+def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runtime(monkeypatch, allow):
+    from deep_ep._store import StoreGroup
+
+    fake_torch = SimpleNamespace(device=lambda name: name, empty=lambda *a, **k: object(), float8_e4m3fn="fp8")
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(urma, "npu_api", lambda: SimpleNamespace(current_device=lambda: 0))
+    monkeypatch.setattr(urma, "_extension", lambda: SimpleNamespace(urma_buffer_size=lambda *a: 2 << 20))
+    checks, created = [], []
+
+    def check(group, stage, error, signature=None):
+        assert error is None
+        checks.append((stage, signature))
+
+    def runtime(group, capacity, timeout, *, allow_multi_host):
+        created.append(allow_multi_host)
+        return SimpleNamespace(closed=True)
+
+    monkeypatch.setattr(urma, "collective_check", check)
+    monkeypatch.setattr(urma, "_UrmaRuntime", runtime)
+    buffer = urma.UrmaBuffer(StoreGroup(None, 0, 16, prefix="test"), allow_multi_host=allow)
+    assert buffer.allow_multi_host is allow
+    assert created == [allow]
+    assert checks[0][1][-1] is allow
+
+
+def test_benchmark_summaries_preserve_two_eight_rank_nodes():
+    from deep_ep_experimental.megamoe.urma_benchmark import summarize_metric
+
+    report = summarize_metric([[float(rank + 1)] * 4 for rank in range(16)], "FULL_E2E", "test", ranks_per_node=8)
+    assert [node["rank_start"] for node in report["per_node"]] == [0, 8]
