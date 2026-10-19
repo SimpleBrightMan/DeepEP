@@ -23,6 +23,7 @@ WARMUP=${WARMUP:-10}
 ITERS=${ITERS:-50}
 CORES=${CORES:-64}
 TIMEOUT=${TIMEOUT:-1800}
+DRY_RUN=0
 MASTER=${MASTER:-$(hostname -I | awk '{print $1}')}
 PORT=${SHMEM_PORT:-19091}
 OUTPUT=${OUTPUT:-$ROOT/benchmarks/alltoall_mte/results/run_$(date +%Y%m%d-%H%M%S)}
@@ -46,6 +47,7 @@ while [[ $# -gt 0 ]]; do
         --master) MASTER=$2; shift 2 ;;
         --output) OUTPUT=$2; shift 2 ;;
         --port) PORT=$2; shift 2 ;;
+        --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage ;;
         *) echo "unknown argument: $1" >&2; usage ;;
     esac
@@ -63,7 +65,6 @@ source "$CANN_ENV"
 [[ ! -f "$SHMEM_ROOT/set_env.sh" ]] || source "$SHMEM_ROOT/set_env.sh"
 export SHMEM_ROOT
 export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
-export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export DEEPEP_SHMEM_ENDPOINT="tcp://$MASTER:$PORT"
 export DEEPEP_SHMEM_DENSE_QPS=0
 export OMP_NUM_THREADS=1
@@ -83,6 +84,40 @@ fi
 echo "[alltoall-mte] master=$MASTER world=$WORLD_SIZE tokens=$TOKENS token_bytes=$TOKEN_BYTES"
 echo "[alltoall-mte] output=$OUTPUT"
 mkdir -p "$OUTPUT"
+OUTPUT=$(cd "$OUTPUT" && pwd)
+
+# A source checkout of `deep_ep` without `_C.so` shadows the installed wheel
+# when the repository root is on sys.path. Prefer a source tree only when it
+# actually contains a native extension; otherwise run from a tiny import root
+# that exposes `benchmarks` but not `deep_ep`, so the installed wheel wins.
+shopt -s nullglob
+dev_extensions=("$ROOT"/deep_ep/_C*.so)
+shopt -u nullglob
+if (( ${#dev_extensions[@]} > 0 )); then
+    RUN_ROOT="$ROOT"
+else
+    RUN_ROOT="$OUTPUT/pyroot"
+    mkdir -p "$RUN_ROOT"
+    ln -sfn "$ROOT/benchmarks" "$RUN_ROOT/benchmarks"
+fi
+export PYTHONPATH="$RUN_ROOT"
+cd "$RUN_ROOT"
+
+if ! "$PYTHON" -c "from deep_ep._native import require_native; m=require_native('alltoall linkage'); assert hasattr(m, 'alltoall') and hasattr(m, 'alltoall_drain')" >/dev/null 2>&1; then
+    echo "[alltoall-mte] cannot load the alltoall native extension." >&2
+    echo "  python:     $PYTHON" >&2
+    echo "  import root: $RUN_ROOT" >&2
+    echo "  Install the wheel built from this branch with this same Python, or keep _C*.so under $ROOT/deep_ep/." >&2
+    echo "  Diagnose from /tmp: \"$PYTHON\" -c \"import deep_ep, pathlib; print(pathlib.Path(deep_ep.__file__).parent)\"" >&2
+    exit 4
+fi
+
+if [[ "$DRY_RUN" == "1" ]]; then
+    echo "[alltoall-mte] dry-run ok: python=$PYTHON import_root=$RUN_ROOT"
+    "$PYTHON" -c "import deep_ep; print('[alltoall-mte] deep_ep=' + deep_ep.__file__)"
+    exit 0
+fi
+
 npu-smi info >"$OUTPUT/npu-before.log" 2>&1 || true
 
 pids=()
