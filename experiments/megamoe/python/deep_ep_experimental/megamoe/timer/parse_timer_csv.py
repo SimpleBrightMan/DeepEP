@@ -25,6 +25,7 @@ from .protocol import (
     WAVE_ID_OFFSET,
     WAVE_ID_PER_CORE,
     task_metadata,
+    validate_timer_schema,
 )
 
 
@@ -48,6 +49,7 @@ def load_raw(path: Path):
             f"{TOTAL_BUFFER_SIZE}; rebuild kernels/extensions and keep the "
             "C++ and Python timer schemas synchronized"
         )
+    validate_timer_schema(values)
     return values
 
 

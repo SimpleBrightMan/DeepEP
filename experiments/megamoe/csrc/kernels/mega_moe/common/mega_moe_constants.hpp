@@ -75,6 +75,20 @@ constexpr int64_t E5M2_QUANT = 3U;
 constexpr int64_t E2M1_QUANT = 5U;
 constexpr int64_t OVERFLOW_MODE_CTRL = 60U;
 constexpr uint8_t COMBINE_NO_QUANT = 0;
+// Full Prefill optimization keeps the physical compute team unchanged.
+constexpr uint32_t PREFILL_COMM_INTRA_CORES = 4U;
+constexpr uint32_t PREFILL_COMM_TOTAL_CORES = 28U;
+constexpr uint32_t WAVE_COMBINE_PREFILL_ROW_BUFFER_COUNT = 8U;
+constexpr uint32_t WAVE_COMBINE_UB_BASE = 64U * 1024U;
+// Ready-scan scratch starts at 184 KiB; it must not overlap the row ring.
+constexpr uint32_t WAVE_COMBINE_UB_LIMIT = 184U * 1024U;
+
+constexpr bool CombinePrefillRowRingFits(uint32_t hidden)
+{
+    const uint64_t strideBytes = (static_cast<uint64_t>(hidden) * 2U + 31U) / 32U * 32U;
+    return strideBytes * WAVE_COMBINE_PREFILL_ROW_BUFFER_COUNT <= WAVE_COMBINE_UB_LIMIT - WAVE_COMBINE_UB_BASE;
+}
+
 constexpr uint8_t MXFP8_E4M3_COMM_QUANT = 4;
 constexpr uint32_t META_INFO_SIZE = 8U;
 constexpr uint8_t GROUPED_MATMUL_MODE_GENERAL = 0U;

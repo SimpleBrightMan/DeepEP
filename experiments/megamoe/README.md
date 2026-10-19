@@ -8,6 +8,10 @@ Modified by Joyce_An 2026
 公开入口：`deep_ep_experimental.megamoe`。W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度。
 构建和多机测试入口位于本目录的 `scripts/`；机器地址及环境配置由使用者提供。
 
+`mega-prefill-1019` 分支的单机 EP16、28 核 Prefill 优化和运行命令见
+[Prefill 1019](PREFILL_1019.md)。它运行完整算子，默认启用 Dispatch metadata DMA、
+Dispatch/Combine 各 4 个本组核和 24 个跨组核、XOR 顺序以及 6/8 槽位；不满足条件时保留原路径。
+
 ## 1. 输入、输出与公开接口
 
 定义：`B` 为每卡 token 数，`H` 为隐藏维度，`I` 为 SwiGLU 后宽度，`K` 为 top-k，
@@ -95,11 +99,12 @@ H=1024～8192 且为64的倍数，I=256～4096 且为128的倍数，1≤K≤min(
 
 两条路径均使用 CATLASS 后端、M256 和 N256 共享 SwiGLU。路由专家在 B≤256 使用逻辑 N128/物理 N256 融合；B>256 使用 gate256/up256 配对任务。
 Token Combine 按实际单卡 B 选择：B≤256 使用六槽，B>256 使用两槽，与是否开启共享专家无关。
+上述单机 Prefill 优化启用时，B>256 的 Combine 使用八槽。
 小 BS 使用逐槽 epoch/count 就绪协议，每个物理 AIV 本地推进一次 epoch，
 输出握手再推进一次；大 BS 使用输入/输出跨卡握手。共享 GMM1 后无需全核屏障。
 共享 SwiGLU 在 AIV1 上优先于 Combine，共享 GMM2 按本核路由完成及共享激活就绪推进。
 S=0 的 W4A8 小 BS 也使用上述量化完成/count 就绪协议；W8A8 使用输入/输出跨卡握手。
-tiling ABI 为 224 字节。
+tiling ABI 仍为 224 字节，新增优化开关占用原尾部 padding（偏移220）；kernel 入口新增 metadata 参数，切换到本分支后须重新编译安装。
 CATLASS GMM 的布局和同步机制见 [GMM 说明](csrc/kernels/mega_moe/catlass_gmm/README.md)。
 
 所有 rank 必须按相同顺序、相同 B 调用，切换 B 时在计时前集体调用 `prepare(B)`。
@@ -229,7 +234,9 @@ python experiments/megamoe/scripts/batch_launch.py --hosts-file "$HOSTS_FILE" --
 精度测试以相同输入、权重和路由生成的 CPU Golden 为参考，生成输出和专家计数的校验报告。
 CPU Golden 缓存位于 `benchmark-golden/`，相同配置可复用。
 性能测试根据关闭 timer 时 profiler 采集的算子 kernel Duration，生成耗时统计报告。
-流水分析根据独立采集的设备 timer 数据，生成流水 JSON 和阶段耗时报告，默认解析主节点 rank0～7。
+流水分析根据独立采集的设备 timer 数据，生成流水 JSON 和阶段耗时报告。
+本节多机脚本显式选择主节点 rank0～7；直接运行 benchmark 时默认采集全部 rank，
+单机 EP16 的完整示例和四类带宽口径见 [Prefill 1019](PREFILL_1019.md)。
 
 终端输出各 BS 的 `[PERF]` 耗时或 `[ACCURACY SUMMARY]` 精度摘要，结果保存至：
 `benchmark-runs/ep<EP>_<时间>_<编号>/`。

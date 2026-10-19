@@ -30,7 +30,7 @@ private:
 
 public:
     using MegaMoeBase::Init;
-    __aicore__ inline void Process();
+    __aicore__ inline void Process(GM_ADDR dispatchMetadata = nullptr);
 
 private:
     using QuantOutType = typename MegaMoeBase::QuantOutType;
@@ -84,6 +84,10 @@ private:
     __aicore__ inline bool NextAivSlice(AivTaskCursor& cursor, bool activation);
     __aicore__ inline bool TryRunReadyActivation(const AivTaskCursor& cursor, int32_t& readySequence);
     __aicore__ inline bool TryRunReadyCombine(const AivTaskCursor& cursor);
+    __aicore__ inline bool UseOptimizedPrefillCommunication() const
+    {
+        return params_.tilingData->prefillCommOptimized != 0U && tokenDispatchScratch_.dmaMetadataInput != nullptr;
+    }
     __aicore__ inline void ProcessAiv1PriorityStages(int32_t& readySequence);
     __aicore__ inline bool IsPositionWithinWave(const ExpertTokenPosition& position, uint32_t waveMGroupCount) const
     {
@@ -150,34 +154,42 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
         params_.workspaceInfo.expertRevTokenNumsPtr, countWorkspace_, commonConfig_.moeExpertPerRank, mGroupsPerWave_,
         waveMGroupCount, position);
     if (range.end.globalTokenIndex > range.begin.globalTokenIndex) {
-        // SwiGLU/Combine 会复用 UB；从 GM 备份恢复本专家 prefix，不依赖上一阶段的 UB 内容。
-        ReloadDispatchCumsumRange(commonConfig_, tokenDispatchScratch_, range.begin.expertIdx, range.begin.expertIdx);
         timer_.SetWave(static_cast<int64_t>(waveId));
-        timer_.StartSpan(AscendTimer::AIV_DISPATCH);
-        // AIC-balance使用独立GMM1/GMM2游标；只映射通信job，不能修改计算游标或物理核号。
-        auto dispatchJob = gmmExecutionConfig_.blockJob;
-        if constexpr (CombineQuantMode == COMBINE_NO_QUANT) {
-            if (dispatchJob.totalJobs != 0U && dispatchJob.jobIndex < dispatchJob.totalJobs) {
-                // 只轮转搬运 owner，不改 peer 配额或 GMM/SwiGLU 共用的物理核编号。
-                // 同 wave 的所有 slice 使用同一偏移；取调度器 waveId，不依赖 timer。
-                uint32_t shift = static_cast<uint32_t>(waveId % dispatchJob.totalJobs);
-                dispatchJob.jobIndex = dispatchJob.jobIndex >= shift
-                                           ? dispatchJob.jobIndex - shift
-                                           : dispatchJob.jobIndex + dispatchJob.totalJobs - shift;
-            }
-        }
-        // 小 batch 每核仅几行，直接二分源 rank，避免空 peer 的配额统计/扫描；索引预取仍保留。
-        // 只改变行排列，token metadata 随行写出；GMM 和 Combine 的 slice/ready 边界不变。
-        if (commonConfig_.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS) {
-            DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch>(
-                tokenDispatchConfig_, commonConfig_, dispatchJob, syncWorkspaceLayout_, params_, g_winRankAddr_,
-                tokenDispatchScratch_, range);
+        timer_.StartCommunication(AscendTimer::AIV_DISPATCH_COMM);
+        // SwiGLU/Combine reuse UB, so reconstruct this expert's route prefix.
+        ReloadDispatchCumsumRange(commonConfig_, tokenDispatchScratch_, range.begin.expertIdx, range.begin.expertIdx);
+        if (UseOptimizedPrefillCommunication()) {
+            DispatchCommSplitSlice<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch>(
+                tokenDispatchConfig_, commonConfig_, syncWorkspaceLayout_, params_, g_winRankAddr_,
+                tokenDispatchScratch_, range, gmmExecutionConfig_.blockJob.jobIndex, waveId, timer_);
         } else {
-            DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch, true>(
-                tokenDispatchConfig_, commonConfig_, dispatchJob, syncWorkspaceLayout_, params_, g_winRankAddr_,
-                tokenDispatchScratch_, range);
+            timer_.StartSpan(AscendTimer::AIV_DISPATCH);
+            // AIC-balance使用独立GMM1/GMM2游标；只映射通信job，不能修改计算游标或物理核号。
+            auto dispatchJob = gmmExecutionConfig_.blockJob;
+            if constexpr (CombineQuantMode == COMBINE_NO_QUANT) {
+                if (dispatchJob.totalJobs != 0U && dispatchJob.jobIndex < dispatchJob.totalJobs) {
+                    // 只轮转搬运 owner，不改 peer 配额或 GMM/SwiGLU 共用的物理核编号。
+                    // 同 wave 的所有 slice 使用同一偏移；取调度器 waveId，不依赖 timer。
+                    uint32_t shift = static_cast<uint32_t>(waveId % dispatchJob.totalJobs);
+                    dispatchJob.jobIndex = dispatchJob.jobIndex >= shift
+                                               ? dispatchJob.jobIndex - shift
+                                               : dispatchJob.jobIndex + dispatchJob.totalJobs - shift;
+                }
+            }
+            // 小 batch 每核仅几行，直接二分源 rank，避免空 peer 的配额统计/扫描；索引预取仍保留。
+            // 只改变行排列，token metadata 随行写出；GMM 和 Combine 的 slice/ready 边界不变。
+            if (commonConfig_.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS) {
+                DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch>(
+                    tokenDispatchConfig_, commonConfig_, dispatchJob, syncWorkspaceLayout_, params_, g_winRankAddr_,
+                    tokenDispatchScratch_, range);
+            } else {
+                DispatchTokenRange<ActivationType, QuantScaleOutType, GMM1_TILE_M, TopkWeightsPrefetch, true>(
+                    tokenDispatchConfig_, commonConfig_, dispatchJob, syncWorkspaceLayout_, params_, g_winRankAddr_,
+                    tokenDispatchScratch_, range);
+            }
+            timer_.EndSpan(AscendTimer::AIV_DISPATCH);
         }
-        timer_.EndSpan(AscendTimer::AIV_DISPATCH);
+        timer_.EndCommunication();
     }
     // 数据和 ready flag 发布后才提交进度；空专家也要推进，避免重复或死循环。
     position = range.end;
@@ -276,6 +288,30 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
 {
     const auto& begin = cursor.slice.begin;
     uint32_t rows = static_cast<uint32_t>(cursor.slice.end.globalTokenIndex - begin.globalTokenIndex);
+    if (UseOptimizedPrefillCommunication()) {
+        // Probe the original GMM2 producer count before touching shared UB.
+        // Communication cohorts never replace the physical compute team here.
+        auto ready = GetTokenCombineReadyCounter(params_, begin.expertIdx, begin.tokenIndexInExpert);
+        if (AscendC::ReadGmByPassDCache(ready) <
+            static_cast<int32_t>(GetTokenCombineProducerCount(commonConfig_, waveCombineJob_, rows))) {
+            return false;
+        }
+        timer_.SetWave(static_cast<int64_t>(cursor.wave));
+        timer_.StartCommunication(AscendTimer::AIV_COMBINE_COMM);
+        ReloadDispatchCumsumRange(commonConfig_, tokenDispatchScratch_, begin.expertIdx, begin.expertIdx);
+        const auto owned =
+            PlanCommSplitSlice(commonConfig_, params_, tokenDispatchScratch_, begin.expertIdx, begin.tokenIndexInExpert,
+                               begin.tokenIndexInExpert + rows, gmmExecutionConfig_.blockJob.jobIndex,
+                               PREFILL_COMM_INTRA_CORES, begin.globalTokenIndex + cursor.wave, true);
+        timer_.SetCommunicationRows(begin.expertIdx, begin.tokenIndexInExpert, owned.rows);
+        ExpertLoopState state = CreateExpertLoopState(commonConfig_);
+        state.expertIdx = begin.expertIdx;
+        state.globalTokenStartIndex = begin.globalTokenIndex - begin.tokenIndexInExpert;
+        RunCommSplitCombineSlice(commonConfig_, params_, state, begin.tokenIndexInExpert, owned, timer_,
+                                 waveCombineScratch_);
+        timer_.EndCommunication();
+        return true;
+    }
     // 只轮换当前 AIV1 的通信任务，不修改成员中的物理核编号。
     // 输入是 Combine 自己的逻辑 wave（cursor.wave），不是当前 Dispatch/GMM1 的进度；
     // BS>=4096 时 GMM2 滞后一轮，使用其他阶段的 wave 会把同一批输出分给错误的 owner。
@@ -310,8 +346,10 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     // 当前 slice 已检查就绪，模板 true 跳过发送入口内的重复等待。计数只增不减，
     // 到本次算子结束前不会重置，因此检查与发送之间无需再次轮询。
     // timer 仍记录物理核；完整行发送及 UB 排空规则保持原样。
+    timer_.StartCommunication(AscendTimer::AIV_COMBINE_COMM);
     RunTokenCombineSlice<true>(commonConfig_, combineJob, params_, state, begin.tokenIndexInExpert, rows, timer_,
                                waveCombineScratch_);
+    timer_.EndCommunication();
     return true;
 }
 
@@ -554,8 +592,15 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
 }
 
 template <TemplateMegaMoeA8W4WaveTypeClass>
-__aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process()
+__aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process(GM_ADDR dispatchMetadata)
 {
+    tokenDispatchScratch_.commTimer = timer_.Enabled() ? &timer_ : nullptr;
+    if constexpr (CombineQuantMode == COMBINE_NO_QUANT && !TopkWeightsPrefetch) {
+        if (params_.tilingData->prefillCommOptimized != 0U) {
+            tokenDispatchScratch_.dmaMetadataInput = dispatchMetadata;
+        }
+    }
+    // Preserve the full input, compute, ready and final Unpermute protocols.
     this->ProcessWave(*this);
 }
 

@@ -25,8 +25,8 @@ __schedmode__(1) __global__
                                        GM_ADDR topk_weights, GM_ADDR weight1, GM_ADDR weight2, GM_ADDR weight_scales1,
                                        GM_ADDR weight_scales2, GM_ADDR shared_weight1, GM_ADDR shared_weight2,
                                        GM_ADDR shared_weight_scales1, GM_ADDR shared_weight_scales2, GM_ADDR y,
-                                       GM_ADDR expert_token_nums, GM_ADDR workspace, GM_ADDR timer,
-                                       MegaMoeTilingData tiling, uint64_t ffts_addr)
+                                       GM_ADDR expert_token_nums, GM_ADDR workspace, GM_ADDR dispatch_metadata,
+                                       GM_ADDR timer, MegaMoeTilingData tiling, uint64_t ffts_addr)
 {
 #if defined(__NPU_DEVICE__)
     InitSocState();
@@ -39,7 +39,7 @@ __schedmode__(1) __global__
         op.Init(context, x, topk_ids, topk_weights, weight1, weight2, nullptr, weight_scales1, weight_scales2, x_scales,
                 shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
                 workspace, &tiling, nullptr, timer);
-        op.Process();
+        op.Process(dispatch_metadata);
     } else {
         MegaMoeImpl::MegaMoeA8W8Wave<bfloat16_t, bfloat16_t, float, fp8_e4m3fn_t, kDispatchE4M3,
                                      MegaMoeImpl::COMBINE_NO_QUANT, false, false>
@@ -56,8 +56,8 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
     uint32_t block_dim, uint32_t ub_bytes, void* stream, bool is_a8w4, uint8_t* context, uint8_t* x, uint8_t* x_scales,
     uint8_t* topk_ids, uint8_t* topk_weights, uint8_t* weight1, uint8_t* weight2, uint8_t* weight_scales1,
     uint8_t* weight_scales2, uint8_t* shared_weight1, uint8_t* shared_weight2, uint8_t* shared_weight_scales1,
-    uint8_t* shared_weight_scales2, uint8_t* y, uint8_t* expert_token_nums, uint8_t* workspace, uint8_t* timer,
-    const uint8_t* tiling_host, uint64_t ffts_addr)
+    uint8_t* shared_weight_scales2, uint8_t* y, uint8_t* expert_token_nums, uint8_t* workspace,
+    uint8_t* dispatch_metadata, uint8_t* timer, const uint8_t* tiling_host, uint64_t ffts_addr)
 {
     const auto& tiling = *reinterpret_cast<const MegaMoeTilingData*>(tiling_host);
     static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
@@ -66,16 +66,16 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
         mega_moe_kernel<true, true><<<block_dim, ub_bytes, stream>>>(
             context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
             shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
-            workspace, timer, tiling, ffts_addr);
+            workspace, dispatch_metadata, timer, tiling, ffts_addr);
     } else if (is_a8w4) {
         mega_moe_kernel<true, false><<<block_dim, ub_bytes, stream>>>(
             context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
             shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
-            workspace, timer, tiling, ffts_addr);
+            workspace, dispatch_metadata, timer, tiling, ffts_addr);
     } else {
         mega_moe_kernel<false><<<block_dim, ub_bytes, stream>>>(
             context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
             shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
-            workspace, timer, tiling, ffts_addr);
+            workspace, dispatch_metadata, timer, tiling, ffts_addr);
     }
 }

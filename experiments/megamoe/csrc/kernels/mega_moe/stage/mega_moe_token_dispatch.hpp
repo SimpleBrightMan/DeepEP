@@ -20,8 +20,11 @@
 
 #include "../common/mega_moe_utils.hpp"
 #include "../common/mega_moe_peer_rows.hpp"
+#include "../common/mega_moe_comm_split.hpp"
+#include "../common/ascend_timer_v2_device.hpp"
 #include "mega_moe_token_quant.hpp"
 #include "mega_moe_count_arrival.hpp"
+#include "mega_moe_dispatch_metadata_dma.hpp"
 
 namespace MegaMoeImpl {
 
@@ -42,6 +45,10 @@ struct TokenDispatchConfig {
 
 template <typename ActivationType>
 struct TokenDispatchScratch {
+    // The optimized full Prefill path binds an immutable local metadata table.
+    // Host ownership keeps it alive until every kernel using this Plan finishes.
+    GM_ADDR dmaMetadataInput = nullptr;
+    AscendTimerDevice* commTimer = nullptr;
     PeerRowLimitsCache peerRowLimitsCache{};  // 标量对象状态；与可复用的 UB Tensor 内容分离。
     GlobalTensor<int32_t> expertRevNumsGlobalTensor;
     GlobalTensor<int32_t> cumsumInfoGlobalTensor;
@@ -119,6 +126,19 @@ __aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
     int32_t tokenIndex = topkIndex / static_cast<int32_t>(params.tilingData->topK);
     uint64_t remoteCopyOffset =
         static_cast<uint64_t>(tokenIndex) * static_cast<uint64_t>(context.quantTokenScaleAlignBytes);
+    if constexpr (!TopkWeightsPrefetch) {
+        if (scratch.dmaMetadataInput != nullptr) {
+            GlobalTensor<int32_t> metadataInput;
+            metadataInput.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(scratch.dmaMetadataInput));
+            uint64_t metadataRow =
+                static_cast<uint64_t>(remoteRankIdx) * params.tilingData->bs * params.tilingData->topK +
+                static_cast<uint32_t>(topkIndex);
+            FetchDispatchTokenWithDmaMetadata<IsBufferReuse>(
+                copyTmpTensor, remoteRankGlobalTensor, remoteCopyOffset, context.quantTokenScaleAlignBytes,
+                scratch.metaInfoTensor[bufferIdx * INT32_PER_256B], metadataInput, metadataRow, bufferIdx);
+            return;
+        }
+    }
     if constexpr (IsBufferReuse) {
         WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
     }
@@ -153,6 +173,15 @@ __aicore__ inline void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
     scaleRevGlobalTensor.SetGlobalBuffer(
         reinterpret_cast<__gm__ QuantScaleType*>(params.workspaceInfo.dispatchRevScalePtr));
     metaInfoGlobalTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr));
+    if constexpr (!TopkWeightsPrefetch) {
+        if (scratch.dmaMetadataInput != nullptr) {
+            StoreDispatchTokenWithDmaMetadata(
+                tokenRevGlobalTensor, scaleRevGlobalTensor, metaInfoGlobalTensor,
+                GetDispatchCopyBuffer(context, scratch, bufferIdx), scratch.metaInfoTensor[bufferIdx * INT32_PER_256B],
+                context.quantTokenAlignBytes, scratch.revTokenElemCnt, scratch.revScaleElemCnt, copyIdx, bufferIdx);
+            return;
+        }
+    }
     TEventID eventId = static_cast<TEventID>(bufferIdx);
     WaitFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
     LocalTensor<ActivationType> tokenScaleBuffer = GetDispatchCopyBuffer(context, scratch, bufferIdx);
@@ -228,6 +257,12 @@ __aicore__ inline void DrainDispatchCopyBuffers(const TokenDispatchConfig& conte
     }
     uint32_t used = progress.issuedRows < bufferCount ? progress.issuedRows : bufferCount;
     for (uint32_t bufferIdx = 0U; bufferIdx < used; ++bufferIdx) {
+        if constexpr (!TopkWeightsPrefetch) {
+            if (scratch.dmaMetadataInput != nullptr) {
+                DrainDispatchMetadataDmaSlot(static_cast<int32_t>(bufferIdx));
+                continue;
+            }
+        }
         TEventID eventId = static_cast<TEventID>(bufferIdx);
         WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
         WaitFlag<AscendC::HardEvent::MTE3_S>(eventId);
@@ -408,6 +443,69 @@ struct DispatchPeerCounts {
     }
 };
 
+template <typename ActivationType>
+__aicore__ inline CommOwnedSegments PlanCommSplitSlice(const MoeStageCommonConfig& common, const Params& params,
+                                                       const TokenDispatchScratch<ActivationType>& scratch,
+                                                       uint32_t expert, uint32_t sliceBegin, uint32_t sliceEnd,
+                                                       uint32_t physicalCore, uint32_t intraCores, uint64_t rotation,
+                                                       bool pairedGroups = false)
+{
+    CommPeerSegment peers[COMM_SPLIT_PEERS];
+    DispatchPeerCounts counts{scratch.cumsumInfoTensor, expert * common.worldSize};
+    BuildCommPeerSegments(counts, common.rankId, params.tilingData->dispatchRanksPerNode, sliceBegin, sliceEnd,
+                          common.tokenNum > W4A8_SMALL_BATCH_MAX_TOKENS, peers);
+    return SelectCommOwnedSegments(peers, common.rankId, physicalCore, params.tilingData->aicNum, intraCores, rotation,
+                                   pairedGroups);
+}
+
+// Each worker owns disjoint source segments, not one continuous output range.
+// Publish only these exact rows after all stores finish, so a GMM1 tile cannot
+// become ready because a different owner's rows were counted on its behalf.
+template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTileM, bool TopkWeightsPrefetch>
+__aicore__ inline void DispatchCommSplitSlice(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
+                                              const MoeSyncWorkspaceLayout& syncLayout, const Params& params,
+                                              GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
+                                              const ExpertTokenRange& range, uint32_t physicalCore, uint64_t wave,
+                                              AscendTimerDevice& timer)
+{
+    if (range.begin.globalTokenIndex >= context.maxOutputSize) return;
+    const uint32_t expert = range.begin.expertIdx;
+    const uint32_t first = range.begin.tokenIndexInExpert;
+    const uint64_t globalEnd =
+        range.end.globalTokenIndex < context.maxOutputSize ? range.end.globalTokenIndex : context.maxOutputSize;
+    const uint32_t rows = static_cast<uint32_t>(globalEnd - range.begin.globalTokenIndex);
+    const uint32_t expertGlobal = static_cast<uint32_t>(range.begin.globalTokenIndex) - first;
+    const auto owned = PlanCommSplitSlice(common, params, scratch, expert, first, first + rows, physicalCore,
+                                          PREFILL_COMM_INTRA_CORES, range.begin.globalTokenIndex + wave, true);
+    timer.SetCommunicationRows(expert, first, owned.rows);
+    if (owned.rows == 0U) return;
+    const auto type = AscendTimer::AIV_DISPATCH;
+    // rows is the exact transferred payload count; the selected intervals can
+    // be disjoint. row_start identifies the original expert slice.
+    timer.SetSlice(expert, first, owned.rows);
+    timer.StartSpan(type);
+    DispatchRouteBatch batch{};
+    DispatchCopyProgress progress{};
+    for (uint32_t i = 0U; i < owned.count; ++i) {
+        const auto& segment = owned.segments[i];
+        DispatchRankTokens<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+            context, common, params, winRankAddr, scratch, expert, static_cast<int32_t>(expertGlobal), segment.peer,
+            static_cast<int32_t>(segment.rowBegin), static_cast<int32_t>(segment.sourceBegin),
+            static_cast<int32_t>(segment.sourceBegin + segment.count), batch, progress);
+    }
+    FlushDispatchRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, winRankAddr, scratch,
+                                                                                 batch, progress);
+    DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch, progress);
+    for (uint32_t i = 0U; i < owned.count; ++i) {
+        const auto& segment = owned.segments[i];
+        PublishGmm1TileReady(syncLayout, params, expert, static_cast<int32_t>(PipelineTileM),
+                             static_cast<int32_t>(segment.rowBegin),
+                             static_cast<int32_t>(segment.rowBegin + segment.count));
+    }
+    timer.EndSpan(type);
+    timer.ClearSlice();
+}
+
 // 同一 slice 内各 peer 分段取数，直接落入原连续工作区；GMM/timer 继续使用原 slice 边界。
 template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTileM, bool TopkWeightsPrefetch>
 __aicore__ inline void DispatchPeerBalancedRows(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
@@ -510,6 +608,10 @@ __aicore__ inline void DispatchTokenRange(const TokenDispatchConfig& context, co
     // 对整个输入范围一次连续均分；按全局起点轮转首 owner，避免余数长期集中在低编号 AIV1。
     WorkRange ownedRange =
         GetRotatedBalancedTokenRange(dispatchRowCount, blockJob.jobIndex, blockJob.totalJobs, dispatchGlobalRowBegin);
+    if (scratch.commTimer != nullptr) {
+        scratch.commTimer->SetCommunicationRows(range.begin.expertIdx,
+                                                range.begin.tokenIndexInExpert + ownedRange.start, ownedRange.count);
+    }
     if (ownedRange.count == 0U) {
         return;
     }

@@ -23,7 +23,7 @@ class Plan {
 public:
     Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world, int64_t max_tokens,
          bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts, uint64_t symmetric_address,
-         int64_t symmetric_bytes);
+         int64_t symmetric_bytes, bool prefill_optimization);
 
     std::tuple<torch::Tensor, torch::Tensor> forward(
         torch::Tensor x, c10::optional<torch::Tensor> x_scales, torch::Tensor topk_ids, torch::Tensor topk_weights,
@@ -37,11 +37,40 @@ public:
         return workspace_.numel();
     }
 
+    bool prefill_optimized() const
+    {
+        return tiling_.prefillCommOptimized != 0U;
+    }
+    bool prefill_requested() const
+    {
+        return prefill_requested_;
+    }
+    bool is_a8w4() const
+    {
+        return is_a8w4_;
+    }
+    int64_t dispatch_buffer_count() const
+    {
+        return tiling_.dispatchBufferConfig.bufferCount;
+    }
+    int64_t combine_buffer_count() const
+    {
+        return prefill_optimized() ? 8 : (tiling_.bs <= 256U ? 6 : 2);
+    }
+    int64_t prefill_metadata_bytes() const
+    {
+        return prefill_metadata_.defined() ? prefill_metadata_.numel() * sizeof(int32_t) : 0;
+    }
+
 private:
     PlatformInfo platform_;
     MegaMoeTilingData tiling_;
     torch::Tensor workspace_;
     torch::Tensor context_;
+    // Immutable identity records: allocated once per prepared BS, outside forward.
+    torch::Tensor prefill_metadata_;
+    bool prefill_requested_;
+    bool is_a8w4_;
     uint64_t ffts_;
 };
 

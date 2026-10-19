@@ -46,11 +46,69 @@ public:
         for (int typeId = 0; typeId < AscendTimer::DYNAMIC_TYPE_COUNT; ++typeId) {
             dynamicCounts_[typeId] = 0;
         }
+        if (Enabled()) {
+            WriteValue(AscendTimer::TIMER_SCHEMA_OFFSET + coreId_, AscendTimer::TIMER_SCHEMA_VERSION);
+            WriteValue(AscendTimer::TIMER_COMPLETION_OFFSET + coreId_, 0);
+        }
     }
 
     __aicore__ inline bool Enabled() const
     {
         return timerAddr_ != nullptr && coreId_ >= 0 && coreId_ < AscendTimer::N_CORE_COUNT;
+    }
+
+    // These intervals observe existing completion/ready boundaries. They do
+    // not introduce PIPE_ALL and do not share the nested tile/span state.
+    __aicore__ inline int64_t CommunicationCycle() const
+    {
+        return Enabled() ? AscendC::GetSystemCycle() : 0;
+    }
+
+    __aicore__ inline void StartCommunication(AscendTimer::DynamicTimingType type, int64_t beginCycle = 0)
+    {
+        if (!Enabled()) return;
+        commType_ = static_cast<int>(type);
+        commIndex_ = dynamicCounts_[commType_]++;
+        commExpert_ = -1;
+        if (commIndex_ < AscendTimer::MAX_DYNAMIC_ITER) {
+            WriteWave(DynamicTimingIndex(commType_, commIndex_), waveId_);
+            WriteStart(DynamicTimingIndex(commType_, commIndex_),
+                       beginCycle != 0 ? beginCycle : AscendC::GetSystemCycle());
+        }
+    }
+
+    __aicore__ inline void SetCommunicationRows(uint32_t expert, uint32_t first, uint32_t rows)
+    {
+        if (!Enabled()) return;
+        commExpert_ = static_cast<int>(expert);
+        commRow_ = first;
+        commRows_ = rows;
+    }
+
+    __aicore__ inline void EndCommunication()
+    {
+        if (!Enabled() || commType_ < 0) return;
+        if (commExpert_ < 0 || commRows_ == 0U) {
+            // Empty tasks have no communication span; per-core completion
+            // stamps still distinguish an idle worker from a missing writer.
+            --dynamicCounts_[commType_];
+            commType_ = commIndex_ = -1;
+            return;
+        }
+        const int64_t end = AscendC::GetSystemCycle();
+        if (commIndex_ < AscendTimer::MAX_DYNAMIC_ITER) {
+            EndRaw(commType_, commIndex_, end);
+            if (commExpert_ >= 0) {
+                const int offset =
+                    AscendTimer::TASK_METADATA_OFFSET +
+                    ((coreId_ * AscendTimer::DYNAMIC_TYPE_COUNT + commType_) * AscendTimer::MAX_DYNAMIC_ITER +
+                     commIndex_) *
+                        2;
+                WriteValue(offset, static_cast<int64_t>((static_cast<uint64_t>(commExpert_ + 1) << 32) | commRow_));
+                WriteValue(offset + 1, static_cast<int64_t>(commRows_));
+            }
+        }
+        commType_ = commIndex_ = -1;
     }
 
     // 由调度层指定实际服务的 Wave，不能从本核任务序号反推。
@@ -209,6 +267,7 @@ public:
             int32_t index = AscendTimer::N_TIMING_COUNTER + coreId_ * AscendTimer::DYNAMIC_ITER_PER_CORE_ALIGN + typeId;
             WriteValue(index, dynamicCounts_[typeId]);
         }
+        WriteValue(AscendTimer::TIMER_COMPLETION_OFFSET + coreId_, 1);
     }
 
 private:
@@ -227,6 +286,11 @@ private:
     uint32_t sliceRow_ = 0;
     uint32_t rowStart_ = 0;
     uint32_t rows_ = 0;
+    int commType_ = -1;
+    int commIndex_ = -1;
+    int commExpert_ = -1;
+    uint32_t commRow_ = 0;
+    uint32_t commRows_ = 0;
 
     __aicore__ inline void WriteMetadata(int typeId, int index)
     {

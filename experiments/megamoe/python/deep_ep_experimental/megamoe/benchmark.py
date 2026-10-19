@@ -127,7 +127,11 @@ def main():
     )
     parser.add_argument("--output-dir", type=Path, required=True, help="New run directory; must not already exist")
     parser.add_argument("--timer", action="store_true", help="One separate instrumented call per case")
-    parser.add_argument("--timer-ranks", type=parse_ranks, help="Default: global ranks 0..min(7,EP-1)")
+    parser.add_argument(
+        "--timer-ranks",
+        type=parse_ranks,
+        help="Default: all global ranks; explicit subsets are reported as partial coverage",
+    )
     parser.add_argument("--check-tokens", type=int, default=0, help="Accuracy samples per rank; default 0 checks all")
     parser.add_argument(
         "--golden-dir", type=Path, default=Path("benchmark-golden"), help="Precomputed CPU Golden cache"
@@ -175,7 +179,7 @@ def run(args, config, group):
             args.relative_rmse,
         ),
     )
-    timer_ranks = args.timer_ranks if args.timer_ranks is not None else list(range(min(world, 8)))
+    timer_ranks = args.timer_ranks if args.timer_ranks is not None else list(range(world))
     if any(value >= world for value in timer_ranks):
         raise ValueError("timer rank exceeds EP world size")
     if config["model"]["num_experts"] % world:
@@ -209,6 +213,7 @@ def run(args, config, group):
         rank=rank,
         local_rank=int(os.environ["LOCAL_RANK"]),
         timer_ranks=timer_ranks,
+        prefill_optimization_configs={},
         host_coordination="tcpstore",
         device_communication="shmem_mte",
         api="fp8_fp4_mega_moe",
@@ -257,6 +262,18 @@ def run(args, config, group):
         buffer.topk_weights[:bs].copy_(torch.from_numpy(weights))
         buffer.validate_inputs(bs, x=activation)
         buffer.prepare(bs)
+        from .prefill_report import validate_config
+
+        actual_prefill, error = None, None
+        try:
+            actual_prefill = validate_config(buffer.prefill_optimization_config)
+        except Exception as failure:
+            error = str(failure)
+        collective_check(group, f"actual Prefill configuration BS={bs}", error, actual_prefill)
+        manifest["prefill_optimization_configs"][str(bs)] = actual_prefill
+        (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        if rank == 0:
+            print(f"[PREFILL] BS={bs} actual={json.dumps(actual_prefill, sort_keys=True)}", flush=True)
         (case / "resources.json").write_text(
             json.dumps(
                 dict(
@@ -264,6 +281,7 @@ def run(args, config, group):
                     symmetric_buffer_bytes=buffer.symmetric_buffer_bytes,
                     prepared_bs=bs,
                     max_tokens=buffer.num_max_tokens_per_rank,
+                    prefill_optimization=actual_prefill,
                 ),
                 indent=2,
             ),
@@ -372,22 +390,34 @@ def run(args, config, group):
                 if any(not item["finite"] or item["relative_rmse"] > args.relative_rmse for item in comparisons):
                     raise AssertionError(f"BS={bs}: timer-on/off output mismatch")
             timer_dir = args.output_dir / f"bs_{bs}" / "timer"
-            breakdown = None
+            breakdown, bandwidth = None, None
             if timer is not None:
                 from .timer.breakdown import compact_events, rank_breakdown
+                from .prefill_report import rank_report
 
                 timer_dir.mkdir(parents=True, exist_ok=True)
                 raw_timer = timer.cpu().numpy().astype("<i8", copy=False).reshape(-1)
                 raw_timer.tofile(timer_dir / f"rank_{rank}_npu_time.bin")
                 breakdown = rank_breakdown(compact_events(raw_timer, rank), rank)
+                bandwidth = rank_report(raw_timer, rank, model["hidden"], actual_prefill)
+                (case / "prefill_bandwidth.json").write_text(
+                    json.dumps(bandwidth, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+                )
                 del raw_timer
                 print(f"[TIMER] rank={rank} BS={bs} raw saved; offline parse required", flush=True)
             records = group.all_gather(breakdown, f"timer breakdown BS={bs}")
+            bandwidth_records = group.all_gather(bandwidth, f"Prefill bandwidth BS={bs}")
             if rank == 0:
                 from .timer.breakdown import write_breakdown
+                from .prefill_report import summarize, write_report
 
                 timer_dir.mkdir(parents=True, exist_ok=True)
                 write_breakdown([r for r in records if r is not None], timer_dir, f"BS={bs}")
+                write_report(
+                    summarize([r for r in bandwidth_records if r is not None], timer_ranks, world),
+                    timer_dir,
+                    f"BS={bs}",
+                )
             del timer
         del prefix
         group.barrier(f"case complete BS={bs}")

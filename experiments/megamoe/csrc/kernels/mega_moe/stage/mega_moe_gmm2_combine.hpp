@@ -27,6 +27,7 @@
 #include "adv_api/reduce/reduce.h"
 #include "../common/mega_moe_gmm_common.hpp"
 #include "../common/mega_moe_utils.hpp"
+#include "../common/mega_moe_comm_split.hpp"
 #include "../common/mega_moe_mxfp8_utils.hpp"
 #include "../mc2_common/mc2_kernel_utils.hpp"
 #include "../mc2_common/quantize_functions.hpp"
@@ -252,10 +253,6 @@ struct WaveCombineScratch {
 constexpr uint32_t WAVE_COMBINE_MIN_ROW_BUFFER_COUNT = 2U;
 constexpr uint32_t WAVE_COMBINE_STEADY_ROW_BUFFER_COUNT = 1U;
 constexpr uint32_t WAVE_COMBINE_MAX_ROW_BUFFER_COUNT = 6U;
-constexpr uint32_t WAVE_COMBINE_UB_BASE = 64U * 1024U;
-// [64 KiB, 184 KiB) is dedicated to the Combine row ring and quant scratch.
-// The ready scan starts at 184 KiB, so adaptive row buffers must stay below it.
-constexpr uint32_t WAVE_COMBINE_UB_LIMIT = 184U * 1024U;
 constexpr uint32_t WAVE_COMBINE_META_INFO_TOKEN_CAPACITY = 1536U;
 
 // 非 layered 路径统一使用的 Combine 行环。常规 Wave 只有 AIV1 建立并使用这些 UB 视图；
@@ -264,8 +261,10 @@ template <uint8_t CombineMode, bool IncludeAiv0 = false, uint32_t MaxRowBufferCo
 __aicore__ inline WaveCombineBufferConfig InitWaveCombineBuffers(const MoeStageCommonConfig& common,
                                                                  WaveCombineScratch& scratch)
 {
-    static_assert(MaxRowBufferCount > 0U && MaxRowBufferCount <= WAVE_COMBINE_MAX_ROW_BUFFER_COUNT,
+    static_assert(MaxRowBufferCount > 0U && MaxRowBufferCount <= WAVE_COMBINE_PREFILL_ROW_BUFFER_COUNT,
                   "invalid Combine row buffer count");
+    static_assert(CombineMode == COMBINE_NO_QUANT || MaxRowBufferCount <= WAVE_COMBINE_MAX_ROW_BUFFER_COUNT,
+                  "eight Combine row slots require the non-quantized Prefill path");
     WaveCombineBufferConfig bufferConfig{};
     if constexpr (g_coreType == AIC) {
         return bufferConfig;
@@ -1180,6 +1179,42 @@ __aicore__ inline void NotifyTokenCombineSliceReady(const Params& params, uint32
     }
 }
 
+// The priority scheduler has already observed this slice's original GMM2
+// producer count. Keep one row ring across all selected peer/group segments;
+// metadata contains the original source rank, token and top-k return slot.
+__aicore__ inline void RunCommSplitCombineSlice(const MoeStageCommonConfig& common, const Params& params,
+                                                const ExpertLoopState& state, uint32_t rowStart,
+                                                const CommOwnedSegments& owned, AscendTimerDevice& timer,
+                                                WaveCombineScratch& scratch)
+{
+    if (owned.rows == 0U) return;
+    auto buffers =
+        InitWaveCombineBuffers<COMBINE_NO_QUANT, false, WAVE_COMBINE_PREFILL_ROW_BUFFER_COUNT>(common, scratch);
+    const auto type = AscendTimer::AIV_COMBINE;
+    timer.SetSlice(state.expertIdx, rowStart, owned.rows);
+    timer.StartSpan(type);
+    const uint64_t expertGlobal = static_cast<uint64_t>(state.globalTokenStartIndex);
+    GM_ADDR output = params.workspaceInfo.gmm2MmadResPtr + expertGlobal * common.tokenHiddenDim * sizeof(bfloat16_t);
+    uint32_t sequence = 0U;
+    for (uint32_t i = 0U; i < owned.count; ++i) {
+        const auto& segment = owned.segments[i];
+        for (uint32_t done = 0U; done < segment.count;) {
+            uint32_t count = segment.count - done;
+            count = count < WAVE_COMBINE_META_INFO_TOKEN_CAPACITY ? count : WAVE_COMBINE_META_INFO_TOKEN_CAPACITY;
+            PreloadWaveCombineMetaInfo(params, scratch, expertGlobal + segment.rowBegin + done, count, 0U);
+            CombineWaveTokenRange<COMBINE_NO_QUANT>(common, buffers, scratch, params, output, segment.rowBegin + done,
+                                                    count, 0U, sequence);
+            // Metadata is consumed by Scalar while issuing each row's address.
+            // Only row slots remain in flight; preloading the next metadata
+            // chunk cannot overwrite the UB data used by those MTE3 operations.
+            done += count;
+        }
+    }
+    DrainCombineRowBuffers(sequence, buffers.rowBufferCount);
+    timer.EndSpan(type);
+    timer.ClearSlice();
+}
+
 // 按完整 token 行发送当前专家 slice；调用方传入的 job 已包含所需的通信 owner 轮换。
 // InputReadyChecked=true 仅供已探测同一 slice 就绪的优先级调度器使用。
 // 其他调用保留一次阻塞等待；输出 metadata、发送目的地及 timer 协议不变。
@@ -1196,6 +1231,7 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
     }
     uint64_t globalRowStart = static_cast<uint64_t>(state.globalTokenStartIndex) + rowStart;
     WorkRange owned = GetWaveCombineOwnedRange(job, rowCount, globalRowStart);
+    timer.SetCommunicationRows(state.expertIdx, rowStart + owned.start, owned.count);
     if (owned.count == 0U) {
         return;
     }

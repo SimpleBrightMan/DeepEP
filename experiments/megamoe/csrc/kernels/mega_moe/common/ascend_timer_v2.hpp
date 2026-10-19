@@ -39,6 +39,8 @@ enum DynamicTimingType {
     AIC_SHARED_GMM2,
     AIV_SHARED_GMM2_PROLOGUE,
     AIV_SHARED_SWIGLU,
+    AIV_DISPATCH_COMM,
+    AIV_COMBINE_COMM,
     DYNAMIC_TYPE_COUNT_ENUM
 };
 
@@ -62,7 +64,11 @@ static constexpr int NO_WAVE = -1;
 static constexpr int WAVE_ID_OFFSET = TASK_METADATA_OFFSET + TASK_METADATA_SIZE;
 static constexpr int WAVE_ID_PER_CORE_ALIGN = (N_TIMING_ITEM_PER_CORE + 15) / 16 * 16;
 static constexpr int WAVE_ID_TOTAL_SIZE = WAVE_ID_PER_CORE_ALIGN * N_CORE_COUNT;
-static constexpr int TOTAL_BUFFER_SIZE = WAVE_ID_OFFSET + WAVE_ID_TOTAL_SIZE;
+// Each physical core stamps initialization and successful count publication.
+static constexpr int TIMER_SCHEMA_VERSION = 1;
+static constexpr int TIMER_SCHEMA_OFFSET = WAVE_ID_OFFSET + WAVE_ID_TOTAL_SIZE;
+static constexpr int TIMER_COMPLETION_OFFSET = TIMER_SCHEMA_OFFSET + N_CORE_COUNT;
+static constexpr int TOTAL_BUFFER_SIZE = TIMER_COMPLETION_OFFSET + N_CORE_COUNT;
 
 }  // namespace AscendTimer
 

@@ -3,6 +3,7 @@
 
 #include "forward.hpp"
 #include "kernel_launch.hpp"
+#include "prefill_policy.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -294,8 +295,8 @@ void CheckTensor(const torch::Tensor& t, int64_t dims, const char* name)
 
 Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world,
            int64_t max_tokens, bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts,
-           uint64_t symmetric_address, int64_t symmetric_bytes)
-    : ffts_(ffts)
+           uint64_t symmetric_address, int64_t symmetric_bytes, bool prefill_optimization)
+    : prefill_requested_(prefill_optimization), is_a8w4_(is_a8w4), ffts_(ffts)
 {
     CheckTensor(example, 2, "plan input");
     TORCH_CHECK(example.size(0) > 0 && example.size(0) <= max_tokens && max_tokens <= 65536,
@@ -313,6 +314,17 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     tiling_ = MakeTiling(example.size(0), example.size(1), intermediate * 2, topk, experts, world, max_tokens, 0,
                          is_a8w4, shared_experts, platform_);
     tiling_.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
+    tiling_.prefillCommOptimized =
+        ranks_per_node == 16 &&
+                UsePrefillProfile({prefill_optimization, is_a8w4,
+                                   tiling_.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT,
+                                   tiling_.topkWeightsPrefetch != 0, tiling_.epWorldSize, platform_.aic, platform_.aiv,
+                                   tiling_.bs, tiling_.h, tiling_.sharedExpertNum, tiling_.moeExpertPerRank,
+                                   platform_.ub, static_cast<uint32_t>(tiling_.dispatchBufferConfig.bufferCount),
+                                   static_cast<uint32_t>(tiling_.dispatchBufferConfig.routeItemsPerBatch),
+                                   tiling_.dispatchBufferConfig.copyBufferBytes})
+            ? 1U
+            : 0U;
     static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
     const MegaMoeImpl::WorkspaceInfo info(nullptr, &tiling_);
     const int64_t bytes =
@@ -335,6 +347,16 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     }
     ASCEND_DEEPEP_CHECK_ACL(
         aclrtMemcpy(context_.data_ptr(), sizeof(context), &context, sizeof(context), ACL_MEMCPY_HOST_TO_DEVICE));
+    if (tiling_.prefillCommOptimized != 0U) {
+        const int64_t rows = static_cast<int64_t>(tiling_.epWorldSize) * tiling_.bs * tiling_.topK;
+        auto identities = torch::empty({rows, 8}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
+        FillPrefillMetadata(identities.data_ptr<int32_t>(), tiling_.epWorldSize, tiling_.bs, tiling_.topK);
+        // Blocking H2D owns the temporary CPU storage. This table is independent
+        // of expert choices and remains valid when routing changes at fixed BS.
+        prefill_metadata_ = identities.to(workspace_.options().dtype(torch::kInt32), false, true);
+        c10_npu::NPUCachingAllocator::recordStream(prefill_metadata_.storage().data_ptr(),
+                                                   c10_npu::getCurrentNPUStream());
+    }
 }
 
 std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
@@ -454,7 +476,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     mega_moe_kernel_do(platform_.block_dim, platform_.ub, stream.stream(), is_a8w4, ptr(context_), ptr(x),
                        opt(x_scales), ptr(topk_ids), ptr(topk_weights), ptr(weight1), ptr(weight2), ptr(weight_scales1),
                        ptr(weight_scales2), opt(shared_weight1), opt(shared_weight2), opt(shared_weight_scales1),
-                       opt(shared_weight_scales2), ptr(y), ptr(expert_tokens), ptr(workspace_), opt(timer),
+                       opt(shared_weight_scales2), ptr(y), ptr(expert_tokens), ptr(workspace_),
+                       prefill_metadata_.defined() ? ptr(prefill_metadata_) : nullptr, opt(timer),
                        reinterpret_cast<const uint8_t*>(&tiling_), ffts_);
     // The direct kernel launch bypasses the PyTorch dispatcher; record that
     // every argument remains live until the current NPU stream reaches it.
@@ -464,6 +487,9 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     }
     if (timer.has_value()) {
         c10_npu::NPUCachingAllocator::recordStream(timer->storage().data_ptr(), stream);
+    }
+    if (prefill_metadata_.defined()) {
+        c10_npu::NPUCachingAllocator::recordStream(prefill_metadata_.storage().data_ptr(), stream);
     }
     if (has_shared) {
         for (const auto* tensor :

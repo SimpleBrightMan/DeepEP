@@ -10,4 +10,5 @@ extern "C" void mega_moe_kernel_do(uint32_t block_dim, uint32_t ub_bytes, void* 
                                    uint8_t* weight1, uint8_t* weight2, uint8_t* weight_scales1, uint8_t* weight_scales2,
                                    uint8_t* shared_weight1, uint8_t* shared_weight2, uint8_t* shared_weight_scales1,
                                    uint8_t* shared_weight_scales2, uint8_t* y, uint8_t* expert_token_nums,
-                                   uint8_t* workspace, uint8_t* timer, const uint8_t* tiling_host, uint64_t ffts_addr);
+                                   uint8_t* workspace, uint8_t* dispatch_metadata, uint8_t* timer,
+                                   const uint8_t* tiling_host, uint64_t ffts_addr);

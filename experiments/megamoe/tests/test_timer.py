@@ -30,7 +30,10 @@ def test_device_schema_and_extended_size():
     assert names("DynamicTimingType", "DYNAMIC_TYPE_COUNT_ENUM") == p.DYNAMIC_NAMES
     for name in ("MAX_DYNAMIC_ITER", "N_CORE_COUNT"):
         assert int(re.search(rf"{name}\s*=\s*(\d+)", header)[1]) == getattr(p, name)
-    assert p.TOTAL_BUFFER_SIZE == p.WAVE_ID_OFFSET + p.WAVE_ID_PER_CORE * p.N_CORE_COUNT
+    assert p.TIMER_SCHEMA_OFFSET == p.WAVE_ID_OFFSET + p.WAVE_ID_PER_CORE * p.N_CORE_COUNT
+    assert p.TIMER_COMPLETION_OFFSET == p.TIMER_SCHEMA_OFFSET + p.N_CORE_COUNT
+    assert p.TOTAL_BUFFER_SIZE == p.TIMER_COMPLETION_OFFSET + p.N_CORE_COUNT
+    assert int(re.search(r"TIMER_SCHEMA_VERSION\s*=\s*(\d+)", header)[1]) == p.TIMER_SCHEMA_VERSION
     assert p.TASK_METADATA_SIZE == p.N_CORE_COUNT * len(p.DYNAMIC_NAMES) * p.MAX_DYNAMIC_ITER * 2
 
 
@@ -60,6 +63,8 @@ def raw_file(tmp_path):
             )
             put(metadata, (3 << 32) | 256, (2 << 32) | 96)
             put(p.WAVE_ID_OFFSET + core * p.WAVE_ID_PER_CORE + logical, 4)
+            put(p.TIMER_SCHEMA_OFFSET + core, p.TIMER_SCHEMA_VERSION)
+            put(p.TIMER_COMPLETION_OFFSET + core, 1)
     return path
 
 

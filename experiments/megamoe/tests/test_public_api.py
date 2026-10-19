@@ -92,6 +92,7 @@ class Tensor:
 
 @pytest.fixture
 def backend(monkeypatch):
+    monkeypatch.delenv("DEEPEP_MEGAMOE_PREFILL_OPT", raising=False)
     events = []
 
     class Group:
@@ -155,6 +156,18 @@ def backend(monkeypatch):
     class Plan:
         def __init__(self, example, *args):
             self.bs, self.workspace_bytes = example.shape[0], 4096
+            self.prefill_optimization_config = dict(
+                enabled=False,
+                requested=args[-1],
+                dispatch_intra_cores=0,
+                combine_intra_cores=0,
+                dispatch_buffer_count=6,
+                combine_buffer_count=6 if self.bs <= 256 else 2,
+                group_order="original",
+                dispatch_metadata_mode="scalar",
+                metadata_bytes=0,
+                timer_schema_version=1,
+            )
             events.append(("prepare", self.bs))
 
         def forward(self, *args):
@@ -187,6 +200,49 @@ def weights():
     for weight, _ in prepared:
         weight.npu_format = 50
     return prepared
+
+
+@pytest.mark.parametrize("option, requested", [("0", False), ("1", True)])
+def test_prefill_option_is_captured_per_buffer_and_reused_across_bs(backend, monkeypatch, option, requested):
+    monkeypatch.setenv("DEEPEP_MEGAMOE_PREFILL_OPT", option)
+    b = api.SymmBuffer(backend.buffer.group, 4, 17, 2, 1024, 256)
+    try:
+        assert b.prefill_optimization_config is None
+        b.prepare(17)
+        assert b.prefill_optimization_config["requested"] is requested
+        # An unsupported shape exposes the actual native fallback, not requested=True.
+        assert b.prefill_optimization_config["enabled"] is False
+        config = b.prefill_optimization_config
+        config["enabled"] = True
+        assert b.prefill_optimization_config["enabled"] is False
+        monkeypatch.setenv("DEEPEP_MEGAMOE_PREFILL_OPT", "1" if option == "0" else "0")
+        first_plan = b._plan
+        b.prepare(17)
+        assert b._plan is first_plan
+        b.prepare(1)
+        assert b._plan is not first_plan
+        assert b.prefill_optimization_config["requested"] is requested
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize("option", ["", "true", "2", " 1", "01"])
+def test_invalid_prefill_option_rejected_collectively_before_allocation(backend, monkeypatch, option):
+    monkeypatch.setenv("DEEPEP_MEGAMOE_PREFILL_OPT", option)
+    count = len(backend.events)
+    with pytest.raises(ValueError, match="DEEPEP_MEGAMOE_PREFILL_OPT must be 0 or 1"):
+        api.SymmBuffer(backend.buffer.group, 4, 17, 2, 1024, 256)
+    assert len(backend.events) == count
+
+
+def test_prefill_option_disagreement_rejected_before_runtime(backend, monkeypatch):
+    def disagree(output, value, **kwargs):
+        error, signature = value
+        output[:] = [value, (error, (*signature[:-1], "0"))]
+
+    monkeypatch.setattr(backend.dist, "all_gather_object", disagree)
+    with pytest.raises(ValueError, match="ranks disagree"):
+        api.SymmBuffer(backend.buffer.group, 4, 17, 2, 1024, 256)
 
 
 @pytest.mark.parametrize("bf16", [False, True])

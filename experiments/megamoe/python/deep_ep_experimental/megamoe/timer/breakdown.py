@@ -13,8 +13,7 @@ from .trace_parser import event_family, merge_intervals
 
 def compact_events(raw, rank):
     """Read only written slots; no wide CSV, task metadata or trace JSON is needed."""
-    if len(raw) != p.TOTAL_BUFFER_SIZE:
-        raise ValueError(f"rank={rank}: timer size differs from the installed protocol")
+    p.validate_timer_schema(raw)
     events = []
     for core in range(p.N_CORE_COUNT):
         group, core_type, sub = core_info(core)

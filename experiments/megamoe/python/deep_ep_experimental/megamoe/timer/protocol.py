@@ -33,6 +33,8 @@ DYNAMIC_NAMES = [
     "AIC_SHARED_GMM2",
     "AIV_SHARED_GMM2_PROLOGUE",
     "AIV_SHARED_SWIGLU",
+    "AIV_DISPATCH_COMM",
+    "AIV_COMBINE_COMM",
 ]
 
 # W4 动态槽保存 tile/slice；其他路径保持原有区间协议。
@@ -48,7 +50,37 @@ TASK_METADATA_SIZE = N_CORE_COUNT * len(DYNAMIC_NAMES) * MAX_DYNAMIC_ITER * 2
 NO_WAVE = -1
 WAVE_ID_OFFSET = TASK_METADATA_OFFSET + TASK_METADATA_SIZE
 WAVE_ID_PER_CORE = (len(FIXED_NAMES) + len(DYNAMIC_NAMES) * MAX_DYNAMIC_ITER + 15) // 16 * 16
-TOTAL_BUFFER_SIZE = WAVE_ID_OFFSET + WAVE_ID_PER_CORE * N_CORE_COUNT
+TIMER_SCHEMA_VERSION = 1
+TIMER_SCHEMA_OFFSET = WAVE_ID_OFFSET + WAVE_ID_PER_CORE * N_CORE_COUNT
+TIMER_COMPLETION_OFFSET = TIMER_SCHEMA_OFFSET + N_CORE_COUNT
+TOTAL_BUFFER_SIZE = TIMER_COMPLETION_OFFSET + N_CORE_COUNT
+
+
+def validate_timer_schema(raw, required_cores=()):
+    """Reject stale buffers and incomplete writers without comparing device clocks."""
+    if len(raw) != TOTAL_BUFFER_SIZE:
+        raise ValueError("Timer size differs from the installed schema; rebuild and recollect")
+    written = set()
+    for core in range(N_CORE_COUNT):
+        version = int(raw[TIMER_SCHEMA_OFFSET + core])
+        complete = int(raw[TIMER_COMPLETION_OFFSET + core])
+        if version == complete == 0:
+            counts = raw[
+                N_TIMING_COUNTER + core * DYNAMIC_ITER_PER_CORE : N_TIMING_COUNTER
+                + core * DYNAMIC_ITER_PER_CORE
+                + len(DYNAMIC_NAMES)
+            ]
+            fixed = raw[core * COUNTERS_PER_CORE : core * COUNTERS_PER_CORE + len(FIXED_NAMES) * 2]
+            if any(counts) or any(fixed):
+                raise ValueError(f"core={core}: timer events have no schema/completion stamp")
+            continue
+        if version != TIMER_SCHEMA_VERSION or complete != 1:
+            raise ValueError(f"core={core}: stale timer schema or incomplete kernel writer")
+        written.add(core)
+    if not written:
+        raise ValueError("Timer has no completed schema-stamped writer; rebuild and recollect")
+    if not set(required_cores).issubset(written):
+        raise ValueError("Timer is missing required communication-core completion stamps")
 
 
 def task_metadata(raw, core_id, logical_index):
@@ -79,4 +111,8 @@ def task_metadata(raw, core_id, logical_index):
         result["expert_kind"] = "shared"
     if n_tile >= 0:
         result.update(n_tile=n_tile, tile_id=dynamic_index % MAX_DYNAMIC_ITER)
+    if family in ("AIV_DISPATCH_COMM", "AIV_COMBINE_COMM"):
+        if n_tile >= 0:
+            raise ValueError("Communication timer rows must use the outer slice metadata layout")
+        result.update(granularity="communication_slice", row_count_semantics="actual_transferred_rows")
     return result

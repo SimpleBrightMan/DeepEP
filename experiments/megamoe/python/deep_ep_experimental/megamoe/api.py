@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 import importlib
+import os
 import threading
 from typing import TYPE_CHECKING
 
@@ -31,7 +32,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 4:
+    if getattr(extension, "api_protocol", None) != 5:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -88,8 +89,11 @@ class SymmBuffer:
         if not isinstance(group, (StoreGroup, dist.ProcessGroup)):
             raise TypeError("Pass a StoreGroup or an initialized ProcessGroup explicitly")
         size = group.size() if isinstance(group, StoreGroup) else dist.get_world_size(group)
+        prefill_option = os.environ.get("DEEPEP_MEGAMOE_PREFILL_OPT", "1")
         error = None
         try:
+            if prefill_option not in ("0", "1"):
+                raise ValueError("DEEPEP_MEGAMOE_PREFILL_OPT must be 0 or 1")
             integer("num_experts", num_experts, 1, 16384)
             integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 65536)
             integer("num_topk", num_topk, 1, min(32, num_experts))
@@ -123,6 +127,7 @@ class SymmBuffer:
             activation,
             ranks_per_node,
             timeout,
+            prefill_option,
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
@@ -135,6 +140,9 @@ class SymmBuffer:
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
         self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
         self.ranks_per_node = ranks_per_node
+        # Captured collectively at construction; changing the environment does
+        # not silently change an existing buffer's prepared plans.
+        self._prefill_requested = prefill_option == "1"
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
         try:
@@ -187,6 +195,7 @@ class SymmBuffer:
             ext.ffts_config(),
             address,
             runtime.native.capacity,
+            self._prefill_requested,
         )
         self._plan_bs = bs
 
@@ -207,7 +216,12 @@ class SymmBuffer:
                     self._prepare(bs)
             except Exception as failure:
                 error = str(failure)
-            collective_check(self.group, f"prepare BS={bs}", error)
+            collective_check(
+                self.group,
+                f"prepare BS={bs}",
+                error,
+                self.prefill_optimization_config if error is None else None,
+            )
         return self
 
     @property
@@ -218,6 +232,15 @@ class SymmBuffer:
     @property
     def symmetric_buffer_bytes(self) -> int:
         return self._runtime.native.capacity
+
+    @property
+    def prefill_optimization_config(self) -> dict | None:
+        """Actual native profile for the prepared BS, or None before prepare.
+
+        DEEPEP_MEGAMOE_PREFILL_OPT=0 selects the original path for a new buffer.
+        The default requests DMA, 4/24 XOR and D6/C8 on supported EP16 Prefill.
+        """
+        return dict(self._plan.prefill_optimization_config) if self._plan is not None else None
 
     @property
     def timer_enabled(self) -> bool:

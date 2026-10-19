@@ -17,6 +17,7 @@
 #ifndef ASCENDC_MEGA_MOE_TILING
 #define ASCENDC_MEGA_MOE_TILING
 
+#include <cstddef>
 #include <cstdint>
 #include "kernel_tiling/kernel_tiling.h"
 
@@ -206,5 +207,13 @@ struct MegaMoeTilingData {
     uint32_t numMaxTokensPerRank;
     // 物理每机 EP rank 数，rank 按机器连续编号；0 表示未知，仅关闭刀片交错；peer均衡及wave轮换仍有效。
     uint32_t dispatchRanksPerNode;
+    // Reuse the original trailing padding. Host gates full W4A8 Prefill:
+    // DMA metadata, fixed 4/24 paired XOR, D6/C8.
+    uint32_t prefillCommOptimized;
 };
+
+// Shared host/device ABI: the new flag occupies the existing final four bytes.
+static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI size changed");
+static_assert(offsetof(MegaMoeTilingData, dispatchRanksPerNode) == 216, "MegaMoE topology field offset changed");
+static_assert(offsetof(MegaMoeTilingData, prefillCommOptimized) == 220, "MegaMoE Prefill flag offset changed");
 #endif
