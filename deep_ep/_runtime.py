@@ -67,6 +67,7 @@ class Runtime:
     """One explicit collective lifetime per process; a live owner is retained."""
 
     _megamoe = False
+    _megamoe_urma = False
 
     def __init__(
         self,
@@ -83,8 +84,11 @@ class Runtime:
         debug_collectives=False,
     ):
         global _OWNER
+        if self._megamoe_urma and not self._megamoe:
+            raise ValueError("The MegaMoE URMA profile requires a MegaMoE runtime owner")
         native = require_native("Runtime.__init__")
-        integer("capacity", capacity, 2 << 20, (1 << 30) if self._megamoe else (1 << 63) - 1)
+        maximum_capacity = (32 << 30) if self._megamoe_urma else (1 << 30) if self._megamoe else (1 << 63) - 1
+        integer("capacity", capacity, 2 << 20, maximum_capacity)
         if capacity % (2 << 20):
             raise ValueError("capacity must be aligned to 2 MiB")
         integer("timeout", timeout, 1, 3600)
@@ -129,9 +133,12 @@ class Runtime:
         factory = native.Runtime
         if self._megamoe:
             integer("world_size", size, 2, 128)
-            factory = getattr(native, "create_megamoe_runtime", None)
+            if self._megamoe_urma and size != 16:
+                raise ValueError("MegaMoE URMA currently requires single-node EP16")
+            factory_name = "create_megamoe_urma_runtime" if self._megamoe_urma else "create_megamoe_runtime"
+            factory = getattr(native, factory_name, None)
             if factory is None:
-                raise RuntimeError("Rebuild with DEEPEP_BUILD_MEGAMOE=ON")
+                raise RuntimeError(f"Rebuild with DEEPEP_BUILD_MEGAMOE=ON; missing {factory_name}")
         else:
             from .buffers._elastic_layout import WORLD_SIZES
 
@@ -171,11 +178,12 @@ class Runtime:
                         ]
                     )
                 local_values.append(
-                    int(udma)
+                    int(udma or self._megamoe_urma)
                     + 2 * int(combine_only)
                     + 4 * int(dense_qps)
                     + 8 * int(use_1g_huge_pages)
                     + 16 * int(debug_collectives)
+                    + 32 * int(self._megamoe_urma)
                 )
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")
@@ -203,6 +211,8 @@ class Runtime:
                             "host identity is required before SHMEM initialization"
                         )
                     hosts = {value[4] for value in values}
+                    if self._megamoe_urma and len(hosts) != 1:
+                        raise ValueError("MegaMoE URMA requires all 16 ranks on one Linux host")
                     for host in hosts:
                         local = [value for value in values if value[4] == host]
                         if len({value[5] for value in local}) != 1:

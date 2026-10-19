@@ -35,8 +35,10 @@ bool Session::busy()
 }
 
 Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
-                 bool megamoe, bool mpi, bool combine_only, bool use_1g_huge_pages)
+                 bool megamoe, bool mpi, bool combine_only, bool use_1g_huge_pages, bool megamoe_urma)
 {
+    if (megamoe_urma && (!megamoe || !udma || size != 16 || mpi || combine_only || use_1g_huge_pages))
+        throw std::invalid_argument("MegaMoE URMA requires its dedicated single-node EP16 runtime");
     if (combine_only && (!udma || megamoe)) throw std::invalid_argument("Combine-only requires UDMA");
     if (use_1g_huge_pages && (!udma || megamoe))
         throw std::invalid_argument("1 GiB huge pages require the Elastic UDMA runtime");
@@ -46,15 +48,16 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     if (dense != "0" && dense != "1") throw std::invalid_argument("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1");
     combine_only_ = combine_only;
     constexpr uint64_t alignment = 2ULL * 1024 * 1024;
+    const uint64_t maximum_bytes = megamoe_urma ? (32ULL << 30) : megamoe ? (1ULL << 30) : ((1ULL << 63) - 1U);
     if (size < 2 || size > (megamoe ? 128 : 512) || (!megamoe && (size & (size - 1))) || rank < 0 || rank >= size ||
-        bytes < alignment || bytes > (megamoe ? (1ULL << 30) : ((1ULL << 63) - 1U)) || bytes % alignment != 0 ||
-        timeout < 1 || timeout > 3600 || (megamoe && (udma || mpi)) ||
+        bytes < alignment || bytes > maximum_bytes || bytes % alignment != 0 || timeout < 1 || timeout > 3600 ||
+        (megamoe && (mpi || (udma && !megamoe_urma))) ||
         (!mpi && (endpoint.empty() || endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN ||
                   endpoint.find('\0') != std::string::npos))) {
         throw std::invalid_argument("Invalid rank, capacity, timeout or bootstrap endpoint");
     }
     // BF16 and FP8 use the same peer-table transport at every supported EP size.
-    peer_table_ = udma;
+    peer_table_ = udma && !megamoe_urma;
     if (peer_table_ && (size < 2 || size > 512 || (size & (size - 1)))) {
         throw std::invalid_argument("peer-table requires EP2/4/8/16/32/64/128/256/512");
     }
@@ -90,7 +93,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     using SetPeerQpMasks = int (*)(const uint64_t*, uint32_t);
     auto set_masks =
         udma ? reinterpret_cast<SetPeerQpMasks>(dlsym(RTLD_DEFAULT, "aclshmemx_set_udma_peer_qp_masks")) : nullptr;
-    if (udma && dense != "1" && !set_masks) {
+    if (udma && !megamoe_urma && dense != "1" && !set_masks) {
         throw std::runtime_error(
             "SHMEM lacks aclshmemx_set_udma_peer_qp_masks; use the SDK pinned in dependencies.lock.json, "
             "or explicitly select dense channels with DEEPEP_SHMEM_DENSE_QPS=1");
@@ -101,7 +104,17 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     bool init_attempted = false;
     bool runtime_started = false;
     try {
-        if (udma) {
+        if (megamoe_urma) {
+            // Each of the fifteen communication workers owns one remote PE.
+            // An independent QP0/SQ per PE is essential: shared Clos SQs would
+            // permit concurrent producers despite disjoint peer ownership.
+            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 1U), "aclshmemx_set_qp_num(MegaMoE URMA)");
+            check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, false),
+                  "aclshmemx_set_shared_jetty(false, MegaMoE URMA)");
+            if (set_masks) {
+                check(set_masks(nullptr, 0U), "aclshmemx_set_udma_peer_qp_masks(clear, MegaMoE URMA)");
+            }
+        } else if (udma) {
             // Combine owns pairs 0..15; peer-table Dispatch uses pairs 0..7.
             // Serialized operators reuse the bank, not concurrent SQ writers.
             // The pinned SDK shares Clos SQs across peers; MESH routes are separate.
@@ -149,11 +162,18 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
             throw std::runtime_error("SHMEM workspace allocation or translation failed");
         }
         check(aclrtMemset(workspace_, allocation_bytes, 0, allocation_bytes), "aclrtMemset");
+        if (megamoe_urma) {
+            // Bootstrap-only collective: every remote ready/handshake slot is
+            // initialized before any rank may launch its first PUT kernel.
+            // Subsequent invocations retain these flags and advance epochs.
+            aclshmem_barrier_all();
+        }
         bytes_ = bytes;
         allocation_bytes_ = allocation_bytes;
         rank_ = rank;
         world_ = size;
         udma_ = udma;
+        megamoe_urma_ = megamoe_urma;
         closed_ = false;
     } catch (...) {
         const auto original_error = std::current_exception();

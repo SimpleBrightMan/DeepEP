@@ -14,6 +14,8 @@ int initialized = 0, allocations = 0, frees = 0, finalized = 0, barriers = 0, me
 int init_status = 0, memset_status = 0, finalize_status = 0;
 bool allocation_failure = false;
 int qp_count = 0;
+int expected_qp_count = 32;
+bool expected_shared_jetty = true;
 int expected_world = 2;
 uint64_t expected_bytes = 2 << 20;
 int storage = 0, context_token = 0, another_context = 0;
@@ -156,14 +158,14 @@ int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
 }
 int aclshmemx_set_shared_jetty(data_op_engine_type_t engine, bool enabled)
 {
-    assert(engine == ACLSHMEM_DATA_OP_UDMA && enabled);
-    return 0;
+    assert(engine == ACLSHMEM_DATA_OP_UDMA && enabled == expected_shared_jetty && initialized == 0);
+    return fault == "jetty" ? -1 : 0;
 }
 int aclshmemx_set_qp_num(data_op_engine_type_t engine, uint32_t count)
 {
-    assert(engine == ACLSHMEM_DATA_OP_UDMA && count == 32 && initialized == 0);
+    assert(engine == ACLSHMEM_DATA_OP_UDMA && count == static_cast<uint32_t>(expected_qp_count) && initialized == 0);
     qp_count = count;
-    return 0;
+    return fault == "qp" ? -1 : 0;
 }
 int aclshmem_finalize()
 {
@@ -202,6 +204,31 @@ int main(int argc, char** argv)
     setenv("DEEPEP_SHMEM_DENSE_QPS", "1", 1);
     const std::string mode = argv[1];
     auto create = []() { return deepep::Session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30); };
+    if (mode.rfind("megamoe-urma-", 0) == 0) {
+        fault = mode.substr(13);
+        setenv("DEEPEP_SHMEM_DENSE_QPS", "0", 1);
+        expected_world = 16;
+        expected_qp_count = 1;
+        expected_shared_jetty = false;
+        if (fault == "large") expected_bytes = 4ULL << 30;
+        auto create_urma = [&]() {
+            return deepep::Session(0, expected_world, expected_bytes, "tcp://127.0.0.1:19091", 30, true, true, false,
+                                   false, false, true);
+        };
+        if (fault == "normal" || fault == "large") {
+            auto session = create_urma();
+            assert(session.megamoe_urma() && session.udma() && !session.peer_table() && !session.sparse_qp_enabled());
+            assert(session.workspace_address() == reinterpret_cast<uintptr_t>(&storage));
+            assert(qp_count == 1 && allocations == 1 && memsets == 1 && barriers == 1);
+            session.close();
+            assert(frees == 1 && finalized == 1 && !deepep::Session::busy());
+        } else {
+            if (fault == "world") expected_world = 8;
+            fails(create_urma);
+            assert(initialized == 0 && allocations == 0 && finalized == 0 && !deepep::Session::busy());
+        }
+        return 0;
+    }
     if (mode.rfind("huge-", 0) == 0) {
         fault = mode.substr(5);
         if (fault == "rounded") expected_bytes = (1ULL << 30) + (2 << 20);

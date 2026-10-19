@@ -27,7 +27,7 @@ struct CatlassGroupedMatmulLayouts {
 
 // Shared AIC/AIV0 pipeline mechanics; projection semantics belong to GMM1/GMM2 below.
 namespace detail {
-template <class Config>
+template <class Config, bool BypassInputL2 = false>
 class A8W4MatmulPipeline {
     using C = typename Config::KernelConfig;
     using A = typename C::ElementAType;
@@ -109,10 +109,13 @@ class A8W4MatmulPipeline {
     bool active_ = false;
 
     template <class Element, class Layout>
-    __aicore__ inline auto Tensor(GM_ADDR address, const Layout& layout)
+    __aicore__ inline auto Tensor(GM_ADDR address, const Layout& layout, bool bypassL2 = false)
     {
         AscendC::GlobalTensor<Element> gm;
         gm.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(address));
+        if (bypassL2) {
+            gm.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+        }
         return tla::MakeTensor(gm, layout, Catlass::Arch::PositionGM{});
     }
 
@@ -182,9 +185,9 @@ protected:
     __aicore__ inline void ComputeProjection(uint32_t m, uint32_t weightN, uint32_t rows, uint32_t cols,
                                              uint32_t outputN)
     {
-        auto a = Tensor<A>(addr_.aGlobal, tla::MakeLayout<A, LayoutA>(config_.m, config_.k));
-        auto sa =
-            Tensor<SA>(addr_.aScaleGlobal, tla::MakeMxScaleLayout<SA, LayoutScaleA, false>(config_.m, config_.scaleK));
+        auto a = Tensor<A>(addr_.aGlobal, tla::MakeLayout<A, LayoutA>(config_.m, config_.k), BypassInputL2);
+        auto sa = Tensor<SA>(addr_.aScaleGlobal,
+                             tla::MakeMxScaleLayout<SA, LayoutScaleA, false>(config_.m, config_.scaleK), BypassInputL2);
         auto sb =
             Tensor<SB>(addr_.bScaleGlobal, tla::MakeMxScaleLayout<SB, LayoutScaleB, true>(config_.scaleK, config_.n));
         auto c = Tensor<Out>(output_, tla::MakeLayout<Out, LayoutC>(config_.m, config_.n));
@@ -208,12 +211,12 @@ protected:
 // Routed GMM1 consumes offline-packed [gate128, up128] in one N256 projection.
 // Shared GMM1 retains planar weights and its independently scheduled N192 tiles.
 // The object may remain alive across expert slices; Begin/End delimit scratch ownership.
-template <class Config>
-class CatlassGmm1 : private detail::A8W4MatmulPipeline<Config> {
+template <class Config, bool BypassInputL2 = false>
+class CatlassGmm1 : private detail::A8W4MatmulPipeline<Config, BypassInputL2> {
     bool fused_ = false;
     bool planarSingle_ = false;
     uint32_t halfN_ = 0;
-    using Pipeline = detail::A8W4MatmulPipeline<Config>;
+    using Pipeline = detail::A8W4MatmulPipeline<Config, BypassInputL2>;
 
 public:
     __aicore__ inline CatlassGmm1() = default;
@@ -254,9 +257,9 @@ public:
 };
 
 // GMM2 owns the down projection and always writes row-major output.
-template <class Config>
-class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config> {
-    using Pipeline = detail::A8W4MatmulPipeline<Config>;
+template <class Config, bool BypassInputL2 = false>
+class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config, BypassInputL2> {
+    using Pipeline = detail::A8W4MatmulPipeline<Config, BypassInputL2>;
 
 public:
     __aicore__ inline CatlassGmm2(const Config& config, const GMMAddrInfo& addr)
