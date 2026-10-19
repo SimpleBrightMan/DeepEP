@@ -42,26 +42,57 @@ All-to-All 的直接映射，不需要额外的收件箱索引。
 
 本 benchmark 不新增 Python 包，只给 `deep_ep._C` 增加 `alltoall` /
 `alltoall_drain` 两个原生入口，并把 `csrc/kernels/alltoall/alltoall_mte.cpp`
-加入设备库。构建方式与仓库主线一致：
+加入设备库。
+
+### 2.1 快速开发构建（推荐）
+
+直接用仓库根 CMake 构建，把 `_C.so` 和 `libdeepep_kernels.so` 装进源码
+`deep_ep/`，不经过 setuptools/pip 的 `MANIFEST.in` 扫描：
+
+```bash
+cd /path/to/DeepEP
+CANN_ENV=/usr/local/Ascend/ascend-toolkit/set_env.sh \
+SHMEM_ROOT=/path/to/shmem/install/shmem \
+PYTHON="$(command -v python3)" \
+JOBS=64 \
+bash benchmarks/alltoall_mte/build_dev.sh
+```
+
+脚本会自动找 `cmake`（PATH 没有时用 Python 环境里的 `cmake` 包）、生成
+`deep_ep/_build_info.json`，并做一次 native import 自检。之后
+`run_16cards.sh` 会检测到源码树里的 `_C*.so`，直接走源码树，不需要再
+`pip install`。
+
+### 2.2 wheel 构建
+
+需要产出 wheel 或安装进 site-packages 时：
 
 ```bash
 source /path/to/ascend-toolkit/set_env.sh
 export SHMEM_ROOT=/path/to/shmem/install/shmem
-source "$SHMEM_ROOT/set_env.sh"
 export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
 export DEEPEP_NPU_ARCH=Ascend950
 
 python -m pip install -v --force-reinstall --no-build-isolation --no-deps .
 ```
 
-只改 Python/文档时不需要重新编译；改 kernel 后重新执行上面的安装命令。增量开发
-也可以直接使用仓库根目录的 CMake 构建，把 `_C.so` 与 `libdeepep_kernels.so`
-装到 `deep_ep/` 下，然后设置 `PYTHONPATH=<repo>`。
+如果 `pip install` 停在 `reading manifest template 'MANIFEST.in'` 很久不动，通常是
+setuptools 在扫描 checkout 里的 `third-party/` 或其他大目录；不要等，改用 2.1 的
+`build_dev.sh`。确实要走 pip 时，可以先把不参与构建的大目录移出仓库，例如：
+
+```bash
+mv third-party/shmem /tmp/shmem-src.$$    # 使用外部 SHMEM_ROOT 时不需要
+mv third-party/catlass /tmp/catlass-src.$$ # 不构建 MegaMoE 时不需要
+python -m pip install -v --force-reinstall --no-build-isolation --no-deps .
+```
+
+只改 Python/文档时不需要重新编译；改 kernel 后重新执行 2.1 或 2.2。
 
 验证扩展和 MTE 会话：
 
 ```bash
-python -c "from deep_ep._native import require_native; m=require_native('alltoall'); print(m.alltoall_workspace_bytes(16,2048,3584))"
+cd /tmp
+PYTHONPATH=/path/to/DeepEP python -c "from deep_ep._native import require_native; m=require_native('alltoall'); print(m.alltoall_workspace_bytes(16,2048,3584))"
 ```
 
 输出应为 `117440512`（16×2048×3584）。
