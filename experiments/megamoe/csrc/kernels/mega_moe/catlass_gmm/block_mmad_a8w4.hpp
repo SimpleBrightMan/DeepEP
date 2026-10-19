@@ -423,7 +423,8 @@ public:
                 tla::MakeTensor(l1ATensorList[l1AListId],
                                 tla::MakeLayout<ElementA, LayoutTagL1A>(mL1Actual, RoundUp<MX_BASEK_FACTOR>(aActual)),
                                 Arch::PositionL1{});
-            if (kOffset == aStart) {
+            // 首窗显式加载；后续A窗已在上一窗提交，不能重复消耗同一empty credit。
+            if (kL1Idx == 0U) {
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1AListId]);
                 auto tensorTileA = GetTile(tensorA, tla::MakeCoord(0, aStart), tla::MakeShape(mBlockActual, aActual));
                 copyGmToL1A(tensorL1A, tensorTileA);
@@ -456,6 +457,23 @@ public:
                 tla::MakeTensor(l1MxScaleBTensorList[l1MxScaleBListId], scaleLayoutB, Arch::PositionL1{});
             const uint32_t l0kOffset = kOffset - scaleStart;
             const uint32_t kL0Loop = CeilDiv<L0_TILE_K>(kL1Actual);
+
+            // 当前A/scale的MTE2->MTE1完成已在上方排入；再预取下一A窗，
+            // 使其可与本窗MTE1/MMAD重叠。必须放在当前完成通知之后，
+            // 否则下一槽的empty等待可能挡住当前消费。容量/槽号及最后读后归还规则不变。
+            const uint32_t nextK = kOffset + kL1Actual;
+            if (nextK < kBlockActual && nextK % ka == 0U) {
+                const uint32_t nextASlot = (l1AListId + 1U) % L1A_STAGES;
+                const uint32_t nextAActual = Min(ka, kBlockActual - nextK);
+                auto nextA = tla::MakeTensor(l1ATensorList[nextASlot],
+                    tla::MakeLayout<ElementA, LayoutTagL1A>(mL1Actual, RoundUp<MX_BASEK_FACTOR>(nextAActual)),
+                    Arch::PositionL1{});
+                auto nextTile = GetTile(tensorA, tla::MakeCoord(0, nextK),
+                                        tla::MakeShape(mBlockActual, nextAActual));
+                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[nextASlot]);
+                copyGmToL1A(nextA, nextTile);
+                InitZeroInL1A(nextA, tla::MakeShape(mL1Actual, nextAActual));
+            }
 
             if (mL1Actual <= 128U) {
                 MmadPairedB(tensorL1A, tensorL1MxScaleA, tensorL1MxScaleB, tensorL0C,
@@ -555,7 +573,6 @@ public:
                 }
 
             }
-            const uint32_t nextK = kOffset + kL1Actual;
             if (nextK == kBlockActual || nextK % ka == 0U) {
                 AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1AListId]);
                 l1AListId = (l1AListId + 1) % L1A_STAGES;
