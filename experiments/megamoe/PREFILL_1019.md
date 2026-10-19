@@ -54,17 +54,26 @@ bash experiments/megamoe/scripts/build.sh
 
 使用已分配的全部 16 张卡：
 
+运行时离开源码根目录，避免其中的 `deep_ep/` 遮蔽已安装 wheel。
+`_build_info.json` 属于 wheel 的编译产物，不应手工复制到源码包。
+若显式将仓库路径加入了 `PYTHONPATH`，也应移除该项；保留 CANN 所需的路径。
+
 ```bash
+REPO="$PWD"
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export DEEPEP_MEGAMOE_PREFILL_OPT=1
 export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
-export LD_LIBRARY_PATH="${SHMEM_ROOT:-$PWD/third-party/shmem/install/shmem}/lib:$ASCEND_HOME_PATH/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-OUT="benchmark-runs/mega-prefill-1019/$(date +%Y%m%d_%H%M%S)"
+export LD_LIBRARY_PATH="${SHMEM_ROOT:-$REPO/third-party/shmem/install/shmem}/lib:$ASCEND_HOME_PATH/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+OUT="$REPO/benchmark-runs/mega-prefill-1019/$(date +%Y%m%d_%H%M%S)"
+(
+cd /tmp || exit 1
+python3 -c 'import deep_ep,pathlib; p=pathlib.Path(deep_ep.__file__); print(p); assert p.with_name("_build_info.json").is_file(), "Installed wheel metadata missing or source package shadows wheel"' || exit 1
 python3 -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=16 \
   -m deep_ep_experimental.megamoe.benchmark \
   --config prefill_1019 --mode perf --input fp8 \
   --bs-values 2048,4096,8192 --routing balanced \
   --timer --timer-ranks 0-15 --output-dir "$OUT"
+)
 ```
 
 算子耗时使用关闭 timer 的重复执行；通信带宽来自额外开启 timer 的诊断调用。
