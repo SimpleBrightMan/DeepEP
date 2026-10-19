@@ -10,6 +10,7 @@
 #endif
 
 #include "ops/notify.hpp"
+#include "ops/alltoall.hpp"
 #include "ops/dispatch.hpp"
 #include "ops/combine.hpp"
 #include "ops/low_latency.hpp"
@@ -79,6 +80,7 @@ PYBIND11_MODULE(_C, module)
 #endif
 
     deepep::bind_notify(module);
+    deepep::bind_alltoall(module);
     deepep::bind_dispatch(module);
     deepep::bind_combine(module);
     deepep::bind_low_latency(module);

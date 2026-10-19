@@ -9,6 +9,14 @@ Modified by Joyce_An 2026
 
 HT 和 LL 有独立的设备正确性与 kernel 测量入口，运行方式见[测试说明](../tests/README.md)，统计口径见[性能说明](../docs/performance.md)。
 
+## MTE All-to-All（EP16 / 四卡分组）
+
+`benchmarks/alltoall_mte/` 是独立的纯 payload All-to-All 微基准，复用主线的
+`aclshmem_ptr` + MTE3 远端写，分别测量本卡内、组内下行（3 卡）和组间下行
+（12 卡）带宽；输入为 `token_bytes`（默认 3584）与每个 rank-pair 的 `tokens`
+（默认 2048，可传 `1024,2048,4096`）。构建、单机/两节点启动命令、表格口径和
+MegaMoE 对应关系见[该目录说明](alltoall_mte/README.md)。
+
 ## 无设备运行
 
 从仓库根目录使用 Python 3.11+，无需 Torch、NumPy 或 NPU：

@@ -21,7 +21,14 @@ include(cmake/Dependencies.cmake)
 option(DEEPEP_BUILD_MEGAMOE "Build the optional MegaMoE Beta" OFF)
 option(DEEPEP_MEGAMOE_TIMER "Compile MegaMoE device tracing" OFF)
 include(cmake/Device.cmake)
-pybind11_add_module(_C csrc/bindings/module.cpp csrc/runtime/session.cpp csrc/ops/notify.cpp csrc/ops/dispatch.cpp csrc/ops/combine.cpp csrc/ops/low_latency.cpp)
+pybind11_add_module(_C
+    csrc/bindings/module.cpp
+    csrc/runtime/session.cpp
+    csrc/ops/notify.cpp
+    csrc/ops/alltoall.cpp
+    csrc/ops/dispatch.cpp
+    csrc/ops/combine.cpp
+    csrc/ops/low_latency.cpp)
 target_include_directories(_C PRIVATE csrc "${ASCEND_HOME_PATH}/include" "${SHMEM_ROOT}/include")
 target_link_libraries(_C PRIVATE ascendcl shmem deepep_device ${CMAKE_DL_LIBS})
 target_compile_options(_C PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O2>" -Wall -Wextra -Werror -fstack-protector-strong)
@@ -48,7 +55,7 @@ endif()
 # Packaging consumes this file instead of maintaining another operator list.
 file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/capabilities.json" CONTENT [=[
 {
-  "capabilities": ["runtime-mte", "runtime-urma", "runtime-mpi-bootstrap", "runtime-shmem-huge1g-v1", "event", "elastic-notify-metadata-v7", "elastic-notify-profile-v1", "elastic-dispatch-expanded-v1", "elastic-combine-expanded-v3", "elastic-combine-rank-return-v1", "elastic-combine-return-slots-v2", "elastic-combine-chunk-tuning-v1", "elastic-combine-profile-v4", "elastic-combine-peers-v1", "elastic-combine-chunks-v2", "runtime-combine-sparse-qp-v1"],
-  "communication_operations": ["ElasticBuffer.dispatch", "ElasticBuffer.combine"]
+  "capabilities": ["runtime-mte", "runtime-urma", "runtime-mpi-bootstrap", "runtime-shmem-huge1g-v1", "event", "elastic-notify-metadata-v7", "elastic-notify-profile-v1", "elastic-dispatch-expanded-v1", "elastic-combine-expanded-v3", "elastic-combine-rank-return-v1", "elastic-combine-return-slots-v2", "elastic-combine-chunk-tuning-v1", "elastic-combine-profile-v4", "elastic-combine-peers-v1", "elastic-combine-chunks-v2", "runtime-combine-sparse-qp-v1", "alltoall-mte-v1"],
+  "communication_operations": ["ElasticBuffer.dispatch", "ElasticBuffer.combine", "Runtime.alltoall"]
 }
 ]=])
