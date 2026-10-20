@@ -61,8 +61,8 @@ enum class TraceEvent : uint32_t {
     InputScaleGather,
     WaitInputScale,
     CombinePublish,
-    WaitReduceReady,
-    ReduceDrain
+    WaitReduceReady,  // Reserved for historical per-token Reduce traces.
+    ReduceDrain       // Reserved: the Reduce envelope now includes its drain.
 };
 
 struct TraceMeta {

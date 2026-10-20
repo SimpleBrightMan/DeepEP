@@ -1,8 +1,9 @@
 """Run the production Reduce header with asynchronous CPU pipeline queues.
 
 The fake Ascend operators model FIFO engines, cross-engine events, UB reuse,
-and BF16/FP32 arithmetic. This checks layout/lifetime and exact accumulation
-order; it does not model NPU timing or replace device precision validation.
+and BF16/FP32 arithmetic. The single Reduce trace must cover dependency waits
+and end only after output drain. This does not model NPU timing or replace
+device precision validation.
 """
 
 import os
@@ -213,12 +214,25 @@ DRIVER = r"""
 using namespace MegaMoeUrma;
 using namespace AscendC;
 struct TraceSink {
-    uint64_t tick{}, waits{}, work{}, drains{};
-    uint64_t TraceBegin() { return ++tick; }
-    void TraceEnd(TraceEvent event, uint64_t, const TraceMeta& meta = TraceMeta{}) {
-        if (event == TraceEvent::WaitReduceReady) { ++waits; assert(meta.rows == 1U); }
-        else if (event == TraceEvent::Reduce) { ++work; assert(meta.rows == 1U); }
-        else { assert(event == TraceEvent::ReduceDrain); ++drains; }
+    uint64_t begins{}, ends{}, expectedRow{}, expectedRows{};
+    bool active{};
+    uint64_t TraceBegin() {
+        assert(!active && begins == 0U && ends == 0U);
+        assert(metadataCopies == 0U && inputCopies == 0U && completedOutputs == 0U);
+        active = true;
+        ++begins;
+        return 73U;
+    }
+    void TraceEnd(TraceEvent event, uint64_t start, const TraceMeta& meta = TraceMeta{}) {
+        assert(event == TraceEvent::Reduce && start == 73U);
+        assert(active && begins == 1U && ends == 0U);
+        assert(meta.row == expectedRow && meta.rows == expectedRows);
+        assert(meta.bytes == expectedRows * 3584U * sizeof(bfloat16_t));
+        assert(completedOutputs == expectedRows);
+        for (const auto& queue : queues) assert(queue.empty());
+        for (const auto& kind : events) for (auto event : kind) assert(!event);
+        active = false;
+        ++ends;
     }
 };
 int main(int argc, char** argv) {
@@ -277,12 +291,16 @@ int main(int argc, char** argv) {
     args.weights = reinterpret_cast<uint64_t>(weights.data());
     args.reduceDependencies = reinterpret_cast<uint64_t>(dependencies.data());
     uint64_t pollClock = 0, remotePolls = 0, selfPolls = 0, outputDuringWait = 0;
+    TraceSink timer;
+    timer.expectedRow = begin;
+    timer.expectedRows = count;
     auto readyAt = [&](uint64_t route) {
         if (initiallyReady) return uint64_t(0);
         const uint64_t token = route / 8U;
         return 100U + (token >= begin ? token - begin : 0U) * 256U + route % 8U * 7U;
     };
     readFlag = [&](uintptr_t address) {
+        assert(timer.active && "Combine/self dependency wait must be inside the Reduce trace");
         ++pollClock;
         Step();  // Other engines may progress while Scalar polls a late producer.
         outputDuringWait += completedOutputs != 0U;
@@ -300,6 +318,7 @@ int main(int argc, char** argv) {
         return pollClock >= readyAt(route) ? args.config.epoch : args.config.epoch - 1U;
     };
     beforePayload = [&](uintptr_t address) {
+        assert(timer.active);
         const auto row = (address - returnedBase) / sizeof(bfloat16_t) / 3584U;
         const auto route = routeForRow[row], token = route / 8U;
         assert(token >= begin && token - begin < count);
@@ -309,11 +328,10 @@ int main(int argc, char** argv) {
         }
         assert(++payloadVisits[route] == 1U);
     };
-    TraceSink timer;
     Reduce(args, worker, timer);
     assert(inputCopies == count * 8U && outputCopies == count);
     assert(metadataCopies == 3U * ((count + 127U) / 128U));
-    assert(timer.waits == count && timer.work == count && timer.drains == (count != 0U));
+    assert(timer.begins == (count != 0U) && timer.ends == (count != 0U) && !timer.active);
     assert(completedOutputs == count);
     if (count > 1U && !initiallyReady) assert(outputDuringWait > 0);
     if (count != 0U) assert(remotePolls && selfPolls);

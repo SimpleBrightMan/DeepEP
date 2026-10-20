@@ -39,7 +39,9 @@ Python会拒绝不含本分支tail调度标记的native扩展。正式耗时仍�
 - 下一次调用仍在Pack完成后进行peer Start握手。Start接受`>= epoch`，防止双向空路由的peer提前进入下一轮、覆盖旧Start而造成死等。有效CV的ready仍使用`== epoch`，并且不逐轮清空对称ready区。
 - 这是每个worker顺序处理自己token区间的实现：若当前token缺任意一路结果，先等它，不扫描后面的就绪token。每CV新增quiet/MTE发布有成本；41核分工和token内部6槽也可能改变本地吞吐，应以完整`CACHED_FORWARD`和trace实测判断收益。
 
-trace新增`CombinePublish`、`WaitReduceReady`及`ReduceDrain`；默认隐藏`WaitReduceReady`，保留真正执行的token Reduce片段及最终排空。打点没有增加每token全流水排空。原始bin保留所有等待，`--trace-include-waits`可以显示它们。旧版本尾部同步事件仍可解码，本分支不会生成已删除的全卡同步事件。
+trace保留每CV的`CombinePublish`。Reduce在每个有任务的reducer上只记录一条：从Reduce函数入口到既有的最终流水排空完成，包含metadata预取、token结果就绪等待、计算及输出写回；在当前三个BS下共41条Reduce。这条跨度不能解释为纯Vector工作时间，也不能通过隐藏等待条扣除其中的ready等待。
+
+新版不再逐token记录`WaitReduceReady`和`Reduce`，也不单独记录`ReduceDrain`，减少循环中的scalar日志写出与cache flush。计时结束使用原有排空位置，不添加同步；其它trace事件不变。`WaitReduceReady`和`ReduceDrain`编号仍保留供历史bin解码，当前设备不会生成这两类事件。`--trace-include-waits`只显示实际记录的等待，不能恢复新版已不记录的逐token等待。旧版本尾部同步事件仍可解码，本分支不会生成已删除的全卡同步事件。
 
 self直接写地址按现有`send_base/receive_base`映射；同一计算组可同时含self和远端行，逐Segment决定输出地址。远端PUT的地址、顺序、CV和数量不变，计算按expert顺序推进多个peer的返回结果。当前Pack完成前不会对peer发布新epoch的Start；上一轮本地计算/返回/Reduce由同一runtime stream串行完成，因此self直接写不会覆盖尚在使用的上一轮数据。
 
@@ -200,7 +202,7 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib${CONDA_PREFIX:+:$CONDA_PREFIX/lib}${LD_L
 
 `--trace`现在自动合并全部rank，每种BS生成`$OUT/bs_<BS>/allrank.json`，可直接在Perfetto/Chrome Trace Viewer打开。每个rank作为独立process，内部保留84条AIC/AIV轨道，按rank编号排列；原有每rank JSON也保留。默认导出的两种JSON均隐藏`Wait*`及普通`LocalSync`；解析旧trace时仍保留尾部`FinalPeerHandshake`、`RankBarrier`和`LocalSync(sync_stage=2)`，本分支已不生成这三类尾部同步事件。`Quiet/Drain`继续显示实际通信完成等待和流水排空。过滤不移动时间戳、不压缩空白，不修改设备同步、原始bin或带宽统计。
 
-如需完整等待条，运行时增加`--trace-include-waits`；也可从已有bin通过下方离线导出命令增加`--include-waits`恢复。只传`--timer`仍仅导出aggregate统计，逐事件流水及`allrank.json`需要`--trace`。
+如需显示所有已记录的等待条，运行时增加`--trace-include-waits`；也可从已有bin通过下方离线导出命令增加`--include-waits`恢复被导出器隐藏的事件。新版Reduce只有每核一条完整跨度，内部ready等待没有单独事件，这些选项不会重新生成逐token等待；历史bin中的`WaitReduceReady`仍可显示。只传`--timer`仍仅导出aggregate统计，逐事件流水及`allrank.json`需要`--trace`。
 
 合并在诊断数据导出之后由rank0执行，不进入正式性能测量。单机/共享文件系统直接读取；双机目录不共享时，通过Host Store分块汇集JSON到rank0临时目录，再合并并清理临时副本。只有全部rank导出成功且文件完整才发布`allrank.json`，失败会通知全部rank，不静默生成缺rank的文件。双机的合并文件位于rank0所在机器。
 
@@ -235,7 +237,7 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 
 此外，`$OUT/bs_<BS>/allrank.json`保存该BS全部rank的合并流水，`summary.json`的`trace_allrank`记录其路径及统计。不同BS分别导出，避免混用不同调用的时间轴。各rank的零点依旧独立；合并只方便浏览，不能用跨rank横坐标差计算通信延迟或推断真实同时性。
 
-每条轨道对应`block 00..27`的`AIC/AIV0/AIV1`，引擎编号为`block*3+0/1/2`。Pack和Reduce现在同时出现在AIV0/AIV1轨道；SelfDispatch/SelfCombine不再产生拷贝事件，旧事件编号保留供历史trace解析。事件参数包含可用的peer、CV、fragment、expert、行起点/行数、M/N tile位置、列数和字节数；不适用字段显示null。`LocalSync`的CV字段另解释为`sync_stage`：0=pack、1=compute/return、2=rank barrier、3=reduce。
+每条轨道对应`block 00..27`的`AIC/AIV0/AIV1`，引擎编号为`block*3+0/1/2`。Pack出现在全部56条AIV轨道；Reduce在28个AIV0及block15～27的13个AIV1上各有一条完整跨度，15个通信AIV1不记录Reduce。SelfDispatch/SelfCombine不再产生拷贝事件，旧事件编号保留供历史trace解析。事件参数包含可用的peer、CV、fragment、expert、行起点/行数、M/N tile位置、列数和字节数；不适用字段显示null。Reduce的行起点/行数表示该reducer的完整token区间，字节数仅为输出BF16写入量。`LocalSync`的CV字段另解释为`sync_stage`：0=pack、3=本次调用的本机退出汇合；1=compute/return、2=rank barrier仅供历史trace解析。
 
 编译和trace运行仍使用上面的命令，不增加调度或采样参数。新计算事件中的`fragment`字段表示专家M组编号，`row`表示expert-major计算行；一个组可以跨多个peer/CV，因此这两个字段为null。`WaitDispatch`保留实际等待的peer/CV及接收行，通信事件仍表示原peer/CV。核对前瞻时按`expert,fragment`观察GMM1与GMM2先后，不能再按peer解释计算轨道。单个核心只记录分给自己的tile，缺少某组的条不等于该组未计算。`WaitActivation`仍表示执行GMM2前尚未满足的依赖；aggregate timer阶段与逐事件schema不变。
 
@@ -246,7 +248,8 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 | `Gmm1Tile/Gmm2Tile [Cube submit]` | Cube任务提交区间，不伪造异步Cube执行完成时刻 |
 | `Gmm1TileDrain/Gmm1Drain/Gmm2Drain [drain]` | 显式等待计算流水排空的区间 |
 | `Wait*`、`LocalSync`、`RankBarrier`等灰色条 | 数据依赖、核间或rank间同步等待 |
-| `Gmm*Dequant`、`ActivationSlice`、`Pack`、`Reduce`等 | 对应设备代码实际打点范围 |
+| `Gmm*Dequant`、`ActivationSlice`、`Pack`等 | 对应设备代码实际打点范围 |
+| `Reduce` | 每reducer一条完整跨度，含metadata预取、ready等待、计算和最终输出排空，不是纯计算时间 |
 
 每个rank以自己的最早事件归零，**不同rank的零点没有全局对齐**，不能将两个文件的横坐标相减计算跨卡延迟。转换先用整数tick相减再转浮点，保留大时间戳的低位；原始tick在JSON参数中用字符串保存。默认1000 ticks/us仍只是显式约定，可修改`--timer-clock-mhz`，离线解析时应使用同一值。
 
@@ -265,7 +268,7 @@ python3 experiments/megamoe/scripts/urma_merge_traces.py \
   /实际路径/已有运行目录 --bs-values 2048,4096,8192
 ```
 
-该脚本只需Python标准库，输出同样是`已有运行目录/bs_<BS>/allrank.json`，默认隐藏上述等待条；省略`--bs-values`会发现`rank_0/bs_*`下的全部case。历史双机结果需先收集全部16个`rank_*`目录；新版本在线运行则自动完成汇集。离线`--include-waits`只能保留输入JSON已有的等待，恢复已过滤事件需使用原始bin。
+该脚本只需Python标准库，输出同样是`已有运行目录/bs_<BS>/allrank.json`，默认隐藏上述等待条；省略`--bs-values`会发现`rank_0/bs_*`下的全部case。历史双机结果需先收集全部16个`rank_*`目录；新版本在线运行则自动完成汇集。离线`--include-waits`只能保留输入JSON已有的等待，恢复已过滤事件需使用原始bin；原始bin本来没有记录的逐token Reduce等待无法恢复。
 
 逐事件schema为每引擎16个uint64 header，后接`capacity*16`个uint64 record。header前五项为`schema,capacity,count,dropped,engine_id`；record前13项为`start_ticks,end_ticks,event_id,peer,cv,fragment,expert,row,rows,tileM,tileN,columns,bytes`，其余保留位为0。未知元数据为`UINT64_MAX`。解析器检查全部引擎的schema、容量、编号、计数、保留位和事件时间；同引擎事件应按平铺顺序不重叠。
 

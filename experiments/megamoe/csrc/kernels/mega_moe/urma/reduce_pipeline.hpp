@@ -86,6 +86,9 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
     using Ub = ReduceUbContract;
     const uint64_t owned = ReduceOwnedRows(args.config.bs, worker);
     if (owned == 0U) return;
+    // One interval per reducer includes metadata, ready waits, arithmetic and
+    // the existing output drain. Never write trace records inside the pipeline.
+    const uint64_t reduceStart = timer.TraceBegin();
     const uint64_t firstToken = ReduceRowBegin(args.config.bs, worker);
 
     GlobalTensor<bfloat16_t> returned, output;
@@ -133,13 +136,7 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
         for (uint32_t token = 0U; token < tokens; ++token) {
             const uint32_t tokenRoute = token * Ub::topk;
             const uint64_t localToken = batch + token;
-            TraceMeta meta;
-            meta.row = firstToken + localToken;
-            meta.rows = 1U;
-            const uint64_t readyStart = timer.TraceBegin();
             WaitReduceToken(args, dependenciesUb, tokenRoute);
-            timer.TraceEnd(TraceEvent::WaitReduceReady, readyStart, meta);
-            const uint64_t workStart = timer.TraceBegin();
 
             for (uint32_t slot = 0U; slot < Ub::inputs; ++slot) {
                 IssueReduceInput(inputs, returned, inverseUb, tokenRoute + slot);
@@ -179,13 +176,10 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
             WaitFlag<HardEvent::V_MTE3>(outputEvent);
             DataCopy(output[(firstToken + localToken) * Ub::hidden], result, Ub::hidden);
             SetFlag<HardEvent::MTE3_V>(outputEvent);
-            meta.bytes = Ub::bf16RowBytes;
-            timer.TraceEnd(TraceEvent::Reduce, workStart, meta);
         }
     }
     // Consume every initial/recycled event and complete all output writes
     // before the phase-private UB can be reused or the kernel can return.
-    const uint64_t drainStart = timer.TraceBegin();
     WaitFlag<HardEvent::MTE2_S>(static_cast<TEventID>(Ub::readyGateEvent));
     for (uint32_t slot = 0U; slot < Ub::inputs; ++slot) {
         WaitFlag<HardEvent::V_MTE2>(static_cast<TEventID>(slot));
@@ -194,7 +188,11 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
         WaitFlag<HardEvent::MTE3_V>(static_cast<TEventID>(slot));
     }
     PipeBarrier<PIPE_ALL>();
-    timer.TraceEnd(TraceEvent::ReduceDrain, drainStart);
+    TraceMeta meta;
+    meta.row = firstToken;
+    meta.rows = owned;
+    meta.bytes = owned * Ub::bf16RowBytes;
+    timer.TraceEnd(TraceEvent::Reduce, reduceStart, meta);
 }
 
 }  // namespace MegaMoeUrma

@@ -58,6 +58,13 @@ class TraceOverflowError(ValueError):
 
 
 def event_style(event):
+    if event == "Reduce":
+        return (
+            event,
+            "compute.copy",
+            "rail_animation",
+            "reduction scope; may include input readiness waits and final output drain",
+        )
     if event in ("DispatchPutX", "DispatchPutScale", "CombinePut"):
         return (
             event + " [PUT submit]",

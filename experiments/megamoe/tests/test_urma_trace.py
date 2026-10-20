@@ -74,7 +74,7 @@ def test_every_event_id_has_a_name_and_no_fabricated_async_events():
     assert {row["args"]["event_id"] for row in events(result)} == set(range(len(EVENTS)))
 
 
-def test_tail_cover_events_keep_completion_signal_and_hide_only_ready_wait():
+def test_historical_tail_cover_events_keep_completion_signal_and_hide_only_ready_wait():
     from deep_ep_experimental.megamoe.urma_trace import filter_trace_waits
 
     raw = trace_buffer(4)
@@ -86,6 +86,19 @@ def test_tail_cover_events_keep_completion_signal_and_hide_only_ready_wait():
     assert [row["args"]["event_id"] for row in filtered] == [30, 25, 32]
     assert filtered[0]["cat"] == "signal.publish"
     assert filtered[1]["ts"] == 0.015
+
+
+def test_reduce_envelope_is_one_visible_interval_including_internal_waits():
+    from deep_ep_experimental.megamoe.urma_trace import filter_trace_waits
+
+    raw = trace_buffer(1)
+    add_record(raw, engine=1, event="Reduce", start=1000, end=901000, row=100, rows=100, bytes=100 * 3584 * 2)
+    filtered = events(filter_trace_waits(decode_trace(raw, rank=0, clock_mhz=1000)))
+    assert len(filtered) == 1
+    event = filtered[0]
+    assert event["name"] == "Reduce" and event["dur"] == 900.0
+    assert event["args"]["rows"] == 100 and event["args"]["bytes"] == 716800
+    assert "readiness waits" in event["args"]["meaning"] and "output drain" in event["args"]["meaning"]
 
 
 def test_expert_group_trace_keeps_multisource_identity_and_scale_preparation():
