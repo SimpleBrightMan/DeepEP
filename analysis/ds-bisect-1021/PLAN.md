@@ -40,3 +40,4 @@ EP8，H7168/I3072/E384/topk6/shared0，FP8/FP4，balanced，seed20260922。真�
 - C3：在C2上正向迁移权重SF的N256-block pair-major。配对GMM1/GMM2离线打包与AIC读取成对修改；planar GMM1保留原布局以支持原N192任务。旧prepared权重必须从raw重新准备，N不满256尽早报错；不改变FP4/SF位模式和FIX补偿。本节点需新API行为测试及原生逐位差分，不能由D1反向收益直接推算。
 - C4：在C3上反向撤销C1/C2的C API leaf及首SF预取，恢复原CATLASS/TLA计算，仅保留权重SF布局迁移。它与L12/C2/C3组成“计算leaf×权重SF布局”的同数值四格对照；C3未有效完成不得启动C4的NPU测试。删除诊断compute依赖，不以更多代码冒充更优实现。
 - C5：在C4上独立对齐权重SF的缓存策略：单M-block不分配L2，多M-block保留默认复用。保持数据布局、数值和调度不变；不能把D1的布局效应与缓存效应混成一个结论。
+- C5-r1：复查发现C5使用的是slice M，不能称为完整DS缓存规则。C5已进入测量，保留为独立的slice策略节点；r1显式传递完整专家token数，未知上下文保留默认L2。两者分别测，不修改已运行版本。

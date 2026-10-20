@@ -574,6 +574,7 @@ __aicore__ inline void UpdateMoeExpertGmm2GlobalBuffer(const GmmExecutionConfig&
     constexpr uint32_t weightElementsPerByte = PackedElementTraits<WeightType>::ELEMENTS_PER_BYTE;
     constexpr uint32_t activationOutputElementsPerByte = PackedElementTraits<ActivationOutType>::ELEMENTS_PER_BYTE;
     uint64_t gmm1OutputDim = static_cast<uint64_t>(Get<N_VALUE>(expertContext.problemShape));
+    gmmAddrInfo.expertTokenCount = static_cast<uint32_t>(Get<M_VALUE>(expertContext.problemShape));
     uint64_t tokenHiddenDim = static_cast<uint64_t>(Get<K_VALUE>(expertContext.problemShape));
     uint64_t globalTokenStartIndex = static_cast<uint64_t>(expertContext.globalTokenStartIndex) + rowOffsetInExpert;
     uint32_t expertMGroupOffset = rowOffsetInExpert / L1_TILE_M_256;
@@ -617,6 +618,7 @@ __aicore__ inline void UpdateSharedExpertGmm2GlobalBuffer(const MoeStageCommonCo
     constexpr uint32_t activationElementsPerByte = PackedElementTraits<ActivationType>::ELEMENTS_PER_BYTE;
     constexpr uint32_t weightElementsPerByte = PackedElementTraits<WeightType>::ELEMENTS_PER_BYTE;
     uint64_t tokenNum = commonConfig.tokenNum;
+    gmmAddrInfo.expertTokenCount = 0U;  // shared不继承之前routed专家的缓存判据。
     uint64_t tokenHiddenDim = commonConfig.tokenHiddenDim;
     uint64_t activationOutputWidth = commonConfig.gmm1OutputDim / ACTIVATION_N_HALF;
     uint64_t activationScaleWidth =

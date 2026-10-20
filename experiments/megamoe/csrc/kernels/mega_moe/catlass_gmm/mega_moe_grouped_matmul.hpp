@@ -131,6 +131,7 @@ class A8W4MatmulPipeline {
     GM_ADDR output_ = nullptr;
     bool active_ = false;
     bool blockedWeightScales_ = false;
+    uint32_t expertTokenCount_ = 0U;
     AscendTimerDevice* timer_ = nullptr;
 
     template <class Element, class Layout>
@@ -146,8 +147,10 @@ class A8W4MatmulPipeline {
     {
         AscendC::GlobalTensor<SB> gm;
         gm.SetGlobalBuffer(reinterpret_cast<__gm__ SB*>(address));
-        // 与DS一致：单M块权重SF没有跨M复用，不挤占激活和控制面的L2空间。
-        if (config_.m <= 256U) gm.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+        // 按完整专家M判断复用，不能把小slice误判为无跨M复用。未知上下文保留默认。
+        if (expertTokenCount_ > 0U && expertTokenCount_ <= 256U) {
+            gm.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+        }
         return tla::MakeTensor(gm,layout,Catlass::Arch::PositionGM{});
     }
 
@@ -211,6 +214,7 @@ public:
                           std::is_same_v<SB, typename Next::ElementMxScaleBType>,
                       "Cannot change GMM element types");
         config_.m = config.m;
+        expertTokenCount_ = addr.expertTokenCount;
         timer_ = addr.timer;
         config_.n = config.n;
         config_.k = config.k;

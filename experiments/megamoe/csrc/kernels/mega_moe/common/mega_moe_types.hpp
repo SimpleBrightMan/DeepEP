@@ -65,6 +65,8 @@ struct GMMAddrInfo {
     // 仅非量化、非prefetch的routed Wave启用；GM计数此时表示issued而非completed。
     bool gmm1AsyncCompletion = false;
     bool gmm1CvOutput = false;
+    // 完整专家行数，不是当前wave/slice的M；0表示未知，缓存策略保持默认。
+    uint32_t expertTokenCount = 0U;
 };
 
 // 保存 TensorList 入口地址，供按 expert 布局解析当前专家权重。

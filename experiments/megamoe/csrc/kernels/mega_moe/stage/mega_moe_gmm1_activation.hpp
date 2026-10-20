@@ -388,6 +388,7 @@ __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
     int64_t n = Get<N_VALUE>(expertContext.problemShape);
     int64_t k = Get<K_VALUE>(expertContext.problemShape);
     int64_t expertOffset = expertContext.expertIdx;
+    gmmAddrInfo.expertTokenCount = static_cast<uint32_t>(Get<M_VALUE>(expertContext.problemShape));
     int64_t globalTokenStartIndex = expertContext.globalTokenStartIndex + rowOffsetInExpert;
     uint32_t expertMGroupOffset = rowOffsetInExpert / L1_TILE_M_256;
     int64_t scaleK = Ops::Base::CeilDiv(k, static_cast<int64_t>(MXFP_DIVISOR_SIZE)) * MXFP_MULTI_BASE_SIZE;
@@ -454,6 +455,7 @@ __aicore__ inline void UpdateSharedExpertGmm1GlobalBuffer(const MoeStageCommonCo
     constexpr uint32_t weightElemsPerByte = PackedElementTraits<WeightType>::ELEMENTS_PER_BYTE;
     constexpr uint32_t outputElemsPerByte = PackedElementTraits<ActivationOutType>::ELEMENTS_PER_BYTE;
     uint64_t m = commonConfig.tokenNum;
+    gmmAddrInfo.expertTokenCount = 0U;  // 本轮只验证routed专家，shared保留默认缓存策略。
     uint64_t n = commonConfig.gmm1OutputDim;
     uint64_t k = commonConfig.tokenHiddenDim;
     uint64_t scaleK = Ops::Base::CeilDiv(k, static_cast<uint64_t>(MXFP_DIVISOR_SIZE)) * MXFP_MULTI_BASE_SIZE;
