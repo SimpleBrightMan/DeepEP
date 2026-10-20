@@ -395,7 +395,7 @@ public:
         const uint32_t kL1Loop = CeilDiv(kBlockActual, kb);
         // DS式最后K衔接：一个N半块完成累加就发FIX，不等另一半的MMAD提交。
         // 回调只负责输出；保持scale=64、父L0C stride和每半块的unit flag。
-        auto emitHalf = [&](const auto& accumulator, uint32_t column, uint32_t columns) {
+        auto emitHalf = [&](const auto& accumulator, uint32_t column, uint32_t columns) __aicore__ {
             if constexpr (TensorC::position == AscendC::TPosition::VECCALC) {
                 using Plan = MegaMoeImpl::Gmm1CvPlan;
                 if (column == 0U) {

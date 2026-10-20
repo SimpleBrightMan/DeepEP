@@ -23,6 +23,9 @@ source, package, build = out/'source', out/'package', out/'native-build'
 source.mkdir()
 archive = campaign/f'{a.name}.tar'
 with tarfile.open(archive) as bundle:
+    archive_revision = bundle.pax_headers.get('comment', '')
+    if not archive_revision.startswith(a.revision) or len(a.revision) < 7:
+        raise ValueError(f'Archive/source revision mismatch: requested={a.revision}, archive={archive_revision}')
     for member in bundle.getmembers():
         rel = PurePosixPath(member.name)
         if rel.is_absolute() or '..' in rel.parts or not (member.isfile() or member.isdir()):
@@ -55,7 +58,7 @@ if len(libraries) != 2:
     raise ValueError('Expected both host extension and kernel')
 for lib in libraries:
     shutil.copyfile(lib, package/'deep_ep_experimental/megamoe'/lib.name)
-identity = dict(revision=a.revision, archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+identity = dict(revision=archive_revision, archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
     libraries={lib.name: hashlib.sha256(lib.read_bytes()).hexdigest() for lib in libraries},
     source_hashes={str(f.relative_to(source)): hashlib.sha256(f.read_bytes()).hexdigest()
                    for f in sorted((source/'experiments/megamoe').rglob('*')) if f.is_file()},
