@@ -40,6 +40,15 @@ struct Gmm1AsyncCompletion {
     {
         asc_sync_intra_arrive(PIPE_MTE3, AIV1 | (EMPTY + sequence % STAGES));
     }
+    // 统一task流中的GMM2不写CV UB：AIV1 Scalar观察真正FIX完成，随后归还同一epilogue credit。
+    __aicore__ static inline void WaitScalarConsumer(unsigned sequence)
+    {
+        asc_sync_intra_wait(PIPE_S, FULL + sequence % STAGES);
+    }
+    __aicore__ static inline void ReleaseScalarConsumer(unsigned sequence)
+    {
+        asc_sync_intra_arrive(PIPE_S, AIV1 | (EMPTY + sequence % STAGES));
+    }
     __aicore__ static inline void DrainProducer()
     {
         // 消耗两槽最终credit，包含从未使用的槽；不得遗留到下次kernel调用。
