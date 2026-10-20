@@ -16,8 +16,8 @@ namespace MegaMoeImpl {
 
 #define TemplateMegaMoeA8W4WaveTypeClass                                                                    \
     typename XType, typename OutputType, typename TopkWeightsType, typename Weight1Type, int32_t QuantMode, \
-        bool FuseGateUp
-#define TemplateMegaMoeA8W4WaveTypeFunc XType, OutputType, TopkWeightsType, Weight1Type, QuantMode, FuseGateUp
+        bool FuseGateUp, bool UseCv
+#define TemplateMegaMoeA8W4WaveTypeFunc XType, OutputType, TopkWeightsType, Weight1Type, QuantMode, FuseGateUp, UseCv
 
 template <TemplateMegaMoeA8W4WaveTypeClass>
 class MegaMoeA8W4Wave : public MegaMoe<XType, OutputType, TopkWeightsType, Weight1Type, QuantMode> {
@@ -41,6 +41,7 @@ private:
     // 一个逻辑任务对应一对 gate/up；生产、SwiGLU 和 GMM2 ready 必须使用同一粒度。
     static constexpr uint32_t GMM1_TASK_N = FuseGateUp ? GMM1_FUSED_TILE_N : L1_TILE_N;
     static constexpr bool ASYNC_GMM1 = true;
+    static_assert(!UseCv || FuseGateUp, "CV requires paired weights");
 
     using Gmm1Config = GmmKernel::Config<true, QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType,
                                          QuantScaleOutType, false, false, false, true, FuseGateUp>;
@@ -147,7 +148,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm1
         gmmAddrInfo, expertContext, slice.rowStartInExpert, gmm1TilesPerMGroup);
     gmmAddrInfo.timer = timer_.Enabled() ? &timer_ : nullptr;
     gmmAddrInfo.gmm1AsyncCompletion = ASYNC_GMM1;
-    gmmAddrInfo.gmm1CvOutput = FuseGateUp;
+    gmmAddrInfo.gmm1CvOutput = UseCv;
     if (computeReplay_) {
         // 输入已在 priming 中完成；本次没有 Dispatch producer，不能等待其被清零的 flag。
         gmmAddrInfo.dispatchToGmm1Flag = nullptr;
@@ -285,7 +286,7 @@ template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunReadyActivation(
     AivTaskCursor& cursor, int32_t& readySequence)
 {
-    if constexpr (FuseGateUp) return TryRunCvActivation(cursor, readySequence);
+    if constexpr (UseCv) return TryRunCvActivation(cursor, readySequence);
     const auto& begin = cursor.slice.begin;
     {
         auto flag = reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagGmmToEpiloguePtr) +
@@ -463,7 +464,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     uint32_t dispatchGroups = 0U;
     if constexpr (ASYNC_GMM1) Gmm1AsyncCompletion::InitConsumer();
     // 一次初始化、逐块消费/归还，最后统一消费末个credit。初始化也覆盖零激活路径。
-    if constexpr (FuseGateUp) {
+    if constexpr (UseCv) {
         const auto* t = params_.tilingData;
         cvActivationOp_.Init({.yGmAddr = params_.workspaceInfo.activationQuantDataPtr,
             .yScaleGmAddr = params_.workspaceInfo.activationQuantScalePtr, .clampLimit = t->clampLimit,
@@ -514,7 +515,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         }
     }
     // 生命周期的唯一收尾。先前slice的ready已发布；不重置仍在飞行的cursor或复用事件。
-    if constexpr (FuseGateUp) Gmm1CvScratch::Finish();
+    if constexpr (UseCv) Gmm1CvScratch::Finish();
     else Aiv1ActivationUb::Finish();
     DrainDispatchCopyBuffers<ActivationType, QuantScaleOutType, false>(
         tokenDispatchConfig_, params_, tokenDispatchScratch_, dispatchAsync_.progress);

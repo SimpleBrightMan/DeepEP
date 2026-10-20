@@ -19,6 +19,7 @@
 #include "kernels/mega_moe/common/ascend_timer_v2.hpp"
 #include "kernels/mega_moe/common/mega_moe_constants.hpp"
 #include "kernels/mega_moe/common/aiv1_async_events.hpp"
+#include "kernels/mega_moe/common/mega_moe_aiv1_ub_layout.hpp"
 #include "kernels/mega_moe/common/mega_moe_workspace.hpp"
 #include "kernels/mega_moe/mc2_common/mc2_moe_context.hpp"
 
@@ -63,8 +64,11 @@ MegaMoeDispatchBufferConfig DispatchConfig(const MegaMoeTilingData& t, uint32_t 
     const uint32_t route = static_cast<uint32_t>(c.routeItemsPerBatch);
     const uint32_t without_slots = fixed + route * sizeof(int32_t);
     const uint32_t budget = ub > without_slots ? ub - without_slots : 0U;
-    const int32_t maxSlots = t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4
-        ? static_cast<int32_t>(MegaMoeImpl::Aiv1AsyncEvents::DispatchSlots) : MAX_DISPATCH_BUFFER_COUNT;
+    const bool cv = t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 &&
+        MegaMoeImpl::UseGmm1CvForLaunch(t.bs, t.topK, t.epWorldSize, t.moeExpertPerRank,
+            MegaMoeImpl::W4A8_PAIRED_GATE_UP_MAX_TOKENS);
+    const int32_t maxSlots = cv ? static_cast<int32_t>(MegaMoeImpl::Aiv1AsyncEvents::DispatchSlots)
+                               : MAX_DISPATCH_BUFFER_COUNT;
     c.bufferCount = std::clamp(static_cast<int32_t>(budget / (c.copyBufferBytes + 32U)), MIN_DISPATCH_BUFFER_COUNT,
                                maxSlots);
     if (static_cast<uint64_t>(c.routeItemsPerBatch) < total) {

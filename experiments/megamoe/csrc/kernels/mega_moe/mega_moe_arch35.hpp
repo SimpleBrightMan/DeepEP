@@ -335,7 +335,9 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::DispatchBuffInit()
                                               static_cast<uint64_t>(cumsumInfoTensorSize) * countWorkspace_.blockIdx));
     }
 
-    uint32_t cumsumInfoTensorAddr = Aiv1ResidentUbLayout::ActivationBytes;
+    const bool cv = ENABLE_A8W4 && UseGmm1CvForLaunch(commonConfig_.tokenNum, params_.tilingData->topK,
+        commonConfig_.worldSize, commonConfig_.moeExpertPerRank, W4A8_PAIRED_GATE_UP_MAX_TOKENS);
+    uint32_t cumsumInfoTensorAddr = cv ? Aiv1ResidentUbLayout::ActivationBytes : Aiv1ResidentUbLayout::GmActivationBytes;
     scratch.cumsumInfoTensor =
         LocalTensor<int32_t>(TPosition::VECCALC, cumsumInfoTensorAddr, cumsumInfoTensorSize / sizeof(int32_t));
     // compact route 已消除 mask 扫描，只保留一份接收 index batch。
@@ -355,14 +357,16 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::DispatchBuffInit()
     uint32_t metaInfoTensorSize = static_cast<uint32_t>(bufferConfig.bufferCount) * INT32_PER_256B * sizeof(int32_t);
     scratch.metaInfoTensor =
         LocalTensor<int32_t>(TPosition::VECCALC, metaInfoTensorAddr, metaInfoTensorSize / sizeof(int32_t));
-    const uint32_t combineSlots = Aiv1AsyncEvents::CombineSlots;
+    const uint32_t combineSlots = cv ? Aiv1AsyncEvents::CombineSlots : Aiv1AsyncEvents::GmCombineSlots;
     const auto resident = MakeAiv1ResidentUbLayout(
         commonConfig_.tokenHiddenDim, commonConfig_.worldSize, commonConfig_.moeExpertPerRank,
-        bufferConfig.routeItemsPerBatch, bufferConfig.bufferCount, context.quantTokenScaleAlignBytes, combineSlots);
+        bufferConfig.routeItemsPerBatch, bufferConfig.bufferCount, context.quantTokenScaleAlignBytes, combineSlots, cv);
     // launcher先检查容量；此处只绑定一次。三阶段仍保留原生完成等待，不靠别的阶段覆盖UB。
-    waveCombineBuffers_ = InitWaveCombineBuffers<false, Aiv1AsyncEvents::CombineSlots>(
+    waveCombineBuffers_ = cv ? InitWaveCombineBuffers<false, Aiv1AsyncEvents::CombineSlots>(
+        commonConfig_, waveCombineScratch_, resident.combineRowsBase, resident.combineMetaBase)
+        : InitWaveCombineBuffers<false, Aiv1AsyncEvents::GmCombineSlots>(
         commonConfig_, waveCombineScratch_, resident.combineRowsBase, resident.combineMetaBase);
-    waveCombineBuffers_.eventBase = Aiv1AsyncEvents::CombineBase;
+    waveCombineBuffers_.eventBase = cv ? Aiv1AsyncEvents::CombineBase : Aiv1AsyncEvents::GmCombineBase;
 }
 
 template <TemplateMegaMoeTypeClass>

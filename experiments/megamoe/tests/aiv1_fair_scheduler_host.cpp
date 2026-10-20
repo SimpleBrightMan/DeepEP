@@ -39,6 +39,7 @@ struct Scheduler {
     using QuantScaleOutType = uint8_t;
     static constexpr bool ASYNC_GMM1 = true;
     static constexpr bool FuseGateUp = false;
+    static constexpr bool UseCv = false;
     struct CvParams {
         int yGmAddr, yScaleGmAddr;
         float clampLimit;

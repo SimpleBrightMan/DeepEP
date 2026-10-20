@@ -9,6 +9,9 @@ struct Aiv1AsyncEvents {
     static constexpr unsigned DispatchSlots = 2;
     static constexpr unsigned CombineBase = DispatchSlots;
     static constexpr unsigned CombineSlots = 4;
+    static constexpr unsigned GmDispatchSlots = 6;
+    static constexpr unsigned GmCombineBase = GmDispatchSlots;
+    static constexpr unsigned GmCombineSlots = LocalEventCount - GmCombineBase;
     // MTE3->S：0..5归Dispatch metadata；两种完成发布各有独立ID。
     static constexpr unsigned ActivationDone = 6;
     static constexpr unsigned DispatchDone = 7;

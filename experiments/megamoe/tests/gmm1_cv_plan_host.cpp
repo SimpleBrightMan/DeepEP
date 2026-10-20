@@ -32,6 +32,16 @@ void drain() {
 }
 #include "common/gmm1_cv_scratch.hpp"
 int main() {
+    for(unsigned bs:{32,96,256,512,1024,2048,4096}) {
+        const bool cv=UseGmm1CvForLaunch(bs,6,8,48,4096);
+        assert(cv==(bs<=1024));
+        const auto p=MakeAiv1ResidentUbLayout(7168,8,48,(bs+255)/256*256,cv?2:6,7392,cv?4:2,cv);
+        assert(p.valid&&p.end<=248*1024);
+        assert(p.dispatchBase==(cv?Gmm1CvPlan::End:Aiv1ResidentUbLayout::GmActivationBytes));
+    }
+    assert(!UseGmm1CvForLaunch(512,6,32,12,4096));
+    assert(!UseGmm1CvForLaunch(5000,1,8,128,4096)); // 未配对权重不能进入CV特化。
+    assert(!UseGmm1CvForLaunch(32,0,8,48,4096));
     unsigned sequence=0;
     for(unsigned rows=1;rows<=256;++rows) {
         Gmm1CvTask task{0,0,rows,128,0};
