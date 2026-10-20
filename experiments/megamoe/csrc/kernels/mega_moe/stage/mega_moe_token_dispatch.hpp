@@ -120,7 +120,7 @@ __aicore__ inline LocalTensor<ActivationType> GetDispatchCopyBuffer(const TokenD
 template <bool IsBufferReuse, bool TopkWeightsPrefetch, typename ActivationType>
 __aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& context, const Params& params,
                                                      TokenDispatchScratch<ActivationType>& scratch, int32_t bufferIdx,
-                                                     int32_t topkIndex, int32_t remoteRankIdx,
+                                                     int32_t topkIndex, int32_t remoteRankIdx, int32_t copyIdx,
                                                      GlobalTensor<ActivationType>& remoteRankGlobalTensor)
 {
     TEventID eventId = static_cast<TEventID>(bufferIdx);
@@ -134,16 +134,13 @@ __aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
     DataCopy(copyTmpTensor, remoteRankGlobalTensor[remoteCopyOffset], context.quantTokenScaleAlignBytes);
     SetFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
 
-    if constexpr (IsBufferReuse) {
-        WaitFlag<AscendC::HardEvent::MTE3_S>(eventId);
-    }
-    scratch.metaInfoTensor[bufferIdx * INT32_PER_256B].SetValue(RANK_ID, remoteRankIdx);
-    scratch.metaInfoTensor[bufferIdx * INT32_PER_256B].SetValue(TOKEN_ID, tokenIndex);
-    scratch.metaInfoTensor[bufferIdx * INT32_PER_256B].SetValue(
-        TOPK_INDEX, topkIndex % static_cast<int32_t>(params.tilingData->topK));
-    {
-        SetFlag<AscendC::HardEvent::S_MTE3>(eventId);
-    }
+    // 与DS相同，DMA进行时由Scalar直接写路由metadata；保留原256B/row ABI，单独隔离协议收益。
+    // 该行只有一个owner；真正发布ready前会等待payload写出并执行DDR barrier。
+    auto route = reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr) +
+                 static_cast<uint64_t>(copyIdx) * INT32_PER_256B;
+    WriteGmByPassDCache(route + RANK_ID, remoteRankIdx);
+    WriteGmByPassDCache(route + TOKEN_ID, tokenIndex);
+    WriteGmByPassDCache(route + TOPK_INDEX, topkIndex % static_cast<int32_t>(params.tilingData->topK));
 }
 
 // copyIdx 是 workspace 绝对行号；待写行可能来自上一个 peer，不能再读取已复用的 route-index 缓冲。
@@ -154,12 +151,10 @@ __aicore__ inline void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
 {
     GlobalTensor<ActivationType> tokenRevGlobalTensor;
     GlobalTensor<QuantScaleType> scaleRevGlobalTensor;
-    GlobalTensor<int32_t> metaInfoGlobalTensor;
     tokenRevGlobalTensor.SetGlobalBuffer(
         reinterpret_cast<__gm__ ActivationType*>(params.workspaceInfo.dispatchRevDataPtr));
     scaleRevGlobalTensor.SetGlobalBuffer(
         reinterpret_cast<__gm__ QuantScaleType*>(params.workspaceInfo.dispatchRevScalePtr));
-    metaInfoGlobalTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr));
     TEventID eventId = static_cast<TEventID>(bufferIdx);
     WaitFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
     LocalTensor<ActivationType> tokenScaleBuffer = GetDispatchCopyBuffer(context, scratch, bufferIdx);
@@ -170,11 +165,7 @@ __aicore__ inline void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
                 {1, static_cast<uint16_t>(scratch.revTokenElemCnt * sizeof(ActivationType)), 0U, 0U, 0U});
     DataCopyPad(scaleRevGlobalTensor[copyIdx * scratch.revScaleElemCnt], scaleBuffer,
                 {1, static_cast<uint16_t>(scratch.revScaleElemCnt * sizeof(QuantScaleType)), 0U, 0U, 0U});
-    WaitFlag<AscendC::HardEvent::S_MTE3>(eventId);
-    DataCopy(metaInfoGlobalTensor[copyIdx * INT32_PER_256B], scratch.metaInfoTensor[bufferIdx * INT32_PER_256B],
-             INT32_PER_256B);
     SetFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
-    SetFlag<AscendC::HardEvent::MTE3_S>(eventId);
 }
 
 // 环形槽持续跨 peer 使用：先发起下一行读，再写出上一行，避免每个小 peer 段都排空 MTE。
@@ -201,10 +192,10 @@ __aicore__ inline void IssuePeerTokenCopies(const TokenDispatchConfig& context, 
         int32_t topkIndex = scratch.validTopkIndexTensor.GetValue(copyStartIdx + issueIdx);
         if (progress.issuedRows < static_cast<uint32_t>(bufferCount)) {
             FetchDispatchTokenAndMetaInfo<false, TopkWeightsPrefetch>(context, params, scratch, issueBufferIdx,
-                                                                      topkIndex, remoteRankIdx, remoteRankGlobalTensor);
+                topkIndex, remoteRankIdx, rowDstOffset + issueIdx, remoteRankGlobalTensor);
         } else {
             FetchDispatchTokenAndMetaInfo<true, TopkWeightsPrefetch>(context, params, scratch, issueBufferIdx,
-                                                                     topkIndex, remoteRankIdx, remoteRankGlobalTensor);
+                topkIndex, remoteRankIdx, rowDstOffset + issueIdx, remoteRankGlobalTensor);
         }
         if (progress.pendingRow >= 0) {
             StoreDispatchTokenAndMetaInfo<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
@@ -229,7 +220,6 @@ __aicore__ inline void DrainDispatchCopyBuffers(const TokenDispatchConfig& conte
     for (uint32_t bufferIdx = 0U; bufferIdx < used; ++bufferIdx) {
         TEventID eventId = static_cast<TEventID>(bufferIdx);
         WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
-        WaitFlag<AscendC::HardEvent::MTE3_S>(eventId);
     }
 }
 
@@ -245,6 +235,8 @@ __aicore__ inline void PublishGmm1TileReady(const MoeSyncWorkspaceLayout& syncLa
     if (!storesCompleted) {
         SyncFuncStatic<AscendC::HardEvent::MTE3_S, SYNC_EVENT_ID5>();
     }
+    // payload由MTE3完成边界保证；Scalar metadata也必须在ready原子计数之前对消费者可见。
+    asc_sync_data_barrier(DSB_DDR);
     __gm__ int32_t* gmm1TileReadyCount =
         reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.flagDispatchToGmm1Ptr) +
         static_cast<uint64_t>(localExpertId) * syncLayout.dispatchFlagSlotCountPerExpert;

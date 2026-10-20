@@ -16,7 +16,9 @@
 |L5|两层共享epilogue task序列与FIX full/empty；AIV1确认GMM2完成|在L4上单独移除GMM2 phase生产端排空，闭合DS式生命周期|两层共用issued/credit，GMM1由V/MTE3消费释放，GMM2由Scalar消费释放；不新增GM空间|
 |L6|CV输入槽原地压缩＋stage末尾累计写出|先隔离32行量化scratch credit与多次DMA，不混入VF数学变化|保留BF16舍入和原有多VF；已读前缀才可覆盖；EMPTY保护MTE3写出|
 |L7|SwiGLU+MX寄存器驻留融合VF|迁移DS的融合结构，不混入数值合同变化|显式保留两次BF16 RN、最大指数scale与后GMM2加权；其他激活模式和FP8格式沿用原计算|
-|L8|DS通信row cursor、紧凑metadata及readiness协议|牵涉布局和三角色依赖，作为闭合协议迁移|源/目的映射与数据可见性；不能仅换flag编号|
+|L8|Dispatch metadata由Scalar写GM，去掉逐槽S/MTE3元数据事件|迁移DS轻量控制面；先不改256B/row ABI|payload仍受双槽MTE credit保护；发布ready前DDR barrier覆盖Scalar metadata|
+|L9|Dispatch route index直接Scalar读取|隔离小批DMA索引与MTE2_S成本|仍按真实prefix/ordinal取数，不改变源/目的排列|
+|L10|DS通信row cursor、紧凑metadata及readiness协议|牵涉布局和三角色依赖，作为闭合协议迁移|源/目的映射与数据可见性；不能仅换flag编号|
 |终点对照|完整冻结DS|用于检查测量链和差距能否闭合，不冒充单项收益|若舍入/加权等合同不同，单独列为语义变更，不能称等价优化|
 
 已接近一致、不重复计功：L1 A3/B4、小M K512/N128和L0A跨N复用、同MTE1队列上B ready覆盖此前A/scale、双128行CV槽、32行VF推进、2pull/4push与常驻通信UB。

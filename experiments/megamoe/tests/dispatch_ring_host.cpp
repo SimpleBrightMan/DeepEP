@@ -26,7 +26,7 @@ struct Indices { int32_t GetValue(uint32_t i) const { return static_cast<int32_t
 template <typename T> struct TokenDispatchScratch { Indices validTopkIndexTensor; };
 #include "dispatch_ring_types.inc"
 
-std::array<bool, 6> fetched{}, reusable{}, finished{};
+std::array<bool, 6> fetched{}, reusable{};
 std::array<int32_t, 6> token{};
 std::vector<int32_t> copied;
 uint32_t readyCount = 0;
@@ -42,29 +42,27 @@ template <AscendC::HardEvent Event> void WaitFlag(TEventID slot) {
             publishObserved = true;
             return;
         }
-        assert(finished[slot]);
-        finished[slot] = false;
+        assert(false); // metadata不再依赖每槽MTE3->Scalar credit。
     }
 }
 template <AscendC::HardEvent Event, uint32_t Id> void SyncFuncStatic() {}
 template <bool Reuse, bool Prefetch, typename T>
 void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig&, const Params&, TokenDispatchScratch<T>&,
-                                   uint32_t slot, int32_t index, int32_t, GlobalTensor<T>&) {
+                                   uint32_t slot, int32_t index, int32_t, int32_t row, GlobalTensor<T>&) {
     if constexpr (Reuse) {
         WaitFlag<AscendC::HardEvent::MTE3_MTE2>(slot);
-        WaitFlag<AscendC::HardEvent::MTE3_S>(slot);
     }
-    assert(!fetched[slot] && !reusable[slot] && !finished[slot]);
+    assert(!fetched[slot] && !reusable[slot] && row==index);
     fetched[slot] = true;
     token[slot] = index;
 }
 template <typename T, typename S, bool Prefetch>
 void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig&, const Params&, TokenDispatchScratch<T>&,
                                    uint32_t slot, int32_t row) {
-    assert(fetched[slot] && !reusable[slot] && !finished[slot]);
+    assert(fetched[slot] && !reusable[slot]);
     assert(row == static_cast<int32_t>(copied.size()) && token[slot] == row);
     fetched[slot] = false;
-    reusable[slot] = finished[slot] = true;
+    reusable[slot] = true;
     copied.push_back(row);
 }
 void PublishGmm1TileReady(const MoeSyncWorkspaceLayout&, const Params&, uint32_t expert,
@@ -74,7 +72,7 @@ void PublishGmm1TileReady(const MoeSyncWorkspaceLayout&, const Params&, uint32_t
         publishObserved = false;
         for (bool f : fetched) assert(!f);
     } else {
-        for (uint32_t i = 0; i < 6; ++i) assert(!fetched[i] && !reusable[i] && !finished[i]);
+        for (uint32_t i = 0; i < 6; ++i) assert(!fetched[i] && !reusable[i]);
         assert(begin == 0);
     }
     assert(expert == 2 && tile == 256 && end == static_cast<int32_t>(copied.size()));
@@ -127,6 +125,6 @@ int main() {
         }
         assert(state.progress.issuedRows == total && copied.size() == total);
         DrainDispatchCopyBuffers<uint8_t, int32_t, false>(config, params, scratch, state.progress);
-        for (uint32_t i = 0; i < 6; ++i) assert(!fetched[i] && !reusable[i] && !finished[i]);
+        for (uint32_t i = 0; i < 6; ++i) assert(!fetched[i] && !reusable[i]);
     }
 }
