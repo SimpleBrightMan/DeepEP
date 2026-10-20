@@ -31,7 +31,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 6:
+    if getattr(extension, "api_protocol", None) != 8:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -320,7 +320,7 @@ def _pack_weight_scale_blocks(scale):
 
 
 class _TilePackedWeightPair(tuple):
-    """FP4 tile-pack v1, not legacy ordinary NZ; Python/native protocol 6."""
+    """FP4 tile-pack v1；protocol 8保留原数值合同，不与DS数学研究版混装。"""
 
 
 class _RoutedWeightPair(_TilePackedWeightPair):
