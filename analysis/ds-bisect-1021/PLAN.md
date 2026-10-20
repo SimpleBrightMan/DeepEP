@@ -35,3 +35,4 @@ EP8，H7168/I3072/E384/topk6/shared0，FP8/FP4，balanced，seed20260922。真�
 - D0：完整冻结DS在本项目诊断目录重新JIT；Git统一LF换行，原始字节归档另存。不是已经迁移到我们的默认kernel。
 - C1：在L12上替换M≤128、N256、K整除512的完整AIC供数/MMAD leaf。使用DS静态物理M128、独立A/SF完成事件及C API L1/L0地址；保留原AIV0 L1B协议、原GM ABI、FIX scale=64与旧数学规则。其他形状仍原实现。这个节点不是完整计算包已全部闭合的声明。
 - 新核对：原工程权重SF的ColumnMajor MX布局实际是每N行连续K-SF；DS权重SF是pair-major。后续布局节点须同时修改离线权重准备和AIC读取，不仅是SwiGLU的激活scale布局。
+- D1/D2/D3：在完整DS终点中，分别恢复原工程权重SF的N-major、激活SF的row-major、两者组合。三者都保持DS数学、任务顺序和完成协议，用DS冻结输出逐位差分；这先闭合混合包的数据ABI，不把它称为已完成完整OO/DO/OD/DD控制矩阵。
