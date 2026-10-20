@@ -21,6 +21,14 @@ GMM按专家聚合不同来源的行，使用M256计算块，仅专家尾块不�
 
 Pack和Reduce是计算前后的独立本地阶段，使用28组中的全部AIV0/AIV1，共56个AIV；任务编号为`block*2+subblock`，按56核划分行。阶段结束仍保留原有DMA完成及本地同步，再复用UB进行计算或结束调用。当前内核固定启动28组；即使物理设备有64个AIV，也只使用已启动的56个，不扩大计算/通信核数量。
 
+本地阶段使用多槽流水，benchmark打印`local_pipeline=pack6-reduce6-output2`。每核分配连续行区间，各核行数与原来的跨步分配完全一致：
+
+- Pack使用6个token/scale槽，按槽等待上一次MTE3完成，再下发新的MTE2；不同槽的读取与写出可以重叠。`order`批量DMA到UB，当前支持的最大BS8192每核最多1171行，一次预取即可，payload循环不再从GM逐行标量读取路由。UB占用65.5 KiB。
+- Reduce使用6个BF16/FP32输入槽、独立FP32累加器和2个BF16输出槽。`inverse + weights`按最多128个token批量搬入UB，输入预取与向量乘加、前一个token输出写入可以重叠。UB占用166 KiB，低于现有192 KiB最低要求。
+- 返回布局、FP32乘加顺序和最终BF16舍入不变。self直接写receive/return，远端PUT和通信CV不变。Pack仍全部完成后才进入Dispatch，Reduce仍在尾部全卡同步后执行；本次不将它们融入通信/计算阶段。
+
+若打印`local_pipeline=single-slot`，加载的native扩展仍为旧版，需重新编译安装。正式耗时仍取关闭timer/trace的`CACHED_FORWARD`；比较Pack/Reduce阶段时使用同rank全部56个AIV记录的`max(last_tick)-min(first_tick)`。原timer的Pack字节统计写入的FP8+scale，Reduce字节仅统计输出BF16，均不是完整HBM读写流量。
+
 self直接写地址按现有`send_base/receive_base`映射；同一计算组可同时含self和远端行，逐Segment决定输出地址。远端PUT的地址、顺序、CV和数量不变，计算按expert顺序推进多个peer的返回结果。当前Pack完成前不会对peer发布新epoch的Start；上一轮本地计算/返回/Reduce由同一runtime stream串行完成，因此self直接写不会覆盖尚在使用的上一轮数据。
 
 接收数据/中间结果/返回结果不按CV覆盖复用。所有BS共享固定对称heap布局，epoch由`UrmaBuffer`统一递增，不因创建新Plan或切换BS重新归零。
@@ -60,6 +68,20 @@ Scale准备只在详细trace中独立计时，未归入原有8个aggregate phase
 | 8192 | 264 | 1320 | 3696 |
 
 该调度默认生效，无需新开关。benchmark打印`[URMA SCHEDULE] compute=expert-m256`并写入manifest；若显示`source-cv`，当前Python加载的还是旧native扩展，需要重新编译安装。流水图和正式耗时仍需实测验证；不能将tile数量减少倍数视为耗时加速倍数。
+
+### 本地多槽流水 A/B 验证（2026-10-20）
+
+在两台Ascend950DT（每机8卡）上对比本次修改与`e319740`对应的单槽本地实现，通信和专家M256计算不变。H3584/I1280/E384/TopK8、balanced、CV256，每次调用仍启动28 AIC/56 AIV。两机全部设备健康OK且空闲后才运行，旧新分别创建独立通信域。
+
+| BS | Pack：旧→新 μs | Reduce：旧→新 μs | 完整forward：旧→新 μs | forward耗时下降 |
+|---:|---:|---:|---:|---:|
+| 2048 | 140.716→35.317 | 171.034→61.518 | 1388.829→1172.365 | 15.59% |
+| 4096 | 279.727→77.510 | 337.898→119.865 | 2396.253→1977.776 | 17.46% |
+| 8192 | 642.160→169.378 | 675.963→235.742 | 4614.845→3708.643 | 19.64% |
+
+Pack/Reduce来自单独aggregate timer调用：先计算每rank全部56 AIV的首尾跨度，再对16个rank求均值，按1000 ticks/μs换算。完整forward是关闭timer/trace的`CACHED_FORWARD rank-max-mean`，不含路由准备；warmup=2、iters=10，取后5轮。两类计时来自不同调用，不能精确相加。
+
+16rank×3BS的全部BF16输出与旧版逐位一致且均为有限值；这是旧新回归，不是独立Golden验证。841项CPU测试、CANN9.2编译和native import通过。本次为一轮双机A/B，表中性能不能视为UBX单机结果。控制机测试目录为`/home/codex-deepep/megamoe-urma-local-pipeline-ab-20261020-b07`，`comparison.json`与`phase_records.json`保留统计口径及逐rank记录。
 
 ## Python 接口与路由成本
 

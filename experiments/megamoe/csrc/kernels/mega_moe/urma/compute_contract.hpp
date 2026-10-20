@@ -73,6 +73,15 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t LocalOwnedRows(uint64_t rows, uin
     return worker < rows ? (rows - 1U - worker) / kLocalWorkers + 1U : 0U;
 }
 
+// Contiguous partitions preserve the old strided schedule's per-worker count,
+// including empty workers and remainder rows. Pack/Reduce can therefore DMA
+// their route metadata in batches without changing timer payload accounting.
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t LocalRowBegin(uint64_t rows, uint32_t worker)
+{
+    const uint64_t remainder = rows % kLocalWorkers;
+    return static_cast<uint64_t>(worker) * (rows / kLocalWorkers) + (worker < remainder ? worker : remainder);
+}
+
 MEGAMOE_URMA_COMPUTE_INLINE constexpr bool IsSelfExpandedRow(uint64_t row, const Config& config)
 {
     return row >= config.selfSendRow && row - config.selfSendRow < config.selfRows;

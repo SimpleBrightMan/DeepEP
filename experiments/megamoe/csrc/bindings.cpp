@@ -17,6 +17,7 @@ PYBIND11_MODULE(_C, module)
     module.def("buffer_size", &deepep::megamoe::buffer_size);
     module.attr("urma_api_protocol") = MegaMoeUrma::kProtocol;
     module.attr("urma_compute_schedule") = "expert-m256";
+    module.attr("urma_local_pipeline") = "pack6-reduce6-output2";
     module.attr("urma_timer_numel") = MegaMoeUrma::kTimerElements;
     module.attr("urma_timer_schema") = MegaMoeUrma::kProtocol;
     module.attr("urma_trace_schema") = MegaMoeUrma::kTraceSchema;

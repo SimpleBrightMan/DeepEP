@@ -70,11 +70,16 @@ void Ownership(uint64_t rows) {
             const auto worker = LocalWorkerIndex(block, sub);
             assert(worker < kLocalWorkers && ++workers[worker] == 1);
             uint64_t count = 0;
-            for (uint64_t row = worker; row < rows; row += kLocalWorkers) {
+            const auto first = LocalRowBegin(rows, worker);
+            const auto end = first + LocalOwnedRows(rows, worker);
+            for (uint64_t row = first; row < end; ++row) {
                 assert(++visits[row] == 1);
                 ++count;
             }
             assert(LocalOwnedRows(rows, worker) == count);
+            const auto previousCount = worker < rows ? (rows - 1U - worker) / kLocalWorkers + 1U : 0U;
+            assert(count == previousCount);
+            assert(end == (worker + 1U == kLocalWorkers ? rows : LocalRowBegin(rows, worker + 1U)));
             owned += count;
             packBytes += count * (h + h / 32);
             outputBytes += count * h * 2;
@@ -178,7 +183,9 @@ int main(int argc, char** argv) {
                 for (uint32_t sub = 0; sub < 2; ++sub) {
                     auto worker = LocalWorkerIndex(block, sub);
                     uint64_t owned = 0;
-                    for (uint64_t row = worker; row < r.order.size(); row += kLocalWorkers) {
+                    const auto first = LocalRowBegin(r.order.size(), worker);
+                    const auto end = first + LocalOwnedRows(r.order.size(), worker);
+                    for (uint64_t row = first; row < end; ++row) {
                         assert(++visits[row] == 1);
                         const auto value = Input(epoch, rank, r.order[row] / topk);
                         if (IsSelfExpandedRow(row, r.config)) {
@@ -280,7 +287,9 @@ int main(int argc, char** argv) {
                 for (uint32_t sub = 0; sub < 2; ++sub) {
                     const auto worker = LocalWorkerIndex(block, sub);
                     uint64_t owned = 0;
-                    for (uint32_t token = worker; token < r.bs; token += kLocalWorkers) {
+                    const auto first = LocalRowBegin(r.bs, worker);
+                    const auto end = first + LocalOwnedRows(r.bs, worker);
+                    for (uint32_t token = first; token < end; ++token) {
                         assert(++visits[token] == 1);
                         Value actual = 0, expected = 0;
                         for (uint32_t slot = 0; slot < topk; ++slot) {

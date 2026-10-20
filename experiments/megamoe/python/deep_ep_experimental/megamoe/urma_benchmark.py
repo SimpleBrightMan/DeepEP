@@ -224,6 +224,7 @@ def run(args, config, group):
         input="prequantized FP8 E4M3 + E8M0; conversion/input generation outside measurement",
         native_urma_protocol=int(_extension().urma_api_protocol),
         compute_schedule=getattr(_extension(), "urma_compute_schedule", "source-cv"),
+        local_pipeline=getattr(_extension(), "urma_local_pipeline", "single-slot"),
         timer_clock_mhz=args.timer_clock_mhz,
         timer_clock_source="explicit assumption; default follows legacy timer/protocol.py CYCLE_TO_US=1000",
         detailed_trace=args.trace,
@@ -235,7 +236,8 @@ def run(args, config, group):
     (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     if rank == 0:
         print(
-            f"[URMA SCHEDULE] compute={manifest['compute_schedule']} communication_cv_rows={args.cv_rows}",
+            f"[URMA SCHEDULE] compute={manifest['compute_schedule']} communication_cv_rows={args.cv_rows} "
+            f"local_pipeline={manifest['local_pipeline']}",
             flush=True,
         )
     all_reports = []
