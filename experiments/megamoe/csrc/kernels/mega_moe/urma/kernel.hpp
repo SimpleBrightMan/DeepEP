@@ -5,6 +5,7 @@
 #include "abi.hpp"
 #include "compute.hpp"
 #include "pack_reduce.hpp"
+#include "tail_completion.hpp"
 #include "timer.hpp"
 #include "transport.hpp"
 
@@ -49,7 +50,7 @@ __aicore__ inline void PublishSelfDispatchReady(const Arguments& args)
             (static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + cv) * kFlagBytes);
         WriteGmByPassDCache(ready, args.config.epoch);
     }
-    AtomicAdd(ComputeFlag(args.localFlags, 0U), 1);
+    AtomicAdd(ComputeFlag(args.localFlags, kLocalFlagDispatchDone), 1);
 }
 
 __aicore__ inline void WaitChunkComputed(const Arguments& args, const Chunk& chunk, Timer& timer)
@@ -69,11 +70,6 @@ __aicore__ inline void WaitChunkComputed(const Arguments& args, const Chunk& chu
         WaitComputeFlag(args.gmm2Done, index, FragmentGmm2Tiles(args, fragment));
         timer.TraceEnd(TraceEvent::WaitCombineReady, start, meta);
     }
-}
-
-__aicore__ inline uint64_t PeerPhaseSlot(const Arguments& args, uint32_t phase, uint32_t source)
-{
-    return args.config.barrierOffset + (static_cast<uint64_t>(phase) * kWorld + source) * kFlagBytes;
 }
 
 // One and only one AIV1 owns all PUT/quiet operations for this peer for the
@@ -129,14 +125,16 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         timer.End(Phase::Dispatch, chunk.rows * (h + scales));
     }
     // Empty peers must still join the local dispatch phase.
-    AtomicAdd(ComputeFlag(args.localFlags, 0U), 1);
+    AtomicAdd(ComputeFlag(args.localFlags, kLocalFlagDispatchDone), 1);
     start = timer.TraceBegin();
-    WaitComputeFlag(args.localFlags, 0U, kWorld);
+    WaitComputeFlag(args.localFlags, kLocalFlagDispatchDone, kWorld);
     timer.TraceEnd(TraceEvent::WaitLocalDispatch, start, peerMeta);
 
     const uint64_t rowBytes = h * sizeof(bfloat16_t);
     uint64_t combineBytes = 0U;
     bool combineStarted = false;
+    bool peerCounted = false;
+    bool selfCounted = false;
     for (uint32_t index = 0U; index < args.config.recvChunkCount; ++index) {
         const Chunk chunk = LoadChunk(args.recvChunks, index);
         if (chunk.peer != peer) continue;
@@ -152,6 +150,9 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             reinterpret_cast<__gm__ uint8_t*>(args.gmm2Output + chunk.localRow * rowBytes),
             static_cast<uint32_t>(chunk.rows * rowBytes), peer);
         timer.TraceEnd(TraceEvent::CombinePut, start, meta);
+        // Opportunistically account this peer's incoming completion without
+        // waiting. The PUT is already submitted and can progress meanwhile.
+        ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);
         meta.bytes = 0U;
         start = timer.TraceBegin();
         Quiet(peer);
@@ -167,6 +168,9 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     // completed tokens while other peers are still computing/returning rows.
     // The aggregate envelope includes producer gaps between CVs.
     if (combineStarted) timer.End(Phase::Combine, combineBytes);
+    // Once all sends finish, this owner only monitors its remaining inbound
+    // contribution (plus self on owner 0). No per-token monitor or rank barrier.
+    FinishCombinePeer(args, owner, signal, peerCounted, selfCounted);
 }
 
 __aicore__ inline void Process(const Arguments& args)
@@ -195,6 +199,7 @@ __aicore__ inline void Process(const Arguments& args)
     TraceLocalSync(timer, 0U);
     if constexpr (g_coreType == AIC) {
         RunCubeAndPrologue(args, block, timer);
+        MarkCubeComplete(args);
     } else if (GetSubBlockIdx() == 0U) {
         RunCubeAndPrologue(args, block, timer);
     } else if (block < kCommunicationWorkers) {

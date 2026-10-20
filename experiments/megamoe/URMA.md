@@ -23,10 +23,10 @@ GMM按专家聚合不同来源的行，使用M256计算块，仅专家尾块不�
 
 Pack使用全部56个AIV，任务编号为`block*2+subblock`。Reduce只使用28个AIV0和block15～27的13个AIV1，共41核；15个通信AIV1不参与Reduce。计算侧每核结束自己的反量化或scale/SwiGLU任务后，先排空本核流水以交还UB/event，再独立进入Reduce。当前内核固定启动28组；即使物理设备有64个AIV，也只使用已启动的56个。
 
-本地阶段使用多槽流水，benchmark打印`local_pipeline=pack6-reduce6-output2 tail=combine-cv-flag-reduce41`。Pack按56核、Reduce按41核分配连续行区间：
+本地阶段使用多槽流水，benchmark打印`local_pipeline=pack6-reduce6-output2 tail=combine-finished-fast-reduce41`。Pack按56核、Reduce按41核分配连续行区间：
 
 - Pack使用6个token/scale槽，按槽等待上一次MTE3完成，再下发新的MTE2；不同槽的读取与写出可以重叠。`order`批量DMA到UB，当前支持的最大BS8192每核最多1171行，一次预取即可，payload循环不再从GM逐行标量读取路由。UB占用65.5 KiB。
-- Reduce使用6个BF16/FP32输入槽、独立FP32累加器和2个BF16输出槽。`inverse + weights + readiness dependencies`按最多128个token批量搬入UB，UB占用174 KiB，低于现有192 KiB最低要求。每个token的8路结果全部就绪后才预取payload，6槽在这个token内部流水；不预取尚未就绪的下一个token。
+- Reduce使用6个BF16/FP32输入槽、独立FP32累加器和2个BF16输出槽。`inverse + weights + readiness dependencies`按最多128个token批量搬入UB，UB占用174 KiB，低于现有192 KiB最低要求。未收齐完成通知时，每个token的8路结果全部就绪后才预取payload，6槽仅在当前token内部流水。锁存全部入站就绪后，6槽预取可以跨token推进；后续metadata批次只搬inverse和weights。
 - 返回布局、FP32乘加顺序和最终BF16舍入不变。self直接写receive/return，远端PUT的CV粒度和数量不变。Pack仍全部完成后才进入Dispatch；Reduce可以与其他核心的计算和Combine重叠。
 
 Python会拒绝不含本分支tail调度标记的native扩展。正式耗时仍取关闭timer/trace的`CACHED_FORWARD`。Pack跨度覆盖56核；本分支Reduce跨度覆盖41核且包含等待结果就绪的时间，不能直接当作纯本地Reduce耗时，也不能与Combine跨度相加。原timer的Pack字节统计写入的FP8+scale，Reduce字节仅统计输出BF16，均不是完整HBM读写流量。
@@ -35,9 +35,13 @@ Python会拒绝不含本分支tail调度标记的native扩展。正式耗时仍�
 
 - 路由准备时为每个expanded row生成依赖：远端为`producer_rank * maxPeerChunks + cv_id`，self为带高位标记的GMM2组编号。再用已有`reduce_index`在NPU上执行一次`index_select`，缓存token-major `[BS,8]`依赖表。forward不重建它；native绑定inverse的地址和版本，修改后必须重新准备路由。
 - 远端每CV的`quiet`完成后，通信owner用MTE发布32B信号到独立128B槽。Reducer只在本地轮询槽，要求epoch精确相等；self等待对应组的全部GMM2列tile完成计数。AIV0结束不能代替self结果完成。
-- 删除原来的尾部peer完成握手、全卡barrier以及Reduce之前的全本机汇合。只保留Pack后的本机汇合和函数退出前的本机MIX汇合；后者包括28 AIC、56 AIV，保护workspace及下一轮复用，不产生跨rank同步。
+- 每个通信owner在每次Combine `PUT`之后、`quiet`之前，非阻塞读取本卡上对应peer的`finished(epoch)`。首次观察到本轮完成才给本卡入站计数器`AtomicAdd(1)`，用核内bool记住已计入，后续不再读取该peer的finished。
+- 本核所有Combine CV均完成`quiet + CV ready发布`后，用MTE发布自己面向该peer的`finished(epoch)`，再带200周期退避地观察尚未计入的入站完成；空edge也发一次通知。必须先发后等，且每个owner只处理自己的peer，避免相互等待形成环。该通知使用独立phase 1的128B槽，不覆盖逐CV ready。
+- 第16份是self：28个AIC各自完成全部GMM2/FIX输出后，给本卡AIC完成计数器加一。通信owner 0非阻塞检查它是否到28，再且仅再给入站计数器加一；不能预置self为完成，也不能用AIV0退出代替GMM2输出就绪。此门槛偏保守，self输出可能更早完成。
+- Reducer入口及慢路径每8个token检查一次入站计数；依赖等待中首次失败及每再8次失败轮询也检查一次。达到16时，执行一次S→MTE2门禁并锁存“全部就绪”。剩余任务不再读取就绪flag、不再逐token做ready门禁，恢复跨token的`route+6`连续预取；metadata、输入槽、Vector和输出槽事件仍保留。普通payload GM读取不受影响。
+- 没有尾部全卡barrier或Reduce之前的全本机汇合。只保留Pack后的本机汇合和函数退出前的本机MIX汇合；后者包括28 AIC、56 AIV和完成计数的所有贡献者，保护workspace及下一轮复用。本轮计数器在发布Start前由原有清零操作重置；finished区保留epoch，不逐轮清空。
 - 下一次调用仍在Pack完成后进行peer Start握手。Start接受`>= epoch`，防止双向空路由的peer提前进入下一轮、覆盖旧Start而造成死等。有效CV的ready仍使用`== epoch`，并且不逐轮清空对称ready区。
-- 这是每个worker顺序处理自己token区间的实现：若当前token缺任意一路结果，先等它，不扫描后面的就绪token。每CV新增quiet/MTE发布有成本；41核分工和token内部6槽也可能改变本地吞吐，应以完整`CACHED_FORWARD`和trace实测判断收益。
+- 这是每个worker顺序处理自己token区间的实现：若当前token缺任意一路结果，先等它，不扫描后面的就绪token。全入站计数仅用于提前解锁连续流水，不要求Reduce先整体等到16。每CV的quiet/MTE发布和新增finished观察都有成本，应以完整`CACHED_FORWARD`和trace实测判断收益。
 
 trace保留每CV的`CombinePublish`。Reduce在每个有任务的reducer上只记录一条：从Reduce函数入口到既有的最终流水排空完成，包含metadata预取、token结果就绪等待、计算及输出写回；在当前三个BS下共41条Reduce。这条跨度不能解释为纯Vector工作时间，也不能通过隐藏等待条扣除其中的ready等待。
 

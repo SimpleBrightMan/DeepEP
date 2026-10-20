@@ -48,21 +48,30 @@ __aicore__ inline void IssueReduceInput(AscendC::LocalTensor<Element>& inputs,
     SetFlag<HardEvent::MTE2_V>(event);
 }
 
-// The caller checks all eight dependencies before it issues this token's
-// first payload DMA. Flags are read locally with cache bypass; no remote GET.
-// Back off only after a failed poll, matching the main MegaMoE's 200 cycles.
-__aicore__ inline void WaitReduceToken(const Arguments& args, AscendC::LocalTensor<uint64_t>& dependencies,
+__aicore__ inline bool AllReduceInputsReady(const Arguments& args)
+{
+    auto* flag =
+        reinterpret_cast<__gm__ int32_t*>(args.localFlags + static_cast<uint64_t>(kLocalFlagIncomingDone) * kFlagBytes);
+    return AscendC::ReadGmByPassDCache(flag) == static_cast<int32_t>(kWorld);
+}
+
+// Return true only after observing the aggregate completion counter. Otherwise
+// check all eight dependencies before this token's first payload DMA. Probe the
+// aggregate again during a long wait, without reading it on every failed poll.
+__aicore__ inline bool WaitReduceToken(const Arguments& args, AscendC::LocalTensor<uint64_t>& dependencies,
                                        uint32_t firstRoute)
 {
     using namespace AscendC;
     constexpr uint64_t pollBackoffCycles = 200U;
     constexpr uint32_t expectedSelfTiles = (ReduceUbContract::hidden + kComputeTileN - 1U) / kComputeTileN;
+    uint32_t failedPolls = 0U;
     for (uint32_t slot = 0U; slot < ReduceUbContract::topk; ++slot) {
         const uint64_t dependency = dependencies.GetValue(firstRoute + slot);
         const uint64_t index = dependency & ~kReduceSelfDependency;
         if ((dependency & kReduceSelfDependency) != 0U) {
             auto* flag = reinterpret_cast<__gm__ int32_t*>(args.gmm2Done + index * kFlagBytes);
             while (ReadGmByPassDCache(flag) < static_cast<int32_t>(expectedSelfTiles)) {
+                if ((failedPolls++ & 7U) == 0U && AllReduceInputsReady(args)) return true;
                 const uint64_t start = GetSystemCycle();
                 while (GetSystemCycle() - start < pollBackoffCycles) {
                 }
@@ -71,14 +80,22 @@ __aicore__ inline void WaitReduceToken(const Arguments& args, AscendC::LocalTens
             auto* flag = reinterpret_cast<__gm__ uint64_t*>(args.symmetric + args.config.combineReadyOffset +
                                                             index * kFlagBytes);
             while (ReadGmByPassDCache(flag) != args.config.epoch) {
+                if ((failedPolls++ & 7U) == 0U && AllReduceInputsReady(args)) return true;
                 const uint64_t start = GetSystemCycle();
                 while (GetSystemCycle() - start < pollBackoffCycles) {
                 }
             }
         }
     }
-    // Payload reads follow Scalar's observation of every ready flag. Reuse
-    // this gate only after MTE2 consumed its previous signal; the credit is
+    return false;
+}
+
+__aicore__ inline void GateReduceInputs()
+{
+    using namespace AscendC;
+    // Payload reads follow Scalar's observation of dependency flags or the
+    // aggregate completion counter. Reuse this gate only after MTE2 consumed
+    // its previous signal; the credit is
     // returned BEFORE payload loads, so this is not a token DMA drain.
     const auto gate = static_cast<TEventID>(ReduceUbContract::readyGateEvent);
     WaitFlag<HardEvent::MTE2_S>(gate);
@@ -125,6 +142,8 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
         SetFlag<HardEvent::MTE3_V>(static_cast<TEventID>(slot));
     }
     SetFlag<HardEvent::MTE2_S>(static_cast<TEventID>(Ub::readyGateEvent));
+    bool allInputsReady = AllReduceInputsReady(args);
+    if (allInputsReady) GateReduceInputs();
 
     for (uint64_t batch = 0U; batch < owned; batch += Ub::batchTokens) {
         const uint32_t tokens =
@@ -137,17 +156,24 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
         WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
         DataCopy(inverseUb, inverse[firstRoute], routes);
         DataCopy(weightsUb, weights[firstRoute], routes);
-        DataCopy(dependenciesUb, dependencies[firstRoute], routes);
+        if (!allInputsReady) DataCopy(dependenciesUb, dependencies[firstRoute], routes);
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
 
+        uint32_t nextInput = 0U;
         for (uint32_t token = 0U; token < tokens; ++token) {
             const uint32_t tokenRoute = token * Ub::topk;
             const uint64_t localToken = batch + token;
-            WaitReduceToken(args, dependenciesUb, tokenRoute);
-
-            for (uint32_t slot = 0U; slot < Ub::inputs; ++slot) {
-                IssueReduceInput(inputs, returned, inverseUb, tokenRoute + slot);
+            if (!allInputsReady) {
+                if (localToken != 0U && (localToken & 7U) == 0U) allInputsReady = AllReduceInputsReady(args);
+                if (!allInputsReady) allInputsReady = WaitReduceToken(args, dependenciesUb, tokenRoute);
+                GateReduceInputs();
+            }
+            // The fast refill already prefetched the next token's first six
+            // routes. Slow tokens and the slow->fast transition seed them here.
+            const uint32_t initialEnd = tokenRoute + Ub::inputs;
+            for (; nextInput < initialEnd; ++nextInput) {
+                IssueReduceInput(inputs, returned, inverseUb, nextInput);
             }
             for (uint32_t topk = 0U; topk < Ub::topk; ++topk) {
                 const uint32_t route = tokenRoute + topk;
@@ -166,12 +192,14 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
                     PipeBarrier<PIPE_V>();
                     Add(accumulator, accumulator, term, Ub::hidden);
                 }
-                // Refill within this ready token only. In particular, waiting
-                // for the next token must never delay submission of this
-                // token's last two routes or its output.
+                // Once all inputs are ready, retain six in-flight routes
+                // across token boundaries, as in the original local pipeline.
+                // The slow path never prefetches an unready next token.
                 SetFlag<HardEvent::V_MTE2>(event);
-                if (topk + Ub::inputs < Ub::topk) {
+                const uint32_t readyEnd = allInputsReady ? routes : tokenRoute + Ub::topk;
+                if (route + Ub::inputs < readyEnd) {
                     IssueReduceInput(inputs, returned, inverseUb, route + Ub::inputs);
+                    ++nextInput;
                 }
             }
             const TEventID outputEvent = static_cast<TEventID>(localToken % Ub::outputs);

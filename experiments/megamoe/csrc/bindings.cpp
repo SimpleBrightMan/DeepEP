@@ -18,7 +18,7 @@ PYBIND11_MODULE(_C, module)
     module.attr("urma_api_protocol") = MegaMoeUrma::kProtocol;
     module.attr("urma_compute_schedule") = "expert-m256";
     module.attr("urma_local_pipeline") = "pack6-reduce6-output2";
-    module.attr("urma_tail_schedule") = "combine-cv-flag-reduce41";
+    module.attr("urma_tail_schedule") = "combine-finished-fast-reduce41";
     module.attr("urma_timer_numel") = MegaMoeUrma::kTimerElements;
     module.attr("urma_timer_schema") = MegaMoeUrma::kProtocol;
     module.attr("urma_trace_schema") = MegaMoeUrma::kTraceSchema;
