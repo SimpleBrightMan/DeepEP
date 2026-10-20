@@ -164,6 +164,12 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib${CONDA_PREFIX:+:$CONDA_PREFIX/lib}${LD_L
 
 增加`--trace`会隐含开启`--timer`。每种BS先完成关闭timer和trace的正式测量，再单独执行一次原有aggregate timer诊断，最后额外执行一次详细trace诊断。因此，详细打点开销不会混入正式耗时或原有带宽统计。它会改变诊断调用自身的耗时，应使用正式测量判断优化收益。
 
+`--trace`现在自动合并全部rank，每种BS生成`$OUT/bs_<BS>/allrank.json`，可直接在Perfetto/Chrome Trace Viewer打开。每个rank作为独立process，内部保留84条AIC/AIV轨道，按rank编号排列；原有每rank JSON也保留。默认导出的两种JSON均隐藏`Wait*`及普通`LocalSync`，保留尾部`FinalPeerHandshake`、`RankBarrier`和`LocalSync(sync_stage=2)`。`Quiet/Drain`继续显示实际通信完成等待和流水排空。过滤不移动时间戳、不压缩空白，不修改设备同步、原始bin或带宽统计。
+
+如需完整等待条，运行时增加`--trace-include-waits`；也可从已有bin通过下方离线导出命令增加`--include-waits`恢复。只传`--timer`仍仅导出aggregate统计，逐事件流水及`allrank.json`需要`--trace`。
+
+合并在诊断数据导出之后由rank0执行，不进入正式性能测量。单机/共享文件系统直接读取；双机目录不共享时，通过Host Store分块汇集JSON到rank0临时目录，再合并并清理临时副本。只有全部rank导出成功且文件完整才发布`allrank.json`，失败会通知全部rank，不静默生成缺rank的文件。双机的合并文件位于rank0所在机器。
+
 在已配置上述CANN、SHMEM环境并分配全部16张UBX卡后，从仓库根目录运行：
 
 ```bash
@@ -193,6 +199,8 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 | `trace_metadata.json` | rank、容量、各引擎记录数、时钟设置、raw路径或解析错误 |
 | `summary.json` | 正式耗时、aggregate带宽及各rank trace导出信息 |
 
+此外，`$OUT/bs_<BS>/allrank.json`保存该BS全部rank的合并流水，`summary.json`的`trace_allrank`记录其路径及统计。不同BS分别导出，避免混用不同调用的时间轴。各rank的零点依旧独立；合并只方便浏览，不能用跨rank横坐标差计算通信延迟或推断真实同时性。
+
 每条轨道对应`block 00..27`的`AIC/AIV0/AIV1`，引擎编号为`block*3+0/1/2`。Pack和Reduce现在同时出现在AIV0/AIV1轨道；SelfDispatch/SelfCombine不再产生拷贝事件，旧事件编号保留供历史trace解析。事件参数包含可用的peer、CV、fragment、expert、行起点/行数、M/N tile位置、列数和字节数；不适用字段显示null。`LocalSync`的CV字段另解释为`sync_stage`：0=pack、1=compute/return、2=rank barrier、3=reduce。
 
 编译和trace运行仍使用上面的命令，不增加调度或采样参数。新计算事件中的`fragment`字段表示专家M组编号，`row`表示expert-major计算行；一个组可以跨多个peer/CV，因此这两个字段为null。`WaitDispatch`保留实际等待的peer/CV及接收行，通信事件仍表示原peer/CV。核对前瞻时按`expert,fragment`观察GMM1与GMM2先后，不能再按peer解释计算轨道。单个核心只记录分给自己的tile，缺少某组的条不等于该组未计算。`WaitActivation`仍表示执行GMM2前尚未满足的依赖；aggregate timer阶段与逐事件schema不变。
@@ -216,6 +224,15 @@ python3 -m deep_ep_experimental.megamoe.urma_trace \
   --output "$OUT/rank_0/bs_4096/urma_trace.json" --rank 0 --clock-mhz 1000
 ```
 
+已经跑完、各rank JSON保存在同一目录树的历史结果，无需重新跑NPU或重新编译，可从仓库根目录直接合并：
+
+```bash
+python3 experiments/megamoe/scripts/urma_merge_traces.py \
+  /实际路径/已有运行目录 --bs-values 2048,4096,8192
+```
+
+该脚本只需Python标准库，输出同样是`已有运行目录/bs_<BS>/allrank.json`，默认隐藏上述等待条；省略`--bs-values`会发现`rank_0/bs_*`下的全部case。历史双机结果需先收集全部16个`rank_*`目录；新版本在线运行则自动完成汇集。离线`--include-waits`只能保留输入JSON已有的等待，恢复已过滤事件需使用原始bin。
+
 逐事件schema为每引擎16个uint64 header，后接`capacity*16`个uint64 record。header前五项为`schema,capacity,count,dropped,engine_id`；record前13项为`start_ticks,end_ticks,event_id,peer,cv,fragment,expert,row,rows,tileM,tileN,columns,bytes`，其余保留位为0。未知元数据为`UINT64_MAX`。解析器检查全部引擎的schema、容量、编号、计数、保留位和事件时间；同引擎事件应按平铺顺序不重叠。
 
 ### 压缩成便于复制的文本
@@ -238,7 +255,7 @@ python3 experiments/megamoe/scripts/urma_trace_to_text.py \
   --output "$OUT/rank_0/bs_4096/selected_cores.txt"
 ```
 
-详细列表默认省略`wait.sync`，但摘要与最长等待仍保留这些数据；增加`--include-waits`可输出全部等待条。quiet/drain始终保留。已过滤的JSON仍可读取，源记录数不一致时标注`INCOMPLETE`，不会把缺失的等待误报为0。文本没有同步不同rank的时钟；当前脚本只接受单rank URMA trace，不接受旧Wave合并格式。
+详细列表默认省略`wait.sync`，但摘要与最长等待仍保留输入JSON已有的这些数据；增加`--include-waits`可输出其中全部等待条。quiet/drain始终保留。新导出器声明的等待过滤显示`FILTERED_WAITS`；其它源记录数不一致显示`INCOMPLETE`，均不会把缺失的等待误报为0。需要分析完整等待时，先从bin导出含等待的JSON。文本没有同步不同rank的时钟；当前文本脚本只接受单rank URMA trace，不接受`allrank.json`或旧Wave合并格式。
 
 ## 下一步优化方向
 
@@ -257,3 +274,5 @@ python3 experiments/megamoe/scripts/urma_trace_to_text.py \
 2026-10-20 逐事件trace版本通过569项CPU回归、全仓pre-commit及CANN 9.2.0完整wheel编译。在另外两台空闲的8卡Ascend950DT、同SuperPod机器上，使用上述命令增加`--trace --trace-capacity 4096`完成EP16验证。三个BS共48份rank/BS流水图均通过完整性校验，84个引擎均有记录，dropped均为0；BS2048/4096/8192每rank分别记录48174/55586/71690条事件，单引擎最大分别为954/1094/1378。正式性能、aggregate timer和详细trace分别运行，两台worker正常退出。本次同样没有Golden数值校验，不据此宣称UBX性能或数值精度通过。
 
 2026-10-20 专家M256版本通过737项MegaMoE/runtime CPU回归、修改文件的pre-commit检查及CANN 9.2.0完整wheel编译。测试覆盖实际C++路由规划器、任意source/CV边界的行映射、L1/L0C分段布局、scale压紧、独立游标调度、self直接返回及旧路径回归；隔离wheel导入确认`urma_compute_schedule=expert-m256`与timer启用。本次只编译和执行CPU测试，没有启动NPU，也没有进行设备数值或性能验证。编译产物与日志保存在`177.2.21.1:/home/codex-deepep/megamoe-urma-expert-m256-20261020/`。
+
+2026-10-20 自动合并/等待过滤版本通过115项Host Store、trace及文本导出测试，包含真实CPU TCPStore传输、单机与非共享目录合并、错误传播、16-rank身份与独立时钟、尾部同步保留和原始时间坐标保持。离线合并脚本另经`python -I -S`验证，不依赖Torch/NPU安装。本次仅修改Python导出层，未修改或启动设备核；测试日志位于`177.2.21.1:/home/codex-deepep/megamoe-urma-allrank-20261020/cpu-tests.log`。

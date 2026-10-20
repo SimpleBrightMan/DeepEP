@@ -166,6 +166,17 @@ def test_source_record_count_mismatch_is_incomplete(trace_text):
     assert "source_status=INCOMPLETE" in trace_text.render_report(doc)
 
 
+def test_declared_wait_filter_is_distinct_from_lost_records(trace_text):
+    from deep_ep_experimental.megamoe.urma_trace import decode_trace, filter_trace_waits
+    from test_urma_trace import add_record, trace_buffer
+
+    raw = trace_buffer()
+    add_record(raw, event="WaitDispatch")
+    add_record(raw, event="DispatchPutX", start=1020, end=1040)
+    doc = filter_trace_waits(decode_trace(raw, rank=0, clock_mhz=1000))
+    assert "source_status=FILTERED_WAITS" in trace_text.render_report(doc)
+
+
 def test_per_engine_count_mismatch_is_incomplete_even_when_total_matches(trace_text):
     doc = document(event("DispatchPutX", 0, 5, peer=1))
     doc["metadata"]["records_per_engine"][2] = 0

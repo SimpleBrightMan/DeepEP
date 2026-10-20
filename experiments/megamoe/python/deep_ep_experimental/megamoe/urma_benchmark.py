@@ -47,6 +47,11 @@ def parse_args(argv=None):
         help="Additional detailed Chrome trace pass; implies --timer; neither pass enters formal timing",
     )
     parser.add_argument(
+        "--trace-include-waits",
+        action="store_true",
+        help="Include dependency waits in exported JSON; default hides them but retains final rank synchronization",
+    )
+    parser.add_argument(
         "--trace-capacity",
         type=int,
         default=4096,
@@ -101,7 +106,7 @@ def main():
         raise
 
 
-def export_trace_collective(group, raw, case, *, bs, clock_mhz):
+def export_trace_collective(group, raw, case, *, bs, clock_mhz, include_waits=False):
     """All ranks exchange exporter errors before any rank raises on overflow."""
     from .urma_trace import export_trace
 
@@ -115,7 +120,9 @@ def export_trace_collective(group, raw, case, *, bs, clock_mhz):
     )
     try:
         raw.astype("<i8", copy=False).tofile(case / "urma_trace.bin")
-        status["metadata"] = export_trace(raw, case / "urma_trace.json", rank=group.rank(), clock_mhz=clock_mhz)
+        status["metadata"] = export_trace(
+            raw, case / "urma_trace.json", rank=group.rank(), clock_mhz=clock_mhz, include_waits=include_waits
+        )
     except Exception as error:
         status["error"] = f"{type(error).__name__}: {error}"
     try:
@@ -151,6 +158,7 @@ def run(args, config, group):
             args.timer_clock_mhz,
             args.trace,
             args.trace_capacity,
+            args.trace_include_waits,
             str(args.golden_dir),
             args.check_tokens,
             args.allow_multi_host,
@@ -220,6 +228,7 @@ def run(args, config, group):
         timer_clock_source="explicit assumption; default follows legacy timer/protocol.py CYCLE_TO_US=1000",
         detailed_trace=args.trace,
         trace_capacity_per_engine=args.trace_capacity,
+        trace_include_waits=args.trace_include_waits,
         trace_clock_alignment="per-rank independent zero; no synchronized cross-rank timeline",
         trace_scope="additional diagnostic invocation after aggregate timer pass; formal measurements have both disabled",
     )
@@ -355,6 +364,8 @@ def run(args, config, group):
                         )
             del prepared, timer, raw_timer
         if args.trace:
+            from .urma_trace_merge import merge_trace_collective
+
             # Keep the aggregate bandwidth pass free from detailed trace costs.
             # Formal cached/full samples above pass neither timer nor trace.
             prepared = owner.prepare_routes(ids)
@@ -369,7 +380,19 @@ def run(args, config, group):
             torch.npu.synchronize()
             raw_trace = trace.cpu().numpy()
             reports["trace_per_rank"] = export_trace_collective(
-                group, raw_trace, case, bs=bs, clock_mhz=args.timer_clock_mhz
+                group,
+                raw_trace,
+                case,
+                bs=bs,
+                clock_mhz=args.timer_clock_mhz,
+                include_waits=args.trace_include_waits,
+            )
+            reports["trace_allrank"] = merge_trace_collective(
+                group,
+                reports["trace_per_rank"],
+                args.output_dir / f"bs_{bs}" / "allrank.json",
+                bs=bs,
+                include_waits=args.trace_include_waits,
             )
             if rank == 0:
                 print(
@@ -378,6 +401,7 @@ def run(args, config, group):
                     f"{args.output_dir}/rank_*/bs_{bs}/urma_trace.json",
                     flush=True,
                 )
+                print(f"[URMA ALLRANK] BS={bs}; {reports['trace_allrank']['path']}", flush=True)
             del prepared, trace, raw_trace
         (case / "summary.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
         all_reports.append(reports)

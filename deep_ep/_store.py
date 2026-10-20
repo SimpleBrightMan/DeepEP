@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import timedelta
 import json
 import os
+from pathlib import Path
 import uuid
 
 _CONTROL_BYTES = 1024 * 1024
@@ -126,6 +127,72 @@ class StoreGroup:
 
     def barrier(self, stage="barrier"):
         self.all_gather(None, f"barrier:{stage}")
+
+    def gather_file(self, path, directory, stage, dst=0):
+        """Copy one file per rank to dst, without requiring a shared filesystem.
+
+        Only dst uses directory and returns rank-ordered Path objects named
+        rank_<n>.bin; other ranks return None. Raw payloads are bounded chunks,
+        transferred one source rank at a time and reclaimed after consumption.
+        This diagnostic export is collective and must run outside device timing.
+        """
+        key = f"file/{self._sequence}"
+        with self._operation(f"{key}/{stage}"):
+            if type(dst) is not int or not 0 <= dst < self._size:
+                raise ValueError("gather_file requires a valid destination rank")
+            outputs = None
+            if self._rank == dst:
+                destination = Path(directory)
+                destination.mkdir(parents=True, exist_ok=True)
+                outputs = [destination / f"rank_{peer}.bin" for peer in range(self._size)]
+                if any(output.resolve() == Path(path).resolve() for output in outputs):
+                    raise ValueError("gather_file destination must not overwrite its source")
+            with Path(path).open("rb") as source:
+                size = os.fstat(source.fileno()).st_size
+                metadata = self.all_gather([dst, size], f"gather_file:{stage}")
+                if any(
+                    not isinstance(entry, list)
+                    or len(entry) != 2
+                    or entry[0] != dst
+                    or type(entry[1]) is not int
+                    or entry[1] < 0
+                    for entry in metadata
+                ):
+                    raise ValueError(f"gather_file metadata mismatch: {metadata}")
+                for peer, (_, peer_size) in enumerate(metadata):
+                    peer_key = f"{key}/rank/{peer}"
+                    if self._rank == dst:
+                        temporary = outputs[peer].with_suffix(".part")
+                        with temporary.open("wb") as output:
+                            if peer != dst:
+                                self._set(f"{peer_key}/ready", b"1")
+                            for start in range(0, peer_size, _CHUNK_BYTES):
+                                count = min(_CHUNK_BYTES, peer_size - start)
+                                chunk_key = f"{peer_key}/{start}"
+                                payload = source.read(count) if peer == dst else self._get(f"{chunk_key}/data")
+                                if len(payload) != count:
+                                    raise ValueError(f"gather_file payload size mismatch at rank={peer} offset={start}")
+                                output.write(payload)
+                                if peer != dst:
+                                    self._delete(f"{chunk_key}/data")
+                                    self._set(f"{chunk_key}/ack", b"1")
+                        temporary.replace(outputs[peer])
+                    elif self._rank == peer:
+                        self._get(f"{peer_key}/ready")
+                        self._delete(f"{peer_key}/ready")
+                        for start in range(0, peer_size, _CHUNK_BYTES):
+                            count = min(_CHUNK_BYTES, peer_size - start)
+                            payload = source.read(count)
+                            if len(payload) != count:
+                                raise ValueError(f"gather_file source shrank at rank={peer} offset={start}")
+                            chunk_key = f"{peer_key}/{start}"
+                            self._set(f"{chunk_key}/data", payload)
+                            self._get(f"{chunk_key}/ack")
+                            self._delete(f"{chunk_key}/ack")
+                if source.read(1):
+                    raise ValueError(f"gather_file source grew during export at rank={self._rank}")
+            self.barrier(f"{key}/{stage}/complete")
+            return outputs
 
     def reduce_sum(self, array, dst, stage):
         """Sum CPU float32 reference output to dst in bounded chunks, outside timing."""

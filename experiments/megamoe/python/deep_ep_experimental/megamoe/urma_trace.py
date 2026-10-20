@@ -220,9 +220,38 @@ def decode_trace(raw, *, rank, clock_mhz):
     return dict(traceEvents=events, displayTimeUnit="us", metadata=metadata)
 
 
-def export_trace(raw, output, *, rank, clock_mhz):
+def filter_trace_waits(trace):
+    """Hide dependency waits without moving timestamps or losing final barriers."""
+    kept, hidden = [], 0
+    for event in trace["traceEvents"]:
+        if event.get("ph") == "X" and event.get("cat") == "wait.sync":
+            name = event["name"]
+            final_barrier = name in ("RankBarrier", "FinalPeerHandshake") or (
+                name == "LocalSync" and event.get("args", {}).get("sync_stage") == 2
+            )
+            if not final_barrier:
+                hidden += 1
+                continue
+        kept.append(event)
+    metadata = dict(trace["metadata"])
+    per_engine = [0] * ENGINE_COUNT
+    for event in kept:
+        if event.get("ph") == "X":
+            per_engine[event["tid"]] += 1
+    metadata.update(
+        visible_record_count=sum(per_engine),
+        visible_records_per_engine=per_engine,
+        hidden_wait_count=metadata.get("hidden_wait_count", 0) + hidden,
+        wait_filter="dependency waits and local sync hidden; final rank barrier/handshake retained; timestamps unchanged",
+    )
+    return dict(trace, traceEvents=kept, metadata=metadata)
+
+
+def export_trace(raw, output, *, rank, clock_mhz, include_waits=False):
     """Validate every record before writing the Chrome JSON file."""
     trace = decode_trace(raw, rank=rank, clock_mhz=clock_mhz)
+    if not include_waits:
+        trace = filter_trace_waits(trace)
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(trace, ensure_ascii=False, separators=(",", ":"), allow_nan=False), encoding="utf-8")
@@ -234,12 +263,19 @@ def main(argv=None):
     parser.add_argument("raw", type=Path, help="One rank's urma_trace.bin; not the aggregate urma_timer.bin")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rank", type=int, required=True)
+    parser.add_argument("--include-waits", action="store_true", help="Restore dependency waits from the raw binary")
     parser.add_argument(
         "--clock-mhz", type=float, required=True, help="Counter ticks/us; use the benchmark's clock setting"
     )
     args = parser.parse_args(argv)
     try:
-        metadata = export_trace(args.raw.read_bytes(), args.output, rank=args.rank, clock_mhz=args.clock_mhz)
+        metadata = export_trace(
+            args.raw.read_bytes(),
+            args.output,
+            rank=args.rank,
+            clock_mhz=args.clock_mhz,
+            include_waits=args.include_waits,
+        )
     except (OSError, ValueError) as error:
         parser.exit(2, f"URMA trace export failed: {error}\n")
     print(json.dumps(dict(output=str(args.output), **metadata), ensure_ascii=False, allow_nan=False))
