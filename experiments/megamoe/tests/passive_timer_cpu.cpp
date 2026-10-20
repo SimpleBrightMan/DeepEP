@@ -64,6 +64,13 @@ int main() {
     assert(data[AscendTimer::N_TIMING_COUNTER_PER_CORE_ALIGN]>0);
     isAiv=false;blockId=AscendTimer::DYNAMIC_TRACE_GROUPS;
     timer.Init(reinterpret_cast<GM_ADDR>(data.data()));
+    if (blockId * 3 >= AscendTimer::N_CORE_COUNT) {
+        // 完整采样时不存在“有效但未采样”的group；边界group应被拒绝，且不能写越界。
+        assert(!timer.Enabled() && !timer.DynamicEnabled());
+        timer.Start(AscendTimer::KERNEL_TIMING);timer.End(AscendTimer::KERNEL_TIMING);
+        timer.FlushDynamicCounts();
+        return 0;
+    }
     assert(timer.Enabled() && !timer.DynamicEnabled());
     timer.SetSlice(0,0,96);
     assert(!timer.StartTile(AscendTimer::AIC_GMM1_ISSUE,0,0,96));
