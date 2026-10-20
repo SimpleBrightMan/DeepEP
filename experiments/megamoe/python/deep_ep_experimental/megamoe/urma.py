@@ -31,6 +31,26 @@ def _extension():
     return extension
 
 
+def _trace_extension():
+    """Check the optional trace ABI only when a caller requests tracing."""
+    extension = _extension()
+    expected = {
+        "urma_trace_schema": 1,
+        "urma_trace_num_engines": 84,
+        "urma_trace_record_elements": 16,
+        "urma_trace_header_elements": 16,
+        "urma_trace_max_capacity": 65536,
+    }
+    for name, value in expected.items():
+        if getattr(extension, name, None) != value:
+            raise RuntimeError(
+                f"URMA trace Python/native versions differ ({name}); rebuild and reinstall the complete wheel"
+            )
+    if not getattr(extension, "urma_timer_enabled", False):
+        raise RuntimeError("URMA trace requires a wheel built with DEEPEP_MEGAMOE_TIMER=ON")
+    return extension
+
+
 class _UrmaRuntime(Runtime):
     _megamoe = True
     _megamoe_urma = True
@@ -155,6 +175,18 @@ class UrmaBuffer:
                 raise RuntimeError("URMA timer requires a wheel built with its timer support")
             return torch.zeros(int(_extension().urma_timer_numel), dtype=torch.int64, device=self._device)
 
+    def allocate_trace(self, capacity=4096):
+        """Allocate bounded per-engine event slices for one diagnostic launch."""
+        import torch
+
+        with self._operation("trace allocation"):
+            extension = _trace_extension()
+            integer("trace capacity", capacity, 1, extension.urma_trace_max_capacity)
+            numel = extension.urma_trace_num_engines * (
+                extension.urma_trace_header_elements + capacity * extension.urma_trace_record_elements
+            )
+            return torch.zeros(numel, dtype=torch.int64, device=self._device)
+
     @contextmanager
     def _operation(self, stage):
         """Fail the collective job, rather than retrying with divergent epochs.
@@ -264,7 +296,7 @@ class UrmaBuffer:
                 self, plan, routing, bs, received_by_rank[self.group.rank()], tuple(value._version for value in tensors)
             )
 
-    def forward_prepared(self, x, topk_weights, l1_weights, l2_weights, prepared, *, timer=None, out=None):
+    def forward_prepared(self, x, topk_weights, l1_weights, l2_weights, prepared, *, timer=None, out=None, trace=None):
         """Expand/Dispatch/GMM1/SwiGLU/GMM2/return PUT/barrier/weighted reduction."""
         import torch
         from .api import _check_fp4_weight_format, _RoutedWeightPair
@@ -297,7 +329,23 @@ class UrmaBuffer:
                 if weight.dtype != torch.uint8:
                     raise TypeError("URMA first profile requires packed FP4 weights")
                 _check_fp4_weight_format(weight, name)
-            operands = (data, scales, topk_weights, weight1, weight2, scale1, scale2, timer, out)
+            if trace is not None:
+                extension = _trace_extension()
+                row_elements = extension.urma_trace_num_engines * extension.urma_trace_record_elements
+                if (
+                    trace.dtype != torch.int64
+                    or trace.ndim != 1
+                    or not trace.is_contiguous()
+                    or trace.numel() % row_elements
+                    or not 2 * row_elements <= trace.numel() <= (extension.urma_trace_max_capacity + 1) * row_elements
+                ):
+                    raise ValueError(
+                        "trace must be contiguous 1D int64 with "
+                        "84 * (16 + capacity * 16) elements, capacity in [1,65536]"
+                    )
+                if trace.data_ptr() % 128:
+                    raise ValueError("trace storage must be 128-byte aligned; use UrmaBuffer.allocate_trace()")
+            operands = (data, scales, topk_weights, weight1, weight2, scale1, scale2, timer, out, trace)
             if any(value is not None and value.device != self._device for value in operands):
                 raise ValueError("all tensors must reside on the creating NPU")
             if any(value is not None and value.requires_grad for value in operands):
@@ -306,29 +354,34 @@ class UrmaBuffer:
                 raise RuntimeError("URMA epoch exhausted; destroy and recreate the collective runtime")
             self._epoch += 1
             self._last_prepared = prepared
-            return self._enqueue_forward(
-                prepared,
-                (
-                    data,
-                    scales,
-                    routing.order,
-                    routing.reduce_index,
-                    topk_weights,
-                    weight1,
-                    weight2,
-                    scale1,
-                    scale2,
-                    timer,
-                    out,
-                    self._epoch,
-                ),
+            native_operands = (
+                data,
+                scales,
+                routing.order,
+                routing.reduce_index,
+                topk_weights,
+                weight1,
+                weight2,
+                scale1,
+                scale2,
+                timer,
+                out,
+                self._epoch,
             )
+            # Preserve the original positional signature for untraced calls,
+            # including older test doubles and wheels used without this feature.
+            if trace is not None:
+                native_operands += (trace,)
+            return self._enqueue_forward(prepared, native_operands)
 
-    def forward(self, x, topk_idx, topk_weights, l1_weights, l2_weights, *, timer=None, out=None):
+    def forward(self, x, topk_idx, topk_weights, l1_weights, l2_weights, *, timer=None, out=None, trace=None):
         """Complete invocation, including fresh real-input route preparation."""
         with self._lock:
             prepared = self.prepare_routes(topk_idx)
-            return self.forward_prepared(x, topk_weights, l1_weights, l2_weights, prepared, timer=timer, out=out)
+            options = dict(timer=timer, out=out)
+            if trace is not None:
+                options["trace"] = trace
+            return self.forward_prepared(x, topk_weights, l1_weights, l2_weights, prepared, **options)
 
     def destroy(self):
         with self._lock:

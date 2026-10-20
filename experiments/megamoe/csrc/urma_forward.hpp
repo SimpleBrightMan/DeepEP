@@ -18,7 +18,8 @@ public:
     torch::Tensor forward(torch::Tensor x, torch::Tensor x_scales, torch::Tensor order, torch::Tensor reduce_index,
                           torch::Tensor topk_weights, torch::Tensor weight1, torch::Tensor weight2,
                           torch::Tensor weight_scales1, torch::Tensor weight_scales2,
-                          c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> out, int64_t epoch);
+                          c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> out, int64_t epoch,
+                          c10::optional<torch::Tensor> trace = c10::nullopt);
     int64_t workspace_bytes() const;
 
 private:

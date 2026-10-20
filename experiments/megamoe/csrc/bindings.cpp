@@ -18,11 +18,19 @@ PYBIND11_MODULE(_C, module)
     module.attr("urma_api_protocol") = MegaMoeUrma::kProtocol;
     module.attr("urma_timer_numel") = MegaMoeUrma::kTimerElements;
     module.attr("urma_timer_schema") = MegaMoeUrma::kProtocol;
+    module.attr("urma_trace_schema") = MegaMoeUrma::kTraceSchema;
+    module.attr("urma_trace_max_capacity") = MegaMoeUrma::kTraceMaxCapacity;
+    module.attr("urma_trace_num_engines") = MegaMoeUrma::kTimerCores;
+    module.attr("urma_trace_record_elements") = MegaMoeUrma::kTraceRecordElements;
+    module.attr("urma_trace_header_elements") = MegaMoeUrma::kTraceHeaderElements;
     module.def("urma_buffer_size", &deepep::megamoe::urma_buffer_size);
     py::class_<deepep::megamoe::UrmaPlan>(module, "UrmaPlan")
         .def(py::init<torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, uint64_t,
                       uint64_t, int64_t>())
-        .def("forward", &deepep::megamoe::UrmaPlan::forward)
+        .def("forward", &deepep::megamoe::UrmaPlan::forward, py::arg("x"), py::arg("x_scales"), py::arg("order"),
+             py::arg("reduce_index"), py::arg("topk_weights"), py::arg("weight1"), py::arg("weight2"),
+             py::arg("weight_scales1"), py::arg("weight_scales2"), py::arg("timer"), py::arg("out"), py::arg("epoch"),
+             py::arg("trace") = py::none())
         .def_property_readonly("workspace_bytes", &deepep::megamoe::UrmaPlan::workspace_bytes);
     py::class_<Plan>(module, "Plan")
         .def(py::init<torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t, int64_t, uint64_t,

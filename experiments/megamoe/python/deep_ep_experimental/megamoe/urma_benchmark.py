@@ -23,7 +23,7 @@ def summarize_metric(per_rank, metric, scope, ranks_per_node=16):
     return report
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="urma")
     parser.add_argument("--bs-values", default="2048,4096,8192")
@@ -42,6 +42,17 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--timer", action="store_true", help="Separate native URMA timer pass, outside formal timing")
     parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Additional detailed Chrome trace pass; implies --timer; neither pass enters formal timing",
+    )
+    parser.add_argument(
+        "--trace-capacity",
+        type=int,
+        default=4096,
+        help="Maximum detailed records per physical engine; overflow fails explicitly",
+    )
+    parser.add_argument(
         "--timer-clock-mhz",
         type=float,
         default=1000.0,
@@ -53,7 +64,15 @@ def main():
     parser.add_argument(
         "--check-tokens", type=int, default=0, help="Must match --check-tokens used to create the optional Golden cache"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if not 1 <= args.trace_capacity <= 65536:
+        parser.error("trace-capacity must be in [1,65536]")
+    args.timer = args.timer or args.trace
+    return args
+
+
+def main():
+    args = parse_args()
     config = load_config(args.config, args.bs_values)
     for key in ("warmup", "iters"):
         value = getattr(args, key)
@@ -67,7 +86,7 @@ def main():
         or not math.isfinite(args.timer_clock_mhz)
         or args.timer_clock_mhz <= 0
     ):
-        parser.error("warmup/check-tokens must be nonnegative; iters/cv-rows must be positive")
+        raise ValueError("warmup/check-tokens must be nonnegative; iters/cv-rows/clock must be positive and finite")
     import torch
     import torch_npu  # noqa: F401
     from deep_ep._store import StoreGroup
@@ -80,6 +99,34 @@ def main():
     except BaseException as error:
         group.abort(f"URMA benchmark: {type(error).__name__}: {error}")
         raise
+
+
+def export_trace_collective(group, raw, case, *, bs, clock_mhz):
+    """All ranks exchange exporter errors before any rank raises on overflow."""
+    from .urma_trace import export_trace
+
+    case = Path(case)
+    status = dict(
+        rank=group.rank(),
+        error=None,
+        metadata=None,
+        raw_path=str(case / "urma_trace.bin"),
+        chrome_path=str(case / "urma_trace.json"),
+    )
+    try:
+        raw.astype("<i8", copy=False).tofile(case / "urma_trace.bin")
+        status["metadata"] = export_trace(raw, case / "urma_trace.json", rank=group.rank(), clock_mhz=clock_mhz)
+    except Exception as error:
+        status["error"] = f"{type(error).__name__}: {error}"
+    try:
+        (case / "trace_metadata.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
+    except OSError as error:
+        status["error"] = (status["error"] or "") + f"; failed to save trace metadata: {error}"
+    records = group.all_gather(status, f"URMA trace export BS={bs}")
+    failures = [f"rank={record['rank']}: {record['error']}" for record in records if record["error"]]
+    if failures:
+        raise RuntimeError("URMA detailed trace failed: " + "; ".join(failures))
+    return records
 
 
 def run(args, config, group):
@@ -102,6 +149,8 @@ def run(args, config, group):
             args.max_recv_rows,
             args.timer,
             args.timer_clock_mhz,
+            args.trace,
+            args.trace_capacity,
             str(args.golden_dir),
             args.check_tokens,
             args.allow_multi_host,
@@ -168,6 +217,10 @@ def run(args, config, group):
         native_urma_protocol=int(_extension().urma_api_protocol),
         timer_clock_mhz=args.timer_clock_mhz,
         timer_clock_source="explicit assumption; default follows legacy timer/protocol.py CYCLE_TO_US=1000",
+        detailed_trace=args.trace,
+        trace_capacity_per_engine=args.trace_capacity,
+        trace_clock_alignment="per-rank independent zero; no synchronized cross-rank timeline",
+        trace_scope="additional diagnostic invocation after aggregate timer pass; formal measurements have both disabled",
     )
     (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     all_reports = []
@@ -293,6 +346,31 @@ def run(args, config, group):
                             flush=True,
                         )
             del prepared, timer, raw_timer
+        if args.trace:
+            # Keep the aggregate bandwidth pass free from detailed trace costs.
+            # Formal cached/full samples above pass neither timer nor trace.
+            prepared = owner.prepare_routes(ids)
+            trace, error = None, None
+            try:
+                trace = owner.allocate_trace(args.trace_capacity)
+            except Exception as failure:
+                error = f"{type(failure).__name__}: {failure}"
+            collective_check(group, f"URMA trace allocation BS={bs}", error)
+            group.barrier(f"URMA detailed trace BS={bs}")
+            owner.forward_prepared(x, topk_weights, *weights, prepared, trace=trace, out=output)
+            torch.npu.synchronize()
+            raw_trace = trace.cpu().numpy()
+            reports["trace_per_rank"] = export_trace_collective(
+                group, raw_trace, case, bs=bs, clock_mhz=args.timer_clock_mhz
+            )
+            if rank == 0:
+                print(
+                    f"[URMA TRACE] BS={bs} all {world} ranks exported; "
+                    f"capacity={args.trace_capacity}/engine; rank-local clocks; "
+                    f"{args.output_dir}/rank_*/bs_{bs}/urma_trace.json",
+                    flush=True,
+                )
+            del prepared, trace, raw_trace
         (case / "summary.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
         all_reports.append(reports)
         if rank == 0:

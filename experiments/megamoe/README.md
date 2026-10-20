@@ -8,6 +8,8 @@ Modified by Joyce_An 2026
 公开入口：`deep_ep_experimental.megamoe`。W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度。
 构建和多机测试入口位于本目录的 `scripts/`；机器地址及环境配置由使用者提供。
 
+独立的完整 URMA 固定 CV 算子、EP16 运行命令和逐事件 Chrome trace 见 [URMA.md](URMA.md)。
+
 ## 1. 输入、输出与公开接口
 
 定义：`B` 为每卡 token 数，`H` 为隐藏维度，`I` 为 SwiGLU 后宽度，`K` 为 top-k，

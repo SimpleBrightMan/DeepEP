@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 import sys
 import threading
+from math import prod
 
 import pytest
 
@@ -153,6 +154,21 @@ class Tensor:
         self.requires_grad = False
         self._version = 0
         self.streams = []
+        self.contiguous = True
+        self.address = 128
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    def numel(self):
+        return prod(self.shape)
+
+    def is_contiguous(self):
+        return self.contiguous
+
+    def data_ptr(self):
+        return self.address
 
     def reshape(self, *shape):
         return Tensor(shape, self.dtype)
@@ -162,7 +178,7 @@ class Tensor:
 
 
 def prepared_call_setup(monkeypatch):
-    dtypes = dict(float8_e4m3fn="fp8", float8_e8m0fnu="scale", uint8="fp4", float32="float")
+    dtypes = dict(float8_e4m3fn="fp8", float8_e8m0fnu="scale", uint8="fp4", float32="float", int64="int64")
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(**dtypes))
     monkeypatch.setattr(api, "_check_fp4_weight_format", lambda *_: None)
     events = []
@@ -177,6 +193,7 @@ def prepared_call_setup(monkeypatch):
     epochs = []
 
     def forward(*operands):
+        assert len(operands) == 12  # The existing untraced native signature stays compatible.
         assert operands[1].shape == (2048, 56, 2)
         epochs.append(operands[-1])
         return Tensor((2048, 3584), "bf16")
@@ -240,3 +257,128 @@ def test_benchmark_summaries_preserve_two_eight_rank_nodes():
 
     report = summarize_metric([[float(rank + 1)] * 4 for rank in range(16)], "FULL_E2E", "test", ranks_per_node=8)
     assert [node["rank_start"] for node in report["per_node"]] == [0, 8]
+
+
+def trace_extension(**changes):
+    values = dict(
+        urma_trace_schema=1,
+        urma_trace_num_engines=84,
+        urma_trace_record_elements=16,
+        urma_trace_header_elements=16,
+        urma_trace_max_capacity=65536,
+        urma_timer_enabled=True,
+    )
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize("capacity", [None, 1, 65536])
+def test_trace_allocation_uses_native_slice_layout_and_owner_device(monkeypatch, capacity):
+    allocations = []
+
+    def zeros(numel, *, dtype, device):
+        allocations.append((numel, dtype, device))
+        return Tensor((numel,), dtype)
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(zeros=zeros, int64="int64"))
+    monkeypatch.setattr(urma, "_extension", lambda: trace_extension())
+    owner, aborts = owner_for(Stream("owner", []))
+    owner._device = "npu:0"
+    trace = owner.allocate_trace() if capacity is None else owner.allocate_trace(capacity)
+    expected = 84 * (16 + (4096 if capacity is None else capacity) * 16)
+    assert allocations == [(expected, "int64", "npu:0")]
+    assert trace.shape == (expected,) and not aborts
+    owner.destroy()
+
+
+@pytest.mark.parametrize("capacity", [0, -1, 65537, True, 1.5])
+def test_trace_allocation_rejects_invalid_capacity_before_allocating(monkeypatch, capacity):
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    monkeypatch.setattr(urma, "_extension", lambda: trace_extension())
+    owner, aborts = owner_for(Stream("owner", []))
+    with pytest.raises(ValueError, match="trace capacity must be an integer"):
+        owner.allocate_trace(capacity)
+    assert len(aborts) == 1
+    owner._runtime.closed = True
+
+
+@pytest.mark.parametrize(
+    "extension, message",
+    [
+        (SimpleNamespace(), "rebuild and reinstall"),
+        (trace_extension(urma_trace_schema=2), "rebuild and reinstall"),
+        (trace_extension(urma_timer_enabled=False), "DEEPEP_MEGAMOE_TIMER=ON"),
+    ],
+)
+def test_trace_requires_matching_native_trace_abi_and_timer_build(monkeypatch, extension, message):
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    monkeypatch.setattr(urma, "_extension", lambda: extension)
+    owner, aborts = owner_for(Stream("owner", []))
+    with pytest.raises(RuntimeError, match=message):
+        owner.allocate_trace()
+    assert len(aborts) == 1
+    owner._runtime.closed = True
+
+
+@pytest.mark.parametrize("fresh_routes", [False, True])
+def test_trace_forward_appends_optional_argument_without_moving_timer_out_or_epoch(monkeypatch, fresh_routes):
+    owner, aborts, x, probs, w1, w2, _, make_plan = prepared_call_setup(monkeypatch)
+    monkeypatch.setattr(urma, "_extension", lambda: trace_extension())
+    prepared = make_plan()
+    trace = Tensor((84 * 16 * 5,), "int64")
+    timer = Tensor((84 * 8 * 16,), "int64")
+    output = Tensor((2048, 3584), "bf16")
+    calls = []
+
+    def forward(*operands):
+        calls.append(operands)
+        return output
+
+    prepared.native.forward = forward
+    if fresh_routes:
+        monkeypatch.setattr(owner, "prepare_routes", lambda _: prepared)
+        result = owner.forward(x, object(), probs, w1, w2, timer=timer, out=output, trace=trace)
+    else:
+        result = owner.forward_prepared(x, probs, w1, w2, prepared, timer=timer, out=output, trace=trace)
+    assert result is output and len(calls) == 1 and len(calls[0]) == 13
+    assert calls[0][9:] == (timer, output, 1, trace)
+    assert owner._epoch == 1 and not aborts
+    owner.destroy()
+
+
+@pytest.mark.parametrize(
+    "fault", ["dtype", "rank", "contiguous", "fraction", "empty", "oversize", "device", "alignment"]
+)
+def test_invalid_trace_rejected_before_epoch_or_native_launch(monkeypatch, fault):
+    owner, aborts, x, probs, w1, w2, epochs, make_plan = prepared_call_setup(monkeypatch)
+    monkeypatch.setattr(urma, "_extension", lambda: trace_extension())
+    trace = Tensor((84 * 16 * 5,), "int64")
+    if fault == "dtype":
+        trace.dtype = "float"
+    elif fault == "rank":
+        trace.shape = (84, 16 * 5)
+    elif fault == "contiguous":
+        trace.contiguous = False
+    elif fault == "fraction":
+        trace.shape = (84 * 16 * 5 + 1,)
+    elif fault == "empty":
+        trace.shape = (84 * 16,)
+    elif fault == "oversize":
+        trace.shape = (84 * 16 * 65538,)
+    elif fault == "device":
+        trace.device = "npu:1"
+    else:
+        trace.address += 8  # A contiguous int64 storage_offset=1 view is still misaligned.
+    message = {"device": "creating NPU", "alignment": "128-byte aligned"}.get(fault, "trace must be")
+    with pytest.raises(ValueError, match=message):
+        owner.forward_prepared(x, probs, w1, w2, make_plan(), trace=trace)
+    assert not epochs and owner._epoch == 0 and len(aborts) == 1
+    owner._runtime.closed = True
+
+
+def test_untraced_forward_does_not_require_new_trace_extension_properties(monkeypatch):
+    owner, aborts, x, probs, w1, w2, epochs, make_plan = prepared_call_setup(monkeypatch)
+    monkeypatch.setattr(urma, "_extension", lambda: pytest.fail("untraced call queried optional trace ABI"))
+    owner.forward_prepared(x, probs, w1, w2, make_plan())
+    assert epochs == [1] and not aborts
+    owner.destroy()

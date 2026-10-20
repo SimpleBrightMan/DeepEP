@@ -1,0 +1,247 @@
+"""Validate URMA detailed trace schema 1 and export a rank-local Chrome trace.
+
+The recorded scopes show submission, waiting and drain separately. A PUT or
+Cube submission interval is never relabelled as asynchronous completion time.
+"""
+
+import argparse
+from collections import Counter
+import json
+import math
+from pathlib import Path
+
+TRACE_SCHEMA = 1
+ENGINE_COUNT = 84
+HEADER_WORDS = RECORD_WORDS = 16
+UNKNOWN = (1 << 64) - 1
+EVENTS = (
+    "Pack",
+    "DispatchPutX",
+    "DispatchPutScale",
+    "DispatchQuiet",
+    "DispatchPublish",
+    "SelfDispatch",
+    "WaitStartPeer",
+    "PublishStart",
+    "WaitLocalDispatch",
+    "WaitCombineReady",
+    "CombinePut",
+    "CombineQuiet",
+    "SelfCombine",
+    "FinalPeerHandshake",
+    "WaitDispatch",
+    "Gmm1Tile",
+    "Gmm1TileDrain",
+    "Gmm1Dequant",
+    "WaitActivation",
+    "Gmm2Tile",
+    "Gmm2Dequant",
+    "Gmm2Drain",
+    "WaitGmm1",
+    "ActivationSlice",
+    "RankBarrier",
+    "Reduce",
+    "LocalSync",
+    "Gmm1Drain",
+)
+METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
+SYNC_STAGES = {0: "pack", 1: "compute/return", 2: "rank barrier", 3: "reduce"}
+
+
+class TraceOverflowError(ValueError):
+    """An incomplete trace must not be used as if it contained every event."""
+
+
+def event_style(event):
+    if event in ("DispatchPutX", "DispatchPutScale", "CombinePut"):
+        return (
+            event + " [PUT submit]",
+            "transport.submit",
+            "thread_state_runnable",
+            "enqueue scope; not remote completion",
+        )
+    if event in ("Gmm1Tile", "Gmm2Tile"):
+        return event + " [Cube submit]", "cube.submit", "good", "submission scope; not Cube completion"
+    if event.endswith("Quiet"):
+        return (
+            event + " [completion wait]",
+            "transport.quiet",
+            "thread_state_iowait",
+            "wait for prior peer PUT completion",
+        )
+    if event.endswith("Drain"):
+        return event + " [drain]", "compute.drain", "thread_state_iowait", "explicit pipeline drain scope"
+    if event.startswith("Wait") or event in ("RankBarrier", "LocalSync", "FinalPeerHandshake"):
+        return event, "wait.sync", "thread_state_iowait", "dependency or synchronization wait"
+    if event in ("DispatchPublish", "PublishStart"):
+        return event, "signal.publish", "rail_response", "signal publication scope"
+    return event, "compute.copy", "rail_animation", "recorded device scope"
+
+
+def decode_trace(raw, *, rank, clock_mhz):
+    """Return Chrome trace JSON. All tick subtraction uses Python integers first.
+
+    Input is an int64/uint64 array or the little-endian raw bytes written by the
+    benchmark. Signed storage is reinterpreted as uint64, including sentinels.
+    Each rank is zeroed independently; joining files cannot align rank clocks.
+    """
+    import numpy as np
+
+    if type(rank) is not int or not 0 <= rank < 16:
+        raise ValueError("rank must be an integer in [0,16)")
+    if isinstance(clock_mhz, bool) or not math.isfinite(clock_mhz) or clock_mhz <= 0:
+        raise ValueError("clock_mhz must be positive and finite")
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        if len(raw) % 8:
+            raise ValueError("trace byte length must be a multiple of 8")
+        values = np.frombuffer(raw, dtype="<u8")
+    else:
+        values = np.asarray(raw)
+        if values.dtype.kind not in "iu" or values.dtype.itemsize != 8:
+            raise ValueError("trace requires 64-bit integer storage")
+        values = values.view(np.dtype(values.dtype.byteorder + "u8")).reshape(-1)
+    if values.size < ENGINE_COUNT * HEADER_WORDS:
+        raise ValueError("trace is missing engine headers")
+    if int(values[0]) != TRACE_SCHEMA:
+        raise ValueError("trace schema is missing or incompatible")
+    capacity = int(values[1])
+    if not 1 <= capacity <= 65536:
+        raise ValueError("trace capacity must be in [1,65536]")
+    stride = HEADER_WORDS + capacity * RECORD_WORDS
+    if values.size != ENGINE_COUNT * stride:
+        raise ValueError(f"trace size disagrees with capacity={capacity}: expected {ENGINE_COUNT * stride} words")
+    slices = values.reshape(ENGINE_COUNT, stride)
+    counts, overflows = [], []
+    for engine, data in enumerate(slices):
+        schema, engine_capacity, count, dropped, engine_id = map(int, data[:5])
+        if schema != TRACE_SCHEMA:
+            raise ValueError(f"engine={engine}: incompatible schema={schema}")
+        if engine_capacity != capacity:
+            raise ValueError(f"engine={engine}: capacity={engine_capacity} differs from {capacity}")
+        if engine_id != engine:
+            raise ValueError(f"engine={engine}: invalid engine id={engine_id}")
+        if count > capacity or dropped:
+            overflows.append(f"engine={engine} count={count} capacity={capacity} dropped={dropped}")
+        if any(int(value) for value in data[5:HEADER_WORDS]):
+            raise ValueError(f"engine={engine}: nonzero reserved header fields")
+        counts.append(count)
+    if overflows:
+        raise TraceOverflowError("URMA trace overflow; increase --trace-capacity; " + "; ".join(overflows))
+
+    records = []
+    for engine, (data, count) in enumerate(zip(slices, counts)):
+        previous_end = None
+        for ordinal in range(count):
+            offset = HEADER_WORDS + ordinal * RECORD_WORDS
+            row = tuple(map(int, data[offset : offset + RECORD_WORDS]))
+            start, end, event_id = row[:3]
+            if event_id >= len(EVENTS):
+                raise ValueError(f"engine={engine} record={ordinal}: unknown event id={event_id}")
+            if end < start or start == UNKNOWN or end == UNKNOWN:
+                raise ValueError(f"engine={engine} record={ordinal}: invalid ticks start={start} end={end}")
+            if previous_end is not None and start < previous_end:
+                raise ValueError(f"engine={engine} record={ordinal}: overlapping or out-of-order event ticks")
+            previous_end = end
+            if any(row[13:]):
+                raise ValueError(f"engine={engine} record={ordinal}: nonzero reserved record fields")
+            if row[3] != UNKNOWN and row[3] >= 16:
+                raise ValueError(f"engine={engine} record={ordinal}: peer must be in [0,16) or unknown")
+            records.append((start, end, engine, ordinal, row))
+    if not records:
+        raise ValueError("trace has no recorded events")
+    origin = min(record[0] for record in records)
+    last = max(record[1] for record in records)
+    metadata = dict(
+        schema=TRACE_SCHEMA,
+        rank=rank,
+        engine_count=ENGINE_COUNT,
+        capacity_per_engine=capacity,
+        records_per_engine=counts,
+        record_count=len(records),
+        dropped=0,
+        raw_bytes=int(values.nbytes),
+        clock_mhz=float(clock_mhz),
+        clock_source="caller-supplied ticks/us; not detected from hardware",
+        origin_tick=str(origin),
+        last_tick=str(last),
+        envelope_ticks=last - origin,
+        envelope_us=(last - origin) / clock_mhz,
+        clock_alignment="each rank starts at its own earliest event; cross-rank clocks are not synchronized",
+        scope="independent diagnostic pass; not the formal performance samples or aggregate bandwidth pass",
+        interpretation="PUT/Cube submit bars do not measure asynchronous completion; inspect quiet/drain/wait separately",
+        events=dict(Counter(EVENTS[record[4][2]] for record in records)),
+    )
+    events = [dict(ph="M", pid=rank, tid=0, name="process_name", args=dict(name=f"rank {rank} (independent clock)"))]
+    for engine in range(ENGINE_COUNT):
+        block, kind = divmod(engine, 3)
+        events.extend(
+            [
+                dict(
+                    ph="M",
+                    pid=rank,
+                    tid=engine,
+                    name="thread_name",
+                    args=dict(name=f"block {block:02d} {('AIC', 'AIV0', 'AIV1')[kind]}"),
+                ),
+                dict(ph="M", pid=rank, tid=engine, name="thread_sort_index", args=dict(sort_index=engine)),
+            ]
+        )
+    for start, end, engine, ordinal, row in sorted(records, key=lambda value: (value[0], value[2], value[3])):
+        event = EVENTS[row[2]]
+        name, category, color, meaning = event_style(event)
+        args = {field: None if value == UNKNOWN else value for field, value in zip(METADATA_FIELDS, row[3:12])}
+        if event == "LocalSync":
+            stage = args.pop("cv")
+            args.update(sync_stage=stage, sync_stage_name=SYNC_STAGES.get(stage, "unknown"))
+        args.update(
+            event_id=row[2],
+            bytes=row[12],
+            record_index=ordinal,
+            start_tick=str(start),
+            end_tick=str(end),
+            elapsed_ticks=end - start,
+            meaning=meaning,
+        )
+        events.append(
+            dict(
+                ph="X",
+                name=name,
+                cat=category,
+                cname=color,
+                pid=rank,
+                tid=engine,
+                ts=(start - origin) / clock_mhz,
+                dur=(end - start) / clock_mhz,
+                args=args,
+            )
+        )
+    return dict(traceEvents=events, displayTimeUnit="us", metadata=metadata)
+
+
+def export_trace(raw, output, *, rank, clock_mhz):
+    """Validate every record before writing the Chrome JSON file."""
+    trace = decode_trace(raw, rank=rank, clock_mhz=clock_mhz)
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(trace, ensure_ascii=False, separators=(",", ":"), allow_nan=False), encoding="utf-8")
+    return trace["metadata"]
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("raw", type=Path, help="One rank's urma_trace.bin; not the aggregate urma_timer.bin")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--rank", type=int, required=True)
+    parser.add_argument(
+        "--clock-mhz", type=float, required=True, help="Counter ticks/us; use the benchmark's clock setting"
+    )
+    args = parser.parse_args(argv)
+    try:
+        metadata = export_trace(args.raw.read_bytes(), args.output, rank=args.rank, clock_mhz=args.clock_mhz)
+    except (OSError, ValueError) as error:
+        parser.exit(2, f"URMA trace export failed: {error}\n")
+    print(json.dumps(dict(output=str(args.output), **metadata), ensure_ascii=False, allow_nan=False))
+
+
+if __name__ == "__main__":
+    main()

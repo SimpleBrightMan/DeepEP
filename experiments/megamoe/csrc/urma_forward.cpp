@@ -232,7 +232,8 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
 torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::Tensor order,
                                 torch::Tensor reduce_index, torch::Tensor topk_weights, torch::Tensor weight1,
                                 torch::Tensor weight2, torch::Tensor weight_scales1, torch::Tensor weight_scales2,
-                                c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> out, int64_t epoch)
+                                c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> out, int64_t epoch,
+                                c10::optional<torch::Tensor> trace)
 {
     const auto& c = args_.config;
     const auto device = expanded_x_.device();
@@ -275,6 +276,24 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
         TORCH_CHECK(timer->scalar_type() == torch::kInt64 && timer->numel() == MegaMoeUrma::kTimerElements,
                     "Invalid URMA timer allocation");
     }
+    uint64_t trace_capacity = 0;
+    if (trace) {
+#ifndef DEEPEP_MEGAMOE_TIMER
+        TORCH_CHECK(false, "Rebuild with DEEPEP_MEGAMOE_TIMER=ON for URMA traces");
+#endif
+        CheckTensor(*trace, 1, "trace", device);
+        TORCH_CHECK(Address(*trace) % 128U == 0,
+                    "trace storage must be 128-byte aligned; use UrmaBuffer.allocate_trace()");
+        static_assert(MegaMoeUrma::kTraceHeaderElements == MegaMoeUrma::kTraceRecordElements);
+        constexpr int64_t trace_row_elements =
+            static_cast<int64_t>(MegaMoeUrma::kTimerCores) * MegaMoeUrma::kTraceRecordElements;
+        TORCH_CHECK(trace->scalar_type() == torch::kInt64 && trace->numel() % trace_row_elements == 0 &&
+                        trace->numel() >= 2 * trace_row_elements &&
+                        trace->numel() <= (int64_t{MegaMoeUrma::kTraceMaxCapacity} + 1) * trace_row_elements,
+                    "trace must contain 84 * (16 + capacity * 16) int64 elements; capacity must be in [1,",
+                    MegaMoeUrma::kTraceMaxCapacity, "]");
+        trace_capacity = static_cast<uint64_t>(trace->numel() / trace_row_elements - 1);
+    }
     auto output = out ? *out : torch::empty({c.bs, c.hidden}, x.options().dtype(torch::kBFloat16));
     CheckTensor(output, 2, "out", device);
     TORCH_CHECK(output.scalar_type() == torch::kBFloat16 && output.sizes() == x.sizes(), "out must be BF16 [BS,H]");
@@ -286,6 +305,10 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     if (timer) {
         ASCEND_DEEPEP_CHECK_ACL(
             aclrtMemsetAsync(timer->data_ptr(), timer->nbytes(), 0, timer->nbytes(), stream.stream()));
+    }
+    if (trace) {
+        ASCEND_DEEPEP_CHECK_ACL(
+            aclrtMemsetAsync(trace->data_ptr(), trace->nbytes(), 0, trace->nbytes(), stream.stream()));
     }
     args_.config.epoch = epoch;
     args_.x = Address(x);
@@ -299,6 +322,8 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     args_.weightScale2 = Address(weight_scales2);
     args_.output = Address(output);
     args_.timer = timer ? Address(*timer) : 0;
+    args_.trace = trace ? Address(*trace) : 0;
+    args_.traceCapacity = trace_capacity;
     mega_moe_urma_kernel_do(platform_.block_dim, platform_.ub, stream.stream(), &args_);
     last_epoch_ = epoch;
     for (const auto* tensor : {&x,
@@ -328,6 +353,7 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }
     if (timer) c10_npu::NPUCachingAllocator::recordStream(timer->storage().data_ptr(), stream);
+    if (trace) c10_npu::NPUCachingAllocator::recordStream(trace->storage().data_ptr(), stream);
     return output;
 }
 

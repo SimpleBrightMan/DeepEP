@@ -120,6 +120,62 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib${CONDA_PREFIX:+:$CONDA_PREFIX/lib}${LD_L
 
 原始tick始终保留。换算默认沿用现有MegaMoE `timer/protocol.py`的1000 ticks/us；这不是硬件频率自动检测。必要时通过`--timer-clock-mhz`覆盖。
 
+## 逐事件流水 trace
+
+增加`--trace`会隐含开启`--timer`。每种BS先完成关闭timer和trace的正式测量，再单独执行一次原有aggregate timer诊断，最后额外执行一次详细trace诊断。因此，详细打点开销不会混入正式耗时或原有带宽统计。它会改变诊断调用自身的耗时，应使用正式测量判断优化收益。
+
+在已配置上述CANN、SHMEM环境并分配全部16张UBX卡后，从仓库根目录运行：
+
+```bash
+REPO="$PWD"
+OUT="$REPO/benchmark-runs/megamoe_urma/trace_$(date +%Y%m%d_%H%M%S)"
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
+(
+  cd /tmp || exit 1
+  python3 -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=16 \
+    -m deep_ep_experimental.megamoe.urma_benchmark \
+    --bs-values 2048,4096,8192 --routing balanced --cv-rows 256 \
+    --warmup 2 --iters 10 --trace --timer --trace-capacity 4096 \
+    --timer-clock-mhz 1000 --output-dir "$OUT"
+)
+```
+
+`--trace-capacity`是**每个物理引擎**最多保存的事件数，范围1到65536，默认4096；84个引擎的默认raw缓冲约42 MiB/rank。超过容量时记录dropped，所有rank先交换解析状态，然后统一报错，保留原始bin和错误信息，不会静默导出不完整流水。可在新的输出目录用更大容量重跑。
+
+每rank、每BS的实际产物如下；例如rank0的BS4096位于`$OUT/rank_0/bs_4096/`：
+
+| 文件 | 内容 |
+|---|---|
+| `urma_timer.bin`、`timer.json` | 原有aggregate timer及schema；来自独立timer调用 |
+| `urma_trace.bin` | 逐事件原始little-endian int64存储，按uint64解释 |
+| `urma_trace.json` | 可在Perfetto或Chrome Trace Viewer打开的流水 |
+| `trace_metadata.json` | rank、容量、各引擎记录数、时钟设置、raw路径或解析错误 |
+| `summary.json` | 正式耗时、aggregate带宽及各rank trace导出信息 |
+
+每条轨道对应`block 00..27`的`AIC/AIV0/AIV1`，引擎编号为`block*3+0/1/2`。事件参数包含可用的peer、CV、fragment、expert、行起点/行数、M/N tile位置、列数和字节数；不适用字段显示null。`LocalSync`的CV字段另解释为`sync_stage`：0=pack、1=compute/return、2=rank barrier、3=reduce。
+
+| 图中标签 | 应如何理解 |
+|---|---|
+| `DispatchPutX/DispatchPutScale/CombinePut [PUT submit]` | PUT指令提交区间，不代表远端数据已经完成写入 |
+| `DispatchQuiet/CombineQuiet [completion wait]` | 等待之前peer PUT完成的区间 |
+| `Gmm1Tile/Gmm2Tile [Cube submit]` | Cube任务提交区间，不伪造异步Cube执行完成时刻 |
+| `Gmm1TileDrain/Gmm1Drain/Gmm2Drain [drain]` | 显式等待计算流水排空的区间 |
+| `Wait*`、`LocalSync`、`RankBarrier`等灰色条 | 数据依赖、核间或rank间同步等待 |
+| `Gmm*Dequant`、`ActivationSlice`、`Pack`、`Reduce`等 | 对应设备代码实际打点范围 |
+
+每个rank以自己的最早事件归零，**不同rank的零点没有全局对齐**，不能将两个文件的横坐标相减计算跨卡延迟。转换先用整数tick相减再转浮点，保留大时间戳的低位；原始tick在JSON参数中用字符串保存。默认1000 ticks/us仍只是显式约定，可修改`--timer-clock-mhz`，离线解析时应使用同一值。
+
+可以在CPU环境离线重新导出单rank，无需启动NPU：
+
+```bash
+python3 -m deep_ep_experimental.megamoe.urma_trace \
+  "$OUT/rank_0/bs_4096/urma_trace.bin" \
+  --output "$OUT/rank_0/bs_4096/urma_trace.json" --rank 0 --clock-mhz 1000
+```
+
+逐事件schema为每引擎16个uint64 header，后接`capacity*16`个uint64 record。header前五项为`schema,capacity,count,dropped,engine_id`；record前13项为`start_ticks,end_ticks,event_id,peer,cv,fragment,expert,row,rows,tileM,tileN,columns,bytes`，其余保留位为0。未知元数据为`UINT64_MAX`。解析器检查全部引擎的schema、容量、编号、计数、保留位和事件时间；同引擎事件应按平铺顺序不重叠。
+
 ## 下一步优化方向
 
 - 将计数交换、前缀和、CV描述符生成移到设备，减少同步和host工作；完整E2E应始终计入实际准备成本。
@@ -133,3 +189,5 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib${CONDA_PREFIX:+:$CONDA_PREFIX/lib}${LD_L
 2026-10-19 已通过 CANN 9.2.0 的设备核、Host扩展和完整wheel编译；MegaMoE及runtime的CPU回归为449项通过。CPU检查涵盖路由逆映射、CV/expert交集、28/13核任务覆盖、完成顺序、stream串行及通信域生命周期。尚未进行EP16 UBX上的数值与性能实测，不能将CPU检查或编译通过视为设备精度通过。
 
 2026-10-20 将SwiGLU改为128行子块后，483项CPU回归及CANN 9.2.0完整wheel编译通过。在两台各8张Ascend950DT、同SuperPod的机器上完成EP16功能验证：`--bs-values 2048,4096,8192 --routing balanced --cv-rows 256 --warmup 1 --iters 2 --timer --allow-multi-host`。三个BS均完成路由准备、完整forward、timer诊断及通信域销毁，两台worker正常退出；没有触发原256 KiB UB检查。测试使用Python 3.12.14、Torch 2.12.0及torch_npu 2.12.0.post2，未启用Golden数值校验，短轮次耗时也不作为UBX性能结论。
+
+2026-10-20 逐事件trace版本通过569项CPU回归、全仓pre-commit及CANN 9.2.0完整wheel编译。在另外两台空闲的8卡Ascend950DT、同SuperPod机器上，使用上述命令增加`--trace --trace-capacity 4096`完成EP16验证。三个BS共48份rank/BS流水图均通过完整性校验，84个引擎均有记录，dropped均为0；BS2048/4096/8192每rank分别记录48174/55586/71690条事件，单引擎最大分别为954/1094/1378。正式性能、aggregate timer和详细trace分别运行，两台worker正常退出。本次同样没有Golden数值校验，不据此宣称UBX性能或数值精度通过。

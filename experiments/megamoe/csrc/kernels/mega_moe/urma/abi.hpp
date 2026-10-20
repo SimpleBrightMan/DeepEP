@@ -16,6 +16,58 @@ constexpr uint32_t kTimerPhases = 8U;
 constexpr uint32_t kTimerRecordElements = 16U;
 constexpr uint64_t kTimerElements = static_cast<uint64_t>(kTimerCores) * kTimerPhases * kTimerRecordElements;
 
+// Detailed traces have independent, bounded single-writer slices per engine.
+// A slice contains a 128B header followed by capacity 128B event records.
+constexpr uint32_t kTraceSchema = 1U;
+constexpr uint32_t kTraceRecordElements = 16U;
+constexpr uint32_t kTraceHeaderElements = 16U;
+constexpr uint32_t kTraceMaxCapacity = 65536U;
+constexpr uint64_t kTraceUnknown = UINT64_MAX;
+
+enum class TraceEvent : uint32_t {
+    Pack = 0,
+    DispatchPutX,
+    DispatchPutScale,
+    DispatchQuiet,
+    DispatchPublish,
+    SelfDispatch,
+    WaitStartPeer,
+    PublishStart,
+    WaitLocalDispatch,
+    WaitCombineReady,
+    CombinePut,
+    CombineQuiet,
+    SelfCombine,
+    FinalPeerHandshake,
+    WaitDispatch,
+    Gmm1Tile,
+    Gmm1TileDrain,
+    Gmm1Dequant,
+    WaitActivation,
+    Gmm2Tile,
+    Gmm2Dequant,
+    Gmm2Drain,
+    WaitGmm1,
+    ActivationSlice,
+    RankBarrier,
+    Reduce,
+    LocalSync,
+    Gmm1Drain
+};
+
+struct TraceMeta {
+    uint64_t peer = kTraceUnknown;
+    uint64_t cv = kTraceUnknown;
+    uint64_t fragment = kTraceUnknown;
+    uint64_t expert = kTraceUnknown;
+    uint64_t row = kTraceUnknown;
+    uint64_t rows = kTraceUnknown;
+    uint64_t tileM = kTraceUnknown;
+    uint64_t tileN = kTraceUnknown;
+    uint64_t columns = kTraceUnknown;
+    uint64_t bytes = 0U;
+};
+
 // One intersection of a peer CV interval and an expert's stable route stream.
 struct Fragment {
     uint32_t expert;
@@ -93,6 +145,8 @@ struct Arguments {
     uint64_t gmm2Done;
     uint64_t localFlags;
     uint64_t timer;
+    uint64_t trace;
+    uint64_t traceCapacity;
     uint64_t systemWorkspace;
     uint64_t ffts;
 };
