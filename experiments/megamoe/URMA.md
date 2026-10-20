@@ -23,10 +23,10 @@ GMM按专家聚合不同来源的行，使用M256计算块，仅专家尾块不�
 
 Pack使用全部56个AIV，任务编号为`block*2+subblock`。Reduce只使用28个AIV0和block15～27的13个AIV1，共41核；15个通信AIV1不参与Reduce。计算侧每核结束自己的反量化或scale/SwiGLU任务后，先排空本核流水以交还UB/event，再独立进入Reduce。当前内核固定启动28组；即使物理设备有64个AIV，也只使用已启动的56个。
 
-本地阶段使用多槽流水，benchmark打印`local_pipeline=pack6-reduce6-output2 tail=combine-finished-fast-reduce41`。Pack按56核、Reduce按41核分配连续行区间：
+本地阶段使用多槽流水，benchmark打印`local_pipeline=pack6-reduce6-output2 tail=combine-ready-scan-reduce41`。Pack按56核、Reduce按41核分配连续行区间：
 
 - Pack使用6个token/scale槽，按槽等待上一次MTE3完成，再下发新的MTE2；不同槽的读取与写出可以重叠。`order`批量DMA到UB，当前支持的最大BS8192每核最多1171行，一次预取即可，payload循环不再从GM逐行标量读取路由。UB占用65.5 KiB。
-- Reduce使用6个BF16/FP32输入槽、独立FP32累加器和2个BF16输出槽。`inverse + weights + readiness dependencies`按最多128个token批量搬入UB，UB占用174 KiB，低于现有192 KiB最低要求。未收齐完成通知时，每个token的8路结果全部就绪后才预取payload，6槽仅在当前token内部流水。锁存全部入站就绪后，6槽预取可以跨token推进；后续metadata批次只搬inverse和weights。
+- Reduce使用6个BF16/FP32输入槽、独立FP32累加器和2个BF16输出槽。每核自己的`inverse + weights + readiness dependencies`一次搬入UB，BS8192时最多200个token，不再用128行metadata批次限制扫描范围。每个token的8路结果全部就绪后才预取payload；槽位按实际提交顺序复用，写回仍使用原始token行号。数据、metadata、正向缓存、提交位图和六项route ring合计191328 B，低于192 KiB。
 - 返回布局、FP32乘加顺序和最终BF16舍入不变。self直接写receive/return，远端PUT的CV粒度和数量不变。Pack仍全部完成后才进入Dispatch；Reduce可以与其他核心的计算和Combine重叠。
 
 Python会拒绝不含本分支tail调度标记的native扩展。正式耗时仍取关闭timer/trace的`CACHED_FORWARD`。Pack跨度覆盖56核；本分支Reduce跨度覆盖41核且包含等待结果就绪的时间，不能直接当作纯本地Reduce耗时，也不能与Combine跨度相加。原timer的Pack字节统计写入的FP8+scale，Reduce字节仅统计输出BF16，均不是完整HBM读写流量。
@@ -38,10 +38,12 @@ Python会拒绝不含本分支tail调度标记的native扩展。正式耗时仍�
 - 每个通信owner在每次Combine `PUT`之后、`quiet`之前，非阻塞读取本卡上对应peer的`finished(epoch)`。首次观察到本轮完成才给本卡入站计数器`AtomicAdd(1)`，用核内bool记住已计入，后续不再读取该peer的finished。
 - 本核所有Combine CV均完成`quiet + CV ready发布`后，用MTE发布自己面向该peer的`finished(epoch)`，再带200周期退避地观察尚未计入的入站完成；空edge也发一次通知。必须先发后等，且每个owner只处理自己的peer，避免相互等待形成环。该通知使用独立phase 1的128B槽，不覆盖逐CV ready。
 - 第16份是self：28个AIC各自完成全部GMM2/FIX输出后，给本卡AIC完成计数器加一。通信owner 0非阻塞检查它是否到28，再且仅再给入站计数器加一；不能预置self为完成，也不能用AIV0退出代替GMM2输出就绪。此门槛偏保守，self输出可能更早完成。
-- Reducer入口及慢路径每8个token检查一次入站计数；依赖等待中首次失败及每再8次失败轮询也检查一次。达到16时，执行一次S→MTE2门禁并锁存“全部就绪”。剩余任务不再读取就绪flag、不再逐token做ready门禁，恢复跨token的`route+6`连续预取；metadata、输入槽、Vector和输出槽事件仍保留。普通payload GM读取不受影响。
+- Reducer轮询入站计数，观察到16时，执行S→MTE2门禁并锁存“全部就绪”。剩余未提交token不再读取就绪flag、不再逐token做ready门禁，直接进入跨token六槽流水；metadata、输入槽、Vector和输出槽事件仍保留。普通payload GM读取不受影响。
 - 没有尾部全卡barrier或Reduce之前的全本机汇合。只保留Pack后的本机汇合和函数退出前的本机MIX汇合；后者包括28 AIC、56 AIV和完成计数的所有贡献者，保护workspace及下一轮复用。本轮计数器在发布Start前由原有清零操作重置；finished区保留epoch，不逐轮清空。
 - 下一次调用仍在Pack完成后进行peer Start握手。Start接受`>= epoch`，防止双向空路由的peer提前进入下一轮、覆盖旧Start而造成死等。有效CV的ready仍使用`== epoch`，并且不逐轮清空对称ready区。
-- 这是每个worker顺序处理自己token区间的实现：若当前token缺任意一路结果，先等它，不扫描后面的就绪token。全入站计数仅用于提前解锁连续流水，不要求Reduce先整体等到16。每CV的quiet/MTE发布和新增finished观察都有成本，应以完整`CACHED_FORWARD`和trace实测判断收益。
+- 每个worker循环扫描自己的未提交token。遇到首个未就绪依赖就跳过该token，遇到可执行token立即提交，不等待凑满一批；提交时即标记，避免重复执行。只在整轮扫描没有进展时退避200个周期。不同token允许乱序执行，同一token的8路FP32乘加顺序保持不变。
+- 已观察到就绪的远端`(producer_rank, CV)`和self计算组记录在本核UB正向缓存中，本次调用不再重复读取对应GM flag；未就绪结果不缓存，下轮重新检查。提交标记每次初始化；正向缓存在需要依赖检查时清零，不跨epoch复用。该流程使用实际路由依赖，不要求balanced或固定token分布。
+- 扫描与下发共用Scalar，GM flag读取仍可能延迟后续指令下发。已有MTE/Vector任务可与扫描重叠，但不保证流水始终饱和；切换token不会主动排空流水，只有最终输出完成后统一退出。全入站计数只用于提前解锁连续流水，不要求Reduce先整体等到16。性能以关闭timer/trace的完整`CACHED_FORWARD`实测判断。
 
 trace保留每CV的`CombinePublish`。Reduce在每个有任务的reducer上只记录一条：从Reduce函数入口到既有的最终流水排空完成，包含metadata预取、token结果就绪等待、计算及输出写回；在当前三个BS下共41条Reduce。这条跨度不能解释为纯Vector工作时间，也不能通过隐藏等待条扣除其中的ready等待。
 
@@ -317,3 +319,7 @@ python3 experiments/megamoe/scripts/urma_trace_to_text.py \
 2026-10-20 专家M256版本通过737项MegaMoE/runtime CPU回归、修改文件的pre-commit检查及CANN 9.2.0完整wheel编译。测试覆盖实际C++路由规划器、任意source/CV边界的行映射、L1/L0C分段布局、scale压紧、独立游标调度、self直接返回及旧路径回归；隔离wheel导入确认`urma_compute_schedule=expert-m256`与timer启用。本次只编译和执行CPU测试，没有启动NPU，也没有进行设备数值或性能验证。编译产物与日志保存在`177.2.21.1:/home/codex-deepep/megamoe-urma-expert-m256-20261020/`。
 
 2026-10-20 自动合并/等待过滤版本通过115项Host Store、trace及文本导出测试，包含真实CPU TCPStore传输、单机与非共享目录合并、错误传播、16-rank身份与独立时钟、尾部同步保留和原始时间坐标保持。离线合并脚本另经`python -I -S`验证，不依赖Torch/NPU安装。本次仅修改Python导出层，未修改或启动设备核；测试日志位于`177.2.21.1:/home/codex-deepep/megamoe-urma-allrank-20261020/cpu-tests.log`。
+
+2026-10-20 本分支的`combine-ready-scan-reduce41`通过990项MegaMoE/runtime CPU回归、CANN 9.2.0完整wheel编译和native导入。新增检查直接运行生产Reduce头文件的异步流水模型，覆盖非单调token提交、最后一个token越过阻塞的第一个token、ready正缓存、跨epoch重置、六槽事件复用、精确计数16快路径及完整BF16输出；真实Host planner另验证极端偏斜/专家尾块下的UB与依赖位图容量。
+
+同版wheel在两台各8卡Ascend950DT上完成EP16运行回归。对照`db7d395`，balanced和random各执行BS2048/4096/8192、CV256、warmup=1、iters=2及独立timer调用；两种路由共96个rank/BS的完整BF16输出均有限且逐位相同，各进程正常结束。本次未使用独立Golden；短轮次双机耗时用于功能诊断，不作为UBX单机性能结论。通信协议、41个Reduce worker和每核一条Reduce trace保持不变。

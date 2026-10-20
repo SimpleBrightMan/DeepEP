@@ -10,10 +10,11 @@ Modified by Joyce_An 2026
 
 独立的完整 URMA 固定 CV 算子、EP16 运行命令和逐事件 Chrome trace 见 [URMA.md](URMA.md)。
 
-URMA 的 `combine-finished-fast-reduce41` 方案保留逐 CV 提前 Reduce，并用 15 份入站 finished
-加 self 完成组成保守的全就绪门槛，随后切换到无需逐 token ready 查询的流水；仍由 **41 核**执行 Reduce。
+URMA 的 `combine-ready-scan-reduce41` 方案由 **41 核**各自扫描全部未提交 token，
+跳过未就绪任务，就绪即下发，按实际提交顺序复用六槽流水，并缓存本轮已经就绪的依赖。
+15 份入站 finished 加 self 完成组成全就绪门槛，随后剩余 token 不再读取 ready flag。
 通信核在 Combine `Quiet` 前做非阻塞检查，发完后继续检查，详见 [URMA 尾部协议](URMA.md)。
-本方案尚无设备性能实测结果。
+UBX 性能收益以关闭 timer/trace 的完整算子实测为准。
 
 ## 1. 输入、输出与公开接口
 

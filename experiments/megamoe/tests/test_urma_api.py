@@ -286,17 +286,19 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
     assert buffer.allow_multi_host is allow
     assert created == [allow]
     assert checks[0][1][-2] is allow
-    assert checks[0][1][-1] == "combine-finished-fast-reduce41"
+    assert checks[0][1][-1] == "combine-ready-scan-reduce41"
 
 
-@pytest.mark.parametrize("tail", [None, "combine-cv-flag-reduce41", "combine-finished-fast-reduce41"])
+@pytest.mark.parametrize(
+    "tail", [None, "combine-cv-flag-reduce41", "combine-finished-fast-reduce41", "combine-ready-scan-reduce41"]
+)
 def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, tail):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
     extension = SimpleNamespace(urma_api_protocol=1, urma_tail_schedule=tail)
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
     urma._extension.cache_clear()
     try:
-        if tail != "combine-finished-fast-reduce41":
+        if tail != "combine-ready-scan-reduce41":
             with pytest.raises(RuntimeError, match="tailCover needs its matching native wheel"):
                 urma._extension()
         else:

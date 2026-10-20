@@ -78,6 +78,9 @@ inline bool bypass;
 inline std::function<void(uintptr_t)> beforePayload;
 inline std::function<void(uintptr_t)> executePayload;
 inline std::function<uint64_t(uintptr_t)> readFlag;
+inline std::function<void()> onCycle;
+inline std::function<void(uintptr_t)> submitOutput;
+inline std::function<void(uintptr_t)> executeOutput;
 inline constexpr uintptr_t returnedBase = uintptr_t(1) << 40U;
 inline constexpr uintptr_t returnedEnd = returnedBase + (uintptr_t(1) << 36U);
 inline bfloat16_t Returned(uint64_t row, uint32_t column) {
@@ -102,6 +105,7 @@ inline void Drain() {
 }
 inline uint64_t GetSystemCycle() {
     static uint64_t cycle = 0;
+    if (onCycle) onCycle();
     return cycle += 200U;
 }
 template <typename T> T ReadGmByPassDCache(T* address) {
@@ -137,6 +141,7 @@ template <unsigned Pipe> void PipeBarrier() {
 }
 template <typename T> struct LocalTensor {
     uint32_t address{}, count{};
+    LocalTensor() = default;
     LocalTensor(TPosition, uint32_t offset, uint32_t n) : address(offset), count(n) {
         assert(address % 32U == 0U);
         assert(uint64_t(address) + uint64_t(count) * sizeof(T) <= ub.size());
@@ -148,6 +153,7 @@ template <typename T> struct LocalTensor {
     }
     T* Data() const { return reinterpret_cast<T*>(ub.data() + address); }
     T GetValue(uint64_t offset) const { assert(offset < count); return Data()[offset]; }
+    void SetValue(uint64_t offset, T value) const { assert(offset < count); Data()[offset] = value; }
 };
 template <typename T> struct GlobalTensor {
     T* data{};
@@ -188,9 +194,11 @@ template <typename T> void DataCopy(LocalTensor<T> destination, GlobalTensor<T> 
 }
 template <typename T> void DataCopy(GlobalTensor<T> destination, LocalTensor<T> source, uint32_t count) {
     assert(count <= source.count);
+    if (submitOutput) submitOutput(reinterpret_cast<uintptr_t>(destination.data));
     ++outputCopies;
     Enqueue(Mte3, [=] {
         std::copy_n(source.Data(), count, destination.data);
+        if (executeOutput) executeOutput(reinterpret_cast<uintptr_t>(destination.data));
         ++completedOutputs;
         return true;
     });
@@ -221,10 +229,13 @@ inline void Add(LocalTensor<float> destination, LocalTensor<float> lhs, LocalTen
 DRIVER = r"""
 #include "reduce_pipeline.hpp"
 #include <iostream>
+#include <map>
 #include <random>
+#include <set>
 #include <string>
 using namespace MegaMoeUrma;
 using namespace AscendC;
+static_assert(ReduceUbContract::end == 191328U);
 struct TraceSink {
     uint64_t begins{}, ends{}, expectedRow{}, expectedRows{};
     bool active{};
@@ -270,10 +281,8 @@ int main(int argc, char** argv) {
     }
     assert(argc == 5 || argc == 6);
     const std::string mode = argc == 6 ? argv[5] : "delayed";
-    const bool waitSwitch = mode.rfind("wait-switch", 0U) == 0U;
-    const bool initiallyReady = mode != "delayed" && !waitSwitch;
     const bool switchMode = mode.rfind("switch:", 0U) == 0U;
-    const uint64_t switchAfter = switchMode ? std::stoul(mode.substr(7U)) : 0U;
+    const uint32_t switchAfter = switchMode ? std::stoul(mode.substr(7U)) : 0U;
     const uint32_t bs = std::stoul(argv[1]), worker = std::stoul(argv[2]);
     priority = std::stoul(argv[3]);
     std::mt19937 random(std::stoul(argv[4]));
@@ -281,164 +290,217 @@ int main(int argc, char** argv) {
     const auto count = ReduceOwnedRows(bs, worker), begin = ReduceRowBegin(bs, worker);
     std::vector<int64_t> inverse(rows);
     std::vector<float> weights(rows);
-    std::vector<uint64_t> dependencies(rows), routeForRow(rows), payloadVisits(rows), observedReady(rows),
-                          payloadGates(rows);
+    std::vector<uint64_t> dependencies(rows), routeForRow(rows);
     for (uint32_t i = 0; i < rows; ++i) {
         inverse[i] = i;
         weights[i] = float(int(random() % 2001U) - 1000) / 997.0F;
     }
     std::shuffle(inverse.begin(), inverse.end(), random);
-    for (uint32_t route = 0; route < rows; ++route) {
-        routeForRow[inverse[route]] = route;
-        dependencies[route] =
-            route % 4U == (mode == "wait-switch-remote" ? 1U : 0U) ? kReduceSelfDependency | route : route;
+    for (uint32_t route = 0; route < rows; ++route) routeForRow[inverse[route]] = route;
+    for (uint32_t local = 0; local < count; ++local) {
+        const std::array<uint64_t, 8> tokenDependencies = {
+            512U + local, 8191U, kReduceSelfDependency | local, kReduceSelfDependency | 4118U,
+            512U + local, 8191U, kReduceSelfDependency | local, kReduceSelfDependency | 4118U};
+        for (uint32_t slot = 0; slot < 8; ++slot)
+            dependencies[(begin + local) * 8U + slot] = tokenDependencies[slot];
     }
     std::vector<bfloat16_t> output(uint64_t(bs) * 3584U);
-    for (auto& value : output) value.bits = 0x7fc1;
+    std::vector<uint32_t> desired;
+    for (uint32_t local : {1U, 7U, 2U, 0U}) if (local < count) desired.push_back(local);
+    for (uint32_t local = 0; local < count; ++local)
+        if (std::find(desired.begin(), desired.end(), local) == desired.end()) desired.push_back(local);
     ub.fill(0xa5);
-    Arguments args{};
-    args.config.hidden = 3584;
-    args.config.topk = 8;
-    args.config.bs = bs;
-    args.config.epoch = 7;
-    args.symmetric = returnedBase;
-    args.config.combineReadyOffset = uintptr_t(1) << 35U;
-    args.gmm2Done = uintptr_t(1) << 42U;
-    args.localFlags = uintptr_t(1) << 43U;
-    args.output = reinterpret_cast<uint64_t>(output.data());
-    args.reduceIndex = reinterpret_cast<uint64_t>(inverse.data());
-    args.weights = reinterpret_cast<uint64_t>(weights.data());
-    args.reduceDependencies = reinterpret_cast<uint64_t>(dependencies.data());
-    uint64_t pollClock = 0, remotePolls = 0, selfPolls = 0, outputDuringWait = 0, aggregatePolls = 0;
-    uint64_t crossTokenPrefetches = 0, gatesBeforeLatch = 0, latchToken = 0;
-    bool allReadyObserved = false;
-    TraceSink timer;
-    timer.expectedRow = begin;
-    timer.expectedRows = count;
-    auto readyAt = [&](uint64_t route) {
-        if (initiallyReady) return uint64_t(0);
-        const uint64_t token = route / 8U;
-        return 100U + (token >= begin ? token - begin : 0U) * 256U + route % 8U * 7U;
-    };
-    readFlag = [&](uintptr_t address) {
-        assert(timer.active && "Combine/self dependency wait must be inside the Reduce trace");
-        assert(!allReadyObserved && "all-ready latch must eliminate all subsequent ready GM reads");
-        ++pollClock;
-        Step();  // Other engines may progress while Scalar polls a late producer.
-        outputDuringWait += completedOutputs != 0U;
-        if (address == args.localFlags + uint64_t(kLocalFlagIncomingDone) * kFlagBytes) {
-            ++aggregatePolls;
-            const bool ready = mode == "fast" || (switchMode && outputCopies >= switchAfter) ||
-                               (waitSwitch && pollClock >= 8U);
-            if (ready) {
-                allReadyObserved = true;
-                gatesBeforeLatch = readyGateSubmissions;
-                latchToken = outputCopies;
+    for (uint32_t invocation = 0U; invocation < (mode == "epochs" ? 2U : 1U); ++invocation) {
+        // Keep the previous invocation's UB bitmaps deliberately intact.
+        inputCopies = outputCopies = metadataCopies = completedOutputs = 0U;
+        readyGateSubmissions = readyGateExecutions = 0U;
+        metadataSources.clear(); bypass = false;
+        for (auto& value : output) value.bits = 0x7fc1;
+        Arguments args{};
+        args.config.hidden = 3584; args.config.topk = 8; args.config.bs = bs;
+        args.config.maxPeerChunks = 512; args.config.fragmentCount = 4119;
+        args.config.epoch = 7U + invocation;
+        args.symmetric = returnedBase;
+        args.config.combineReadyOffset = uintptr_t(1) << 35U;
+        args.gmm2Done = uintptr_t(1) << 42U;
+        args.localFlags = uintptr_t(1) << 43U;
+        args.output = reinterpret_cast<uint64_t>(output.data());
+        args.reduceIndex = reinterpret_cast<uint64_t>(inverse.data());
+        args.weights = reinterpret_cast<uint64_t>(weights.data());
+        args.reduceDependencies = reinterpret_cast<uint64_t>(dependencies.data());
+        uint64_t pollClock = 0U, aggregatePolls = 0U, gatesBeforeLatch = 0U, crossTokenPrefetches = 0U;
+        uint64_t cycleCalls = 0U, backoffRounds = 0U;
+        uint32_t readyCandidate = count;
+        bool allInputsObserved = false;
+        std::vector<uint32_t> admissionOrder, outputOrder;
+        std::vector<bool> admitted(count), written(count);
+        std::vector<uint64_t> payloadVisits(rows), payloadGates(rows);
+        std::map<uint64_t, uint32_t> positiveReads, failedReads;
+        std::set<uint32_t> failedTokens;
+        TraceSink timer;
+        timer.expectedRow = begin; timer.expectedRows = count;
+        auto tokenCondition = [&](uint32_t local) {
+            if (mode == "head") return local != 0U || written[count - 1U];
+            if (mode == "last") return local == count - 1U || written[count - 1U];
+            if (mode == "sequence")
+                return admissionOrder.size() < desired.size() && desired[admissionOrder.size()] == local;
+            if (mode == "stalled") return backoffRounds >= 2U;
+            if (mode == "wait-switch") return false;
+            if (mode == "delayed" || mode == "epochs" || mode == "future" || mode == "self-delayed")
+                return pollClock >= 20U + ((local * 37U) % std::max<uint64_t>(count, 1U)) * 7U;
+            return true;
+        };
+        auto ready = [&](uint64_t dependency) {
+            if (dependency == 8191U || dependency == (kReduceSelfDependency | 4118U)) return true;
+            const auto index = dependency & ~kReduceSelfDependency;
+            const uint32_t local = dependency & kReduceSelfDependency ? index : index - 512U;
+            assert(local < count);
+            if (mode == "self-delayed" && !(dependency & kReduceSelfDependency)) return true;
+            return tokenCondition(local);
+        };
+        readFlag = [&](uintptr_t address) {
+            assert(timer.active && !allInputsObserved && "ready GM read after aggregate latch");
+            assert(readyCandidate == count && "a ready token was not submitted immediately");
+            ++pollClock;
+            assert(pollClock < 200000U && "ready-first scanner made no progress");
+            Step();
+            if (address == args.localFlags + uint64_t(kLocalFlagIncomingDone) * kFlagBytes) {
+                ++aggregatePolls;
+                const bool complete = mode == "fast" || (switchMode && admissionOrder.size() >= switchAfter) ||
+                                      (mode == "wait-switch" && aggregatePolls >= 3U);
+                if (complete) { allInputsObserved = true; gatesBeforeLatch = readyGateSubmissions; }
+                return uint64_t(complete ? 16U : mode == "overcount" ? 17U : 15U);
             }
-            return uint64_t(ready ? 16U : mode == "overcount" ? 17U : 15U);
-        }
-        if (address >= args.gmm2Done && address < args.gmm2Done + uint64_t(rows) * 128U) {
-            ++selfPolls;
-            const uint64_t route = (address - args.gmm2Done) / 128U;
-            // An incomplete self GMM2 group must not be accepted.
-            const bool ready = !waitSwitch && pollClock >= readyAt(route);
-            if (ready) observedReady[route] = 1U;
-            return uint64_t(ready ? 14U : 13U);
-        }
-        const uintptr_t remote = args.symmetric + args.config.combineReadyOffset;
-        assert(address >= remote && address < remote + uint64_t(rows) * 128U);
-        ++remotePolls;
-        const uint64_t route = (address - remote) / 128U;
-        // Previous invocation's epoch is deliberately already nonzero.
-        const bool ready = !waitSwitch && pollClock >= readyAt(route);
-        if (ready) observedReady[route] = 1U;
-        return ready ? args.config.epoch : args.config.epoch - 1U;
-    };
-    beforePayload = [&](uintptr_t address) {
-        assert(timer.active);
-        const auto row = (address - returnedBase) / sizeof(bfloat16_t) / 3584U;
-        const auto route = routeForRow[row], token = route / 8U;
-        assert(token >= begin && token - begin < count);
-        assert(readyGateSubmissions > 0U);
-        if (!allReadyObserved) {
-            for (uint32_t slot = 0; slot < 8; ++slot) {
-                assert(observedReady[token * 8U + slot] &&
-                       "payload submitted before all eight token dependencies were observed ready");
+            uint64_t dependency;
+            if (address >= args.gmm2Done && address < args.gmm2Done + uint64_t(4119U) * 128U) {
+                assert((address - args.gmm2Done) % 128U == 0U);
+                dependency = kReduceSelfDependency | ((address - args.gmm2Done) / 128U);
+            } else {
+                const uintptr_t remote = args.symmetric + args.config.combineReadyOffset;
+                assert(address >= remote && address < remote + uint64_t(8192U) * 128U);
+                assert((address - remote) % 128U == 0U);
+                dependency = (address - remote) / 128U;
+            }
+            assert(positiveReads[dependency] == 0U && "positive readiness must be cached for the invocation");
+            const bool complete = ready(dependency);
+            if (complete) ++positiveReads[dependency];
+            else {
+                ++failedReads[dependency];
+                const uint64_t index = dependency & ~kReduceSelfDependency;
+                failedTokens.insert(dependency & kReduceSelfDependency ? index : index - 512U);
+            }
+            if (complete) for (uint32_t local = 0U; local < count; ++local) {
+                if (admitted[local]) continue;
+                bool tokenReady = true;
+                for (uint32_t slot = 0U; slot < 8U; ++slot)
+                    tokenReady &= positiveReads[dependencies[(begin + local) * 8U + slot]] == 1U;
+                if (tokenReady) {
+                    assert(readyCandidate == count);
+                    readyCandidate = local;
+                }
+            }
+            if (dependency & kReduceSelfDependency) return uint64_t(complete ? 14U : 13U);
+            return complete ? args.config.epoch : mode == "future" ? args.config.epoch + 1U : args.config.epoch - 1U;
+        };
+        beforePayload = [&](uintptr_t address) {
+            assert(timer.active);
+            const auto row = (address - returnedBase) / sizeof(bfloat16_t) / 3584U;
+            const auto route = routeForRow[row], token = route / 8U, local = token - begin;
+            assert(token >= begin && local < count && readyGateSubmissions > 0U);
+            if (!allInputsObserved) for (uint32_t slot = 0; slot < 8; ++slot)
+                assert(positiveReads[dependencies[token * 8U + slot]] == 1U && "payload precedes ready acquire");
+            if (route % 8U == 0U) {
+                assert(!admitted[local]);
+                if (!allInputsObserved) assert(readyCandidate == local);
+                readyCandidate = count;
+                admitted[local] = true;
+                admissionOrder.push_back(local);
+                failedTokens.clear();
+            }
+            assert(admitted[local] && admissionOrder.back() == local);
+            assert(inputCopies % 8U == route % 8U && "TopK route order changed");
+            if (admissionOrder.size() > outputCopies + 1U) ++crossTokenPrefetches;
+            payloadGates[route] = readyGateSubmissions;
+            assert(++payloadVisits[route] == 1U);
+        };
+        executePayload = [&](uintptr_t address) {
+            const auto row = (address - returnedBase) / sizeof(bfloat16_t) / 3584U;
+            const auto route = routeForRow[row];
+            assert(payloadGates[route] != 0U && readyGateExecutions >= payloadGates[route]);
+        };
+        submitOutput = [&](uintptr_t address) {
+            const uint32_t token = (address - args.output) / (3584U * sizeof(bfloat16_t));
+            assert(address >= args.output && token >= begin && token - begin < count);
+            assert(outputOrder.size() < admissionOrder.size());
+            assert(token - begin == admissionOrder[outputOrder.size()]);
+            outputOrder.push_back(token - begin);
+        };
+        executeOutput = [&](uintptr_t address) {
+            const uint32_t token = (address - args.output) / (3584U * sizeof(bfloat16_t));
+            assert(!written[token - begin]); written[token - begin] = true;
+        };
+        onCycle = [&] {
+            // Only a whole unsuccessful scan can enter the 200-cycle delay.
+            if ((cycleCalls++ & 1U) == 0U) {
+                for (uint32_t local = 0; local < count; ++local)
+                    if (!admitted[local]) assert(failedTokens.count(local) == 1U);
+                ++backoffRounds;
+            }
+            Step();
+        };
+        Reduce(args, worker, timer);
+        assert(inputCopies == count * 8U && outputCopies == count && completedOutputs == count);
+        assert(metadataCopies == (count == 0U ? 0U : mode == "fast" ? 2U : 3U));
+        assert(admissionOrder.size() == count && outputOrder == admissionOrder);
+        assert(timer.begins == (count != 0U) && timer.ends == (count != 0U) && !timer.active);
+        if (allInputsObserved) assert(readyGateSubmissions == gatesBeforeLatch + 1U);
+        else assert(readyGateSubmissions == count);
+        assert(readyGateExecutions == readyGateSubmissions);
+        assert(bypass == (count != 0U));
+        if (count != 0U) {
+            assert(aggregatePolls > 0U);
+            if (mode == "fast") {
+                assert(aggregatePolls == 1U && positiveReads.empty() && failedReads.empty());
+                assert(cycleCalls == 0U);
+            }
+            if (mode == "head") assert(admissionOrder.front() == 1U && admissionOrder.back() == 0U);
+            if (mode == "last") assert(admissionOrder.front() == count - 1U);
+            if (mode == "sequence") assert(admissionOrder == desired && cycleCalls == 0U);
+            if (mode == "stalled") assert(backoffRounds == 2U && failedReads[512U] >= 2U);
+            if (mode == "overcount") assert(!allInputsObserved);
+            if (mode == "wait-switch") {
+                assert(allInputsObserved);
+                for (const auto& entry : positiveReads) assert(entry.second == 0U);
+            }
+            if (switchMode) assert(allInputsObserved);
+            if (mode == "ready" || mode == "overcount" || mode == "fast") {
+                if (count > 1U) assert(crossTokenPrefetches > 0U);
+                assert(cycleCalls == 0U);
+            }
+            if (mode != "fast" && mode != "wait-switch") {
+                assert(positiveReads[8191U] == 1U && positiveReads[kReduceSelfDependency | 4118U] == 1U);
+                if (!allInputsObserved) {
+                    for (uint32_t local = 0; local < count; ++local)
+                        assert(positiveReads[512U + local] == 1U && positiveReads[kReduceSelfDependency | local] == 1U);
+                }
+            }
+        } else assert(aggregatePolls == 0U);
+        for (const auto& queue : queues) assert(queue.empty());
+        for (const auto& kind : events) for (auto event : kind) assert(!event);
+        for (uint32_t token = 0; token < bs; ++token) {
+            const bool mine = token >= begin && token - begin < count;
+            for (uint32_t column = 0; column < 3584; ++column) {
+                if (!mine) { assert(output[uint64_t(token) * 3584U + column].bits == 0x7fc1); continue; }
+                float accumulator = 0.0F;
+                for (uint32_t slot = 0; slot < 8; ++slot) {
+                    const auto route = uint64_t(token) * 8U + slot;
+                    volatile float term = float(Returned(inverse[route], column)) * weights[route];
+                    accumulator = slot == 0 ? term : accumulator + term;
+                }
+                assert(output[uint64_t(token) * 3584U + column].bits == bfloat16_t(accumulator).bits);
             }
         }
-        if (token - begin > outputCopies) {
-            assert(allReadyObserved && "slow path must not prefetch a following token");
-            ++crossTokenPrefetches;
-        }
-        payloadGates[route] = readyGateSubmissions;
-        assert(++payloadVisits[route] == 1U);
-    };
-    executePayload = [&](uintptr_t address) {
-        const auto row = (address - returnedBase) / sizeof(bfloat16_t) / 3584U;
-        const auto route = routeForRow[row];
-        assert(payloadGates[route] != 0U && readyGateExecutions >= payloadGates[route] &&
-               "MTE2 payload execution must follow the ready observation gate");
-    };
-    Reduce(args, worker, timer);
-    assert(inputCopies == count * 8U && outputCopies == count);
-    const uint64_t batches = (count + 127U) / 128U;
-    const uint64_t dependencyBatches =
-        count == 0U || mode == "fast" ? 0U : allReadyObserved ? latchToken / 128U + 1U : batches;
-    assert(metadataCopies == 2U * batches + dependencyBatches);
-    uint64_t actualDependencyCopies = 0U;
-    for (const auto address : metadataSources) {
-        if (address >= args.reduceDependencies && address < args.reduceDependencies + rows * sizeof(uint64_t))
-            ++actualDependencyCopies;
     }
-    assert(actualDependencyCopies == dependencyBatches);
-    assert(timer.begins == (count != 0U) && timer.ends == (count != 0U) && !timer.active);
-    assert(completedOutputs == count);
-    if (count > 1U && mode == "delayed") assert(outputDuringWait > 0);
-    if (allReadyObserved) {
-        assert(readyGateSubmissions == gatesBeforeLatch + 1U);
-        if (count > latchToken + 1U) assert(crossTokenPrefetches > 0U);
-    } else {
-        assert(readyGateSubmissions == count && crossTokenPrefetches == 0U);
-    }
-    assert(readyGateExecutions == readyGateSubmissions);
-    if (count != 0U) {
-        assert(aggregatePolls > 0U);
-        if (mode == "fast") {
-            assert(allReadyObserved && aggregatePolls == 1U && remotePolls == 0U && selfPolls == 0U);
-        } else if (waitSwitch) {
-            assert(allReadyObserved && latchToken == 0U && selfPolls + remotePolls > 0U);
-        } else {
-            assert(remotePolls && selfPolls);
-            if (initiallyReady) {
-                const uint64_t periodicLatch = switchMode ? (switchAfter + 7U) / 8U * 8U : count;
-                assert(allReadyObserved == (switchMode && periodicLatch < count));
-                assert(aggregatePolls == 1U + (allReadyObserved ? latchToken : count - 1U) / 8U);
-                assert(remotePolls + selfPolls == (allReadyObserved ? latchToken : count) * 8U);
-            }
-        }
-    } else {
-        assert(aggregatePolls == 0U && remotePolls == 0U && selfPolls == 0U);
-    }
-    assert(bypass == (count != 0U));
-    for (const auto& queue : queues) assert(queue.empty());
-    for (const auto& kind : events) for (auto event : kind) assert(!event);
-    for (uint32_t token = 0; token < bs; ++token) {
-        const bool owned = token >= begin && token - begin < count;
-        for (uint32_t column = 0; column < 3584; ++column) {
-            if (!owned) {
-                assert(output[uint64_t(token) * 3584 + column].bits == 0x7fc1);
-                continue;
-            }
-            float accumulator = 0.0F;
-            for (uint32_t slot = 0; slot < 8; ++slot) {
-                const auto route = uint64_t(token) * 8U + slot;
-                volatile float term = float(Returned(inverse[route], column)) * weights[route];
-                accumulator = slot == 0 ? term : accumulator + term;
-            }
-            assert(output[uint64_t(token) * 3584 + column].bits == bfloat16_t(accumulator).bits);
-        }
-    }
-    std::cout << "rows=" << count << " input_dma=" << inputCopies << " metadata_dma=" << metadataCopies << "\n";
 }
 """
 
@@ -509,7 +571,7 @@ def test_reduce_41_worker_partition_covers_every_token(reduce_binary):
 @pytest.mark.parametrize("priority", [0, 1, 2])
 def test_ready_tokens_do_not_overwrite_unconsumed_gate_events(reduce_binary, bs, priority):
     result = subprocess.run(
-        [str(reduce_binary), str(bs), "0", str(priority), "29", "all-ready"],
+        [str(reduce_binary), str(bs), "0", str(priority), "29", "ready"],
         capture_output=True,
         text=True,
         timeout=30,
@@ -538,14 +600,25 @@ def test_aggregate_ready_restores_cross_token_pipeline_without_further_polls(red
         "switch:127",
         "switch:128",
         "wait-switch",
-        "wait-switch-remote",
         "overcount",
     ],
 )
 @pytest.mark.parametrize("priority", [0, 1, 2])
-def test_aggregate_ready_latches_during_tokens_batches_and_slow_wait(reduce_binary, mode, priority):
+def test_aggregate_ready_latches_during_full_token_scans(reduce_binary, mode, priority):
     result = subprocess.run(
         [str(reduce_binary), "8192", "40", str(priority), "37", mode],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("mode", ["head", "last", "sequence", "stalled", "epochs", "future", "self-delayed"])
+@pytest.mark.parametrize("priority", [0, 1, 2])
+def test_ready_first_skips_blocked_tokens_without_batching_or_reusing_positive_cache(reduce_binary, mode, priority):
+    result = subprocess.run(
+        [str(reduce_binary), "8192", "0", str(priority), "43", mode],
         capture_output=True,
         text=True,
         timeout=30,
