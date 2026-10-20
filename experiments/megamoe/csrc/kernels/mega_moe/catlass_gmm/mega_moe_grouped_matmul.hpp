@@ -318,7 +318,7 @@ protected:
         }
         auto b = tla::MakeTensor(weight, block_.params.layoutPrologueB, Catlass::Arch::PositionGM{});
         auto tileB = tla::GetTile(b, tla::MakeCoord(0, weightN), tla::MakeShape(config_.k, cols));
-        block_.op(tileB, Catlass::GemmCoord{rows, cols, config_.k}, block_.params, config_.m < 256U);
+        block_.op(tileB, Catlass::GemmCoord{rows, cols, config_.k}, block_.params, config_.m < 256U, weightN);
     }
 };
 

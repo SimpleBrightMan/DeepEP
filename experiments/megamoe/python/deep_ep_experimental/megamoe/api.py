@@ -31,7 +31,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 5:
+    if getattr(extension, "api_protocol", None) != 6:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -319,7 +319,11 @@ def _pack_weight_scale_blocks(scale):
     return raw.transpose(2,3).contiguous().reshape(shape).view(torch.float8_e8m0fnu)
 
 
-class _RoutedWeightPair(tuple):
+class _TilePackedWeightPair(tuple):
+    """FP4 tile-pack v1, not legacy ordinary NZ; Python/native protocol 6."""
+
+
+class _RoutedWeightPair(_TilePackedWeightPair):
     """Tuple-compatible immutable prepared weights; both layouts are built off the hot path."""
 
     def __new__(cls, fused, planar):
@@ -334,6 +338,23 @@ class _RoutedWeightPair(tuple):
         return tuple(self) if fused else self._planar
 
 
+def _tilepack_fp4_for_nz_cast(weight):
+    """Inverse NZ input for physical [N256,K512,N128,K32,N128,16B], including K tails."""
+    import torch
+    e,n,half_k=weight.shape
+    if n % 256 or half_k % 32:
+        raise ValueError("FP4 tile-pack requires N%256=0 and K%64=0")
+    blocks=[]
+    source=weight.reshape((e,n//256,2,128,half_k))
+    for begin in range(0,half_k,256):
+        width=min(256,half_k-begin)
+        block=source[...,begin:begin+width].reshape((e,n//256,2,128,width//16,16))
+        blocks.append(block.permute(0,1,2,4,3,5).contiguous().reshape((e,n//256,256*width)))
+    physical=torch.cat(blocks,dim=2)
+    # format_cast随后转为[K32,N,16B]；先逆排，避免把目标physical再错误转置一次。
+    return physical.reshape((e,half_k//16,n,16)).permute(0,2,1,3).contiguous().reshape(weight.shape)
+
+
 def transform_weights_for_mega_moe(
     l1_weights: WeightPair, l2_weights: WeightPair, activation: str = "swiglu", *, shared: bool = False
 ) -> tuple[WeightPair, WeightPair]:
@@ -344,7 +365,8 @@ def transform_weights_for_mega_moe(
     Planar GMM1 retains its original SF layout. Raw inputs use [gate | up]. Routed FP4 GMM1 prepares both planar Prefill and
     [gate128, up128] Decode layouts. Keep the returned l1 pair intact and immutable;
     the API selects its layout by actual BS without a timed conversion. Pass shared=True for
-    shared experts, whose GMM1 remains planar. FP8 and GMM2 keep their layout.
+    shared experts, whose GMM1 remains planar. Routed FP4 data uses tile-pack v1,
+    not ordinary NZ; regenerate old prepared weights. FP8/shared preparation is unchanged.
     This is not the CUDA UTCCP transform. Old prepared FP4 routed weights must
     be regenerated from raw ND inputs; do not transform prepared NZ twice.
     """
@@ -383,14 +405,14 @@ def transform_weights_for_mega_moe(
                 # 两种布局一次准备；独立存储并启用版本计数，禁止原地修改后两份权重失配。
                 with torch.inference_mode(False):
                     planar_weight = torch_npu.npu_format_cast(
-                        weight, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
+                        _tilepack_fp4_for_nz_cast(weight), 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
                     )
                     planar_scale = scale.view(torch.uint8).clone().view(torch.float8_e8m0fnu)
                     weight = _interleave_gate_up_128(weight)
                     scale = _pack_weight_scale_blocks(
                         _interleave_gate_up_128(scale.view(torch.uint8)).view(torch.float8_e8m0fnu))
                     weight = torch_npu.npu_format_cast(
-                        weight, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
+                        _tilepack_fp4_for_nz_cast(weight), 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
                     )
                     _check_fp4_weight_format(planar_weight, name)
                     _check_fp4_weight_format(weight, name)
@@ -398,7 +420,7 @@ def transform_weights_for_mega_moe(
                 continue
             # uint8 只是两个 FP4 的存储载体；FP8 布局参数不能代替输入的 FP4 类型声明。
             weight = torch_npu.npu_format_cast(
-                weight,
+                weight if shared else _tilepack_fp4_for_nz_cast(weight),
                 29,
                 customize_dtype=torch.float8_e4m3fn,
                 input_dtype=torch_npu.float4_e2m1fn_x2,
@@ -406,7 +428,7 @@ def transform_weights_for_mega_moe(
             _check_fp4_weight_format(weight, name)
             if name == "l2_weights":
                 scale = _pack_weight_scale_blocks(scale)
-        transformed.append((weight, scale))
+        transformed.append(_TilePackedWeightPair((weight, scale)) if weight.dtype == torch.uint8 and not shared else (weight, scale))
     return tuple(transformed)
 
 
@@ -487,6 +509,8 @@ def _run(
         raise TypeError("Weight dtype differs from buffer mma_type")
     prepared_inputs = ()
     if w1.dtype == torch.uint8:
+        if not all(isinstance(pair, _TilePackedWeightPair) for pair in (l1_weights,l2_weights)):
+            raise ValueError("FP4 tile-pack v1 requires fresh transform_weights_for_mega_moe output; keep its returned l1 pair intact")
         fused = data.shape[0] <= _extension().paired_gate_up_max_tokens
         if isinstance(l1_weights, _RoutedWeightPair):
             prepared_inputs = (*l1_weights, *l1_weights._planar)

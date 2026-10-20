@@ -60,6 +60,9 @@ class Tensor:
     def transpose(self, first, second):
         return Tensor(self.data.swapaxes(first, second), self.dtype, self.device)
 
+    def permute(self, *axes):
+        return Tensor(self.data.transpose(axes), self.dtype, self.device)
+
     def contiguous(self):
         return Tensor(np.ascontiguousarray(self.data), self.dtype, self.device)
 
@@ -110,6 +113,7 @@ def backend(monkeypatch):
         empty_like=lambda t, dtype: Tensor(np.empty(t.shape, dtype=DTYPES[dtype]), dtype, t.device),
         distributed=dist,
         inference_mode=lambda _: contextlib.nullcontext(),
+        cat=lambda values,dim: Tensor(np.concatenate([t.data for t in values],axis=dim),values[0].dtype,values[0].device),
     )
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "torch.distributed", dist)
@@ -187,7 +191,7 @@ def weights():
     )
     for weight, _ in prepared:
         weight.npu_format = 50
-    return prepared
+    return tuple(api._TilePackedWeightPair(pair) for pair in prepared)
 
 
 @pytest.mark.parametrize("bf16", [False, True])
@@ -280,6 +284,30 @@ def test_timer_disabled_and_destroyed_buffer_fail_explicitly(backend):
         api.fp8_fp4_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), *weights(), backend.buffer)
 
 
+def packed_tile_reference(raw):
+    # 独立按地址序列枚举，不调用生产打包函数；16B段保持packed FP4原始位模式。
+    e,n,half_k=raw.shape
+    spans=[]
+    for expert in range(e):
+        for block_n in range(0,n,256):
+            for window in range(0,half_k,256):
+                for half_n in (0,128):
+                    for k32 in range(window,min(window+256,half_k),16):
+                        spans.append(raw[expert,block_n+half_n:block_n+half_n+128,k32:k32+16].reshape(-1))
+    return np.concatenate(spans)
+
+
+@pytest.mark.parametrize("n,k", [(256,64),(512,128),(512,768),(256,3072),(256,7168)])
+def test_fp4_tile_pack_matches_physical_reader_and_k_tails(backend,n,k):
+    raw=np.arange(2*n*k//2,dtype=np.uint32).astype(np.uint8).reshape(2,n,k//2)
+    encoded=api._tilepack_fp4_for_nz_cast(Tensor(raw,"uint8"))
+    # format_cast的标准NZ物理转置，与CPU storage double故意区分。
+    physical=encoded.data.reshape(2,n,k//32,16).transpose(0,2,1,3).reshape(-1)
+    np.testing.assert_array_equal(physical,packed_tile_reference(raw))
+    assert encoded.shape==raw.shape
+    np.testing.assert_array_equal(raw,np.arange(raw.size,dtype=np.uint32).astype(np.uint8).reshape(raw.shape))
+
+
 @pytest.mark.parametrize("dtype", ["int8", "uint8"])
 def test_fp4_and_packed_e8m0_are_reinterpreted_without_numeric_cast(backend, dtype):
     raw = np.arange(512 * 64, dtype=np.uint8).reshape(1, 512, 64)
@@ -296,14 +324,16 @@ def test_fp4_and_packed_e8m0_are_reinterpreted_without_numeric_cast(backend, dty
     prepared = api.transform_weights_for_mega_moe(pair, pair)
     for idx, (weight, scale) in enumerate(prepared):
         rows = order if idx == 0 else np.arange(512)
-        np.testing.assert_array_equal(weight.data, raw[:, rows])
+        physical=weight.data.reshape(1,512,4,16).transpose(0,2,1,3).reshape(-1)
+        np.testing.assert_array_equal(physical, packed_tile_reference(raw[:, rows]))
         expected_sf = sf[:, rows].reshape(1,2,256,2,2).transpose(0,1,3,2,4).reshape(1,512,2,2)
         np.testing.assert_array_equal(scale.data, expected_sf)
         assert weight.dtype == "uint8" and scale.dtype == "float8_e8m0fnu"
         assert weight.npu_format == 50
     assert sum(isinstance(event, tuple) and event[0] == "format_cast" for event in backend.events) == 3
     planar_weight, planar_scale = prepared[0].select(False)
-    np.testing.assert_array_equal(planar_weight.data, raw)
+    physical=planar_weight.data.reshape(1,512,4,16).transpose(0,2,1,3).reshape(-1)
+    np.testing.assert_array_equal(physical,packed_tile_reference(raw))
     np.testing.assert_array_equal(planar_scale.data, sf.reshape(1, 512, 2, 2))
 
 

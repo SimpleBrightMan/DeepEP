@@ -14,6 +14,7 @@
 
 #include "resource.hpp"
 #include "a8w4_k_plan.hpp"
+#include "packed_weight_tiles.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/coord.hpp"
 #include "catlass/numeric_size.hpp"
@@ -140,7 +141,7 @@ public:
 
     template <class TensorBIn, class ActualBlockShape>
     CATLASS_DEVICE void operator()(const TensorBIn& bGlobal, const ActualBlockShape& actualBlockShape,
-                                   const Params& params, bool allowDynamicB = false)
+                                   const Params& params, bool allowDynamicB = false, uint32_t weightN = 0U)
     {
         uint32_t kSize = tla::get<0>(params.layoutPrologueB.originShape());
         const auto kPlan =
@@ -162,7 +163,7 @@ public:
                                       tla::MakeShape(actualK, columns));
                 auto l1Tile = GetTile(tensorL1B, tla::MakeCoord(0, 0),
                                       tla::MakeShape(actualK, columns));
-                ProcessL1Nz(l1Tile, gmTile);
+                ProcessL1Nz(l1Tile, gmTile, kSize, kLoopIdx * kL1Size, weightN + n);
                 ubInputListId = (ubInputListId + 1U) % UB_INPUT_STAGES;
                 ubOutputListId = (ubOutputListId + 1U) % UB_OUTPUT_STAGES;
                 // 小M每K窗口依次发布N0/N128；每个独立64KiB槽均有自己的full/empty。
@@ -173,7 +174,8 @@ public:
     }
 
     template <class TensorOut, class TensorIn>
-    __aicore__ inline void ProcessL1Nz(const TensorOut& tensorOut, const TensorIn& tensorIn)
+    __aicore__ inline void ProcessL1Nz(const TensorOut& tensorOut, const TensorIn& tensorIn,
+                                      uint32_t fullK, uint32_t startK, uint32_t startN)
     {
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[ubInputListId]);
         uint32_t shapeN;
@@ -188,7 +190,7 @@ public:
         auto tensorCastIn = tla::MakeTensor(ubCastInTensor[ubInputListId], layoutCastIn, Catlass::Arch::PositionUB{});
         auto tensorCastOut = tla::MakeTensor(ubCastOutTensor[ubOutputListId], layoutCastOut, Catlass::Arch::PositionUB{});
 
-        CopyNzInWeightTensor(tensorCastIn, tensorIn);
+        CopyNzInWeightTensor(tensorCastIn, tensorIn, fullK, startK, startN, shapeK, shapeN);
 
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(ubInputEventList[ubInputListId]);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(ubInputEventList[ubInputListId]);
@@ -209,19 +211,17 @@ public:
     }
 
     template <class TensorDst, class TensorSrc>
-    __aicore__ inline void CopyNzInWeightTensor(TensorDst const& dstTensor, TensorSrc const& srcTensor)
+    __aicore__ inline void CopyNzInWeightTensor(TensorDst const& dstTensor, TensorSrc const& srcTensor,
+                                               uint32_t fullK, uint32_t startK, uint32_t startN,
+                                               uint32_t tileK, uint32_t tileN)
     {
-        uint32_t blockCount = tla::get<0, 1>(srcTensor.shape());
-        uint32_t blockLen = tla::get<0, 1>(dstTensor.stride()) >> 1;
         AscendC::DataCopyExtParams repeatParams;
-
-        repeatParams.blockCount = blockCount;
-        repeatParams.blockLen = blockLen;
-        repeatParams.srcStride = (tla::get<0, 1>(srcTensor.stride()) - tla::get<0, 1>(dstTensor.stride())) >> 1;
+        repeatParams.blockCount = tileN / 128U;
+        repeatParams.blockLen = tileK * 64U;
+        repeatParams.srcStride = (MegaMoeImpl::GmmKernel::PackedWeightWindowK(fullK,startK)-tileK) * 64U;
         repeatParams.dstStride = 0;
-
         auto dstOffset = dstTensor.layout()(dstTensor.coord());
-        auto srcOffset = srcTensor.layout()(srcTensor.coord());
+        const uint64_t srcOffset = MegaMoeImpl::GmmKernel::PackedWeightLogicalOffset(fullK,startN,startK);
         AscendC::DataCopyPadExtParams<typename TensorDst::Element> padParams;
         AscendC::DataCopyPad(dstTensor.data()[dstOffset], srcTensor.data()[srcOffset], repeatParams, padParams);
     }
@@ -265,11 +265,12 @@ public:
         AscendC::Reg::Duplicate<int8_t, AscendC::Reg::MaskMergeMode::ZEROING>(wAndReg, E2M1_AND_MASK, preg);
 
         for (uint16_t loopKIdx = 0; loopKIdx < params.loopKNum; ++loopKIdx) {
-            for (uint16_t innerLoopIdx = 0; innerLoopIdx < params.innerLoopNum; ++innerLoopIdx) {
+            for (uint16_t panelIdx = 0; panelIdx < params.nRealSizeAlign / 128U; ++panelIdx) {
+              for (uint16_t vectorIdx = 0; vectorIdx < 16U; ++vectorIdx) {
                 // DIST_US_B8 load mode expands each packed B4 byte into lane-aligned B8 slots.
                 // Packed B4 address offset (bytes) = logical element index >> 1.
                 AscendC::Reg::AddrReg aregWeightB8In = AscendC::Reg::CreateAddrReg<uint8_t>(
-                    loopKIdx, (C0_SIZE_B8 * params.nRealSizeAlign) >> 1, innerLoopIdx, AscendC::GetVecLen() >> 1);
+                    loopKIdx, 2048U, panelIdx, params.loopKNum * 2048U, vectorIdx, 128U);
                 AscendC::Reg::LoadAlign<uint8_t, AscendC::Reg::LoadDist::DIST_US_B8>(
                     (AscendC::Reg::RegTensor<uint8_t>&)wLoad, (__ubuf__ uint8_t*&)params.weightInUbAddr,
                     aregWeightB8In);
@@ -279,10 +280,12 @@ public:
                 AscendC::Reg::And(wAnd, wShr1, wAndReg, preg);
 
                 AscendC::Reg::AddrReg aregWeightB8Out = AscendC::Reg::CreateAddrReg<uint8_t>(
-                    loopKIdx, params.loopKDstStride, innerLoopIdx, params.innerDstStride);
+                    loopKIdx, params.loopKDstStride, panelIdx, 16U * params.innerDstStride,
+                    vectorIdx, params.innerDstStride);
                 AscendC::Reg::StoreAlign<uint8_t, AscendC::Reg::StoreDist::DIST_NORM_B8>(
                     (__ubuf__ uint8_t*&)params.weightOutUbAddr, (AscendC::Reg::RegTensor<uint8_t>&)wAnd,
                     aregWeightB8Out, preg);
+              }
             }
         }
     }
