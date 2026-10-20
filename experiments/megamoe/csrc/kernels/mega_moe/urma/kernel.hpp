@@ -5,7 +5,6 @@
 #include "abi.hpp"
 #include "compute.hpp"
 #include "pack_reduce.hpp"
-#include "ready_monitor.hpp"
 #include "timer.hpp"
 #include "transport.hpp"
 
@@ -135,8 +134,6 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     WaitComputeFlag(args.localFlags, 0U, kWorld);
     timer.TraceEnd(TraceEvent::WaitLocalDispatch, start, peerMeta);
 
-    ReadyMonitor readyMonitor;
-    readyMonitor.Init(args, owner);
     const uint64_t rowBytes = h * sizeof(bfloat16_t);
     uint64_t combineBytes = 0U;
     bool combineStarted = false;
@@ -157,9 +154,6 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         timer.TraceEnd(TraceEvent::CombinePut, start, meta);
         meta.bytes = 0U;
         start = timer.TraceBegin();
-        readyMonitor.RefreshOnce(args);
-        timer.TraceEnd(TraceEvent::CombineReadyMonitor, start, meta);
-        start = timer.TraceBegin();
         Quiet(peer);
         timer.TraceEnd(TraceEvent::CombineQuiet, start, meta);
         const uint64_t readyIndex = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + chunk.cv;
@@ -173,12 +167,6 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     // completed tokens while other peers are still computing/returning rows.
     // The aggregate envelope includes producer gaps between CVs.
     if (combineStarted) timer.End(Phase::Combine, combineBytes);
-    TraceMeta monitorMeta;
-    monitorMeta.row = readyMonitor.TokenBegin();
-    monitorMeta.rows = readyMonitor.TokenCount();
-    start = timer.TraceBegin();
-    readyMonitor.Finish(args);
-    timer.TraceEnd(TraceEvent::TailReadyMonitor, start, monitorMeta);
 }
 
 __aicore__ inline void Process(const Arguments& args)

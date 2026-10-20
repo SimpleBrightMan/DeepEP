@@ -1,7 +1,7 @@
 """Run the production Reduce header with asynchronous CPU pipeline queues.
 
 The fake Ascend operators model FIFO engines, cross-engine events, UB reuse,
-and BF16/FP32 arithmetic. The single Reduce trace must cover token-ready waits
+and BF16/FP32 arithmetic. The single Reduce trace must cover dependency waits
 and end only after output drain. This does not model NPU timing or replace
 device precision validation.
 """
@@ -34,7 +34,7 @@ enum class CacheMode { CACHE_MODE_DISABLE };
 enum class RoundMode { CAST_NONE, CAST_RINT };
 using TEventID = uint32_t;
 constexpr TEventID EVENT_ID0 = 0;
-enum class HardEvent { V_MTE2, MTE2_V, MTE3_V, V_MTE3, S_MTE2, MTE2_S, S_MTE3, MTE3_S };
+enum class HardEvent { V_MTE2, MTE2_V, MTE3_V, V_MTE3, S_MTE2, MTE2_S };
 enum { PIPE_V, PIPE_ALL };
 enum Engine : unsigned { Scalar, Mte2, Vector, Mte3 };
 struct EventEngines { Engine source, destination; };
@@ -46,8 +46,6 @@ constexpr EventEngines Engines(HardEvent event) {
     case HardEvent::V_MTE3: return {Vector, Mte3};
     case HardEvent::S_MTE2: return {Scalar, Mte2};
     case HardEvent::MTE2_S: return {Mte2, Scalar};
-    case HardEvent::S_MTE3: return {Scalar, Mte3};
-    case HardEvent::MTE3_S: return {Mte3, Scalar};
     }
     assert(false);
     return {};
@@ -70,7 +68,7 @@ struct bfloat16_t {
 static_assert(sizeof(bfloat16_t) == 2);
 using Command = std::function<bool()>;
 inline std::array<std::deque<Command>, 4> queues;
-inline bool events[8][8]{};
+inline bool events[6][8]{};
 alignas(64) inline std::array<unsigned char, 192 * 1024> ub;
 inline unsigned priority;
 inline uint64_t inputCopies, outputCopies, metadataCopies, completedOutputs;
@@ -134,7 +132,6 @@ template <unsigned Pipe> void PipeBarrier() {
 }
 template <typename T> struct LocalTensor {
     uint32_t address{}, count{};
-    LocalTensor() = default;
     LocalTensor(TPosition, uint32_t offset, uint32_t n) : address(offset), count(n) {
         assert(address % 32U == 0U);
         assert(uint64_t(address) + uint64_t(count) * sizeof(T) <= ub.size());
@@ -146,7 +143,6 @@ template <typename T> struct LocalTensor {
     }
     T* Data() const { return reinterpret_cast<T*>(ub.data() + address); }
     T GetValue(uint64_t offset) const { assert(offset < count); return Data()[offset]; }
-    void SetValue(uint64_t offset, T value) const { assert(offset < count); Data()[offset] = value; }
 };
 template <typename T> struct GlobalTensor {
     T* data{};
@@ -221,7 +217,6 @@ DRIVER = r"""
 #include <random>
 using namespace MegaMoeUrma;
 using namespace AscendC;
-static_assert(ReduceUbContract::end == 166U * 1024U);
 struct TraceSink {
     uint64_t begins{}, ends{}, expectedRow{}, expectedRows{};
     bool active{};
@@ -274,7 +269,7 @@ int main(int argc, char** argv) {
     const auto count = ReduceOwnedRows(bs, worker), begin = ReduceRowBegin(bs, worker);
     std::vector<int64_t> inverse(rows);
     std::vector<float> weights(rows);
-    std::vector<uint64_t> routeForRow(rows), payloadVisits(rows), observedReady(bs);
+    std::vector<uint64_t> dependencies(rows), routeForRow(rows), payloadVisits(rows);
     for (uint32_t i = 0; i < rows; ++i) {
         inverse[i] = i;
         weights[i] = float(int(random() % 2001U) - 1000) / 997.0F;
@@ -282,6 +277,7 @@ int main(int argc, char** argv) {
     std::shuffle(inverse.begin(), inverse.end(), random);
     for (uint32_t route = 0; route < rows; ++route) {
         routeForRow[inverse[route]] = route;
+        dependencies[route] = route % 4U == 0 ? kReduceSelfDependency | route : route;
     }
     std::vector<bfloat16_t> output(uint64_t(bs) * 3584U);
     for (auto& value : output) value.bits = 0x7fc1;
@@ -292,56 +288,57 @@ int main(int argc, char** argv) {
     args.config.bs = bs;
     args.config.epoch = 7;
     args.symmetric = returnedBase;
-    args.tokenReady = uintptr_t(1) << 42U;
+    args.config.combineReadyOffset = uintptr_t(1) << 35U;
+    args.gmm2Done = uintptr_t(1) << 42U;
     args.output = reinterpret_cast<uint64_t>(output.data());
     args.reduceIndex = reinterpret_cast<uint64_t>(inverse.data());
     args.weights = reinterpret_cast<uint64_t>(weights.data());
-    uint64_t pollClock = 0, readyPolls = 0, stalePolls = 0, outputDuringWait = 0;
+    args.reduceDependencies = reinterpret_cast<uint64_t>(dependencies.data());
+    uint64_t pollClock = 0, remotePolls = 0, selfPolls = 0, outputDuringWait = 0;
     TraceSink timer;
     timer.expectedRow = begin;
     timer.expectedRows = count;
-    auto readyAt = [&](uint64_t token) {
+    auto readyAt = [&](uint64_t route) {
         if (initiallyReady) return uint64_t(0);
-        return 100U + (token >= begin ? token - begin : 0U) * 256U;
+        const uint64_t token = route / 8U;
+        return 100U + (token >= begin ? token - begin : 0U) * 256U + route % 8U * 7U;
     };
     readFlag = [&](uintptr_t address) {
-        assert(timer.active && "token-ready wait must be inside the Reduce trace");
+        assert(timer.active && "Combine/self dependency wait must be inside the Reduce trace");
         ++pollClock;
         Step();  // Other engines may progress while Scalar polls a late producer.
         outputDuringWait += completedOutputs != 0U;
-        assert(address >= args.tokenReady && address < args.tokenReady + uint64_t(bs) * 128U);
-        assert((address - args.tokenReady) % 128U == 0U);
-        const uint64_t token = (address - args.tokenReady) / 128U;
-        assert(token >= begin && token - begin < count);
-        ++readyPolls;
-        // Previous invocation's epoch is deliberately already nonzero.
-        if (pollClock < readyAt(token)) {
-            ++stalePolls;
-            return args.config.epoch - 1U;
+        if (address >= args.gmm2Done && address < args.gmm2Done + uint64_t(rows) * 128U) {
+            ++selfPolls;
+            const uint64_t route = (address - args.gmm2Done) / 128U;
+            // An incomplete self GMM2 group must not be accepted.
+            return uint64_t(pollClock >= readyAt(route) ? 14U : 13U);
         }
-        observedReady[token] = args.config.epoch;
-        return args.config.epoch;
+        const uintptr_t remote = args.symmetric + args.config.combineReadyOffset;
+        assert(address >= remote && address < remote + uint64_t(rows) * 128U);
+        ++remotePolls;
+        const uint64_t route = (address - remote) / 128U;
+        // Previous invocation's epoch is deliberately already nonzero.
+        return pollClock >= readyAt(route) ? args.config.epoch : args.config.epoch - 1U;
     };
     beforePayload = [&](uintptr_t address) {
         assert(timer.active);
         const auto row = (address - returnedBase) / sizeof(bfloat16_t) / 3584U;
         const auto route = routeForRow[row], token = route / 8U;
         assert(token >= begin && token - begin < count);
-        assert(observedReady[token] == args.config.epoch &&
-               "payload submitted before reading this token's current ready epoch");
-        assert(pollClock >= readyAt(token));
+        for (uint32_t slot = 0; slot < 8; ++slot) {
+            assert(pollClock >= readyAt(token * 8U + slot) &&
+                   "payload submitted before all eight token dependencies are ready");
+        }
         assert(++payloadVisits[route] == 1U);
     };
     Reduce(args, worker, timer);
     assert(inputCopies == count * 8U && outputCopies == count);
-    assert(metadataCopies == 2U * ((count + 127U) / 128U));
+    assert(metadataCopies == 3U * ((count + 127U) / 128U));
     assert(timer.begins == (count != 0U) && timer.ends == (count != 0U) && !timer.active);
     assert(completedOutputs == count);
     if (count > 1U && !initiallyReady) assert(outputDuringWait > 0);
-    if (count != 0U) {
-        assert(readyPolls >= count);
-        if (!initiallyReady) assert(stalePolls > 0U);
-    }
+    if (count != 0U) assert(remotePolls && selfPolls);
     assert(bypass == (count != 0U));
     for (const auto& queue : queues) assert(queue.empty());
     for (const auto& kind : events) for (auto event : kind) assert(!event);

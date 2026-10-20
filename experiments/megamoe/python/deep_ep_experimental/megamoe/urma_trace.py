@@ -48,8 +48,6 @@ EVENTS = (
     "CombinePublish",
     "WaitReduceReady",
     "ReduceDrain",
-    "CombineReadyMonitor",
-    "TailReadyMonitor",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
 SYNC_STAGES = {0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
@@ -60,20 +58,6 @@ class TraceOverflowError(ValueError):
 
 
 def event_style(event):
-    if event == "CombineReadyMonitor":
-        return (
-            event,
-            "readiness.monitor",
-            "rail_animation",
-            "nonblocking inbound readiness scan and local token-ready publication; not PUT completion",
-        )
-    if event == "TailReadyMonitor":
-        return (
-            event,
-            "readiness.monitor",
-            "rail_animation",
-            "token readiness monitoring through completion; includes polling backoff and local publication",
-        )
     if event == "Reduce":
         return (
             event,

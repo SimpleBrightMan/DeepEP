@@ -28,7 +28,7 @@ def _extension():
     extension = importlib.import_module(__package__ + "._C")
     if getattr(extension, "urma_api_protocol", None) != 1:
         raise RuntimeError("URMA Python/native versions differ; rebuild and reinstall the complete wheel")
-    if getattr(extension, "urma_tail_schedule", None) != "combine-token-ready-reduce41":
+    if getattr(extension, "urma_tail_schedule", None) != "combine-cv-flag-reduce41":
         raise RuntimeError("URMA tailCover needs its matching native wheel; rebuild and reinstall the complete wheel")
     return extension
 
@@ -130,7 +130,7 @@ class UrmaBuffer:
                 max_recv_rows,
                 timeout,
                 allow_multi_host,
-                "combine-token-ready-reduce41",
+                "combine-cv-flag-reduce41",
             ),
         )
         self.group = group
