@@ -51,6 +51,15 @@ def test_issue_interval_is_not_reported_as_completion():
     assert result["gmm2_spans_us"] == 30
 
 
+def test_async_dispatch_is_required_but_not_reported_as_completion():
+    rows = [dict(e, name=e['name'].replace('AIV_DISPATCH_', 'AIV_DISPATCH_ISSUE_')) for e in fixture_events()]
+    result = rank_breakdown(rows, 0)
+    assert result['status'] == 'ok'
+    assert result['aiv_dispatch_semantics'] == 'issue_not_completion'
+    with pytest.raises(ValueError, match='communication event'):
+        rank_breakdown([event('AIV_DISPATCH_ISSUE_0', 1, 2)], 0, compute_replay=True)
+
+
 def test_both_gmms_can_have_independent_issue_semantics():
     events = [event("AIC_GMM1_ISSUE_0", 5, 45), event("AIC_GMM1_END_0", 45, 49),
               event("AIC_GMM2_ISSUE_0", 50, 80)]

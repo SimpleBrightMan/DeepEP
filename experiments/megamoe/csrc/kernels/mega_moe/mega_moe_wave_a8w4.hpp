@@ -87,6 +87,11 @@ private:
         Activation,
         Combine,
     };
+    DispatchAsyncState dispatchAsync_{};
+    uint32_t combineRowSequence_ = 0U;
+    __gm__ int32_t* activationReadyFlag_ = nullptr;
+    bool activationPending_ = false;
+    __aicore__ inline bool RetireActivation();
     __aicore__ inline bool NextAivSlice(AivTaskCursor& cursor, AivTaskKind kind);
     __aicore__ inline bool TryRunReadyActivation(const AivTaskCursor& cursor, int32_t& readySequence);
     __aicore__ inline bool TryRunReadyCombine(const AivTaskCursor& cursor);
@@ -162,6 +167,16 @@ template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::DispatchNextExpertSlice(
     ExpertTokenPosition& position, uint32_t& waveMGroupCount, uint64_t waveId)
 {
+    if (dispatchAsync_.pending) {
+        timer_.SetWave(static_cast<int64_t>(waveId));
+        timer_.SetSlice(dispatchAsync_.expertIdx, dispatchAsync_.completed.localExpertRowBegin,
+                        dispatchAsync_.completed.localExpertRowEnd - dispatchAsync_.completed.localExpertRowBegin);
+        const int boundary = timer_.BeginBoundary(AscendTimer::AIV_DISPATCH_SYNC);
+        RetireDispatchReady<GMM1_TILE_M>(syncWorkspaceLayout_, params_, dispatchAsync_);
+        timer_.EndBoundary(AscendTimer::AIV_DISPATCH_SYNC, boundary);
+        timer_.ClearSlice();
+        return;
+    }
     ExpertTokenRange range = PlanNextExpertTokenRangeInWave<GMM1_TILE_M>(
         params_.workspaceInfo.expertRevTokenNumsPtr, countWorkspace_, commonConfig_.moeExpertPerRank, mGroupsPerWave_,
         waveMGroupCount, position);
@@ -171,7 +186,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
                                 range.begin.globalTokenIndex};
         // Prefix与两种消费者的工作区互不重叠，保持本launch的UB快照，不再从GM恢复。
         timer_.SetWave(static_cast<int64_t>(waveId));
-        timer_.StartSpan(AscendTimer::AIV_DISPATCH);
+        timer_.StartSpan(AscendTimer::AIV_DISPATCH_ISSUE);
         // AIC-balance使用独立GMM1/GMM2游标；只映射通信job，不能修改计算游标或物理核号。
         auto dispatchJob = gmmExecutionConfig_.blockJob;
         {
@@ -189,16 +204,30 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
         if (commonConfig_.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS) {
             DispatchExpertSlice<ActivationType, QuantScaleOutType, GMM1_TILE_M, false>(
                 tokenDispatchConfig_, commonConfig_, dispatchJob, syncWorkspaceLayout_, params_, g_winRankAddr_,
-                tokenDispatchScratch_, slice);
+                tokenDispatchScratch_, slice, &dispatchAsync_);
         } else {
             DispatchExpertSlice<ActivationType, QuantScaleOutType, GMM1_TILE_M, false, true>(
                 tokenDispatchConfig_, commonConfig_, dispatchJob, syncWorkspaceLayout_, params_, g_winRankAddr_,
-                tokenDispatchScratch_, slice);
+                tokenDispatchScratch_, slice, &dispatchAsync_);
         }
-        timer_.EndSpan(AscendTimer::AIV_DISPATCH);
+        timer_.EndSpan(AscendTimer::AIV_DISPATCH_ISSUE);
     }
-    // 数据和 ready flag 发布后才提交进度；空专家也要推进，避免重复或死循环。
+    // 这里提交issue游标；completed范围另存dispatchAsync_，下次访问真实完成后才发布ready。
     position = range.end;
+}
+
+// 与DS一样把量化提交和就绪发布拆开；只在已有MTE3完成边界观察，不增加全局屏障。
+template <TemplateMegaMoeA8W4WaveTypeClass>
+__aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RetireActivation()
+{
+    if (!activationPending_) return false;
+    timer_.SetWave(AscendTimer::NO_WAVE);
+    const int boundary = timer_.BeginBoundary(AscendTimer::AIV_SWIGLU_SYNC);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(static_cast<TEventID>(Aiv1AsyncEvents::ActivationDone));
+    if (activationReadyFlag_ != nullptr) AscendC::AtomicAdd(activationReadyFlag_, 1);
+    activationPending_ = false;
+    timer_.EndBoundary(AscendTimer::AIV_SWIGLU_SYNC, boundary);
+    return true;
 }
 
 // 惰性枚举原 Wave 的 slice；SwiGLU 只重放 AIC 的独立 GMM1 分核游标，
@@ -273,10 +302,13 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
         // issued探测成功才排入等待，避免抢占AIV1后阻止尚未提交任务所需的Dispatch。
         Gmm1AsyncCompletion::WaitConsumer(readySequence);
     }
-    RunReadyGmm1ActivationTileA8W4<QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
+    activationReadyFlag_ = RunReadyGmm1ActivationTileA8W4<QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
                                    GMM1_TILE_M, FuseGateUp>(epilogueOp_, expertContext.problemShape, addr,
                                                             gmmExecutionConfig_.blockJob, cursor.nextTile,
-                                                            static_cast<uint32_t>(begin.globalTokenIndex));
+                                                            static_cast<uint32_t>(begin.globalTokenIndex),
+                                                            AscendTimer::AIV_SWIGLU_ISSUE, true);
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(static_cast<TEventID>(Aiv1AsyncEvents::ActivationDone));
+    activationPending_ = true;
     timer_.ClearSlice();
     if constexpr (ASYNC_GMM1) {
         // 归还事件槽；输出GM独立寻址不复用，SwiGLU的读入/量化/写出均保持原依赖。
@@ -328,7 +360,7 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     // 到本次算子结束前不会重置，因此检查与发送之间无需再次轮询。
     // timer 仍记录物理核；完整行发送及 UB 排空规则保持原样。
     RunTokenCombineSlice<true>(commonConfig_, combineJob, params_, expertContext, begin.tokenIndexInExpert, rows,
-                               timer_, waveCombineScratch_, &waveCombineBuffers_);
+                               timer_, waveCombineScratch_, &waveCombineBuffers_, &combineRowSequence_);
     return true;
 }
 
@@ -349,10 +381,13 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     }
     uint32_t dispatchGroups = 0U;
     if constexpr (ASYNC_GMM1) Gmm1AsyncCompletion::InitConsumer();
+    // 一次初始化、逐块消费/归还，最后统一消费末个credit。初始化也覆盖零激活路径。
+    Aiv1ActivationUb::Init();
     uint64_t dispatchWave = 0U;
     bool preferCombine = false;
-    while (hasActivation || hasCombine || !shared.done || dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
-        bool progressed = false;
+    while (hasActivation || activationPending_ || hasCombine || !shared.done || dispatchAsync_.pending ||
+           dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
+        bool progressed = RetireActivation();
         if (hasActivation && TryRunReadyActivation(activation, readySequence)) {
             activation.nextTile += gmmExecutionConfig_.blockJob.totalJobs;
             if (activation.nextTile >= activation.tileCount) {
@@ -363,13 +398,14 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         if (!shared.done && TryRunSharedExpertActivation(shared)) {
             progressed = true;
         }
-        if (hasCombine && (preferCombine || dispatch.expertIdx >= commonConfig_.moeExpertPerRank) &&
+        const bool hasDispatch = dispatchAsync_.pending || dispatch.expertIdx < commonConfig_.moeExpertPerRank;
+        if (hasCombine && (preferCombine || !hasDispatch) &&
             TryRunReadyCombine(combine)) {
             hasCombine = NextAivSlice(combine, AivTaskKind::Combine);
             preferCombine = false;
             progressed = true;
-        } else if (dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
-            if (dispatchGroups >= mGroupsPerWave_) {
+        } else if (hasDispatch) {
+            if (!dispatchAsync_.pending && dispatchGroups >= mGroupsPerWave_) {
                 dispatchGroups = 0U;
                 ++dispatchWave;
             }
@@ -385,6 +421,11 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         while (AscendC::GetSystemCycle() - start < GM_FLAG_POLL_BACKOFF_CYCLES) {
         }
     }
+    // 生命周期的唯一收尾。先前slice的ready已发布；不重置仍在飞行的cursor或复用事件。
+    Aiv1ActivationUb::Finish();
+    DrainDispatchCopyBuffers<ActivationType, QuantScaleOutType, false>(
+        tokenDispatchConfig_, params_, tokenDispatchScratch_, dispatchAsync_.progress);
+    DrainCombineRowBuffers(combineRowSequence_, waveCombineBuffers_.rowBufferCount, waveCombineBuffers_.eventBase);
     timer_.ClearSlice();
     timer_.SetWave(AscendTimer::NO_WAVE);
 }

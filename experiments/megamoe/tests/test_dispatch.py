@@ -25,6 +25,7 @@ def test_dispatch_layout_and_direct_slice_match_legacy(tmp_path, fast_path, core
     types = "struct WorkRange" + cpp_body(utils, "struct WorkRange") + ";\n"
     types += "struct ExpertDispatchCoreRange" + cpp_body(source, "struct ExpertDispatchCoreRange") + ";\n"
     types += "struct DispatchPeerCounts" + cpp_body(source, "struct DispatchPeerCounts") + ";\n"
+    types += "struct DispatchAsyncState" + cpp_body(source, "struct DispatchAsyncState") + ";\n"
     (tmp_path / "dispatch_plan_types.inc").write_text(types, encoding="utf-8")
     methods = [function_source(utils, name) for name in ("GetBalancedTokenRange", "GetRotatedBalancedTokenRange")]
     methods += [function_source(source, name) for name in (
@@ -45,11 +46,11 @@ def test_dispatch_ring_drains_before_ready(tmp_path):
     kernel = ROOT / "experiments/megamoe/csrc/kernels/mega_moe"
     source = (kernel / "stage/mega_moe_token_dispatch.hpp").read_text(encoding="utf-8")
     types = "\n".join("struct " + name + cpp_body(source, "struct " + name) + ";" for name in (
-        "ExpertDispatchCoreRange", "DispatchCopyProgress", "DispatchRouteSegment", "DispatchRouteBatch",
+        "ExpertDispatchCoreRange", "DispatchCopyProgress", "DispatchAsyncState", "DispatchRouteSegment", "DispatchRouteBatch",
     ))
     (tmp_path / "dispatch_ring_types.inc").write_text(types, encoding="utf-8")
     methods = "\n".join(function_source(source, name) for name in (
-        "IssuePeerTokenCopies", "DrainDispatchCopyBuffers", "ConsumeRouteBatch", "FinishDispatchOwnedRows",
+        "IssuePeerTokenCopies", "DrainDispatchCopyBuffers", "ConsumeRouteBatch", "FinishDispatchOwnedRows", "RetireDispatchReady",
     ))
     (tmp_path / "dispatch_ring_methods.inc").write_text(methods, encoding="utf-8")
     compile_and_run(Path(__file__).with_name("dispatch_ring_host.cpp"), tmp_path)

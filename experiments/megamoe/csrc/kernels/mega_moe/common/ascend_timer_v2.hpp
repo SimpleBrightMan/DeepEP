@@ -49,6 +49,13 @@ enum DynamicTimingType {
     AIC_GMM1_ISSUE,
     // 布局版本槽：不记录事件；使旧的排空式 trace 与被动 trace 长度不同，禁止误解码。
     PASSIVE_TRACE_SCHEMA_V1,
+    // 跨任务异步版只把issue段画实心条；sync记录调度器原生的完成观察。
+    // 新槽同时改变raw大小，拒绝使用旧扩展/旧parser误读。
+    AIV_DISPATCH_ISSUE,
+    AIV_DISPATCH_SYNC,
+    AIV_SWIGLU_ISSUE,
+    AIV_SWIGLU_SYNC,
+    AIV_COMBINE_ISSUE,
     DYNAMIC_TYPE_COUNT_ENUM
 };
 

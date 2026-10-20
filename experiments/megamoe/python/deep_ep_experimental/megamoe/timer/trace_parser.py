@@ -199,6 +199,7 @@ def trace_events(
         }
         if issue_observation:
             display_name = display_name.replace(family, family + "_ISSUE", 1)
+        issue_observation = issue_observation or family.endswith("_ISSUE")
         result.append(
             {
                 "ph": "X",
@@ -221,7 +222,7 @@ def trace_events(
                     "input_sync_mode": input_sync_mode,
                     "include_wait": include_wait,
                     "time_origin": time_origin,
-                    "timer_protocol": "passive_v1",
+                    "timer_protocol": "passive_aiv1_async_v2",
                     "dynamic_trace_groups": list(range(DYNAMIC_TRACE_GROUPS)),
                     "dynamic_trace_aiv0": bool(DYNAMIC_TRACE_AIV0),
                     "observation": "scalar_issue_with_native_dependencies" if issue_observation else "native_boundary",

@@ -22,6 +22,7 @@
 #include "../common/mega_moe_peer_rows.hpp"
 #include "mega_moe_token_quant.hpp"
 #include "mega_moe_count_arrival.hpp"
+#include "../common/aiv1_async_events.hpp"
 
 namespace MegaMoeImpl {
 
@@ -66,6 +67,14 @@ struct ExpertDispatchCoreRange {
 struct DispatchCopyProgress {
     uint32_t issuedRows = 0U;
     int32_t pendingRow = -1;
+};
+
+// 一次只保留一个待发布owner范围；槽号跨任务递增，不能在yield时重置或消费empty事件。
+struct DispatchAsyncState {
+    DispatchCopyProgress progress{};
+    ExpertDispatchCoreRange completed{};
+    uint32_t expertIdx = 0U;
+    bool pending = false;
 };
 
 struct DispatchRouteSegment {
@@ -227,12 +236,15 @@ __aicore__ inline void DrainDispatchCopyBuffers(const TokenDispatchConfig& conte
 // 按本核已经落地的目标行发布 GMM1 M-group ready，多个 owner 的行贡献可原子累加。
 __aicore__ inline void PublishGmm1TileReady(const MoeSyncWorkspaceLayout& syncLayout, const Params& params,
                                             uint32_t localExpertId, int32_t gmm1TileRowCount,
-                                            int32_t segmentExpertRowBegin, int32_t segmentExpertRowEnd)
+                                            int32_t segmentExpertRowBegin, int32_t segmentExpertRowEnd,
+                                            bool storesCompleted = false)
 {
     if (segmentExpertRowBegin >= segmentExpertRowEnd) {
         return;
     }
-    SyncFuncStatic<AscendC::HardEvent::MTE3_S, SYNC_EVENT_ID5>();
+    if (!storesCompleted) {
+        SyncFuncStatic<AscendC::HardEvent::MTE3_S, SYNC_EVENT_ID5>();
+    }
     __gm__ int32_t* gmm1TileReadyCount =
         reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.flagDispatchToGmm1Ptr) +
         static_cast<uint64_t>(localExpertId) * syncLayout.dispatchFlagSlotCountPerExpert;
@@ -246,6 +258,19 @@ __aicore__ inline void PublishGmm1TileReady(const MoeSyncWorkspaceLayout& syncLa
         int32_t overlapRowEnd = segmentExpertRowEnd < tileExpertRowEnd ? segmentExpertRowEnd : tileExpertRowEnd;
         AtomicAdd(gmm1TileReadyCount + static_cast<int64_t>(tileIdx) * INT_CACHELINE, overlapRowEnd - overlapRowBegin);
     }
+}
+
+// 发布只发生在真实MTE3完成后；不消费token槽的复用事件，后续任务继续沿用该环。
+template <uint32_t PipelineTileM>
+__aicore__ inline void RetireDispatchReady(const MoeSyncWorkspaceLayout& syncLayout, const Params& params,
+                                           DispatchAsyncState& state)
+{
+    if (!state.pending) return;
+    WaitFlag<HardEvent::MTE3_S>(static_cast<TEventID>(Aiv1AsyncEvents::DispatchDone));
+    PublishGmm1TileReady(syncLayout, params, state.expertIdx, static_cast<int32_t>(PipelineTileM),
+                        static_cast<int32_t>(state.completed.localExpertRowBegin),
+                        static_cast<int32_t>(state.completed.localExpertRowEnd), true);
+    state.pending = false;
 }
 
 // route-index 使用独立的 MTE2_S 事件 6，避免与持续存活的 token 槽 0..5 冲突。
@@ -275,10 +300,25 @@ __aicore__ inline void FinishDispatchOwnedRows(const TokenDispatchConfig& contex
                                                 const MoeSyncWorkspaceLayout& syncLayout, const Params& params,
                                                 GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
                                                 uint32_t expertIdx, const ExpertDispatchCoreRange& completed,
-                                                DispatchRouteBatch& batch, DispatchCopyProgress& progress)
+                                                DispatchRouteBatch& batch, DispatchCopyProgress& progress,
+                                                DispatchAsyncState* async = nullptr)
 {
     ConsumeRouteBatch<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, winRankAddr, scratch,
                                                                         batch, progress);
+    if (async != nullptr) {
+        // 最后一行必须先真正提交，yield不是省略末行。metadata/行槽保持到下次复用。
+        if (progress.pendingRow >= 0) {
+            StoreDispatchTokenAndMetaInfo<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+                context, params, scratch, (progress.issuedRows - 1U) % context.bufferConfig.bufferCount,
+                progress.pendingRow);
+            progress.pendingRow = -1;
+        }
+        async->expertIdx = expertIdx;
+        async->completed = completed;
+        async->pending = true;
+        SetFlag<HardEvent::MTE3_S>(static_cast<TEventID>(Aiv1AsyncEvents::DispatchDone));
+        return;
+    }
     DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch, progress);
     PublishGmm1TileReady(syncLayout, params, expertIdx, static_cast<int32_t>(PipelineTileM),
                          static_cast<int32_t>(completed.localExpertRowBegin),
@@ -357,7 +397,8 @@ template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTil
 __aicore__ inline void DispatchOwnedExpertRows(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
                                                const MoeSyncWorkspaceLayout& syncLayout, const Params& params,
                                                GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
-                                               uint32_t localExpertId, const ExpertDispatchCoreRange& coreRange)
+                                               uint32_t localExpertId, const ExpertDispatchCoreRange& coreRange,
+                                               DispatchAsyncState* async = nullptr)
 {
     uint32_t coreGlobalRowBegin = coreRange.expertGlobalRowBegin + coreRange.localExpertRowBegin;
     uint32_t coreGlobalRowEnd = coreRange.expertGlobalRowBegin + coreRange.localExpertRowEnd;
@@ -365,7 +406,8 @@ __aicore__ inline void DispatchOwnedExpertRows(const TokenDispatchConfig& contex
     uint32_t sourceRankIdx = FindDispatchSourceRank(common, scratch, localExpertId, coreGlobalRowBegin);
     int32_t dispatchedRowCount = 0;
     DispatchRouteBatch batch{};
-    DispatchCopyProgress progress{};
+    DispatchCopyProgress localProgress{};
+    DispatchCopyProgress& progress = async != nullptr ? async->progress : localProgress;
 
     while (sourceRankIdx < common.worldSize) {
         uint32_t prefixIndex = localExpertId * common.worldSize + sourceRankIdx;
@@ -391,7 +433,7 @@ __aicore__ inline void DispatchOwnedExpertRows(const TokenDispatchConfig& contex
     const ExpertDispatchCoreRange completed{coreRange.expertGlobalRowBegin, coreRange.localExpertRowBegin,
                                             coreRange.localExpertRowBegin + static_cast<uint32_t>(dispatchedRowCount)};
     FinishDispatchOwnedRows<ActivationType, QuantScaleType, PipelineTileM, TopkWeightsPrefetch>(
-        context, syncLayout, params, winRankAddr, scratch, localExpertId, completed, batch, progress);
+        context, syncLayout, params, winRankAddr, scratch, localExpertId, completed, batch, progress, async);
 }
 
 // 原 prefix 仍表示 [expert][source rank] 的真实路由数量，只改变 Dispatch 的目标行排列。
@@ -413,10 +455,11 @@ __aicore__ inline void DispatchPeerBalancedRows(const TokenDispatchConfig& conte
                                                 const MoeSyncWorkspaceLayout& syncLayout, const Params& params,
                                                 GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
                                                 uint32_t expertIdx, const ExpertDispatchCoreRange& coreRange,
-                                                const ExpertSlice& slice)
+                                                const ExpertSlice& slice, DispatchAsyncState* async = nullptr)
 {
     DispatchRouteBatch batch{};
-    DispatchCopyProgress progress{};
+    DispatchCopyProgress localProgress{};
+    DispatchCopyProgress& progress = async != nullptr ? async->progress : localProgress;
     DispatchPeerCounts counts{scratch.cumsumInfoTensor, expertIdx * common.worldSize};
 #if MEGAMOE_PREFILL_PEER_FAST_PATH
     const PeerRowLimits& limits =
@@ -433,7 +476,7 @@ __aicore__ inline void DispatchPeerBalancedRows(const TokenDispatchConfig& conte
             context, common, params, winRankAddr, scratch, expertIdx, transfer, batch, progress);
     }
     FinishDispatchOwnedRows<ActivationType, QuantScaleType, PipelineTileM, TopkWeightsPrefetch>(
-        context, syncLayout, params, winRankAddr, scratch, expertIdx, coreRange, batch, progress);
+        context, syncLayout, params, winRankAddr, scratch, expertIdx, coreRange, batch, progress, async);
 }
 
 // 两种真实行布局共享执行边界；本核 owner 范围和整个 slice 分开，避免把配额算成本核局部配额。
@@ -442,14 +485,15 @@ template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTil
 __aicore__ inline void DispatchOwnedExpertSlice(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
                                                  const MoeSyncWorkspaceLayout& syncLayout, const Params& params,
                                                  GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
-                                                 const ExpertSlice& slice, const ExpertDispatchCoreRange& owned)
+                                                 const ExpertSlice& slice, const ExpertDispatchCoreRange& owned,
+                                                 DispatchAsyncState* async = nullptr)
 {
     if constexpr (PeerBalanced) {
         DispatchPeerBalancedRows<ActivationType, QuantScaleType, PipelineTileM, TopkWeightsPrefetch>(
-            context, common, syncLayout, params, winRankAddr, scratch, slice.expertIdx, owned, slice);
+            context, common, syncLayout, params, winRankAddr, scratch, slice.expertIdx, owned, slice, async);
     } else {
         DispatchOwnedExpertRows<ActivationType, QuantScaleType, PipelineTileM, TopkWeightsPrefetch>(
-            context, common, syncLayout, params, winRankAddr, scratch, slice.expertIdx, owned);
+            context, common, syncLayout, params, winRankAddr, scratch, slice.expertIdx, owned, async);
     }
 }
 
@@ -459,7 +503,8 @@ template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTil
 __aicore__ inline void DispatchExpertSlice(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
                                             const BlockJobContext& blockJob, const MoeSyncWorkspaceLayout& syncLayout,
                                             const Params& params, GM_ADDR* winRankAddr,
-                                            TokenDispatchScratch<ActivationType>& scratch, const ExpertSlice& slice)
+                                            TokenDispatchScratch<ActivationType>& scratch, const ExpertSlice& slice,
+                                            DispatchAsyncState* async = nullptr)
 {
     if constexpr (g_coreType == AIC) {
         return;
@@ -480,7 +525,7 @@ __aicore__ inline void DispatchExpertSlice(const TokenDispatchConfig& context, c
         static_cast<uint32_t>(clipped.globalRowStart - clipped.rowStartInExpert),
         clipped.rowStartInExpert + rows.start, clipped.rowStartInExpert + rows.start + rows.count};
     DispatchOwnedExpertSlice<ActivationType, QuantScaleType, PipelineTileM, TopkWeightsPrefetch, PeerBalanced>(
-        context, common, syncLayout, params, winRankAddr, scratch, clipped, owned);
+        context, common, syncLayout, params, winRankAddr, scratch, clipped, owned, async);
 }
 
 /*

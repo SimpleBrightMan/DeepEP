@@ -112,7 +112,8 @@ template <typename ElementC, typename MakeLayoutC, bool IsWaveFlagGrained, typen
           typename Config, typename ActualShape>
 __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQuantOp, TensorC& l0cOutGm,
                                                 const GMMAddrInfo& gmmAddrInfo, const Config& config,
-                                                const ActualShape& actualShape, uint32_t mLoc, uint32_t nLoc)
+                                                const ActualShape& actualShape, uint32_t mLoc, uint32_t nLoc,
+                                                bool deferOutput = false)
 {
     if (Get<M_VALUE>(actualShape) == 0U) {
         return;
@@ -132,6 +133,10 @@ __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQua
     auto tensorBlockUbSecond = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetSecond), layoutL0cUb);
     auto copyGm2Ub = AscendC::Te::MakeCopy(AscendC::Te::CopyGM2UB{});
     for (uint32_t row = 0U; row < Get<M_VALUE>(actualShape); row += ubRows) {
+        if (deferOutput) {
+            // 上个量化块的MTE3读取结束，经V归还UB；与通信事件域无交叉。
+            Aiv1ActivationUb::Acquire();
+        }
         const uint32_t count = Min(ubRows, static_cast<uint32_t>(Get<M_VALUE>(actualShape)) - row);
         auto tensorBlockGmFirst = l0cOutGm.Slice(Te::MakeCoord(mLoc + row, gateLoc),
                                                Te::MakeShape(count, Get<N_VALUE>(actualShape)));
@@ -148,11 +153,13 @@ __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQua
                 CeilDiv(nLoc, MXFP_DIVISOR_SIZE) * MXFP_MULTI_BASE_SIZE,
             0, 0, 0, 0};
         AscendC::SetCtrlSpr<60, 60>(0);
-        activationQuantOp(epilogueShape, epilogueOffset);
+        activationQuantOp(epilogueShape, epilogueOffset, 0, deferOutput);
     }
-    NotifyGmm2InputReady<IsWaveFlagGrained>(gmmAddrInfo.activationToGmm2Flag, mLoc / L1_TILE_M_256);
-    AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);
+    if (!deferOutput) {
+        NotifyGmm2InputReady<IsWaveFlagGrained>(gmmAddrInfo.activationToGmm2Flag, mLoc / L1_TILE_M_256);
+        AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);
+    }
 }
 
 // AIV0 按同一投影顺序展开权重：routed 单次融合，shared 使用 planar 调度。
@@ -252,10 +259,10 @@ __aicore__ inline void RunGmm1VectorEpilogueA8W4(Scheduler& scheduler, const Par
 // 共享 activationToGmm2Flag=nullptr，使用独立的共享激活完成标记。
 template <typename ElementA, typename ElementB, typename ElementC, typename ElementMxScaleA, typename ElementMxScaleB,
           uint32_t Gmm1TileM, bool FuseGateUp = false, typename ActivationQuantOp>
-__aicore__ inline void RunReadyGmm1ActivationTileA8W4(
+__aicore__ inline __gm__ int32_t* RunReadyGmm1ActivationTileA8W4(
     ActivationQuantOp& activationQuantOp, const ProblemShape& problemShape, const GMMAddrInfo& gmmAddrInfo,
     const BlockJobContext& blockJob, uint32_t loopIdx, uint32_t expertBeforeCnt,
-    AscendTimer::DynamicTimingType timingType = AscendTimer::AIV_SWIGLU)
+    AscendTimer::DynamicTimingType timingType = AscendTimer::AIV_SWIGLU, bool deferOutput = false)
 {
     using GmmConfig = GmmKernel::Config<true, ElementA, ElementB, ElementC, ElementMxScaleA, ElementMxScaleB, false,
                                         false, false, true, FuseGateUp>;
@@ -275,8 +282,10 @@ __aicore__ inline void RunReadyGmm1ActivationTileA8W4(
     AscendTimerTileScope timer(gmmAddrInfo.timer, timingType, m, n, Get<M_VALUE>(shape), decltype(config)::GMM1_TILE_N);
     {
         GmmKernel::Gmm1Aiv1EpilogueTileA8W4<ElementC, typename GmmConfig::MakeLayoutC, true>(
-            activationQuantOp, gmC, gmmAddrInfo, config, shape, m, n);
+            activationQuantOp, gmC, gmmAddrInfo, config, shape, m, n, deferOutput);
     }
+    return gmmAddrInfo.activationToGmm2Flag == nullptr ? nullptr :
+        gmmAddrInfo.activationToGmm2Flag + static_cast<uint64_t>(m / L1_TILE_M_256) * INT_CACHELINE;
 }
 
 // RunGmm1A8W4：执行 A8W4 prologue（W4→W8）、GMM1、SwiGLU 和量化。

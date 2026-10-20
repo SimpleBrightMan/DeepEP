@@ -10,6 +10,7 @@
 #include "mega_moe_tiling.hpp"
 #include "common/mega_moe_constants.hpp"
 #include "common/mega_moe_aiv1_ub_layout.hpp"
+#include "common/aiv1_async_events.hpp"
 #include <stdexcept>
 #include <string>
 #if defined(__NPU_DEVICE__)
@@ -67,13 +68,15 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
         using MegaMoeImpl::Aiv1ResidentUbLayout;
         static_assert(Aiv1ResidentUbLayout::MetaWords == MegaMoeImpl::META_INFO_SIZE &&
                       Aiv1ResidentUbLayout::MetaWords == MegaMoeImpl::INT32_PER_256B);
-        const uint32_t slots = tiling.bs <= MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS ? 6U : 2U;
+        const uint32_t slots = MegaMoeImpl::Aiv1AsyncEvents::CombineSlots;
         const auto& config = tiling.dispatchBufferConfig;
         const auto resident = MegaMoeImpl::MakeAiv1ResidentUbLayout(
             tiling.h, tiling.epWorldSize, tiling.moeExpertPerRank, config.routeItemsPerBatch,
             config.bufferCount, config.copyBufferBytes, slots);
         // 实验分支不让未适配的共享激活覆盖常驻数据；容量错误在发射NPU前报告。
-        if (tiling.sharedExpertNum != 0U || !resident.valid || resident.end > ub_bytes || resident.end > 256U * 1024U) {
+        if (tiling.sharedExpertNum != 0U || !resident.valid ||
+            config.bufferCount > MegaMoeImpl::Aiv1AsyncEvents::DispatchSlots ||
+            resident.end > ub_bytes || resident.end > 256U * 1024U) {
             throw std::invalid_argument("AIV1 resident UB unsupported: BS=" + std::to_string(tiling.bs) +
                 " H=" + std::to_string(tiling.h) + " EP=" + std::to_string(tiling.epWorldSize) +
                 " local_experts=" + std::to_string(tiling.moeExpertPerRank) +

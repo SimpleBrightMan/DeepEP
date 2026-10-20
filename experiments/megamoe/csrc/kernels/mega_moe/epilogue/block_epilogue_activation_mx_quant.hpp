@@ -30,6 +30,7 @@
 #include "activation/swiglu_activation.hpp"
 #include "activation/swigluoai_activation.hpp"
 #include "block_epilogue_ub_layout.hpp"
+#include "../common/aiv1_activation_ub.hpp"
 #include "quant/mx_quant_common.hpp"
 #include "quant/mx_quant_compute_scale.hpp"
 #include "quant/mxfp4_quant.hpp"
@@ -85,7 +86,7 @@ public:
     __aicore__ inline auto GetTopkWeightTensor();
     // 计算并写回一个激活/量化 tile，不包含流水通知。
     __aicore__ inline void operator()(const BlockShape& blockShape, const BlockCoord& blockCoord,
-                                      uint16_t pingpongIdx = 0);
+                                      uint16_t pingpongIdx = 0, bool deferOutput = false);
     __aicore__ inline void UpdateGlobalAddr(const BlockCoord& baseOffset);
     __aicore__ inline void UpdateNextProblem(const ProblemShape& problemShape);
 
@@ -380,7 +381,8 @@ template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t 
 __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
                                                       IsInterleaved_>::operator()(const BlockShape& blockShape,
                                                                                   const BlockCoord& blockCoord,
-                                                                                  uint16_t pingpongIdx)
+                                                                                  uint16_t pingpongIdx,
+                                                                                  bool deferOutput)
 {
     uint32_t tileRowCount = Get<M_VALUE>(blockShape);     // 128
     uint32_t tileColumnCount = Get<N_VALUE>(blockShape);  // 256
@@ -428,10 +430,16 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
         StoreQuantScaleCompact(quantScaleGlobal_, quantScaleOutput_, tileRowCount, yScaleOffset,
                                intermediateHiddenScaleElements_, tileColumnCount);
     }
-    SetFlag<HardEvent::MTE3_V>(0);
-    WaitFlag<HardEvent::MTE3_V>(0);
-    SetFlag<HardEvent::MTE3_S>(0);
-    WaitFlag<HardEvent::MTE3_S>(0);
+    if (deferOutput) {
+        // MTE3->V等待已经排入V队列；再由V通知下轮MTE2，保护输入/输出重叠的UB。
+        // Scalar可以切换到Dispatch/Combine，不在这里等待量化写出完成。
+        Aiv1ActivationUb::Release();
+    } else {
+        SetFlag<HardEvent::MTE3_V>(0);
+        WaitFlag<HardEvent::MTE3_V>(0);
+        SetFlag<HardEvent::MTE3_S>(0);
+        WaitFlag<HardEvent::MTE3_S>(0);
+    }
 }
 
 }  // namespace MegaMoeImpl

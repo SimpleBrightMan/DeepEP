@@ -52,6 +52,9 @@ def rank_breakdown(events, rank, *, compute_replay=False):
     families = defaultdict(list)
     for event in active:
         families[event_family(event["name"])].append(event)
+    for family in ("AIV_DISPATCH", "AIV_SWIGLU", "AIV_COMBINE"):
+        result[family.lower() + "_semantics"] = "issue_not_completion" if families[family + "_ISSUE"] else "native_completion"
+        families[family] += families[family + "_ISSUE"]
     result["gmm2_semantics"] = "issue_not_completion" if families["AIC_GMM2_ISSUE"] else "native_completion"
     families["AIC_GMM2"] += families["AIC_GMM2_ISSUE"]
     result["gmm1_semantics"] = "issue_not_completion" if families["AIC_GMM1_ISSUE"] else "native_completion"
@@ -60,7 +63,7 @@ def rank_breakdown(events, rank, *, compute_replay=False):
     if compute_replay:
         result["measurement"] = "compute_replay"
         required = ("AIC_GMM1", "AIC_GMM2")
-        forbidden = ("AIV_DISPATCH", "AIV_COMBINE", "AIV_UNPERMUTE", "AIV_INPUT_CROSS_RANK_SYNC", "AIV_FINAL_CROSS_RANK_WAIT")
+        forbidden = ("AIV_DISPATCH", "AIV_DISPATCH_ISSUE", "AIV_COMBINE", "AIV_COMBINE_ISSUE", "AIV_UNPERMUTE", "AIV_INPUT_CROSS_RANK_SYNC", "AIV_FINAL_CROSS_RANK_WAIT")
         if any(event_family(e["name"]) in forbidden for e in events):
             raise ValueError(f"rank={rank}: communication event present in compute replay")
     missing = [name for name in required if not families[name]]

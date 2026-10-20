@@ -2,6 +2,7 @@
 // Legacy functions below are frozen from fa7fbc8; no Git history is needed to run this test.
 #define __aicore__
 #include "common/mega_moe_peer_rows.hpp"
+#include "common/aiv1_async_events.hpp"
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -19,7 +20,10 @@ template <typename T> struct LocalTensor {
 };
 struct MoeStageCommonConfig { uint32_t worldSize, rankId, moeExpertPerRank; };
 struct BlockJobContext { uint32_t jobIndex, totalJobs; };
-struct TokenDispatchConfig { uint64_t maxOutputSize; uint32_t ranksPerNode; };
+struct TokenDispatchConfig {
+    uint64_t maxOutputSize; uint32_t ranksPerNode;
+    struct { uint32_t bufferCount = 6; } bufferConfig;
+};
 struct MoeSyncWorkspaceLayout {};
 struct Params {};
 template <typename T> struct TokenDispatchScratch {
@@ -27,7 +31,11 @@ template <typename T> struct TokenDispatchScratch {
     PeerRowLimitsCache peerRowLimitsCache{};
 };
 struct DispatchRouteBatch {};
-struct DispatchCopyProgress {};
+struct DispatchCopyProgress { uint32_t issuedRows = 0; int32_t pendingRow = -1; };
+enum class HardEvent { MTE3_S };
+using TEventID = uint32_t;
+template <HardEvent> void SetFlag(TEventID) { assert(false); }
+template <typename A, typename S, bool P, class... T> void StoreDispatchTokenAndMetaInfo(T...) { assert(false); }
 using Event = std::array<uint64_t, 6>;
 std::vector<Event> events;
 #include "dispatch_plan_types.inc"
@@ -64,7 +72,7 @@ void DrainDispatchCopyBuffers(const TokenDispatchConfig&, const Params&, TokenDi
     events.push_back({2, 0, 0, 0, 0, 0});
 }
 void PublishGmm1TileReady(const MoeSyncWorkspaceLayout&, const Params&, uint32_t e, int32_t tileM,
-                         int32_t begin, int32_t end) {
+                         int32_t begin, int32_t end, bool = false) {
     assert(begin <= end);
     events.push_back({3, e, static_cast<uint32_t>(tileM), static_cast<uint32_t>(begin),
                       static_cast<uint32_t>(end), 0});

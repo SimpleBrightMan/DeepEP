@@ -3,12 +3,20 @@
 #include <cassert>
 #include <cstdint>
 #include <vector>
+#include "common/aiv1_async_events.hpp"
+using MegaMoeImpl::Aiv1AsyncEvents;
 #define __aicore__
 #define __gm__
 using GM_ADDR = uint8_t*;
 using TEventID = uint32_t;
 constexpr uint32_t MAX_DISPATCH_BUFFER_COUNT = 6;
 namespace AscendC { enum class HardEvent { MTE3_MTE2, MTE3_S, MTE2_S }; }
+using AscendC::HardEvent;
+bool publishFence = false, publishObserved = false;
+template <HardEvent E> void SetFlag(TEventID id) {
+    assert(E == HardEvent::MTE3_S && id == 7 && !publishFence);
+    publishFence = true;
+}
 using MegaMoeDispatchBufferConfig = struct { int32_t bufferCount; };
 struct TokenDispatchConfig { MegaMoeDispatchBufferConfig bufferConfig; uint32_t quantWinOffset = 0; };
 struct Params {};
@@ -28,6 +36,12 @@ template <AscendC::HardEvent Event> void WaitFlag(TEventID slot) {
         assert(reusable[slot]);
         reusable[slot] = false;
     } else if constexpr (Event == AscendC::HardEvent::MTE3_S) {
+        if (slot == 7) {
+            assert(publishFence);
+            publishFence = false;
+            publishObserved = true;
+            return;
+        }
         assert(finished[slot]);
         finished[slot] = false;
     }
@@ -54,9 +68,16 @@ void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig&, const Params&, To
     copied.push_back(row);
 }
 void PublishGmm1TileReady(const MoeSyncWorkspaceLayout&, const Params&, uint32_t expert,
-                          int32_t tile, int32_t begin, int32_t end) {
-    for (uint32_t i = 0; i < 6; ++i) assert(!fetched[i] && !reusable[i] && !finished[i]);
-    assert(expert == 2 && tile == 256 && begin == 0 && end == static_cast<int32_t>(copied.size()));
+                          int32_t tile, int32_t begin, int32_t end, bool storesCompleted = false) {
+    if (storesCompleted) {
+        assert(publishObserved && !publishFence && begin <= end);
+        publishObserved = false;
+        for (bool f : fetched) assert(!f);
+    } else {
+        for (uint32_t i = 0; i < 6; ++i) assert(!fetched[i] && !reusable[i] && !finished[i]);
+        assert(begin == 0);
+    }
+    assert(expert == 2 && tile == 256 && end == static_cast<int32_t>(copied.size()));
     ++readyCount;
 }
 #include "dispatch_ring_methods.inc"
@@ -88,5 +109,24 @@ int main() {
             assert(copied.size() == static_cast<uint32_t>(rows) && readyCount == 1);
             assert(batch.count == 0 && batch.usedItems == 0);
         }
+        copied.clear(); readyCount = 0;
+        DispatchAsyncState state{};
+        TokenDispatchConfig config{{slots}};
+        uint32_t total = 0;
+        for (uint32_t rows : {1U, 2U, 7U, 0U, 33U}) {
+            DispatchRouteBatch batch{};
+            IssuePeerTokenCopies<uint8_t, int32_t, false>(
+                config, params, peers, scratch, total, 0, total, rows, state.progress);
+            const auto before = readyCount;
+            FinishDispatchOwnedRows<uint8_t, int32_t, 256, false>(
+                config, sync, params, peers, scratch, 2, {0,total,total+rows}, batch, state.progress, &state);
+            assert(state.pending && readyCount == before && state.progress.pendingRow == -1);
+            RetireDispatchReady<256>(sync, params, state);
+            assert(!state.pending && readyCount == before+1 && !publishFence);
+            total += rows;
+        }
+        assert(state.progress.issuedRows == total && copied.size() == total);
+        DrainDispatchCopyBuffers<uint8_t, int32_t, false>(config, params, scratch, state.progress);
+        for (uint32_t i = 0; i < 6; ++i) assert(!fetched[i] && !reusable[i] && !finished[i]);
     }
 }

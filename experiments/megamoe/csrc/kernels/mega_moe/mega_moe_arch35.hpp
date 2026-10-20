@@ -355,16 +355,14 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::DispatchBuffInit()
     uint32_t metaInfoTensorSize = static_cast<uint32_t>(bufferConfig.bufferCount) * INT32_PER_256B * sizeof(int32_t);
     scratch.metaInfoTensor =
         LocalTensor<int32_t>(TPosition::VECCALC, metaInfoTensorAddr, metaInfoTensorSize / sizeof(int32_t));
-    const uint32_t combineSlots = commonConfig_.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS ? 6U : 2U;
+    const uint32_t combineSlots = Aiv1AsyncEvents::CombineSlots;
     const auto resident = MakeAiv1ResidentUbLayout(
         commonConfig_.tokenHiddenDim, commonConfig_.worldSize, commonConfig_.moeExpertPerRank,
         bufferConfig.routeItemsPerBatch, bufferConfig.bufferCount, context.quantTokenScaleAlignBytes, combineSlots);
     // launcher先检查容量；此处只绑定一次。三阶段仍保留原生完成等待，不靠别的阶段覆盖UB。
-    waveCombineBuffers_ = combineSlots == 6U
-        ? InitWaveCombineBuffers<false, 6U>(commonConfig_, waveCombineScratch_, resident.combineRowsBase,
-                                          resident.combineMetaBase)
-        : InitWaveCombineBuffers<false, 2U>(commonConfig_, waveCombineScratch_, resident.combineRowsBase,
-                                          resident.combineMetaBase);
+    waveCombineBuffers_ = InitWaveCombineBuffers<false, Aiv1AsyncEvents::CombineSlots>(
+        commonConfig_, waveCombineScratch_, resident.combineRowsBase, resident.combineMetaBase);
+    waveCombineBuffers_.eventBase = Aiv1AsyncEvents::CombineBase;
 }
 
 template <TemplateMegaMoeTypeClass>

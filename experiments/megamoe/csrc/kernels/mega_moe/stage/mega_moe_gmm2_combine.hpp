@@ -113,6 +113,7 @@ struct WaveCombineBufferConfig {
     uint32_t rowStrideBytes = 0;
     uint32_t slotStrideBytes = 0;
     uint32_t rowBufferCount = 0;
+    uint32_t eventBase = 0;
 };
 
 struct WaveCombineScratch {
@@ -200,12 +201,13 @@ __aicore__ inline WorkRange GetWaveCombineOwnedRange(const AivJobContext& job, u
 }
 
 // 等待并消费当前 Wave 的 Combine 发送在行环形 buffer 上产生的全部完成事件，使该环不再有在途 slot。
-__aicore__ inline void DrainCombineRowBuffers(uint32_t& issuedRowCount, uint32_t rowBufferCount)
+__aicore__ inline void DrainCombineRowBuffers(uint32_t& issuedRowCount, uint32_t rowBufferCount,
+                                              uint32_t eventBase = 0U)
 {
     uint32_t activeSlotCount = issuedRowCount < rowBufferCount ? issuedRowCount : rowBufferCount;
     for (uint32_t slot = 0U; slot < activeSlotCount; ++slot) {
         WaitFlag<HardEvent::MTE3_MTE2>(
-            static_cast<TEventID>(static_cast<int32_t>(EVENT_ID0) + static_cast<int32_t>(slot)));
+            static_cast<TEventID>(eventBase + slot));
     }
     /*
      * Drain 会消费所有在途事件，下一段必须从空闲的 slot 0 重新开始；否则该段会把已消费的事件
@@ -238,7 +240,7 @@ __aicore__ inline void SendWaveCombineToken(const MoeStageCommonConfig& common,
                                             uint64_t gmRemoteBaseOffset, uint32_t tokenLocal,
                                             LocalTensor<int32_t>& tokenMetaInfo, uint32_t slot)
 {
-    TEventID eventId = static_cast<TEventID>(static_cast<int32_t>(EVENT_ID0) + static_cast<int32_t>(slot));
+    TEventID eventId = static_cast<TEventID>(bufferConfig.eventBase + slot);
     if constexpr (IsBufferReuse) {
         WaitFlag<HardEvent::MTE3_MTE2>(eventId);
     }
@@ -702,7 +704,8 @@ template <bool InputReadyChecked = false>
 __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, const AivJobContext& job,
                                             const Params& params, const ExpertContext& expertContext, uint32_t rowStart,
                                             uint32_t rowCount, AscendTimerDevice& timer, WaveCombineScratch& scratch,
-                                            const WaveCombineBufferConfig* residentBuffers = nullptr)
+                                            const WaveCombineBufferConfig* residentBuffers = nullptr,
+                                            uint32_t* persistentSequence = nullptr)
 {
     if constexpr (g_coreType == AIC) {
         return;
@@ -722,12 +725,15 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
                                                       : InitWaveCombineBuffers<false, 2U>(common, scratch));
     GM_ADDR sliceOutput =
         params.workspaceInfo.gmm2MmadResPtr + globalRowStart * common.tokenHiddenDim * sizeof(bfloat16_t);
-    uint32_t rowSequence = 0U;
+    uint32_t localSequence = 0U;
+    uint32_t& rowSequence = persistentSequence != nullptr ? *persistentSequence : localSequence;
     timer.SetSlice(expertContext.expertIdx, rowStart, rowCount);
     for (uint32_t done = 0U; done < owned.count;) {
         uint32_t count = owned.count - done;
         count = count < WAVE_COMBINE_META_INFO_TOKEN_CAPACITY ? count : WAVE_COMBINE_META_INFO_TOKEN_CAPACITY;
-        AscendTimerTileScope rows(timer.Enabled() ? &timer : nullptr, AscendTimer::AIV_COMBINE, owned.start + done,
+        AscendTimerTileScope rows(timer.Enabled() ? &timer : nullptr,
+                                  persistentSequence != nullptr ? AscendTimer::AIV_COMBINE_ISSUE : AscendTimer::AIV_COMBINE,
+                                  owned.start + done,
                                   static_cast<uint32_t>(-1), count);
         if constexpr (!InputReadyChecked) {
             if (done == 0U) {
@@ -740,7 +746,10 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
         CombineWaveTokenRange(common, buffers, scratch, params, sliceOutput, owned.start + done, count, 0U,
                               rowSequence);
         // 发送完成才结束计时和复用 metadata/UB；不增加全核或全卡同步。
-        DrainCombineRowBuffers(rowSequence, buffers.rowBufferCount);
+        // metadata已由Scalar读成路由值，后续可覆盖；行槽必须等自己的MTE3_MTE2归还。
+        if (persistentSequence == nullptr) {
+            DrainCombineRowBuffers(rowSequence, buffers.rowBufferCount, buffers.eventBase);
+        }
         done += count;
     }
     timer.ClearSlice();
