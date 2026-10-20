@@ -332,8 +332,8 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     return true;
 }
 
-// AIV1 独立流水，优先级严格为：路由 SwiGLU > Dispatch > 共享 SwiGLU > Combine。
-// 每次完成一个 tile/slice 后重新探测；只看各流队首，不抢占正在执行的搬运。
+// 三套UB常驻后，每轮推进一个就绪激活，再交替服务Dispatch/Combine。
+// Combine未就绪时立即退回Dispatch；不进入阻塞等待，不抢占正在执行的tile/slice。
 template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessAiv1PriorityStages(
     int32_t& readySequence)
@@ -350,27 +350,34 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     uint32_t dispatchGroups = 0U;
     if constexpr (ASYNC_GMM1) Gmm1AsyncCompletion::InitConsumer();
     uint64_t dispatchWave = 0U;
+    bool preferCombine = false;
     while (hasActivation || hasCombine || !shared.done || dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
+        bool progressed = false;
         if (hasActivation && TryRunReadyActivation(activation, readySequence)) {
             activation.nextTile += gmmExecutionConfig_.blockJob.totalJobs;
             if (activation.nextTile >= activation.tileCount) {
                 hasActivation = NextAivSlice(activation, AivTaskKind::Activation);
             }
-            continue;
+            progressed = true;
         }
-        if (dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
+        if (!shared.done && TryRunSharedExpertActivation(shared)) {
+            progressed = true;
+        }
+        if (hasCombine && (preferCombine || dispatch.expertIdx >= commonConfig_.moeExpertPerRank) &&
+            TryRunReadyCombine(combine)) {
+            hasCombine = NextAivSlice(combine, AivTaskKind::Combine);
+            preferCombine = false;
+            progressed = true;
+        } else if (dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
             if (dispatchGroups >= mGroupsPerWave_) {
                 dispatchGroups = 0U;
                 ++dispatchWave;
             }
             DispatchNextExpertSlice(dispatch, dispatchGroups, dispatchWave);
-            continue;
+            preferCombine = true;
+            progressed = true;
         }
-        if (!shared.done && TryRunSharedExpertActivation(shared)) {
-            continue;
-        }
-        if (hasCombine && TryRunReadyCombine(combine)) {
-            hasCombine = NextAivSlice(combine, AivTaskKind::Combine);
+        if (progressed) {
             continue;
         }
         // 没有可执行任务才退避；不能进入 Combine 的阻塞等待，否则可能挡住 GMM2 所需的 SwiGLU。
