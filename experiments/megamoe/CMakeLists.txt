@@ -17,7 +17,6 @@ find_library(TORCH_NPU_LIBRARY torch_npu PATHS "${torch_npu_root}/lib" NO_DEFAUL
 find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" NO_DEFAULT_PATH REQUIRED)
 
 set(beta_include
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../analysis/ds-bisect-1021/reference/deep_gemm/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/csrc"
     "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/mega_moe"
     "${CATLASS_ROOT}/include" "${CATLASS_ROOT}/examples/common"

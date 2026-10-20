@@ -254,20 +254,6 @@ public:
     }
 
 protected:
-    __aicore__ inline void PrimeWeightScales(uint32_t weightN, uint32_t rows, uint32_t cols)
-    {
-        if (blockedWeightScales_) {
-            auto sb = Tensor<SB>(addr_.bScaleGlobal + static_cast<uint64_t>(weightN) * config_.scaleK,
-                tla::MakeMxScaleLayout<SB,Catlass::layout::RowMajor,true>(config_.scaleK,256U));
-            auto tile = tla::GetTile(sb,tla::MakeCoord(0U,0U),tla::MakeShape(config_.scaleK,cols));
-            block_.PrimeWeightScales(tile,rows,cols,config_.k);
-            return;
-        }
-        auto sb = Tensor<SB>(addr_.bScaleGlobal,
-            tla::MakeMxScaleLayout<SB,LayoutScaleB,true>(config_.scaleK,config_.n));
-        auto tile = tla::GetTile(sb,tla::MakeCoord(0U,weightN),tla::MakeShape(config_.scaleK,cols));
-        block_.PrimeWeightScales(tile,rows,cols,config_.k);
-    }
 
     __aicore__ inline void ComputeProjection(uint32_t m, uint32_t weightN, uint32_t rows, uint32_t cols,
                                              uint32_t outputN, __gm__ int32_t* outputIssued = nullptr,
@@ -368,10 +354,6 @@ public:
         // 只由配对routed入口调用：logical N128 -> physical gate/up N256。
         Pipeline::ComputeProjection(m, n * 2U, rows, cols * 2U, n * 2U, issued, sequence);
     }
-    __aicore__ inline void PrefetchWeightScales(uint32_t n, uint32_t rows, uint32_t cols)
-    {
-        if (fused_) Pipeline::PrimeWeightScales(n * 2U,rows,cols * 2U);
-    }
     __aicore__ inline void Dequantize(uint32_t n, uint32_t rows, uint32_t cols)
     {
         if (fused_) {
@@ -410,10 +392,6 @@ public:
     __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols)
     {
         Pipeline::ComputeProjection(m, n, rows, cols, n);
-    }
-    __aicore__ inline void PrefetchWeightScales(uint32_t n, uint32_t rows, uint32_t cols)
-    {
-        Pipeline::PrimeWeightScales(n,rows,cols);
     }
     __aicore__ inline void Dequantize(uint32_t n, uint32_t rows, uint32_t cols)
     {
