@@ -255,6 +255,7 @@ public:
             return;
         }
         l1AListId = l1BListId = l0AListId = l0BListId = l0CListId = 0;
+        sfBPrimed_ = false;
         RestoreStatus();
         if constexpr (ENABLE_UNIT_FLAG && tla::detail::isRowMajor<LayoutC>::value) {
             AscendC::SetMMLayoutTransform(true);
@@ -297,6 +298,7 @@ public:
         next.l0CListId = l0CListId;
         next.l1MxScaleAListId = l1MxScaleAListId;
         next.l1MxScaleBListId = l1MxScaleBListId;
+        next.sfBPrimed_ = sfBPrimed_;
         next.active_ = active_;
         active_ = false;
     }
@@ -338,6 +340,23 @@ public:
     ~MegaMoeBlockMmadA8W4()
     {
         Deactivate();
+    }
+
+    // 权重SF不依赖Dispatch/SwiGLU：先发出首chunk，再由外层等待激活。
+    // 只预占当前SF槽一次，真正SFFull仍要等后续A SF也已提交；不是提前宣告输入就绪。
+    template <class SB>
+    CATLASS_DEVICE void PrimeWeightScales(SB& sb, uint32_t m, uint32_t n, uint32_t k)
+    {
+        if (m > 128U || n != 256U || k % 512U != 0U) return;
+        using namespace deep_gemm;
+        const auto base = sb.data()[sb.layout()(sb.coord())].GetPhyAddr();
+        const uint32_t stride = tla::get<1>(sb.stride()) / 2U;
+        l1_ptr<int16_t> dst(256U, 32U, reinterpret_cast<uintptr_t>(l1MxScaleBTensorList[0].GetPhyAddr()));
+        asc_sync_wait(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(3U + l1MxScaleAListId));
+        copy_gm_to_l1_mx(dst[l1MxScaleAListId],
+            gm_ptr<int16_t, Major::K>(stride, reinterpret_cast<uintptr_t>(base)),
+            256U, Min(32U,k / 64U), asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
+        sfBPrimed_ = true;
     }
 
     /// Perform a block-scoped matrix multiply-accumulate
@@ -701,10 +720,13 @@ protected:
             const uint32_t sfSlot = l1MxScaleAListId;
             const uint32_t pairs = Min(SfPairs, kTotal / 64U - pair);
             if (pair % SfPairs == 0U) {
-                asc_sync_wait(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(3U + sfSlot));
-                copy_gm_to_l1_mx(lsb[sfSlot],
-                    gm_ptr<int16_t, Major::K>(sbStride, reinterpret_cast<uintptr_t>(gmSb + pair)),
-                    256U, pairs, asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
+                if (ki == 0U && sfBPrimed_) sfBPrimed_ = false;
+                else {
+                    asc_sync_wait(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(3U + sfSlot));
+                    copy_gm_to_l1_mx(lsb[sfSlot],
+                        gm_ptr<int16_t, Major::K>(sbStride, reinterpret_cast<uintptr_t>(gmSb + pair)),
+                        256U, pairs, asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
+                }
             }
             asc_sync_wait(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(l1AListId));
             copy_gm_to_l1(la[l1AListId],
@@ -914,6 +936,7 @@ protected:
     MatrixCoord lastCoordB[L1B_STAGES];
 
     bool active_ = false;
+    bool sfBPrimed_ = false;
 
     // The id of current stage
     uint32_t l1AListId{0};
