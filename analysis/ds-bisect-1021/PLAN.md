@@ -29,3 +29,9 @@ EP8，H7168/I3072/E384/topk6/shared0，FP8/FP4，balanced，seed20260922。真�
 - 完整DS包归档SHA256：6597c1b56e817f73bb22814834e2f37895ce88b3c32785bd10ce9316f5e9eada。
 
 `reference/deep_gemm`是冻结包的源码快照（不提交.so）；各变体以Git提交区分，不引入正式运行时多后端开关。DS文件保留MIT许可，完整归档及host扩展另存本地证据。
+
+## 实际节点
+
+- D0：完整冻结DS在本项目诊断目录重新JIT；Git统一LF换行，原始字节归档另存。不是已经迁移到我们的默认kernel。
+- C1：在L12上替换M≤128、N256、K整除512的完整AIC供数/MMAD leaf。使用DS静态物理M128、独立A/SF完成事件及C API L1/L0地址；保留原AIV0 L1B协议、原GM ABI、FIX scale=64与旧数学规则。其他形状仍原实现。这个节点不是完整计算包已全部闭合的声明。
+- 新核对：原工程权重SF的ColumnMajor MX布局实际是每N行连续K-SF；DS权重SF是pair-major。后续布局节点须同时修改离线权重准备和AIC读取，不仅是SwiGLU的激活scale布局。

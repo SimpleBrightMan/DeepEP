@@ -25,6 +25,7 @@
 #include "catlass/gemm_coord.hpp"
 #include "tla/layout.hpp"
 #include "tla/tensor.hpp"
+#include <deep_gemm/ascend.hpp>
 
 namespace Catlass::Gemm::Block {
 
@@ -427,6 +428,14 @@ public:
                 copy(destination, accumulator, 0b11);
             }
         };
+        // 诊断C1：替换完整的小M供数/MMAD leaf，不新增GM重排，也不改变旧数值与输出协议。
+        // 原GM ABI仍是A/SFA行主序、SFB按N行存放；与DS的pair-major差异单列后续实验。
+        if constexpr (ENABLE_UNIT_FLAG) {
+            if (mBlockActual <= 128U && nBlockActual == 256U && kBlockActual % 512U == 0U) {
+                ComputeDsLeaf(tensorA, tensorMxScaleA, tensorMxScaleB, mBlockActual, kBlockActual, emitHalf);
+                return;
+            }
+        }
         for (uint32_t kL1Idx = 0; kL1Idx < kL1Loop; ++kL1Idx) {
             const uint32_t kOffset = kL1Idx * kb;
             const uint32_t kL1Actual = Min(kb, kBlockActual - kOffset);
@@ -661,6 +670,102 @@ public:
     }
 
 protected:
+    // 从冻结DS的aic_gemm_pipeline适配：固定物理M128/K512、A与SF独立完成、A跨N复用。
+    // credit仍由本对象唯一持有，沿用AIV0的L1B旗标和FIX消费者，不能重新投放/偷删等待。
+    // 改编自DeepSeek，Copyright (c) 2026 DeepSeek，MIT，完整许可见诊断目录reference/LICENSE。
+    template <class A, class SA, class SB, class Emit>
+    CATLASS_DEVICE void ComputeDsLeaf(A& a, SA& sa, SB& sb, uint32_t m, uint32_t kTotal, Emit& emit)
+    {
+        using namespace deep_gemm;
+        constexpr uint32_t BlockK = 512U, MadK = 256U, MadN = 128U, SfPairs = 32U;
+        const uint32_t alignedM = RoundUp<16U>(m);
+        const auto aBase = a.data()[a.layout()(a.coord())].GetPhyAddr();
+        const auto saBase = sa.data()[sa.layout()(sa.coord())].GetPhyAddr();
+        const auto sbBase = sb.data()[sb.layout()(sb.coord())].GetPhyAddr();
+        constexpr uintptr_t AddressMask = (uintptr_t{1} << 60U) - 1U;
+        auto gmA = reinterpret_cast<__gm__ float8_e4m3_t*>(reinterpret_cast<uintptr_t>(aBase) & AddressMask);
+        auto gmSa = reinterpret_cast<__gm__ int16_t*>(reinterpret_cast<uintptr_t>(saBase) & AddressMask);
+        auto gmSb = reinterpret_cast<__gm__ int16_t*>(sbBase);
+        const uint32_t aStride = tla::get<0>(a.stride());
+        const uint32_t saStride = tla::get<0>(sa.stride()) / 2U;
+        const uint32_t sbStride = tla::get<1>(sb.stride()) / 2U;
+        l1_ptr<float8_e4m3_t> la(128U, BlockK, reinterpret_cast<uintptr_t>(l1ATensorList[0].GetPhyAddr()));
+        l1_ptr<float8_e4m3_t> lb(MadN, BlockK, reinterpret_cast<uintptr_t>(l1BTensorList[0].GetPhyAddr()));
+        l1_ptr<int16_t> lsa(256U, SfPairs, reinterpret_cast<uintptr_t>(l1MxScaleATensorList[0].GetPhyAddr()));
+        l1_ptr<int16_t> lsb(256U, SfPairs, reinterpret_cast<uintptr_t>(l1MxScaleBTensorList[0].GetPhyAddr()));
+        l0a_ptr<float8_e4m3_t> l0a(128U, MadK, reinterpret_cast<uintptr_t>(l0ATensorList[0].GetPhyAddr()));
+        l0b_ptr<float8_e4m3_t> l0b(MadN, MadK, reinterpret_cast<uintptr_t>(l0BTensorList[0].GetPhyAddr()));
+        l0c_ptr<float> l0c(128U, MadN, reinterpret_cast<uintptr_t>(l0CTensorList[0].GetPhyAddr()));
+        for (uint32_t ki = 0U; ki < kTotal; ki += BlockK) {
+            const uint32_t pair = ki / 64U;
+            const uint32_t sfSlot = l1MxScaleAListId;
+            const uint32_t pairs = Min(SfPairs, kTotal / 64U - pair);
+            if (pair % SfPairs == 0U) {
+                asc_sync_wait(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(3U + sfSlot));
+                copy_gm_to_l1_mx(lsb[sfSlot],
+                    gm_ptr<int16_t, Major::K>(sbStride, reinterpret_cast<uintptr_t>(gmSb + pair)),
+                    256U, pairs, asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
+            }
+            asc_sync_wait(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(l1AListId));
+            copy_gm_to_l1(la[l1AListId],
+                gm_ptr<float8_e4m3_t, Major::K>(aStride, reinterpret_cast<uintptr_t>(gmA + ki)),
+                m, BlockK, asc_load_l2_cache_mode::NORMAL_LAST_VICTIM);
+            asc_sync_notify(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(l1AListId));
+            if (pair % SfPairs == 0U) {
+                copy_gm_to_l1_mx(lsa[sfSlot],
+                    gm_ptr<int16_t, Major::K>(saStride, reinterpret_cast<uintptr_t>(gmSa + pair)),
+                    m, pairs, asc_load_l2_cache_mode::NORMAL_LAST_VICTIM);
+                asc_sync_notify(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(3U + sfSlot));
+            }
+            asc_sync_wait(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(l1AListId));
+            for (uint32_t ni = 0U; ni < 2U; ++ni)
+                AscendC::CrossCoreWaitFlag<AIC_SYNC_AIV_MODE, PIPE_MTE1>(
+                    AIV_SYNC_AIC_FLAG + (l1BListId + ni) % L1B_STAGES);
+            for (uint32_t km = 0U; km < BlockK; km += MadK) {
+                const uint32_t aSlot = km / MadK;
+                const uint32_t sfOffset = (pair + km / 64U) % SfPairs;
+                const auto aa = l0a[aSlot].as_mad_aligned(alignedM, MadK);
+                asc_sync_wait(PIPE_M, PIPE_MTE1, static_cast<event_t>(aSlot));
+                copy_l1_to_l0a(aa, la[l1AListId], 0U, km);
+                if (pair % SfPairs == 0U && km == 0U)
+                    asc_sync_wait(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(3U + sfSlot));
+                copy_l1_to_l0a_mx(aa, lsa[sfSlot], 0U, sfOffset, MadK);
+                const bool last = ki + km + MadK == kTotal;
+                for (uint32_t ni = 0U; ni < 2U; ++ni) {
+                    const uint32_t bSlot = ni;
+                    asc_sync_wait(PIPE_M, PIPE_MTE1, static_cast<event_t>(2U + bSlot));
+                    copy_l1_to_l0b(l0b[bSlot], lb[(l1BListId + ni) % L1B_STAGES], 0U, km);
+                    copy_l1_to_l0b_mx(l0b[bSlot], lsb[sfSlot], ni * MadN, sfOffset, MadK);
+                    asc_sync_notify(PIPE_MTE1, PIPE_M, static_cast<event_t>(2U + bSlot));
+                    asc_sync_wait(PIPE_MTE1, PIPE_M, static_cast<event_t>(2U + bSlot));
+                    const auto cc = l0c[ni].as_mad_aligned(alignedM, MadN);
+                    mad(cc, aa, l0b[bSlot], alignedM, MadN, MadK,
+                        last ? asc_unit_flag_mode::ENABLE_UPDATE : asc_unit_flag_mode::ENABLE_KEEP,
+                        ki + km == 0U);
+                    if (ni == 1U) asc_sync_notify(PIPE_M, PIPE_MTE1, static_cast<event_t>(aSlot));
+                    asc_sync_notify(PIPE_M, PIPE_MTE1, static_cast<event_t>(2U + bSlot));
+                    if (last) {
+                        auto source = tla::MakeTensor(l0CTensorList[0][ni * Buffers::SmallL0CHalfElements],
+                            tla::MakeLayoutL0C(alignedM, MadN), Arch::PositionL0C{});
+                        emit(source, ni * MadN, MadN);
+                    }
+                }
+            }
+            for (uint32_t ni = 0U; ni < 2U; ++ni)
+                AscendC::CrossCoreSetFlag<AIC_SYNC_AIV_MODE, PIPE_MTE1>(
+                    AIC_SYNC_AIV_FLAG + (l1BListId + ni) % L1B_STAGES);
+            l1BListId = (l1BListId + 2U) % L1B_STAGES;
+            asc_sync_notify(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(l1AListId));
+            l1AListId = (l1AListId + 1U) % L1A_STAGES;
+            if ((pair + BlockK / 64U) % SfPairs == 0U || ki + BlockK == kTotal) {
+                asc_sync_notify(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(3U + sfSlot));
+                l1MxScaleAListId = (sfSlot + 1U) % Buffers::ScaleStages;
+                l1MxScaleBListId = l1MxScaleAListId;
+            }
+        }
+        l0AListId = l0BListId = 0U;
+    }
+
     // M<=128 时，32KiB L0A 可容纳 M×256，32KiB L0B 可容纳 256×128。
     // 同一 A 供两个 N 半块使用；只有最后一半消费后才归还 A credit。
     // UnitFlag 是按 L0C 存储单元生效：每个 N 半块各自在最后 K 发布完成，
