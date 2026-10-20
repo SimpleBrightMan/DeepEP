@@ -80,7 +80,7 @@ struct DispatchAsyncState {
 struct DispatchRouteSegment {
     uint32_t sourceRank;
     int32_t dstRow;
-    uint32_t indexOffset;
+    uint64_t indexOffset; // maskRecvPtr内的字节偏移，不再是索引UB槽号。
     int32_t rowCount;
 };
 
@@ -172,7 +172,7 @@ __aicore__ inline void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
 template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
 __aicore__ inline void IssuePeerTokenCopies(const TokenDispatchConfig& context, const Params& params,
                                            GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
-                                           int32_t rowDstOffset, int32_t remoteRankIdx, int32_t copyStartIdx,
+                                           int32_t rowDstOffset, int32_t remoteRankIdx, uint64_t copyStartIdx,
                                            int32_t copyNum, DispatchCopyProgress& progress)
 {
     const MegaMoeDispatchBufferConfig& bufferConfig = context.bufferConfig;
@@ -189,7 +189,9 @@ __aicore__ inline void IssuePeerTokenCopies(const TokenDispatchConfig& context, 
             progress.pendingRow = -1;
         }
         int32_t issueBufferIdx = progress.issuedRows % bufferCount;
-        int32_t topkIndex = scratch.validTopkIndexTensor.GetValue(copyStartIdx + issueIdx);
+        // count/route到达协议已经保证该GM索引可见；短任务无需再做DMA→UB→MTE2_S。
+        const auto route = reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.maskRecvPtr + copyStartIdx);
+        int32_t topkIndex = ReadGmByPassDCache(route + issueIdx);
         if (progress.issuedRows < static_cast<uint32_t>(bufferCount)) {
             FetchDispatchTokenAndMetaInfo<false, TopkWeightsPrefetch>(context, params, scratch, issueBufferIdx,
                 topkIndex, remoteRankIdx, rowDstOffset + issueIdx, remoteRankGlobalTensor);
@@ -265,7 +267,7 @@ __aicore__ inline void RetireDispatchReady(const MoeSyncWorkspaceLayout& syncLay
     state.pending = false;
 }
 
-// route-index 使用独立的 MTE2_S 事件 6，避免与持续存活的 token 槽 0..5 冲突。
+// batch只保留路由段描述，实际索引由Scalar从GM读取；payload槽的异步credit保持不变。
 template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
 __aicore__ inline void ConsumeRouteBatch(const TokenDispatchConfig& context, const Params& params,
                                         GM_ADDR* winRankAddr, TokenDispatchScratch<ActivationType>& scratch,
@@ -274,7 +276,6 @@ __aicore__ inline void ConsumeRouteBatch(const TokenDispatchConfig& context, con
     if (batch.count == 0U) {
         return;
     }
-    SyncFuncStatic<AscendC::HardEvent::MTE2_S, MAX_DISPATCH_BUFFER_COUNT>();
     for (uint32_t i = 0U; i < batch.count; ++i) {
         const auto& segment = batch.segments[i];
         IssuePeerTokenCopies<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
@@ -318,8 +319,7 @@ __aicore__ inline void FinishDispatchOwnedRows(const TokenDispatchConfig& contex
 }
 
 /*
- * 保持 Prefill 的 peer 选择、源 ordinal 和目标行不变，只合并多个 peer 的索引读取屏障。
- * 每段 UB 起点按 32B 对齐；容不下完整段时先消费旧 batch，不为填满 UB 切碎小 peer。
+ * 保持peer选择、源ordinal和目标行不变；分段上限沿用已有配置，只替换索引供给路径。
  */
 template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>
 __aicore__ inline int32_t AppendPeerRouteSegment(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
@@ -342,14 +342,9 @@ __aicore__ inline int32_t AppendPeerRouteSegment(const TokenDispatchConfig& cont
         }
         const uint64_t slotOffset =
             (static_cast<uint64_t>(localExpertId) * common.worldSize + transfer.sourceRank) * context.routeIndexAlignSize;
-        GlobalTensor<int32_t> remoteRouteIndexGlobal;
-        remoteRouteIndexGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(
-            params.peermemInfo.maskRecvPtr + slotOffset +
-            static_cast<uint64_t>(transfer.sourceOrdinalBegin + processed) * sizeof(int32_t)));
-        DataCopyPad(scratch.validTopkIndexTensor[batch.usedItems], remoteRouteIndexGlobal,
-                    {1U, take * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
         batch.segments[batch.count++] = {transfer.sourceRank, static_cast<int32_t>(transfer.destinationRow) + processed,
-                                         batch.usedItems, static_cast<int32_t>(take)};
+            slotOffset + static_cast<uint64_t>(transfer.sourceOrdinalBegin + processed) * sizeof(int32_t),
+            static_cast<int32_t>(take)};
         batch.usedItems += padded;
         processed += static_cast<int32_t>(take);
     }

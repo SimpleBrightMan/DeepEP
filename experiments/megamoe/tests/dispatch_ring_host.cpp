@@ -19,7 +19,9 @@ template <HardEvent E> void SetFlag(TEventID id) {
 }
 using MegaMoeDispatchBufferConfig = struct { int32_t bufferCount; };
 struct TokenDispatchConfig { MegaMoeDispatchBufferConfig bufferConfig; uint32_t quantWinOffset = 0; };
-struct Params {};
+std::array<int32_t,256> routeIndices{};
+struct Params { struct { GM_ADDR maskRecvPtr = reinterpret_cast<GM_ADDR>(routeIndices.data()); } peermemInfo; };
+int32_t ReadGmByPassDCache(int32_t* p) { assert(p>=routeIndices.data() && p<routeIndices.data()+256); return *p; }
 struct MoeSyncWorkspaceLayout {};
 template <typename T> struct GlobalTensor { void SetGlobalBuffer(T*) {} };
 struct Indices { int32_t GetValue(uint32_t i) const { return static_cast<int32_t>(i); } };
@@ -81,6 +83,7 @@ void PublishGmm1TileReady(const MoeSyncWorkspaceLayout&, const Params&, uint32_t
 #include "dispatch_ring_methods.inc"
 
 int main() {
+    for(uint32_t i=0;i<routeIndices.size();++i)routeIndices[i]=i;
     uint8_t dummy = 0;
     GM_ADDR peers[] = {&dummy, &dummy};
     Params params;
@@ -99,7 +102,7 @@ int main() {
                     ConsumeRouteBatch<uint8_t, int32_t, false>(config, params, peers, scratch, batch, progress);
                 }
                 batch.segments[batch.count++] = {static_cast<uint32_t>(row % 2), row,
-                                                static_cast<uint32_t>(row), 1};
+                                                static_cast<uint64_t>(row)*sizeof(int32_t), 1};
                 ++batch.usedItems;
             }
             FinishDispatchOwnedRows<uint8_t, int32_t, 256, false>(
@@ -114,7 +117,7 @@ int main() {
         for (uint32_t rows : {1U, 2U, 7U, 0U, 33U}) {
             DispatchRouteBatch batch{};
             IssuePeerTokenCopies<uint8_t, int32_t, false>(
-                config, params, peers, scratch, total, 0, total, rows, state.progress);
+                config, params, peers, scratch, total, 0, total*sizeof(int32_t), rows, state.progress);
             const auto before = readyCount;
             FinishDispatchOwnedRows<uint8_t, int32_t, 256, false>(
                 config, sync, params, peers, scratch, 2, {0,total,total+rows}, batch, state.progress, &state);
