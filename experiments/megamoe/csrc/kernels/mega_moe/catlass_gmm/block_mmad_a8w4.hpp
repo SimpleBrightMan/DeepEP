@@ -15,6 +15,8 @@
 
 #include "resource.hpp"
 #include "a8w4_k_plan.hpp"
+#include "../common/gmm1_cv_plan.hpp"
+#include "../common/gmm1_async_completion.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/coord.hpp"
 #include "catlass/numeric_size.hpp"
@@ -342,7 +344,8 @@ public:
               class TensorBias = EmptyClass>
     CATLASS_DEVICE void operator()(TensorA& tensorA, TensorC& tensorC, GemmCoord const& actualShape,
                                    TensorMxScaleA const& tensorMxScaleA = {}, TensorMxScaleB const& tensorMxScaleB = {},
-                                   bool allowDynamicB = false, TensorBias const& tensorBias = {})
+                                   bool allowDynamicB = false, TensorBias const& tensorBias = {},
+                                   uint32_t outputSequence = 0U, __gm__ int32_t* outputIssued = nullptr)
     {
         // Check L1TileShape
         if constexpr (HAS_BIAS) {
@@ -590,6 +593,25 @@ public:
         }
         // copy block out
         copyL0CToDst.params.scale = 64;
+        if constexpr (TensorC::position == AscendC::TPosition::VECCALC) {
+            using Plan = MegaMoeImpl::Gmm1CvPlan;
+            // issued必须在MMAD提交后、任何FIX EMPTY等待之前发布，不能形成等issued/empty的环。
+            AscendC::WriteGmByPassDCache(outputIssued,
+                static_cast<int32_t>(outputSequence + Plan::ChunkCount(mBlockActual)));
+            for (uint32_t row = 0U; row < mBlockActual; row += Plan::Rows) {
+                const uint32_t rows = Min(Plan::Rows, mBlockActual - row);
+                const uint32_t seq = outputSequence + row / Plan::Rows;
+                auto source = GetTile(tensorL0C, tla::MakeCoord(row, 0U), tla::MakeShape(rows, nBlockActual));
+                MegaMoeImpl::Gmm1AsyncCompletion::AcquireProducer(seq);
+                AscendC::LocalTensor<ElementC> ub(AscendC::TPosition::VECCALC,
+                    Plan::SlotOffset(seq), Plan::SlotBytes / sizeof(ElementC));
+                auto destination = tla::MakeTensor(ub,
+                    tla::MakeLayout<ElementC,Catlass::layout::RowMajor>(rows, nBlockActual), Arch::PositionUB{});
+                copyL0CToDst(destination, source, 0b11);
+                MegaMoeImpl::Gmm1AsyncCompletion::PublishCompleted(seq);
+            }
+            return;
+        }
         if constexpr (!ENABLE_UNIT_FLAG) {
             AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);
             AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);

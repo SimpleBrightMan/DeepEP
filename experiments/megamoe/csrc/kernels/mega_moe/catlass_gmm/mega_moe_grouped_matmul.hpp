@@ -9,6 +9,7 @@
 #include "catlass/gemm/gemm_type.hpp"
 #include "block_mmad_a8w4.hpp"
 #include "block_prologue_a8w4.hpp"
+#include "copy_scaled_cv_output.hpp"
 #include <c_api/asc_simd.h>
 
 namespace MegaMoeImpl::GmmKernel {
@@ -60,10 +61,10 @@ class A8W4MatmulPipeline {
     using L0 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<128>>;
     using ScaleALayout = decltype(tla::MakeMxScaleLayout<SA, LayoutScaleA, false>(uint32_t{}, uint32_t{}));
     using ScaleBLayout = decltype(tla::MakeMxScaleLayout<SB, LayoutScaleB, true>(uint32_t{}, uint32_t{}));
-    using TileCopy =
+    using TileCopy = ScaledCvOutputCopy<
         Catlass::Gemm::Tile::PackedMxA8W4TileCopyTla<Arch, A, LayoutA, W, LayoutB, A, LayoutDequantizedB, SA,
                                                      ScaleALayout, SB, ScaleBLayout, Out, LayoutC, void, false,
-                                                     Catlass::Gemm::Tile::ScaleGranularity::PER_TENSOR>;
+                                                     Catlass::Gemm::Tile::ScaleGranularity::PER_TENSOR>>;
     using Policy = Catlass::Gemm::MmadA8W4Mx<Arch, true, false, 8, 1,
                                            Buffers::AStages, Buffers::BStages, 2, 2>;
     using Mmad = Catlass::Gemm::Block::MegaMoeBlockMmadA8W4<Policy, L1, L0, A, A, Out, void, TileCopy>;
@@ -251,7 +252,8 @@ public:
 
 protected:
     __aicore__ inline void ComputeProjection(uint32_t m, uint32_t weightN, uint32_t rows, uint32_t cols,
-                                             uint32_t outputN)
+                                             uint32_t outputN, __gm__ int32_t* outputIssued = nullptr,
+                                             uint32_t outputSequence = 0U)
     {
         auto aAddress = reinterpret_cast<GM_ADDR>(ReusedActivationReadAddress(reinterpret_cast<uint64_t>(addr_.aGlobal)));
         auto saAddress = reinterpret_cast<GM_ADDR>(ReusedActivationReadAddress(reinterpret_cast<uint64_t>(addr_.aScaleGlobal)));
@@ -264,6 +266,14 @@ protected:
         auto tileA = tla::GetTile(a, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.k));
         auto tileSA = tla::GetTile(sa, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.scaleK));
         auto tileSB = tla::GetTile(sb, tla::MakeCoord(0, weightN), tla::MakeShape(config_.scaleK, cols));
+        if (outputIssued != nullptr) {
+            AscendC::LocalTensor<Out> ub(AscendC::TPosition::VECCALC, 0U,
+                Gmm1CvPlan::SlotBytes / sizeof(Out));
+            auto cv = tla::MakeTensor(ub, tla::MakeLayout<Out, LayoutC>(rows, cols), Catlass::Arch::PositionUB{});
+            block_(tileA, cv, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U,
+                   Catlass::EmptyClass{}, outputSequence, outputIssued);
+            return;
+        }
         auto tileC = tla::GetTile(c, tla::MakeCoord(m, outputN), tla::MakeShape(rows, cols));
         block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U);
     }
@@ -322,6 +332,12 @@ public:
                 Pipeline::ComputeProjection(m, n + halfN_, rows, cols, n + halfN_);
             }
         }
+    }
+    __aicore__ inline void ComputeCv(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols,
+                                      uint32_t sequence, __gm__ int32_t* issued)
+    {
+        // 只由配对routed入口调用：logical N128 -> physical gate/up N256。
+        Pipeline::ComputeProjection(m, n * 2U, rows, cols * 2U, n * 2U, issued, sequence);
     }
     __aicore__ inline void Dequantize(uint32_t n, uint32_t rows, uint32_t cols)
     {

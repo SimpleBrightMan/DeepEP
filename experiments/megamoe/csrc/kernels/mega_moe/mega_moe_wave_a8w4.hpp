@@ -48,6 +48,14 @@ private:
     using Gmm2Config = GmmKernel::Config<true, ActivationQuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType,
                                          QuantScaleOutType, false, false, false, true, FuseGateUp>;
     GmmKernel::CatlassGmm2<typename Gmm2Config::ProblemConfig> gmm2WaveContext_;
+    using CvActivationOp = BlockEpilogueActivationMxQuant<ActivationQuantOutType, bfloat16_t,
+        Gmm1CvPlan::StepRows, Gmm1CvPlan::Columns, false, true>;
+    CvActivationOp cvActivationOp_;
+    Gmm1CvTask cvActivation_{};
+    static constexpr auto CvScratch = Detail::BuildActivationMxQuantUbOffsets<
+        bfloat16_t, Gmm1CvPlan::StepRows, Gmm1CvPlan::Columns, true>();
+    static_assert(CvScratch.reciprocalScaleOffsetBytes + CvScratch.scaleElementCapacity * sizeof(uint16_t)
+                  <= Gmm1CvPlan::ScratchBytes);
 
     using MegaMoeBase::commonConfig_;
     using MegaMoeBase::computeReplay_;
@@ -82,6 +90,7 @@ private:
         uint32_t startBlockIdx = 0U;
         uint32_t nextTile = 0U;
         uint32_t tileCount = 0U;
+        uint32_t nextRow = 0U;
     };
     enum class AivTaskKind {
         Activation,
@@ -93,7 +102,8 @@ private:
     bool activationPending_ = false;
     __aicore__ inline bool RetireActivation();
     __aicore__ inline bool NextAivSlice(AivTaskCursor& cursor, AivTaskKind kind);
-    __aicore__ inline bool TryRunReadyActivation(const AivTaskCursor& cursor, int32_t& readySequence);
+    __aicore__ inline bool TryRunReadyActivation(AivTaskCursor& cursor, int32_t& readySequence);
+    __aicore__ inline bool TryRunCvActivation(AivTaskCursor& cursor, int32_t& readySequence);
     __aicore__ inline bool TryRunReadyCombine(const AivTaskCursor& cursor);
     __aicore__ inline void ProcessAiv1PriorityStages(int32_t& readySequence);
     __aicore__ inline bool HasWaveCapacity(const ExpertTokenPosition& position, uint32_t waveMGroupCount) const
@@ -137,6 +147,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm1
         gmmAddrInfo, expertContext, slice.rowStartInExpert, gmm1TilesPerMGroup);
     gmmAddrInfo.timer = timer_.Enabled() ? &timer_ : nullptr;
     gmmAddrInfo.gmm1AsyncCompletion = ASYNC_GMM1;
+    gmmAddrInfo.gmm1CvOutput = FuseGateUp;
     if (computeReplay_) {
         // 输入已在 priming 中完成；本次没有 Dispatch producer，不能等待其被清零的 flag。
         gmmAddrInfo.dispatchToGmm1Flag = nullptr;
@@ -272,8 +283,9 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::NextAiv
 // 只探测本核下一个GMM1 tile；异步模式的GM序号仅表示已提交，随后由MTE2等待真实FIX完成。
 template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunReadyActivation(
-    const AivTaskCursor& cursor, int32_t& readySequence)
+    AivTaskCursor& cursor, int32_t& readySequence)
 {
+    if constexpr (FuseGateUp) return TryRunCvActivation(cursor, readySequence);
     const auto& begin = cursor.slice.begin;
     {
         auto flag = reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagGmmToEpiloguePtr) +
@@ -317,6 +329,75 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     {
         ++readySequence;
     }
+    return true;
+}
+
+// DS式：FIX双槽输入常驻，V直接等待full；每次最多32行，然后把Scalar交还通信调度。
+template <TemplateMegaMoeA8W4WaveTypeClass>
+__aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunCvActivation(
+    AivTaskCursor& cursor, int32_t& readySequence)
+{
+    if (cursor.nextRow % Gmm1CvPlan::Rows == 0U) {
+        const auto issued = reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagGmmToEpiloguePtr) +
+            static_cast<uint64_t>(gmmExecutionConfig_.blockJob.jobIndex) * INT_CACHELINE;
+        if (AscendC::ReadGmByPassDCache(issued) < readySequence + 1) return false;
+    }
+    const auto& begin = cursor.slice.begin;
+    if (cursor.nextRow == 0U) {
+        const uint32_t rows = static_cast<uint32_t>(cursor.slice.end.globalTokenIndex - begin.globalTokenIndex);
+        auto expert = CreateExpertContext(commonConfig_);
+        expert.expertIdx = begin.expertIdx;
+        expert.globalTokenStartIndex = begin.globalTokenIndex - begin.tokenIndexInExpert;
+        Get<M_VALUE>(expert.problemShape) = rows;
+        GMMAddrInfo addr{};
+        const uint32_t tilesPerM = Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF,
+                                                     static_cast<uint32_t>(GMM1_TASK_N));
+        UpdateMoeExpertGmm1GlobalBuffer<ActivationType, Weight1Type, ActivationQuantOutType, QuantScaleOutType,
+            A_ELEMS_PER_BYTE, true>(gmmExecutionConfig_, syncWorkspaceLayout_, params_.workspaceInfo,
+                moeWeightTensorListAddrs_, cvActivationOp_, addr, expert, begin.tokenIndexInExpert, tilesPerM);
+        auto config = Gmm1Config::BuildGmm1ProblemConfig(expert.problemShape, gmmExecutionConfig_.blockJob, GMM1_TILE_M);
+        GmmKernel::BlockScheduler scheduler({config.m, config.outputN, config.k},
+            GmmKernel::BlockScheduler::Params{Te::MakeCoord(static_cast<int64_t>(config.tileM),
+                                                            static_cast<int64_t>(GMM1_TASK_N))});
+        const auto coord = scheduler.GetBlockCoord(cursor.nextTile);
+        const auto shape = scheduler.GetBlockShape(coord);
+        cvActivation_ = {static_cast<uint32_t>(Get<M_VALUE>(coord)), static_cast<uint32_t>(Get<N_VALUE>(coord)),
+                         static_cast<uint32_t>(Get<M_VALUE>(shape)), static_cast<uint32_t>(Get<N_VALUE>(shape)), 0U};
+        cvActivationOp_.UpdateNextProblem({config.m, config.outputN, config.k, 0});
+        activationReadyFlag_ = addr.activationToGmm2Flag +
+            static_cast<uint64_t>(cvActivation_.m / L1_TILE_M_256) * INT_CACHELINE;
+    }
+    if (cvActivation_.StageBegin()) Gmm1AsyncCompletion::WaitVectorConsumer(static_cast<uint32_t>(readySequence));
+    const uint32_t count = cvActivation_.StepCount();
+    const uint32_t row = cvActivation_.nextRow;
+    timer_.SetWave(static_cast<int64_t>(cursor.wave));
+    timer_.SetSlice(begin.expertIdx, begin.tokenIndexInExpert, cursor.slice.end.globalTokenIndex - begin.globalTokenIndex);
+    {
+        AscendTimerTileScope step(timer_.Enabled() ? &timer_ : nullptr, AscendTimer::AIV_SWIGLU_ISSUE,
+            cvActivation_.m + row, cvActivation_.n, count, cvActivation_.columns);
+        // MTE3最后读完输出scratch，V才可覆盖；不等待Scalar，不重读GM中的GMM1结果。
+        Gmm1CvScratch::Acquire();
+        const uint32_t input = Gmm1CvPlan::SlotOffset(static_cast<uint32_t>(readySequence)) +
+            (row % Gmm1CvPlan::Rows) * Gmm1CvPlan::Columns * sizeof(bfloat16_t);
+        const uint32_t outputN = commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF;
+        const uint32_t scaleN = CeilDiv(outputN, MXFP_DIVISOR_SIZE) * MXFP_MULTI_BASE_SIZE;
+        AscendC::SetCtrlSpr<60, 60>(0);
+        cvActivationOp_({count, cvActivation_.columns, 0, 0},
+            {(cvActivation_.m + row) * outputN + cvActivation_.n,
+             (cvActivation_.m + row) * scaleN + CeilDiv(cvActivation_.n, MXFP_DIVISOR_SIZE) * MXFP_MULTI_BASE_SIZE,
+             0, 0, 0, 0}, 0, false, input);
+    }
+    if (cvActivation_.Advance(count)) {
+        // 仅该stage的最后一组读取/写出入队后归还EMPTY；另一stage仍由其自己的credit保护。
+        Gmm1AsyncCompletion::ReleaseConsumer(static_cast<uint32_t>(readySequence));
+        ++readySequence;
+    }
+    cursor.nextRow = cvActivation_.Complete() ? 0U : cvActivation_.nextRow;
+    if (cvActivation_.Complete()) {
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(static_cast<TEventID>(Aiv1AsyncEvents::ActivationDone));
+        activationPending_ = true;
+    }
+    timer_.ClearSlice();
     return true;
 }
 
@@ -382,16 +463,27 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     uint32_t dispatchGroups = 0U;
     if constexpr (ASYNC_GMM1) Gmm1AsyncCompletion::InitConsumer();
     // 一次初始化、逐块消费/归还，最后统一消费末个credit。初始化也覆盖零激活路径。
-    Aiv1ActivationUb::Init();
+    if constexpr (FuseGateUp) {
+        const auto* t = params_.tilingData;
+        cvActivationOp_.Init({.yGmAddr = params_.workspaceInfo.activationQuantDataPtr,
+            .yScaleGmAddr = params_.workspaceInfo.activationQuantScalePtr, .clampLimit = t->clampLimit,
+            .actMode = t->actMode, .actSubMode = t->actSubMode, .activationAlpha = t->activationAlpha,
+            .activationBeta = t->activationBeta, .ubBaseBytes = Gmm1CvPlan::ScratchBase});
+        Gmm1CvScratch::Init();
+    } else {
+        Aiv1ActivationUb::Init();
+    }
     uint64_t dispatchWave = 0U;
     bool preferCombine = false;
     while (hasActivation || activationPending_ || hasCombine || !shared.done || dispatchAsync_.pending ||
            dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
         bool progressed = RetireActivation();
         if (hasActivation && TryRunReadyActivation(activation, readySequence)) {
-            activation.nextTile += gmmExecutionConfig_.blockJob.totalJobs;
-            if (activation.nextTile >= activation.tileCount) {
-                hasActivation = NextAivSlice(activation, AivTaskKind::Activation);
+            if (activation.nextRow == 0U) {
+                activation.nextTile += gmmExecutionConfig_.blockJob.totalJobs;
+                if (activation.nextTile >= activation.tileCount) {
+                    hasActivation = NextAivSlice(activation, AivTaskKind::Activation);
+                }
             }
             progressed = true;
         }
@@ -422,7 +514,8 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         }
     }
     // 生命周期的唯一收尾。先前slice的ready已发布；不重置仍在飞行的cursor或复用事件。
-    Aiv1ActivationUb::Finish();
+    if constexpr (FuseGateUp) Gmm1CvScratch::Finish();
+    else Aiv1ActivationUb::Finish();
     DrainDispatchCopyBuffers<ActivationType, QuantScaleOutType, false>(
         tokenDispatchConfig_, params_, tokenDispatchScratch_, dispatchAsync_.progress);
     DrainCombineRowBuffers(combineRowSequence_, waveCombineBuffers_.rowBufferCount, waveCombineBuffers_.eventBase);

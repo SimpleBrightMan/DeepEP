@@ -31,6 +31,11 @@ struct Gmm1AsyncCompletion {
         // AIV等待时flag使用本地低4位；GM->UB读取必须位于这个MTE2依赖之后。
         asc_sync_intra_wait(PIPE_MTE2, FULL + sequence % STAGES);
     }
+    __aicore__ static inline void WaitVectorConsumer(unsigned sequence)
+    {
+        // CV数据已经由FIX写UB，不再经过MTE2；真正的FIX full直接约束V读输入。
+        asc_sync_intra_wait(PIPE_V, FULL + sequence % STAGES);
+    }
     __aicore__ static inline void ReleaseConsumer(unsigned sequence)
     {
         asc_sync_intra_arrive(PIPE_MTE3, AIV1 | (EMPTY + sequence % STAGES));

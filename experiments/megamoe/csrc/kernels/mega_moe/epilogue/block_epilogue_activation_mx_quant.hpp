@@ -31,6 +31,7 @@
 #include "activation/swigluoai_activation.hpp"
 #include "block_epilogue_ub_layout.hpp"
 #include "../common/aiv1_activation_ub.hpp"
+#include "../common/gmm1_cv_scratch.hpp"
 #include "quant/mx_quant_common.hpp"
 #include "quant/mx_quant_compute_scale.hpp"
 #include "quant/mxfp4_quant.hpp"
@@ -67,6 +68,7 @@ public:
         uint8_t actSubMode{static_cast<uint8_t>(ActSubMode::DEFAULT)};
         float activationAlpha{1.0f};
         float activationBeta{1.0f};
+        uint32_t ubBaseBytes{0U};
         Arguments() = default;
     };
 
@@ -86,7 +88,8 @@ public:
     __aicore__ inline auto GetTopkWeightTensor();
     // 计算并写回一个激活/量化 tile，不包含流水通知。
     __aicore__ inline void operator()(const BlockShape& blockShape, const BlockCoord& blockCoord,
-                                      uint16_t pingpongIdx = 0, bool deferOutput = false);
+                                      uint16_t pingpongIdx = 0, bool deferOutput = false,
+                                      uint32_t cvInputOffset = static_cast<uint32_t>(-1));
     __aicore__ inline void UpdateGlobalAddr(const BlockCoord& baseOffset);
     __aicore__ inline void UpdateNextProblem(const ProblemShape& problemShape);
 
@@ -202,15 +205,17 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
     activationBeta_ = params.activationBeta;
 
     constexpr auto ubOffsets = Detail::BuildActivationMxQuantUbOffsets<DataTypeIn, TileM, TileN, IsInterleaved_>();
-    gluRes_ = LocalTensor<bfloat16_t>(TPosition::VECCALC, ubOffsets.activationOutputOffsetBytes,
+    l0cOutUbFirst_ = LocalTensor<DataTypeIn>(TPosition::VECIN, params.ubBaseBytes + kUbFirstOffset, kUbInputElementCapacity);
+    l0cOutUbSecond_ = LocalTensor<DataTypeIn>(TPosition::VECIN, params.ubBaseBytes + kUbSecondOffset, kUbInputElementCapacity);
+    gluRes_ = LocalTensor<bfloat16_t>(TPosition::VECCALC, params.ubBaseBytes + ubOffsets.activationOutputOffsetBytes,
                                       ubOffsets.activationQuantElementCapacity);
-    quantOutput_ = LocalTensor<int8_t>(TPosition::VECOUT, ubOffsets.quantOutputOffsetBytes,
+    quantOutput_ = LocalTensor<int8_t>(TPosition::VECOUT, params.ubBaseBytes + ubOffsets.quantOutputOffsetBytes,
                                        ubOffsets.activationQuantElementCapacity);
     quantScaleOutput_ =
-        LocalTensor<int8_t>(TPosition::VECOUT, ubOffsets.quantScaleOffsetBytes, ubOffsets.scaleElementCapacity);
-    maxExp_ = LocalTensor<uint16_t>(TPosition::VECCALC, ubOffsets.maxExpOffsetBytes, ubOffsets.scaleElementCapacity);
+        LocalTensor<int8_t>(TPosition::VECOUT, params.ubBaseBytes + ubOffsets.quantScaleOffsetBytes, ubOffsets.scaleElementCapacity);
+    maxExp_ = LocalTensor<uint16_t>(TPosition::VECCALC, params.ubBaseBytes + ubOffsets.maxExpOffsetBytes, ubOffsets.scaleElementCapacity);
     halfScale_ =
-        LocalTensor<uint16_t>(TPosition::VECCALC, ubOffsets.reciprocalScaleOffsetBytes, ubOffsets.scaleElementCapacity);
+        LocalTensor<uint16_t>(TPosition::VECCALC, params.ubBaseBytes + ubOffsets.reciprocalScaleOffsetBytes, ubOffsets.scaleElementCapacity);
 
     // weight UB: 放在 VECIN 区之后的安全区域，仅 mode=1 分配
 
@@ -382,7 +387,8 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
                                                       IsInterleaved_>::operator()(const BlockShape& blockShape,
                                                                                   const BlockCoord& blockCoord,
                                                                                   uint16_t pingpongIdx,
-                                                                                  bool deferOutput)
+                                                                                  bool deferOutput,
+                                                                                  uint32_t cvInputOffset)
 {
     uint32_t tileRowCount = Get<M_VALUE>(blockShape);     // 128
     uint32_t tileColumnCount = Get<N_VALUE>(blockShape);  // 256
@@ -402,6 +408,12 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
         (__ubuf__ int8_t*)quantOutput_.GetPhyAddr(), (__ubuf__ uint16_t*)quantScaleOutput_.GetPhyAddr(),
         (__ubuf__ uint16_t*)maxExp_.GetPhyAddr(), (__ubuf__ uint16_t*)halfScale_.GetPhyAddr(), tileColumnCount,
         pingpongIdx);
+    if (cvInputOffset != static_cast<uint32_t>(-1)) {
+        // CV输入槽只读；输出/scratch独立常驻，不能原地压缩后覆盖另一未消费行。
+        LocalTensor<DataTypeIn> cvInput(TPosition::VECCALC, cvInputOffset, MAX_SINGLE_MN);
+        ubPointers.firstInput = (__ubuf__ DataTypeIn*)cvInput.GetPhyAddr();
+        ubPointers.secondInput = ubPointers.firstInput + tileColumnCount;
+    }
     uint32_t outputRowStrideElements = Ops::Base::CeilAlign(tileColumnCount, static_cast<uint32_t>(ONE_BLK_SIZE));
     RunGatedActivationTile(ubPointers.firstInput, ubPointers.secondInput, ubPointers.activationOutput,
                            static_cast<uint16_t>(tileRowCount), static_cast<uint16_t>(tileColumnCount),
@@ -430,7 +442,10 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
         StoreQuantScaleCompact(quantScaleGlobal_, quantScaleOutput_, tileRowCount, yScaleOffset,
                                intermediateHiddenScaleElements_, tileColumnCount);
     }
-    if (deferOutput) {
+    if (cvInputOffset != static_cast<uint32_t>(-1)) {
+        // 下个32行step在V队列消费该credit，保护单份量化scratch，不阻塞Scalar。
+        Gmm1CvScratch::Release();
+    } else if (deferOutput) {
         // MTE3->V等待已经排入V队列；再由V通知下轮MTE2，保护输入/输出重叠的UB。
         // Scalar可以切换到Dispatch/Combine，不在这里等待量化写出完成。
         Aiv1ActivationUb::Release();

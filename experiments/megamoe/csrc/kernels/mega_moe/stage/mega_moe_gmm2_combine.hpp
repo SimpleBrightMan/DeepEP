@@ -11,6 +11,7 @@
 
 #ifndef MEGA_MOE_GMM2_COMBINE_H
 #define MEGA_MOE_GMM2_COMBINE_H
+#include "../common/mega_moe_aiv1_ub_layout.hpp"
 
 #include <type_traits>
 
@@ -128,7 +129,7 @@ constexpr uint32_t WAVE_COMBINE_UB_BASE = 64U * 1024U;
 // [64 KiB, 184 KiB) is dedicated to the Combine row ring and quant scratch.
 // The ready scan starts at 184 KiB, so adaptive row buffers must stay below it.
 constexpr uint32_t WAVE_COMBINE_UB_LIMIT = 184U * 1024U;
-constexpr uint32_t WAVE_COMBINE_META_INFO_TOKEN_CAPACITY = 1536U;
+constexpr uint32_t WAVE_COMBINE_META_INFO_TOKEN_CAPACITY = Aiv1ResidentUbLayout::CombineMetaRows;
 
 // MTE BF16 Combine 行环。常规 Wave 只有 AIV1 建立并使用这些 UB 视图；
 // 最后一轮不再与 GMM1/SwiGLU 并行时，调用方才为 AIV0 补充初始化。

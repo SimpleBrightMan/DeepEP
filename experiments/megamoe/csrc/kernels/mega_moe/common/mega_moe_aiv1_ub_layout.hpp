@@ -4,13 +4,14 @@
 #define MEGA_MOE_AIV1_UB_LAYOUT_HPP
 
 #include <cstdint>
+#include "gmm1_cv_plan.hpp"
 
 namespace MegaMoeImpl {
 struct Aiv1ResidentUbLayout {
-    static constexpr uint32_t ActivationRows = 64U;
+    static constexpr uint32_t ActivationRows = Gmm1CvPlan::StepRows;
     static constexpr uint32_t ActivationColumns = 256U;
-    static constexpr uint32_t ActivationBytes = ActivationRows * ActivationColumns * 2U * 2U;
-    static constexpr uint32_t CombineMetaRows = 1536U;
+    static constexpr uint32_t ActivationBytes = Gmm1CvPlan::End;
+    static constexpr uint32_t CombineMetaRows = 384U;
     static constexpr uint32_t MetaWords = 8U;
     uint64_t dispatchBase;
     uint64_t dispatchEnd;
