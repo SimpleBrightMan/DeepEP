@@ -141,6 +141,16 @@ class A8W4MatmulPipeline {
         return tla::MakeTensor(gm, layout, Catlass::Arch::PositionGM{});
     }
 
+    template <class Layout>
+    __aicore__ inline auto WeightScaleTensor(GM_ADDR address, const Layout& layout)
+    {
+        AscendC::GlobalTensor<SB> gm;
+        gm.SetGlobalBuffer(reinterpret_cast<__gm__ SB*>(address));
+        // 与DS一致：单M块权重SF没有跨M复用，不挤占激活和控制面的L2空间。
+        if (config_.m <= 256U) gm.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
+        return tla::MakeTensor(gm,layout,Catlass::Arch::PositionGM{});
+    }
+
 public:
     template <class NextConfig, bool NextGmm2>
     __aicore__ inline void HandoffTo(A8W4MatmulPipeline<NextConfig, NextGmm2>& next)
@@ -265,7 +275,7 @@ protected:
         auto sa =
             Tensor<SA>(saAddress, tla::MakeMxScaleLayout<SA, LayoutScaleA, false>(config_.m, config_.scaleK));
         auto sb =
-            Tensor<SB>(addr_.bScaleGlobal, tla::MakeMxScaleLayout<SB, LayoutScaleB, true>(config_.scaleK, config_.n));
+            WeightScaleTensor(addr_.bScaleGlobal, tla::MakeMxScaleLayout<SB, LayoutScaleB, true>(config_.scaleK, config_.n));
         auto c = Tensor<Out>(output_, tla::MakeLayout<Out, LayoutC>(config_.m, config_.n));
         auto tileA = tla::GetTile(a, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.k));
         auto tileSA = tla::GetTile(sa, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.scaleK));
@@ -283,7 +293,7 @@ protected:
         };
         if (blockedWeightScales_) {
             // 所有blocked调用均为N256任务；planar GMM1仍允许原N192策略。
-            auto packed = Tensor<SB>(addr_.bScaleGlobal + static_cast<uint64_t>(weightN) * config_.scaleK,
+            auto packed = WeightScaleTensor(addr_.bScaleGlobal + static_cast<uint64_t>(weightN) * config_.scaleK,
                 tla::MakeMxScaleLayout<SB,Catlass::layout::RowMajor,true>(config_.scaleK,256U));
             auto tile = tla::GetTile(packed,tla::MakeCoord(0U,0U),tla::MakeShape(config_.scaleK,cols));
             compute(tile);

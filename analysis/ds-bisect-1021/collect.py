@@ -64,7 +64,7 @@ if (endpoint/'campaign.rc').is_file() and (endpoint/'campaign.rc').read_text().s
     for bs in (512,1024):
         methods={name:method(endpoint,bs,name) for name in ('l6','l12','reference','endpoint')}
         summary['endpoint'].append(dict(bs=bs,methods=methods,trace=trace(endpoint/f'bs{bs}-endpoint-a')))
-for name in ('c1','c1-r1','c2','c3','c4','d1','d2','d3'):
+for name in ('c1','c1-r1','c2','c3','c4','c5','d1','d2','d3'):
     node=root/name
     if not node.is_dir():continue
     rc=(node/'campaign.rc').read_text().strip() if (node/'campaign.rc').exists() else None
@@ -94,6 +94,26 @@ for node in root.iterdir():
                 add(f)
         package=node/'package'
         for f in package.rglob('*.so'):add(f,f'{node.name}/native/{f.name}')
+screen=root/'screen'
+if (screen/'campaign.rc').exists():
+    screen_rc=(screen/'campaign.rc').read_text().strip()
+    cases=[];routing=[]
+    for bs in (32,96,256,512,1024,2048,4096):
+        folder=screen/f'bs{bs}'
+        if not all((folder/m/'regression.json').exists() for m in ('l6','candidate','ds')):continue
+        cases.append(dict(bs=bs,methods={m:run(folder/m,bs) for m in ('l6','candidate','ds')}))
+    for mode in ('random','skewed'):
+        folder=screen/mode
+        if all((folder/m/'regression.json').exists() for m in ('l6','candidate')):
+            routing.append(dict(bs=96,routing=mode,methods={m:run(folder/m,96) for m in ('l6','candidate')}))
+    if screen_rc=='0' and (len(cases)!=7 or len(routing)!=2):raise ValueError('Incomplete successful screening')
+    expected=json.loads((root/'c4/identity.json').read_text())['libraries']['libmegamoe_kernel.so']
+    if any(c['methods']['candidate']['kernel_sha256']!=expected for c in cases+routing):raise ValueError('Screen changed native candidate')
+    summary['screening']=dict(campaign_rc=screen_rc,cases=cases,routing=routing,
+        scope='one launch/method/shape; same C4 binary; no per-shape splice; screening not stability proof')
+    for f in screen.rglob('*'):
+        if f.suffix in ('.json','.log','.rc') or f.name=='kernel_details.csv':add(f)
+    stable.add('screen')
 for f in root.iterdir():
     if f.suffix in ('.sh','.py','.tar') or (f.suffix=='.log' and any(f.name.startswith(n+'-') for n in stable)):add(f)
 report=root/f'{a.checkpoint}-summary.json'
