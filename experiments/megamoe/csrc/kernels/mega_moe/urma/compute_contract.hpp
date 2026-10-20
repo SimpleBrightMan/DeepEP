@@ -39,11 +39,46 @@ struct ActivationRowSlice {
     uint32_t rows;
 };
 
+enum class ComputeBatchStage : uint32_t { None = 0U, Gmm1 = 1U, Gmm2 = 2U };
+
+struct ComputeBatchTask {
+    ComputeBatchStage stage;
+    uint32_t chunkIndex;
+};
+
+struct ComputeBatchRange {
+    uint32_t begin;
+    uint32_t end;
+};
+
 #if defined(__NPU_DEVICE__)
 #define MEGAMOE_URMA_COMPUTE_INLINE __aicore__ inline
 #else
 #define MEGAMOE_URMA_COMPUTE_INLINE inline
 #endif
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ComputeBatchTaskCount(uint32_t chunkCount)
+{
+    return static_cast<uint64_t>(chunkCount) * 2U;
+}
+
+// A batch is one existing receive chunk, uniquely identified by (peer, cv).
+// Warmup G1(0), then G1(i) -> G2(i-1), then drain G2(last). No new communication
+// boundary, expert split, or task ownership is introduced by this ordering.
+MEGAMOE_URMA_COMPUTE_INLINE constexpr ComputeBatchTask ComputeBatchTaskAt(uint64_t step, uint32_t chunkCount)
+{
+    const uint64_t taskCount = ComputeBatchTaskCount(chunkCount);
+    if (step >= taskCount) return {ComputeBatchStage::None, 0U};
+    if (step == 0U) return {ComputeBatchStage::Gmm1, 0U};
+    if (step == taskCount - 1U) return {ComputeBatchStage::Gmm2, chunkCount - 1U};
+    if ((step & 1U) != 0U) return {ComputeBatchStage::Gmm1, static_cast<uint32_t>((step + 1U) / 2U)};
+    return {ComputeBatchStage::Gmm2, static_cast<uint32_t>(step / 2U - 1U)};
+}
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr ComputeBatchRange ComputeBatchFragments(const Chunk& chunk)
+{
+    return {chunk.fragmentBegin, chunk.fragmentBegin + chunk.fragmentCount};
+}
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr ActivationRowSlice ActivationSlice(uint32_t tileRowBegin, uint32_t tileRows,
                                                                          uint32_t offset)

@@ -127,119 +127,165 @@ __aicore__ inline TraceMeta ComputeTileTraceMeta(const TraceMeta& fragmentMeta, 
     return meta;
 }
 
-// Only an AIC and its paired AIV0 enter this routine. They enumerate precisely
-// the same global tile IDs, including empty ownership, preserving CATLASS's
-// cross-core weight-prologue/L1 event protocol without involving AIV1.
-__aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, Timer& timer)
+// A new context must not republish the initial 8/9 free-slot credits until
+// AIV0 has consumed the old context's final credits. The acknowledgement is
+// ordered on those same MTE pipelines; it needs neither a scalar fence nor a
+// full-core barrier. Only this AIC and its paired AIV0 use flag 10.
+__aicore__ inline void CompleteComputeContext()
+{
+    constexpr uint16_t kContextEndFlag = 10U;
+    if constexpr (g_coreType == AIC) {
+        CrossCoreWaitFlag<4, PIPE_MTE1>(kContextEndFlag);
+    } else {
+        CrossCoreSetFlag<4, PIPE_MTE3>(kContextEndFlag);
+    }
+}
+
+using UrmaGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig, true>;
+
+__aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex, UrmaGmm1& gmm1,
+                                       Timer& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
-    // URMA updates receive GM outside this core's cache hierarchy. Keep input
-    // and scale reads uncached across repeated invocations; weights retain
-    // their original cache policy and every existing MTE caller defaults off.
-    MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig, true> gmm1;
-    for (uint32_t fragmentIndex = 0U; fragmentIndex < args.config.fragmentCount; ++fragmentIndex) {
-        const Fragment fragment = LoadFragment(args, fragmentIndex);
-        const auto fragmentMeta = FragmentTraceMeta(args, fragment, fragmentIndex);
-        const auto shape = FragmentShape(args, fragment);
-        auto config1 = UrmaGmmConfig::BuildGmm1ProblemConfig(shape, job, kComputeTileM);
-        MegaMoeImpl::GmmKernel::BlockScheduler schedule1(
-            {config1.m, config1.schedulerN, config1.k},
-            MegaMoeImpl::GmmKernel::BlockScheduler::Params{
-                Te::MakeCoord(static_cast<int64_t>(config1.tileM), static_cast<int64_t>(config1.tileN))});
-        const uint32_t count1 = schedule1.GetTileNum();
-        const uint32_t first1 = FirstOwnedComputeTile(fragment.gmm1TileBegin, block, kAic);
-        if (first1 < count1) {
-            if constexpr (g_coreType == AIC) {
-                const uint64_t waitStart = timer.TraceBegin();
-                WaitLocalDone(reinterpret_cast<__gm__ uint8_t*>(args.symmetric + args.config.dispatchReadyOffset +
-                                                                fragment.inputReadyIndex * kFlagBytes),
-                              args.config.epoch);
-                timer.TraceEnd(TraceEvent::WaitDispatch, waitStart, fragmentMeta);
-            }
-            timer.Begin(Phase::Gmm1);
-            const auto addr = Gmm1Addresses(args, fragment);
-            gmm1.UpdateProblem(config1, addr);
-            gmm1.Begin();
-            for (uint32_t tile = first1; tile < count1; tile += kAic) {
-                const auto coord = schedule1.GetBlockCoord(tile);
-                const auto tileShape = schedule1.GetBlockShape(coord);
-                const uint32_t m = Get<MegaMoeImpl::M_VALUE>(coord);
-                const uint32_t n = Get<MegaMoeImpl::N_VALUE>(coord);
-                const uint32_t rows = Get<MegaMoeImpl::M_VALUE>(tileShape);
-                const uint32_t columns = Get<MegaMoeImpl::N_VALUE>(tileShape);
-                const auto tileMeta = ComputeTileTraceMeta(fragmentMeta, m, n, rows, columns);
-                if constexpr (g_coreType == AIC) {
-                    // Compute submits asynchronous work and may wait on its
-                    // existing internal dependencies; it is not a FIX drain.
-                    const uint64_t computeStart = timer.TraceBegin();
-                    gmm1.Compute(m, n, rows, columns);
-                    timer.TraceEnd(TraceEvent::Gmm1Tile, computeStart, tileMeta);
-                    const uint64_t drainStart = timer.TraceBegin();
-                    SetFlag<HardEvent::FIX_S>(EVENT_ID0);
-                    WaitFlag<HardEvent::FIX_S>(EVENT_ID0);
-                    timer.TraceEnd(TraceEvent::Gmm1TileDrain, drainStart, tileMeta);
-                    WriteGmByPassDCache(ComputeFlag(args.gmm1Done, fragment.gmm1TileBegin + tile), 1);
-                } else {
-                    const uint64_t dequantStart = timer.TraceBegin();
-                    gmm1.Dequantize(n, rows, columns);
-                    timer.TraceEnd(TraceEvent::Gmm1Dequant, dequantStart, tileMeta);
-                }
-            }
-            const uint64_t endStart = timer.TraceBegin();
-            gmm1.End(g_coreType == AIC);
-            timer.TraceEnd(TraceEvent::Gmm1Drain, endStart, fragmentMeta);
-            timer.End(Phase::Gmm1);
+    const Fragment fragment = LoadFragment(args, fragmentIndex);
+    const auto fragmentMeta = FragmentTraceMeta(args, fragment, fragmentIndex);
+    const auto shape = FragmentShape(args, fragment);
+    auto config1 = UrmaGmmConfig::BuildGmm1ProblemConfig(shape, job, kComputeTileM);
+    MegaMoeImpl::GmmKernel::BlockScheduler schedule1(
+        {config1.m, config1.schedulerN, config1.k},
+        MegaMoeImpl::GmmKernel::BlockScheduler::Params{
+            Te::MakeCoord(static_cast<int64_t>(config1.tileM), static_cast<int64_t>(config1.tileN))});
+    const uint32_t count1 = schedule1.GetTileNum();
+    const uint32_t first1 = FirstOwnedComputeTile(fragment.gmm1TileBegin, block, kAic);
+    if (first1 >= count1) return;
+    if constexpr (g_coreType == AIC) {
+        const uint64_t waitStart = timer.TraceBegin();
+        WaitLocalDone(reinterpret_cast<__gm__ uint8_t*>(args.symmetric + args.config.dispatchReadyOffset +
+                                                        fragment.inputReadyIndex * kFlagBytes),
+                      args.config.epoch);
+        timer.TraceEnd(TraceEvent::WaitDispatch, waitStart, fragmentMeta);
+    }
+    timer.Begin(Phase::Gmm1);
+    const auto addr = Gmm1Addresses(args, fragment);
+    gmm1.UpdateProblem(config1, addr);
+    gmm1.Begin();
+    for (uint32_t tile = first1; tile < count1; tile += kAic) {
+        const auto coord = schedule1.GetBlockCoord(tile);
+        const auto tileShape = schedule1.GetBlockShape(coord);
+        const uint32_t m = Get<MegaMoeImpl::M_VALUE>(coord);
+        const uint32_t n = Get<MegaMoeImpl::N_VALUE>(coord);
+        const uint32_t rows = Get<MegaMoeImpl::M_VALUE>(tileShape);
+        const uint32_t columns = Get<MegaMoeImpl::N_VALUE>(tileShape);
+        const auto tileMeta = ComputeTileTraceMeta(fragmentMeta, m, n, rows, columns);
+        if constexpr (g_coreType == AIC) {
+            // Compute submits asynchronous work and may wait on its
+            // existing internal dependencies; it is not a FIX drain.
+            const uint64_t computeStart = timer.TraceBegin();
+            gmm1.Compute(m, n, rows, columns);
+            timer.TraceEnd(TraceEvent::Gmm1Tile, computeStart, tileMeta);
+            const uint64_t drainStart = timer.TraceBegin();
+            SetFlag<HardEvent::FIX_S>(EVENT_ID0);
+            WaitFlag<HardEvent::FIX_S>(EVENT_ID0);
+            timer.TraceEnd(TraceEvent::Gmm1TileDrain, drainStart, tileMeta);
+            WriteGmByPassDCache(ComputeFlag(args.gmm1Done, fragment.gmm1TileBegin + tile), 1);
+        } else {
+            const uint64_t dequantStart = timer.TraceBegin();
+            gmm1.Dequantize(n, rows, columns);
+            timer.TraceEnd(TraceEvent::Gmm1Dequant, dequantStart, tileMeta);
         }
+    }
+    const uint64_t endStart = timer.TraceBegin();
+    gmm1.End(g_coreType == AIC);
+    CompleteComputeContext();
+    timer.TraceEnd(TraceEvent::Gmm1Drain, endStart, fragmentMeta);
+    timer.End(Phase::Gmm1);
+}
 
-        auto config2 = UrmaGmmConfig::BuildGmm2ProblemConfig(shape, job, kComputeTileM);
-        MegaMoeImpl::GmmKernel::BlockScheduler schedule2(
-            {config2.m, config2.schedulerN, config2.k},
-            MegaMoeImpl::GmmKernel::BlockScheduler::Params{
-                Te::MakeCoord(static_cast<int64_t>(config2.tileM), static_cast<int64_t>(config2.tileN))});
-        const uint32_t count2 = schedule2.GetTileNum();
-        const uint32_t first2 = FirstOwnedComputeTile(fragment.gmm2TileBegin, block, kAic);
-        if (first2 < count2) {
+__aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex, Timer& timer)
+{
+    const MegaMoeImpl::BlockJobContext job{block, kAic};
+    const Fragment fragment = LoadFragment(args, fragmentIndex);
+    const auto fragmentMeta = FragmentTraceMeta(args, fragment, fragmentIndex);
+    const auto shape = FragmentShape(args, fragment);
+    auto config2 = UrmaGmmConfig::BuildGmm2ProblemConfig(shape, job, kComputeTileM);
+    MegaMoeImpl::GmmKernel::BlockScheduler schedule2(
+        {config2.m, config2.schedulerN, config2.k},
+        MegaMoeImpl::GmmKernel::BlockScheduler::Params{
+            Te::MakeCoord(static_cast<int64_t>(config2.tileM), static_cast<int64_t>(config2.tileN))});
+    const uint32_t count2 = schedule2.GetTileNum();
+    const uint32_t first2 = FirstOwnedComputeTile(fragment.gmm2TileBegin, block, kAic);
+    if (first2 >= count2) return;
+    if constexpr (g_coreType == AIC) {
+        // The 13 independent activation workers collectively publish one
+        // contribution per original GMM1 tile after both FP8 planes drain.
+        const uint64_t waitStart = timer.TraceBegin();
+        WaitComputeFlag(args.activationDone, fragmentIndex, FragmentGmm1Tiles(args, fragment));
+        timer.TraceEnd(TraceEvent::WaitActivation, waitStart, fragmentMeta);
+    }
+    timer.Begin(Phase::Gmm2);
+    uint32_t completed = 0U;
+    uint64_t drainStart = 0U;
+    {
+        const auto addr = Gmm2Addresses(args, fragment);
+        MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig> gmm2(config2, addr);
+        for (uint32_t tile = first2; tile < count2; tile += kAic) {
+            const auto coord = schedule2.GetBlockCoord(tile);
+            const auto tileShape = schedule2.GetBlockShape(coord);
+            const uint32_t m = Get<MegaMoeImpl::M_VALUE>(coord);
+            const uint32_t n = Get<MegaMoeImpl::N_VALUE>(coord);
+            const uint32_t rows = Get<MegaMoeImpl::M_VALUE>(tileShape);
+            const uint32_t columns = Get<MegaMoeImpl::N_VALUE>(tileShape);
+            const auto tileMeta = ComputeTileTraceMeta(fragmentMeta, m, n, rows, columns);
             if constexpr (g_coreType == AIC) {
-                // The 13 independent activation workers collectively publish
-                // one contribution per GMM1 tile after both FP8 planes drain.
-                const uint64_t waitStart = timer.TraceBegin();
-                WaitComputeFlag(args.activationDone, fragmentIndex, count1);
-                timer.TraceEnd(TraceEvent::WaitActivation, waitStart, fragmentMeta);
+                // Submission time only: output completion belongs to
+                // the existing context destructor below.
+                const uint64_t computeStart = timer.TraceBegin();
+                gmm2.Compute(m, n, rows, columns);
+                timer.TraceEnd(TraceEvent::Gmm2Tile, computeStart, tileMeta);
+            } else {
+                const uint64_t dequantStart = timer.TraceBegin();
+                gmm2.Dequantize(n, rows, columns);
+                timer.TraceEnd(TraceEvent::Gmm2Dequant, dequantStart, tileMeta);
             }
-            timer.Begin(Phase::Gmm2);
-            uint32_t completed = 0U;
-            uint64_t drainStart = 0U;
-            {
-                const auto addr = Gmm2Addresses(args, fragment);
-                MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig> gmm2(config2, addr);
-                for (uint32_t tile = first2; tile < count2; tile += kAic) {
-                    const auto coord = schedule2.GetBlockCoord(tile);
-                    const auto tileShape = schedule2.GetBlockShape(coord);
-                    const uint32_t m = Get<MegaMoeImpl::M_VALUE>(coord);
-                    const uint32_t n = Get<MegaMoeImpl::N_VALUE>(coord);
-                    const uint32_t rows = Get<MegaMoeImpl::M_VALUE>(tileShape);
-                    const uint32_t columns = Get<MegaMoeImpl::N_VALUE>(tileShape);
-                    const auto tileMeta = ComputeTileTraceMeta(fragmentMeta, m, n, rows, columns);
-                    if constexpr (g_coreType == AIC) {
-                        // Submission time only: output completion belongs to
-                        // the existing context destructor below.
-                        const uint64_t computeStart = timer.TraceBegin();
-                        gmm2.Compute(m, n, rows, columns);
-                        timer.TraceEnd(TraceEvent::Gmm2Tile, computeStart, tileMeta);
-                    } else {
-                        const uint64_t dequantStart = timer.TraceBegin();
-                        gmm2.Dequantize(n, rows, columns);
-                        timer.TraceEnd(TraceEvent::Gmm2Dequant, dequantStart, tileMeta);
-                    }
-                    ++completed;
-                }
-                drainStart = timer.TraceBegin();
-            }  // CATLASS destructor drains FIX and the paired L1 event tokens.
-            timer.TraceEnd(TraceEvent::Gmm2Drain, drainStart, fragmentMeta);
-            if constexpr (g_coreType == AIC) {
-                AtomicAdd(ComputeFlag(args.gmm2Done, fragmentIndex), static_cast<int32_t>(completed));
+            ++completed;
+        }
+        drainStart = timer.TraceBegin();
+    }  // CATLASS destructor drains FIX and the paired L1 event tokens.
+    CompleteComputeContext();
+    timer.TraceEnd(TraceEvent::Gmm2Drain, drainStart, fragmentMeta);
+    if constexpr (g_coreType == AIC) {
+        AtomicAdd(ComputeFlag(args.gmm2Done, fragmentIndex), static_cast<int32_t>(completed));
+    }
+    timer.End(Phase::Gmm2);
+}
+
+__aicore__ inline ComputeBatchRange LoadComputeBatch(const Arguments& args, uint32_t index)
+{
+    const auto* gm = reinterpret_cast<__gm__ Chunk*>(args.recvChunks) + index;
+    Chunk chunk{};
+    chunk.fragmentBegin = gm->fragmentBegin;
+    chunk.fragmentCount = gm->fragmentCount;
+    return ComputeBatchFragments(chunk);
+}
+
+// Only an AIC and its paired AIV0 enter this routine. They use the identical
+// CV schedule and original global tile ownership. SwiGLU remains independent:
+// running the next CV's GMM1 gives it time to finish the preceding CV.
+__aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, Timer& timer)
+{
+    // URMA updates receive GM outside this core's cache hierarchy. Keep input
+    // and scale reads uncached; every existing MTE caller still defaults off.
+    UrmaGmm1 gmm1;
+    const uint64_t taskCount = ComputeBatchTaskCount(args.config.recvChunkCount);
+    for (uint64_t step = 0U; step < taskCount; ++step) {
+        const auto task = ComputeBatchTaskAt(step, args.config.recvChunkCount);
+        const auto range = LoadComputeBatch(args, task.chunkIndex);
+        for (uint32_t fragmentIndex = range.begin; fragmentIndex < range.end; ++fragmentIndex) {
+            if (task.stage == ComputeBatchStage::Gmm1) {
+                RunGmm1Fragment(args, block, fragmentIndex, gmm1, timer);
+            } else {
+                RunGmm2Fragment(args, block, fragmentIndex, timer);
             }
-            timer.End(Phase::Gmm2);
         }
     }
 }

@@ -4,6 +4,7 @@ These checks cover route coverage/progress, not NPU arithmetic or URMA ordering.
 """
 
 import os
+from itertools import groupby
 from pathlib import Path
 import shlex
 import shutil
@@ -47,17 +48,30 @@ int main() {
     static_assert(ActivationUbContract::reciprocalOffset == 101376);
     assert(ActivationSlice(512, 0, 0).rows == 0);
     assert(ActivationSlice(512, 128, 128).rows == 0);
-    std::vector<uint32_t> rows;
-    uint32_t row;
-    while (std::cin >> row) { assert(row > 0); rows.push_back(row); }
-    assert(!rows.empty());
+    uint32_t maxPeerChunks = 0, chunkCount = 0;
+    assert(std::cin >> maxPeerChunks >> chunkCount);
+    assert(maxPeerChunks > 0);
+    std::vector<Chunk> chunks;
     std::vector<Fragment> fragments;
     uint64_t prefix1 = 0, prefix2 = 0, rowBegin = 0;
-    for (uint32_t i = 0; i < rows.size(); ++i) {
-        fragments.push_back({i % 24, i % 16, rowBegin, rows[i], i, prefix1, prefix2});
-        prefix1 += ComputeTileCount(rows[i], 1280);
-        prefix2 += ComputeTileCount(rows[i], 3584);
-        rowBegin += rows[i];
+    std::vector<uint32_t> fragmentChunk;
+    for (uint32_t index = 0; index < chunkCount; ++index) {
+        uint32_t peer = 0, cv = 0, count = 0;
+        assert(std::cin >> peer >> cv >> count);
+        assert(peer < 16 && cv < maxPeerChunks);
+        const auto begin = static_cast<uint32_t>(fragments.size());
+        const auto chunkRow = rowBegin;
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t expert = 0, row = 0;
+            assert(std::cin >> expert >> row);
+            assert(expert < 24 && row > 0);
+            fragments.push_back({expert, peer, rowBegin, row, peer * maxPeerChunks + cv, prefix1, prefix2});
+            fragmentChunk.push_back(index);
+            prefix1 += ComputeTileCount(row, 1280);
+            prefix2 += ComputeTileCount(row, 3584);
+            rowBegin += row;
+        }
+        chunks.push_back({peer, cv, chunkRow, 0, static_cast<uint32_t>(rowBegin - chunkRow), begin, count, 0});
     }
     std::vector<std::vector<Task>> tasks(28 + 13);
     std::vector<uint32_t> g1Owners(prefix1), g2Owners(prefix2), actOwners(prefix1);
@@ -100,11 +114,11 @@ int main() {
         for (uint32_t core = 0; core < 28; ++core) {
             for (auto j = FirstOwnedComputeTile(d.gmm1TileBegin, core, 28); j < n1; j += 28) {
                 auto id = d.gmm1TileBegin + j;
-                assert(id % 28 == core); ++g1Owners[id]; tasks[core].push_back({0, f, id});
+                assert(id % 28 == core); ++g1Owners[id];
             }
             for (auto j = FirstOwnedComputeTile(d.gmm2TileBegin, core, 28); j < n2; j += 28) {
                 auto id = d.gmm2TileBegin + j;
-                assert(id % 28 == core); ++g2Owners[id]; tasks[core].push_back({2, f, id});
+                assert(id % 28 == core); ++g2Owners[id];
             }
         }
         for (uint32_t worker = 0; worker < 13; ++worker)
@@ -115,6 +129,54 @@ int main() {
     }
     for (auto* owners : {&g1Owners, &g2Owners, &actOwners})
         assert(std::all_of(owners->begin(), owners->end(), [](auto n) { return n == 1; }));
+
+    // Use the same production task and chunk-range helpers as the device
+    // routine. CVs are the supplied communication descriptors, never inferred
+    // from rows or conflated merely because two sources have the same CV id.
+    using Stage = ComputeBatchStage;
+    std::vector<ComputeBatchTask> expected;
+    if (!chunks.empty()) {
+        expected.push_back({Stage::Gmm1, 0});
+        for (uint32_t i = 1; i < chunks.size(); ++i) {
+            expected.push_back({Stage::Gmm1, i});
+            expected.push_back({Stage::Gmm2, i - 1});
+        }
+        expected.push_back({Stage::Gmm2, static_cast<uint32_t>(chunks.size() - 1)});
+    }
+    assert(ComputeBatchTaskCount(chunkCount) == expected.size());
+    assert(ComputeBatchTaskAt(0, 0).stage == Stage::None);
+    assert(ComputeBatchTaskAt(expected.size(), chunkCount).stage == Stage::None);
+    std::vector<uint32_t> g1Visits(prefix1), g2Visits(prefix2), g1ChunkVisits(chunkCount), g2ChunkVisits(chunkCount);
+    for (uint32_t step = 0; step < expected.size(); ++step) {
+        const auto task = ComputeBatchTaskAt(step, chunkCount);
+        assert(task.stage == expected[step].stage && task.chunkIndex == expected[step].chunkIndex);
+        assert(task.chunkIndex < chunks.size());
+        auto& chunkVisits = task.stage == Stage::Gmm1 ? g1ChunkVisits : g2ChunkVisits;
+        assert(++chunkVisits[task.chunkIndex] == 1);
+        if (task.stage == Stage::Gmm2) assert(g1ChunkVisits[task.chunkIndex] == 1);
+        const auto& chunk = chunks[task.chunkIndex];
+        const auto range = ComputeBatchFragments(chunk);
+        assert(range.begin == chunk.fragmentBegin && range.end == chunk.fragmentBegin + chunk.fragmentCount);
+        for (uint32_t f = range.begin; f < range.end; ++f) {
+            const auto& fragment = fragments[f];
+            assert(fragmentChunk[f] == task.chunkIndex);
+            assert(fragment.sourceRank == chunk.peer);
+            assert(fragment.inputReadyIndex == chunk.peer * maxPeerChunks + chunk.cv);
+            const bool first = task.stage == Stage::Gmm1;
+            const auto prefix = first ? fragment.gmm1TileBegin : fragment.gmm2TileBegin;
+            const auto count = ComputeTileCount(fragment.rows, first ? 1280 : 3584);
+            for (uint32_t core = 0; core < 28; ++core)
+                for (uint32_t tile = FirstOwnedComputeTile(prefix, core, 28); tile < count; tile += 28) {
+                    const auto id = prefix + tile;
+                    assert(id % 28 == core);  // Identical ownership to the original fragment schedule.
+                    auto& visits = first ? g1Visits : g2Visits;
+                    assert(++visits[id] == 1);
+                    tasks[core].push_back({first ? 0U : 2U, f, id});
+                }
+        }
+    }
+    for (auto* visits : {&g1Visits, &g2Visits, &g1ChunkVisits, &g2ChunkVisits})
+        assert(std::all_of(visits->begin(), visits->end(), [](auto n) { return n == 1; }));
     // Prefix arithmetic must remain correct beyond a 32-bit global tile ID.
     for (uint64_t prefix : {0ULL, 27ULL, 28ULL, (1ULL << 32) + 31ULL})
         for (uint32_t workers : {13U, 28U})
@@ -122,20 +184,31 @@ int main() {
                 auto start = FirstOwnedComputeTile(prefix, worker, workers);
                 assert(start < workers && (prefix + start) % workers == worker);
             }
-    for (uint32_t seed = 0; seed < 5; ++seed) {
+    for (uint32_t seed = 0; seed < 10; ++seed) {
         std::mt19937 random(seed);
         std::vector<size_t> cursor(tasks.size());
         std::vector<uint32_t> g1Done(prefix1), actDone(fragments.size()), g2Done(fragments.size());
         std::vector<uint32_t> actors(tasks.size());
         std::iota(actors.begin(), actors.end(), 0);
+        // Dispatch has an independent producer. The earliest compute CV may
+        // arrive last; ready events do not depend on downstream GMM2 progress.
+        std::vector<uint32_t> readyAt(chunkCount);
+        for (auto& ready : readyAt) ready = random() % 53;
+        if (chunkCount) readyAt[0] = 80;
+        uint32_t activationStart[13]{};
+        activationStart[0] = 95;  // The self-copy owner can reach SwiGLU late.
         uint64_t left = 0;
         for (auto& actor : tasks) left += actor.size();
+        const auto totalTasks = left;
+        uint64_t tick = 0;
         while (left) {
             std::shuffle(actors.begin(), actors.end(), random);
             uint32_t progress = 0;
             for (auto actor : actors) {
                 if (cursor[actor] == tasks[actor].size()) continue;
                 auto t = tasks[actor][cursor[actor]];
+                if (t.kind == 0 && tick < readyAt[fragmentChunk[t.fragment]]) continue;
+                if (t.kind == 1 && tick < activationStart[actor - 28]) continue;
                 if (t.kind == 1 && !g1Done[t.tile]) continue;
                 if (t.kind == 2 && actDone[t.fragment] != ComputeTileCount(fragments[t.fragment].rows, 1280))
                     continue;
@@ -144,7 +217,11 @@ int main() {
                 else ++g2Done[t.fragment];
                 ++cursor[actor]; --left; ++progress;
             }
-            assert(progress && "independent 28/13 task sequences must not deadlock");
+            ++tick;
+            // Before tick 95 a whole iteration may legitimately wait for an
+            // independent arrival. Thereafter a nonempty DAG must progress.
+            assert((progress || tick <= 95) && "CV lookahead must not create a circular dependency");
+            assert(tick <= totalTasks + 96 && "bounded arrivals must lead to bounded completion");
         }
         for (uint32_t f = 0; f < fragments.size(); ++f) {
             assert(actDone[f] == ComputeTileCount(fragments[f].rows, 1280));
@@ -173,6 +250,31 @@ int main() {
     return binary
 
 
+def run_scheduler(scheduler_binary, chunks):
+    """Send explicit peer/CV descriptors and their expert fragments to C++."""
+    max_peer_chunks = max((cv + 1 for _, cv, _ in chunks), default=1)
+    lines = [f"{max_peer_chunks} {len(chunks)}"]
+    for peer, cv, fragments in chunks:
+        lines.append(f"{peer} {cv} {len(fragments)}")
+        lines.extend(f"{expert} {rows}" for expert, rows in fragments)
+    result = subprocess.run(
+        [str(scheduler_binary)],
+        input="\n".join(lines),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def communication_chunks(fragments):
+    """Preserve the oracle's actual source/CV intersections and expert ids."""
+    return [
+        (source, cv, [(f.local_expert, f.rows) for f in group])
+        for (source, cv), group in groupby(fragments, lambda f: (f.source_rank, f.cv_id))
+    ]
+
+
 @pytest.mark.parametrize("bs", [2048, 4096, 8192])
 @pytest.mark.parametrize("cv_rows", [128, 256, 1024, 4096])
 def test_actual_fragment_assignment_and_independent_activation_progress(scheduler_binary, bs, cv_rows):
@@ -182,28 +284,59 @@ def test_actual_fragment_assignment_and_independent_activation_progress(schedule
         ids = ((linear % 16) * 24 + (linear // 16) % 24).reshape(bs, 8)
         routes.append(plan_routes(ids, 384, 16))
     fragments = cv_fragments(routes, destination_rank=7, cv_rows=cv_rows)
-    result = subprocess.run(
-        [str(scheduler_binary)],
-        input=" ".join(str(fragment.rows) for fragment in fragments),
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+    run_scheduler(scheduler_binary, communication_chunks(fragments))
 
 
 def test_partial_and_multi_mtile_fragments(scheduler_binary):
-    result = subprocess.run(
-        [str(scheduler_binary)],
-        input="1 255 256 257 511 512 513 1024 170 43 85",
-        capture_output=True,
-        text=True,
-        timeout=30,
+    # Both within-CV and peer-boundary ragged tails, with multiple M tiles in
+    # the same fragment. CV 0 on source 3 must remain separate from source 0.
+    run_scheduler(
+        scheduler_binary,
+        [
+            (0, 0, [(0, 1), (1, 255), (2, 256)]),
+            (0, 1, [(2, 257), (3, 511), (4, 512)]),
+            (3, 0, [(5, 513), (6, 1024)]),
+            (15, 7, [(7, 170), (8, 43), (9, 85)]),
+        ],
     )
-    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("rows", [1, 43, 85, 127, 128, 129, 171, 255, 256, 257, 511, 512, 513, 4096])
 def test_activation_subtile_bounds_and_one_completion_per_original_tile(scheduler_binary, rows):
-    result = subprocess.run([str(scheduler_binary)], input=str(rows), capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0, result.stdout + result.stderr
+    run_scheduler(scheduler_binary, [(0, 0, [(0, rows)])])
+
+
+@pytest.mark.parametrize("chunk_count", [0, 1, 2, 3, 7, 16, 33])
+def test_cv_warmup_alternating_lookahead_and_tail(scheduler_binary, chunk_count):
+    # The real TaskAt helper is checked against the full requested stage
+    # sequence inside the executable, including zero and out-of-range steps.
+    chunks = [(i // 8, i % 8, [(i % 24, 1 + i % 517)]) for i in range(chunk_count)]
+    run_scheduler(scheduler_binary, chunks)
+
+
+@pytest.mark.parametrize("cv_rows", [128, 256, 1024, 4096])
+def test_sparse_routes_empty_peers_and_ragged_multi_mtile_cv(scheduler_binary, cv_rows):
+    routes = []
+    for rank in range(16):
+        # Only some sources contribute to rank 7. The remainder target rank 0,
+        # leaving rank 15 completely empty and source-major CV ids sparse.
+        destination = 7 if rank % 3 == 1 else 0
+        rows = 769 + 17 * rank
+        ids = np.full((rows, 8), destination * 24, dtype=np.int64)
+        ids[-13:, 4:] += 1
+        routes.append(plan_routes(ids, 384, 16))
+    for destination in (7, 15):
+        fragments = cv_fragments(routes, destination_rank=destination, cv_rows=cv_rows)
+        run_scheduler(scheduler_binary, communication_chunks(fragments))
+
+
+def test_ragged_descriptor_ranges_do_not_merge_sources_with_same_cv_id(scheduler_binary):
+    run_scheduler(
+        scheduler_binary,
+        [
+            (0, 0, [(0, 42), (1, 43), (2, 43), (3, 43), (4, 43), (5, 42)]),
+            (1, 0, [(0, 256)]),
+            (1, 1, [(1, 3), (2, 126)]),
+            (15, 0, [(23, 1)]),
+        ],
+    )

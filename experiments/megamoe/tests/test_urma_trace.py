@@ -83,6 +83,55 @@ def test_local_sync_cv_field_is_a_named_sync_stage():
     assert event["cname"] == "thread_state_iowait"
 
 
+@pytest.mark.parametrize(
+    "engine,gmm1_event,gmm2_event",
+    [(0, "Gmm1Tile", "Gmm2Tile"), (1, "Gmm1Dequant", "Gmm2Dequant")],
+)
+def test_cv_lookahead_trace_preserves_reordered_fragment_and_peer_identity(engine, gmm1_event, gmm2_event):
+    # One source CV may contain several expert fragments; the next source's
+    # cv_id restarts at zero. Neither CV nor fragment IDs are time coordinates.
+    sequence = [
+        (gmm1_event, 0, 0, 0, 0),
+        (gmm1_event, 0, 0, 1, 1),
+        (gmm1_event, 0, 1, 2, 1),
+        (gmm2_event, 0, 0, 0, 0),
+        (gmm2_event, 0, 0, 1, 1),
+        (gmm1_event, 1, 0, 3, 0),
+        (gmm2_event, 0, 1, 2, 1),
+        (gmm2_event, 1, 0, 3, 0),
+    ]
+    raw = trace_buffer(len(sequence))
+    for index, (name, peer, cv, fragment, expert) in enumerate(sequence):
+        add_record(
+            raw,
+            engine=engine,
+            event=name,
+            start=1000 + index * 20,
+            end=1010 + index * 20,
+            peer=peer,
+            cv=cv,
+            fragment=fragment,
+            expert=expert,
+            tile_m=0,
+            tile_n=0,
+        )
+    result = decode_trace(raw, rank=7, clock_mhz=1000)
+    rows = events(result)
+    assert [
+        (
+            EVENTS[row["args"]["event_id"]],
+            row["args"]["peer"],
+            row["args"]["cv"],
+            row["args"]["fragment"],
+            row["args"]["expert"],
+        )
+        for row in rows
+    ] == sequence
+    assert [row["ts"] for row in rows] == [index * 0.02 for index in range(len(sequence))]
+    assert all(row["tid"] == engine and row["dur"] == 0.01 for row in rows)
+    assert result["metadata"]["record_count"] == len(sequence)
+
+
 @pytest.mark.parametrize("origin", [(1 << 53) + 101, (1 << 63) + 101, UNKNOWN - 100])
 def test_large_ticks_are_subtracted_as_integers_before_float_conversion(origin):
     raw = trace_buffer()

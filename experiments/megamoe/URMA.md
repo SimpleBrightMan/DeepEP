@@ -14,7 +14,7 @@ GMM保留256行tile；SwiGLU在每个已就绪GMM1 tile内按最多128行处理�
 2. 本地将 FP8 token 和 E8M0 scale 展开到连续发送区。一个token命中多个expert时复制对应多行，本版不做去重。
 3. 每个目标rank的连续行流按 `cv_rows` 截断，通过 URMA PUT 发送。token与scale使用各自连续平面。
 4. 每个CV与expert区间取交集，产生 `source_rank、cv_id、expert、cv_row、expert_row、rows、source_expanded_row` 描述符。GMM1、SwiGLU、GMM2共用行身份；跨expert边界必须分别计算。
-5. SwiGLU按已完成的gate/up tile推进；首版GMM2等待该CV/expert交集的全部SwiGLU tile完成，返回PUT等待整个CV的完整H列。GMM2直接写按来源rank排列的连续返回区。
+5. 计算按通信CV前瞻一批：先执行首个CV的GMM1，随后交替执行下一个CV的GMM1和上一个CV的GMM2，最后执行末个CV的GMM2。SwiGLU按已完成的gate/up tile独立推进；GMM2仍等待对应CV/expert交集的全部SwiGLU tile完成。返回PUT等待整个CV的完整H列，GMM2直接写按来源rank排列的连续返回区。
 6. 本rank的15个远端及self Dispatch全部完成后才提交Combine PUT，此处不插入全卡同步。Combine延后quiet，所有PUT完成后参加最终全卡同步，再按`reduce_index`读取各top-k结果、乘路由权重并求和。
 
 15个通信AIV1各独占一个远端rank。通信worker `w` 的peer为 `w < rank ? w : w+1`；剩余13个AIV1执行SwiGLU。本卡通路使用本地搬运。两个阶段都只使用PUT，队列同一peer始终只有一个提交者。
@@ -22,6 +22,24 @@ GMM保留256行tile；SwiGLU在每个已就绪GMM1 tile内按最多128行处理�
 接收数据/中间结果/返回结果不按CV覆盖复用。所有BS共享固定对称heap布局，epoch由`UrmaBuffer`统一递增，不因创建新Plan或切换BS重新归零。
 
 通信域启用MTE和UDMA，每个对端独立QP0，不使用共享jetty。MTE只用于完成标志与本地搬运；远端token、scale和FFN结果均走UDMA PUT。每次调用在同一runtime stream串行执行，并在下一次写入前与各peer握手，保护上一轮Reduce尚未读完的结果。
+
+### 计算按通信 CV 前瞻一批
+
+这里的一个CV是**单个来源rank发送的一段连续行**，用`(source_rank, cv_id)`唯一标识。不同来源rank的同号CV彼此独立，不会合成一批。计算沿现有描述符顺序遍历；一个CV跨越多个expert时，先完成该CV内所有expert交集的GMM1，再按下面的顺序安排GMM2：
+
+```text
+GMM1(CV0)
+for i = 0 .. 最后一个CV之前:
+    GMM1(CV[i+1])
+    GMM2(CV[i])
+GMM2(最后一个CV)
+```
+
+只有一个非空CV时直接执行`GMM1→GMM2`；没有接收行时没有计算任务。前瞻把下一个CV的GMM1放到当前CV的GMM2之前，让13个SwiGLU核在这段时间处理已就绪的当前CV。28组AIC/AIV0仍按原有全局tile编号分工，不改变每个CV的行、专家边界、tile数量或输出位置。
+
+各AIC及其配对AIV0按本核任务独立推进，CV批次之间没有barrier。这里`GMM1(CV)`完成指本核负责的任务结束，并不代表全部核心同时完成该CV；GMM2仍检查对应fragment的真实SwiGLU完成计数。每段GMM结束后，配对AIV0向本组AIC发送End确认，确保旧段已消费完6–9号流水槽信号后才复用；此确认只涉及该对AIC/AIV0，不让15个通信AIV1或13个SwiGLU AIV1参与同步。
+
+该调度默认生效，无需新开关。它保留Dispatch就绪检查、`WaitActivation`、原有计算流水完成等待及计数发布，不增加全核或全卡同步；PUT顺序、payload、量化算术、路由权重和Reduce公式均保持原有定义。它能否减少等待需要由正式耗时与trace验证，不能仅凭前瞻顺序推定收益。
 
 ## Python 接口与路由成本
 
@@ -154,6 +172,8 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 | `summary.json` | 正式耗时、aggregate带宽及各rank trace导出信息 |
 
 每条轨道对应`block 00..27`的`AIC/AIV0/AIV1`，引擎编号为`block*3+0/1/2`。事件参数包含可用的peer、CV、fragment、expert、行起点/行数、M/N tile位置、列数和字节数；不适用字段显示null。`LocalSync`的CV字段另解释为`sync_stage`：0=pack、1=compute/return、2=rank barrier、3=reduce。
+
+编译和trace运行仍使用上面的命令，不增加调度或采样参数。核对前瞻顺序时，在AIC/AIV0轨道按`(peer, cv)`合并同一CV的fragment，观察GMM1与GMM2条的先后；fragment/expert元数据沿用原编号，因此重排后编号可以往回跳。单个核心只记录分给自己的tile，缺少某CV的条不等于该CV未计算。`WaitActivation`仍会出现，表示该核心实际执行GMM2前尚未满足的依赖；aggregate timer阶段与逐事件schema均不变。
 
 | 图中标签 | 应如何理解 |
 |---|---|
