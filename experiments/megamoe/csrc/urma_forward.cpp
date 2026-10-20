@@ -1,6 +1,7 @@
 // Copyright (c) 2026, Lu Lu
 // Modified by SimpleBright_Man 2026
 #include "urma_forward.hpp"
+#include "kernels/mega_moe/urma/compute_contract.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -100,8 +101,12 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub);
     const uint32_t aic = platform->GetCoreNumAic();
     const uint32_t aiv = platform->GetCoreNumAiv();
-    TORCH_CHECK(aic >= MegaMoeUrma::kAic && aiv >= 2U * MegaMoeUrma::kAic && ub >= 256U * 1024U,
-                "URMA v1 needs at least 28 AIC / 56 AIV and 256 KiB UB; it always launches 28 AIC blocks");
+    TORCH_CHECK(aic >= MegaMoeUrma::kAic && aiv >= 2U * MegaMoeUrma::kAic,
+                "URMA v1 needs at least 28 AIC / 56 AIV; detected AIC=", aic, ", AIV=", aiv, ", UB=", ub,
+                " bytes. It always launches 28 AIC blocks");
+    TORCH_CHECK(ub >= MegaMoeUrma::kRequiredUbBytes, "URMA v1 requires ", MegaMoeUrma::kRequiredUbBytes,
+                " bytes of UB for the W4 prologue and 128-row SwiGLU slices; detected UB=", ub, " bytes, AIC=", aic,
+                ", AIV=", aiv);
     // Physical devices may have more cores. The kernel's 28/15/13 partitions
     // and timer storage are fixed: never launch the extra physical blocks.
     constexpr uint32_t launch_aic = MegaMoeUrma::kAic;

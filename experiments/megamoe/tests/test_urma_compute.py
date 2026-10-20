@@ -36,6 +36,17 @@ def scheduler_binary(tmp_path_factory):
 using namespace MegaMoeUrma;
 struct Task { uint32_t kind, fragment; uint64_t tile; };
 int main() {
+    static_assert(kComputeTileM == 256 && kActivationTileM == 128);
+    static_assert(kRequiredUbBytes == 196608);
+    static_assert(ActivationUbContract::inputEnd == 131072);
+    static_assert(ActivationUbContract::scratchEnd == 103424);
+    static_assert(ActivationUbContract::upOffset == 65536);
+    static_assert(ActivationUbContract::quantOffset == 65536);
+    static_assert(ActivationUbContract::scaleOffset == 98304);
+    static_assert(ActivationUbContract::maxExpOffset == 99328);
+    static_assert(ActivationUbContract::reciprocalOffset == 101376);
+    assert(ActivationSlice(512, 0, 0).rows == 0);
+    assert(ActivationSlice(512, 128, 128).rows == 0);
     std::vector<uint32_t> rows;
     uint32_t row;
     while (std::cin >> row) { assert(row > 0); rows.push_back(row); }
@@ -55,6 +66,37 @@ int main() {
         auto n1 = ComputeTileCount(d.rows, 1280), n2 = ComputeTileCount(d.rows, 3584);
         assert(n1 == ((d.rows + 255) / 256) * 5);
         assert(n2 == ((d.rows + 255) / 256) * 14);
+        std::vector<uint32_t> outputVisits(d.rows * 5), scaleVisits(d.rows * 40);
+        uint32_t originalTileContributions = 0;
+        for (uint32_t m = 0; m < d.rows; m += kComputeTileM) {
+            const auto tileRows = std::min(kComputeTileM, d.rows - m);
+            for (uint32_t n = 0; n < 1280; n += 256) {
+                uint32_t slices = 0, visitedRows = 0;
+                for (uint32_t offset = 0; offset < tileRows; offset += kActivationTileM) {
+                    auto slice = ActivationSlice(m, tileRows, offset);
+                    assert(slice.rows > 0 && slice.rows <= 128);
+                    assert(slice.rowBegin == m + offset && slice.rowBegin + slice.rows <= d.rows);
+                    assert(ActivationUbContract::upOffset + slice.rows * 256 * 2 <=
+                           ActivationUbContract::inputEnd);
+                    assert(ActivationUbContract::reciprocalOffset + slice.rows * 8 * 2 <=
+                           ActivationUbContract::scratchEnd);
+                    for (uint32_t row = slice.rowBegin; row < slice.rowBegin + slice.rows; ++row) {
+                        ++outputVisits[row * 5 + n / 256];
+                        for (uint32_t scale = n / 32; scale < (n + 256) / 32; ++scale)
+                            ++scaleVisits[row * 40 + scale];
+                    }
+                    visitedRows += slice.rows;
+                    ++slices;
+                }
+                assert(visitedRows == tileRows && slices == (tileRows + 127) / 128);
+                // Completion belongs to the original ready tile, never each
+                // sub-slice: GMM2 must not observe a half-written M256 tile.
+                ++originalTileContributions;
+            }
+        }
+        assert(originalTileContributions == n1);
+        for (auto* visits : {&outputVisits, &scaleVisits})
+            assert(std::all_of(visits->begin(), visits->end(), [](auto n) { return n == 1; }));
         for (uint32_t core = 0; core < 28; ++core) {
             for (auto j = FirstOwnedComputeTile(d.gmm1TileBegin, core, 28); j < n1; j += 28) {
                 auto id = d.gmm1TileBegin + j;
@@ -132,7 +174,7 @@ int main() {
 
 
 @pytest.mark.parametrize("bs", [2048, 4096, 8192])
-@pytest.mark.parametrize("cv_rows", [128, 256, 1024])
+@pytest.mark.parametrize("cv_rows", [128, 256, 1024, 4096])
 def test_actual_fragment_assignment_and_independent_activation_progress(scheduler_binary, bs, cv_rows):
     routes = []
     for rank in range(16):
@@ -158,4 +200,10 @@ def test_partial_and_multi_mtile_fragments(scheduler_binary):
         text=True,
         timeout=30,
     )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("rows", [1, 43, 85, 127, 128, 129, 171, 255, 256, 257, 511, 512, 513, 4096])
+def test_activation_subtile_bounds_and_one_completion_per_original_tile(scheduler_binary, rows):
+    result = subprocess.run([str(scheduler_binary)], input=str(rows), capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr

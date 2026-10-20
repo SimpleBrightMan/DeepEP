@@ -11,12 +11,46 @@ namespace MegaMoeUrma {
 constexpr uint32_t kComputeCores = kAic;
 constexpr uint32_t kComputeTileM = 256U;
 constexpr uint32_t kComputeTileN = 256U;
+// Keep matrix scheduling at M256; only the AIV1 epilogue works in M128
+// slices. The W4 AIV0 prologue remains the largest UB user at exactly 192KiB.
+constexpr uint32_t kActivationTileM = 128U;
+constexpr uint32_t kRequiredUbBytes = 192U * 1024U;
+struct ActivationUbContract {
+    static constexpr uint32_t elements = kActivationTileM * kComputeTileN;
+    static constexpr uint32_t gateOffset = 0U;
+    static constexpr uint32_t upOffset = elements * sizeof(uint16_t);
+    static constexpr uint32_t inputEnd = upOffset + elements * sizeof(uint16_t);
+    // Gate/up are dead before quantization reuses their storage.
+    static constexpr uint32_t activationOffset = 0U;
+    static constexpr uint32_t quantOffset = elements * sizeof(uint16_t);
+    static constexpr uint32_t scaleElements = elements / 32U;
+    static constexpr uint32_t scaleOffset = quantOffset + elements;
+    static constexpr uint32_t maxExpOffset = scaleOffset + scaleElements;
+    static constexpr uint32_t reciprocalOffset = maxExpOffset + scaleElements * sizeof(uint16_t);
+    static constexpr uint32_t scratchEnd = reciprocalOffset + scaleElements * sizeof(uint16_t);
+};
+static_assert(ActivationUbContract::inputEnd == 128U * 1024U);
+static_assert(ActivationUbContract::scratchEnd == 101U * 1024U);
+static_assert(ActivationUbContract::inputEnd <= kRequiredUbBytes &&
+              ActivationUbContract::scratchEnd <= kRequiredUbBytes);
+
+struct ActivationRowSlice {
+    uint32_t rowBegin;
+    uint32_t rows;
+};
 
 #if defined(__NPU_DEVICE__)
 #define MEGAMOE_URMA_COMPUTE_INLINE __aicore__ inline
 #else
 #define MEGAMOE_URMA_COMPUTE_INLINE inline
 #endif
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr ActivationRowSlice ActivationSlice(uint32_t tileRowBegin, uint32_t tileRows,
+                                                                         uint32_t offset)
+{
+    const uint32_t remaining = offset < tileRows ? tileRows - offset : 0U;
+    return {tileRowBegin + offset, remaining < kActivationTileM ? remaining : kActivationTileM};
+}
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ComputeTileCount(uint32_t rows, uint32_t columns)
 {

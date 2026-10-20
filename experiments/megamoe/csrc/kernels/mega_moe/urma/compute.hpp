@@ -79,6 +79,22 @@ __aicore__ inline MegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& args, 
 using UrmaGmmConfig = MegaMoeImpl::GmmKernel::Config<true, 0, fp8_e4m3fn_t, fp4x2_e2m1_t, bfloat16_t, fp8_e8m0_t,
                                                      fp8_e8m0_t, false, false, false, false, false, false, false>;
 using UrmaProblemConfig = UrmaGmmConfig::ProblemConfig;
+using UrmaActivation =
+    MegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, kActivationTileM, kComputeTileN, false>;
+
+// Tie the host-testable memory contract to the shared arithmetic's real UB
+// layout. Top-k weights are consumed by Reduce, so no prefetch buffer exists.
+constexpr auto kActualActivationUb =
+    MegaMoeImpl::Detail::BuildActivationMxQuantUbOffsets<bfloat16_t, kActivationTileM, kComputeTileN, false>();
+static_assert(kActualActivationUb.firstInputOffsetBytes == ActivationUbContract::gateOffset &&
+                  kActualActivationUb.secondInputOffsetBytes == ActivationUbContract::upOffset &&
+                  kActualActivationUb.activationOutputOffsetBytes == ActivationUbContract::activationOffset &&
+                  kActualActivationUb.quantOutputOffsetBytes == ActivationUbContract::quantOffset &&
+                  kActualActivationUb.quantScaleOffsetBytes == ActivationUbContract::scaleOffset &&
+                  kActualActivationUb.maxExpOffsetBytes == ActivationUbContract::maxExpOffset &&
+                  kActualActivationUb.reciprocalScaleOffsetBytes == ActivationUbContract::reciprocalOffset &&
+                  kActualActivationUb.scaleElementCapacity == ActivationUbContract::scaleElements,
+              "URMA activation UB contract must match the shared epilogue");
 
 __aicore__ inline MegaMoeImpl::ProblemShape FragmentShape(const Arguments& args, const Fragment& fragment)
 {
@@ -180,8 +196,7 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
 // the original same-block GMM1/SwiGLU readiness sequence is not reused.
 __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Timer& timer)
 {
-    using Epilogue = MegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 256, 256, false>;
-    Epilogue epilogue;
+    UrmaActivation epilogue;
     epilogue.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(args.activation),
                    .yScaleGmAddr = reinterpret_cast<GM_ADDR>(args.activationScale)});
     const MegaMoeImpl::BlockJobContext job{worker, kActivationWorkers};
@@ -198,12 +213,35 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
         epilogue.UpdateGlobalAddr({static_cast<int64_t>(fragment.rowBegin * args.config.intermediate),
                                    static_cast<int64_t>(fragment.rowBegin * (args.config.intermediate / 32U)), 0, 0, 0,
                                    0});
+        auto config = UrmaGmmConfig::BuildGmm1ProblemConfig(shape, job, kComputeTileM);
+        const auto layouts = UrmaGmmConfig::BuildLayouts(config);
+        auto gmC = Te::MakeTensor(
+            Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ bfloat16_t*>(addr.gmm1OutGlobal)), layouts.c);
+        MegaMoeImpl::GmmKernel::BlockScheduler scheduler(
+            {config.m, config.outputN, config.k},
+            MegaMoeImpl::GmmKernel::BlockScheduler::Params{
+                Te::MakeCoord(static_cast<int64_t>(kComputeTileM), static_cast<int64_t>(kComputeTileN))});
+        epilogue.UpdateNextProblem({config.m, config.outputN, config.k, 0});
+        // The scheduler and ready IDs above stay M256. Only the staging copy
+        // helper's UB shape changes, matching UrmaActivation's two 64KiB inputs.
+        config.tileM = kActivationTileM;
         for (uint32_t tile = first; tile < tileCount; tile += kActivationWorkers) {
             WaitComputeFlag(args.gmm1Done, fragment.gmm1TileBegin + tile, 1U);
             timer.Begin(Phase::Activation);
-            MegaMoeImpl::RunReadyGmm1ActivationTileA8W4<fp8_e4m3fn_t, fp4x2_e2m1_t, bfloat16_t, fp8_e8m0_t, fp8_e8m0_t,
-                                                        256, false>(epilogue, shape, addr, job, tile, 0U);
-            // The reused epilogue drains its MTE3 stores before returning.
+            const auto coord = scheduler.GetBlockCoord(tile);
+            const auto tileShape = scheduler.GetBlockShape(coord);
+            const uint32_t m = Get<MegaMoeImpl::M_VALUE>(coord);
+            const uint32_t n = Get<MegaMoeImpl::N_VALUE>(coord);
+            const uint32_t rows = Get<MegaMoeImpl::M_VALUE>(tileShape);
+            const uint32_t columns = Get<MegaMoeImpl::N_VALUE>(tileShape);
+            for (uint32_t offset = 0U; offset < rows; offset += kActivationTileM) {
+                const auto slice = ActivationSlice(m, rows, offset);
+                const MegaMoeImpl::GmmKernel::BlockScheduler::BlockShape sliceShape{slice.rows, columns, config.k};
+                MegaMoeImpl::GmmKernel::Gmm1Aiv1EpilogueTileA8W4<bfloat16_t, UrmaGmmConfig::MakeLayoutC, true>(
+                    epilogue, gmC, addr, config, sliceShape, slice.rowBegin, n);
+            }
+            // Each sub-slice drains MTE3 before reusing UB. Publish exactly one
+            // contribution for the original GMM1 tile, after all its rows.
             AtomicAdd(ComputeFlag(args.activationDone, fragmentIndex), 1);
             timer.End(Phase::Activation);
         }
