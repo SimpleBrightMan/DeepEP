@@ -685,7 +685,7 @@ protected:
         constexpr uintptr_t AddressMask = (uintptr_t{1} << 60U) - 1U;
         auto gmA = reinterpret_cast<__gm__ float8_e4m3_t*>(reinterpret_cast<uintptr_t>(aBase) & AddressMask);
         auto gmSa = reinterpret_cast<__gm__ int16_t*>(reinterpret_cast<uintptr_t>(saBase) & AddressMask);
-        auto gmSb = reinterpret_cast<__gm__ int16_t*>(sbBase);
+        auto gmSb = reinterpret_cast<const __gm__ int16_t*>(sbBase);
         const uint32_t aStride = tla::get<0>(a.stride());
         const uint32_t saStride = tla::get<0>(sa.stride()) / 2U;
         const uint32_t sbStride = tla::get<1>(sb.stride()) / 2U;

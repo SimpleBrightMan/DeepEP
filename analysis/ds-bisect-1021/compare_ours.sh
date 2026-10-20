@@ -11,6 +11,9 @@ source "$root/env.sh"
 exec 9>"$root/benchmark.lock"
 flock -w 900 9
 test "$(cat "$out/build.rc")" = 0
+if test -d "$campaign/$parent/package"; then parent_package="$campaign/$parent/package"
+else parent_package="$root/ds-ladder-1020/$parent/package"; fi
+test -d "$parent_package/deep_ep_experimental/megamoe"
 unset MEGAMOE_TRACE MEGAMOE_PMU DS_TRACE TILEPACK_EXTERNAL_PMU
 cd /tmp
 for bs in 512 1024; do
@@ -27,7 +30,7 @@ for bs in 512 1024; do
       runner=("$campaign/ds_runner.py" --root "$root" --node d0 --label "$label" --bs "$bs")
       baseline=dashboard1020_bs${bs}_baseline_a
     else
-      if test "$method" = parent; then export MEGAMOE_PACKAGE="$root/ds-ladder-1020/$parent/package"
+      if test "$method" = parent; then export MEGAMOE_PACKAGE="$parent_package"
       else export MEGAMOE_PACKAGE="$out/package"; fi
       if test "$method:$round" = candidate:a; then export MEGAMOE_TRACE=1; fi
       runner=("$root/ours.py" "$label")
