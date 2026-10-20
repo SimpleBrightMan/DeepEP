@@ -59,7 +59,7 @@ private:
     static constexpr auto CvScratch = Detail::BuildActivationMxQuantUbOffsets<
         bfloat16_t, Gmm1CvPlan::StepRows, Gmm1CvPlan::Columns, true>();
     static_assert(CvScratch.reciprocalScaleOffsetBytes + CvScratch.scaleElementCapacity * sizeof(uint16_t)
-                  <= Gmm1CvPlan::ScratchBytes);
+                  <= Gmm1CvPlan::ScaleBase - Gmm1CvPlan::ScratchBase);
 
     using MegaMoeBase::commonConfig_;
     using MegaMoeBase::computeReplay_;
@@ -384,17 +384,16 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunC
     {
         AscendTimerTileScope step(timer_.Enabled() ? &timer_ : nullptr, AscendTimer::AIV_SWIGLU_ISSUE,
             cvActivation_.m + row, cvActivation_.n, count, cvActivation_.columns);
-        // MTE3最后读完输出scratch，V才可覆盖；不等待Scalar，不重读GM中的GMM1结果。
-        Gmm1CvScratch::Acquire();
-        const uint32_t input = Gmm1CvPlan::SlotOffset(static_cast<uint32_t>(readySequence)) +
-            (row % Gmm1CvPlan::Rows) * Gmm1CvPlan::Columns * sizeof(bfloat16_t);
+        const uint32_t stageBegin = row / Gmm1CvPlan::Rows * Gmm1CvPlan::Rows;
+        const uint32_t stageRows = min(Gmm1CvPlan::Rows, cvActivation_.rows - stageBegin);
         const uint32_t outputN = commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF;
         const uint32_t scaleN = CeilDiv(outputN, MXFP_DIVISOR_SIZE) * MXFP_MULTI_BASE_SIZE;
         AscendC::SetCtrlSpr<60, 60>(0);
-        cvActivationOp_({count, cvActivation_.columns, 0, 0},
-            {(cvActivation_.m + row) * outputN + cvActivation_.n,
-             (cvActivation_.m + row) * scaleN + CeilDiv(cvActivation_.n, MXFP_DIVISOR_SIZE) * MXFP_MULTI_BASE_SIZE,
-             0, 0, 0, 0}, 0, false, input);
+        cvActivationOp_.RunCvStep(
+            {(cvActivation_.m + stageBegin) * outputN + cvActivation_.n,
+             (cvActivation_.m + stageBegin) * scaleN + CeilDiv(cvActivation_.n, MXFP_DIVISOR_SIZE) * MXFP_MULTI_BASE_SIZE,
+             0, 0, 0, 0},
+            {static_cast<uint32_t>(readySequence), row - stageBegin, count, stageRows});
     }
     if (cvActivation_.Advance(count)) {
         // 仅该stage的最后一组读取/写出入队后归还EMPTY；另一stage仍由其自己的credit保护。
@@ -478,7 +477,6 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
             .yScaleGmAddr = params_.workspaceInfo.activationQuantScalePtr, .clampLimit = t->clampLimit,
             .actMode = t->actMode, .actSubMode = t->actSubMode, .activationAlpha = t->activationAlpha,
             .activationBeta = t->activationBeta, .ubBaseBytes = Gmm1CvPlan::ScratchBase});
-        Gmm1CvScratch::Init();
     } else {
         Aiv1ActivationUb::Init();
     }
@@ -523,8 +521,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         }
     }
     // 生命周期的唯一收尾。先前slice的ready已发布；不重置仍在飞行的cursor或复用事件。
-    if constexpr (UseCv) Gmm1CvScratch::Finish();
-    else Aiv1ActivationUb::Finish();
+    if constexpr (!UseCv) Aiv1ActivationUb::Finish();
     DrainDispatchCopyBuffers<ActivationType, QuantScaleOutType, false>(
         tokenDispatchConfig_, params_, tokenDispatchScratch_, dispatchAsync_.progress);
     DrainCombineRowBuffers(combineRowSequence_, waveCombineBuffers_.rowBufferCount, waveCombineBuffers_.eventBase);
@@ -858,7 +855,6 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         .yScaleGmAddr=params_.workspaceInfo.activationQuantScalePtr,.clampLimit=t->clampLimit,
         .actMode=t->actMode,.actSubMode=t->actSubMode,.activationAlpha=t->activationAlpha,
         .activationBeta=t->activationBeta,.ubBaseBytes=Gmm1CvPlan::ScratchBase});
-    Gmm1CvScratch::Init();
     next();
     bool hasCombine=NextAivSlice(combine,AivTaskKind::Combine),preferCombine=false;
     ExpertTokenPosition dispatch{};
@@ -910,7 +906,6 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
             while (AscendC::GetSystemCycle()-start<GM_FLAG_POLL_BACKOFF_CYCLES) {}
         }
     }
-    Gmm1CvScratch::Finish();
     DrainDispatchCopyBuffers<ActivationType,QuantScaleOutType,false>(
         tokenDispatchConfig_,params_,tokenDispatchScratch_,dispatchAsync_.progress);
     DrainCombineRowBuffers(combineRowSequence_,waveCombineBuffers_.rowBufferCount,waveCombineBuffers_.eventBase);

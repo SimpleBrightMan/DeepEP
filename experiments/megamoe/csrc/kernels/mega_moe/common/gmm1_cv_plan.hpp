@@ -8,7 +8,7 @@
 #define MEGAMOE_CV_INLINE constexpr inline
 #endif
 namespace MegaMoeImpl {
-// 物理N256包含gate/up各128列。两个FIX输入槽常驻，量化scratch独立，不能覆盖在途CV数据。
+// 物理N256包含gate/up各128列；量化结果只压缩到已消费前缀，EMPTY仍由stage写出完成归还。
 struct Gmm1CvPlan {
     static constexpr uint32_t Rows = 128U;
     static constexpr uint32_t Columns = 256U;
@@ -18,8 +18,24 @@ struct Gmm1CvPlan {
     static constexpr uint32_t ScratchBase = Stages * SlotBytes;
     static constexpr uint32_t ScratchBytes = 16U * 1024U;
     static constexpr uint32_t End = ScratchBase + ScratchBytes;
+    static constexpr uint32_t ScaleBytes = Rows * Columns / 64U;
+    static constexpr uint32_t ScaleBase = End - Stages * ScaleBytes;
     static MEGAMOE_CV_INLINE uint32_t ChunkCount(uint32_t rows) { return (rows + Rows - 1U) / Rows; }
     static MEGAMOE_CV_INLINE uint32_t SlotOffset(uint32_t seq) { return seq % Stages * SlotBytes; }
+    static MEGAMOE_CV_INLINE uint32_t ScaleOffset(uint32_t seq) { return ScaleBase + seq % Stages * ScaleBytes; }
+};
+struct Gmm1CvStep {
+    uint32_t sequence, row, rows, stageRows;
+    MEGAMOE_CV_INLINE bool Last() const { return row + rows == stageRows; }
+    MEGAMOE_CV_INLINE uint32_t InputOffset() const {
+        return Gmm1CvPlan::SlotOffset(sequence) + row * Gmm1CvPlan::Columns * 2U;
+    }
+    MEGAMOE_CV_INLINE uint32_t OutputOffset() const {
+        return Gmm1CvPlan::SlotOffset(sequence) + row * Gmm1CvPlan::Columns / 2U;
+    }
+    MEGAMOE_CV_INLINE uint32_t ScaleOffset() const {
+        return Gmm1CvPlan::ScaleOffset(sequence) + row * Gmm1CvPlan::Columns / 64U;
+    }
 };
 // 当前逻辑tile的持久状态；只在任务边界构造地址/shape，32行yield不重复重建专家上下文。
 struct Gmm1CvTask {

@@ -31,7 +31,7 @@
 #include "activation/swigluoai_activation.hpp"
 #include "block_epilogue_ub_layout.hpp"
 #include "../common/aiv1_activation_ub.hpp"
-#include "../common/gmm1_cv_scratch.hpp"
+#include "../common/gmm1_cv_plan.hpp"
 #include "quant/mx_quant_common.hpp"
 #include "quant/mx_quant_compute_scale.hpp"
 #include "quant/mxfp4_quant.hpp"
@@ -88,8 +88,8 @@ public:
     __aicore__ inline auto GetTopkWeightTensor();
     // 计算并写回一个激活/量化 tile，不包含流水通知。
     __aicore__ inline void operator()(const BlockShape& blockShape, const BlockCoord& blockCoord,
-                                      uint16_t pingpongIdx = 0, bool deferOutput = false,
-                                      uint32_t cvInputOffset = static_cast<uint32_t>(-1));
+                                      uint16_t pingpongIdx = 0, bool deferOutput = false);
+    __aicore__ inline void RunCvStep(const BlockCoord& stageOutput, const Gmm1CvStep& step);
     __aicore__ inline void UpdateGlobalAddr(const BlockCoord& baseOffset);
     __aicore__ inline void UpdateNextProblem(const ProblemShape& problemShape);
 
@@ -387,8 +387,7 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
                                                       IsInterleaved_>::operator()(const BlockShape& blockShape,
                                                                                   const BlockCoord& blockCoord,
                                                                                   uint16_t pingpongIdx,
-                                                                                  bool deferOutput,
-                                                                                  uint32_t cvInputOffset)
+                                                                                  bool deferOutput)
 {
     uint32_t tileRowCount = Get<M_VALUE>(blockShape);     // 128
     uint32_t tileColumnCount = Get<N_VALUE>(blockShape);  // 256
@@ -408,12 +407,6 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
         (__ubuf__ int8_t*)quantOutput_.GetPhyAddr(), (__ubuf__ uint16_t*)quantScaleOutput_.GetPhyAddr(),
         (__ubuf__ uint16_t*)maxExp_.GetPhyAddr(), (__ubuf__ uint16_t*)halfScale_.GetPhyAddr(), tileColumnCount,
         pingpongIdx);
-    if (cvInputOffset != static_cast<uint32_t>(-1)) {
-        // CV输入槽只读；输出/scratch独立常驻，不能原地压缩后覆盖另一未消费行。
-        LocalTensor<DataTypeIn> cvInput(TPosition::VECCALC, cvInputOffset, MAX_SINGLE_MN);
-        ubPointers.firstInput = (__ubuf__ DataTypeIn*)cvInput.GetPhyAddr();
-        ubPointers.secondInput = ubPointers.firstInput + tileColumnCount;
-    }
     uint32_t outputRowStrideElements = Ops::Base::CeilAlign(tileColumnCount, static_cast<uint32_t>(ONE_BLK_SIZE));
     RunGatedActivationTile(ubPointers.firstInput, ubPointers.secondInput, ubPointers.activationOutput,
                            static_cast<uint16_t>(tileRowCount), static_cast<uint16_t>(tileColumnCount),
@@ -442,10 +435,7 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
         StoreQuantScaleCompact(quantScaleGlobal_, quantScaleOutput_, tileRowCount, yScaleOffset,
                                intermediateHiddenScaleElements_, tileColumnCount);
     }
-    if (cvInputOffset != static_cast<uint32_t>(-1)) {
-        // 下个32行step在V队列消费该credit，保护单份量化scratch，不阻塞Scalar。
-        Gmm1CvScratch::Release();
-    } else if (deferOutput) {
+    if (deferOutput) {
         // MTE3->V等待已经排入V队列；再由V通知下轮MTE2，保护输入/输出重叠的UB。
         // Scalar可以切换到Dispatch/Combine，不在这里等待量化写出完成。
         Aiv1ActivationUb::Release();
@@ -455,6 +445,45 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
         SetFlag<HardEvent::MTE3_S>(0);
         WaitFlag<HardEvent::MTE3_S>(0);
     }
+}
+
+// 每32行保留原有BF16舍入及MX计算，stage末尾才提交一次量化结果/scale写出。
+// FP8输出压缩到已读完的BF16前缀，不会覆盖后续输入；两stage分别由FIX full/empty保护。
+template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
+          bool IsInterleaved_>
+__aicore__ inline void
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
+                               IsInterleaved_>::RunCvStep(const BlockCoord& stageOutput, const Gmm1CvStep& step)
+{
+    static_assert(IsInterleaved_ && !TopkWeightsPrefetch && TileM == Gmm1CvPlan::StepRows &&
+                  TileN == Gmm1CvPlan::Columns, "CV step requires paired 32x256 input");
+    static_assert(IsSameType<DataTypeOut, fp8_e4m3fn_t>::value || IsSameType<DataTypeOut, fp8_e5m2_t>::value,
+                  "CV in-place compression requires FP8 output");
+    constexpr uint32_t columns = Gmm1CvPlan::Columns / 2U;
+    const uint32_t slot = Gmm1CvPlan::SlotOffset(step.sequence);
+    LocalTensor<DataTypeIn> input(TPosition::VECCALC, step.InputOffset(), TileM * TileN);
+    LocalTensor<int8_t> output(TPosition::VECCALC, slot, Gmm1CvPlan::SlotBytes);
+    LocalTensor<int8_t> scale(TPosition::VECCALC, Gmm1CvPlan::ScaleOffset(step.sequence), Gmm1CvPlan::ScaleBytes);
+    UbPointers p{};
+    p.firstInput = (__ubuf__ DataTypeIn*)input.GetPhyAddr();
+    p.secondInput = p.firstInput + columns;
+    p.activationOutput = (__ubuf__ bfloat16_t*)gluRes_.GetPhyAddr();
+    p.quantOutput = (__ubuf__ int8_t*)output.GetPhyAddr() + step.OutputOffset() - slot;
+    p.quantScale = (__ubuf__ uint16_t*)((__ubuf__ int8_t*)scale.GetPhyAddr() +
+        step.ScaleOffset() - Gmm1CvPlan::ScaleOffset(step.sequence));
+    p.maxExp = (__ubuf__ uint16_t*)maxExp_.GetPhyAddr();
+    p.reciprocalScale = (__ubuf__ uint16_t*)halfScale_.GetPhyAddr();
+    RunGatedActivationTile(p.firstInput, p.secondInput, p.activationOutput,
+                          static_cast<uint16_t>(step.rows), columns, columns);
+    RunMxQuantTile(p, static_cast<uint16_t>(step.rows), columns);
+    if (!step.Last()) return;
+    SetFlag<HardEvent::V_MTE3>(0);
+    WaitFlag<HardEvent::V_MTE3>(0);
+    StoreQuantOutput(quantOutputGlobal_, output, step.stageRows, Get<Y_IDX>(stageOutput),
+                     intermediateHiddenSize_, columns);
+    StoreQuantScaleCompact(quantScaleGlobal_, scale, step.stageRows, Get<Y_SCALE_IDX>(stageOutput),
+                           intermediateHiddenScaleElements_, columns);
+    // 调度器在MTE3队列归还EMPTY，两个写出均包含在该依赖之前。
 }
 
 }  // namespace MegaMoeImpl

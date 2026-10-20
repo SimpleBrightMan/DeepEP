@@ -26,10 +26,8 @@ int64_t GetSystemCycle() {
 #define __aicore__
 #include "common/aiv1_activation_ub.hpp"
 #include "common/gmm1_cv_plan.hpp"
-#include "common/gmm1_cv_scratch.hpp"
 using MegaMoeImpl::Aiv1ActivationUb;
 using MegaMoeImpl::Gmm1CvPlan;
-using MegaMoeImpl::Gmm1CvScratch;
 namespace AscendTimer { constexpr int NO_WAVE = -1; }
 constexpr int GM_FLAG_POLL_BACKOFF_CYCLES = 1;
 template <typename A, typename S, bool P, class... T> void DrainDispatchCopyBuffers(T...) {}
