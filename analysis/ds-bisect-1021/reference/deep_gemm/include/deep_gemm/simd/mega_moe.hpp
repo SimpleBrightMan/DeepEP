@@ -187,8 +187,9 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
             vector_uint8_t packed_sf_half, unused_sf_half;
             asc_intlv(packed_sf_half, unused_sf_half, reinterpret_cast<vector_uint8_t&>(bits[0]),
                       reinterpret_cast<vector_uint8_t&>(bits[1]));
-            asc_storealign_1st(output_sf + sf_pair_idx * STORE_BLOCK_M,
-                               reinterpret_cast<vector_int16_t&>(packed_sf_half), m_idx + m_offset);
+            // 反向布局消融：UB和GM同时恢复row-major，数值与真实完成协议不变。
+            asc_storealign_1st(output_sf + (m_idx + m_offset) * kNumPairsPerRow + sf_pair_idx,
+                               reinterpret_cast<vector_int16_t&>(packed_sf_half), 0);
         }
     }
 }

@@ -554,7 +554,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                 if (sf_pair_idx % kNumSFPairsPerChunk == 0) {
                     wait<PIPE_MTE1, PIPE_MTE2>(kSFEmpty, sf_stage_idx);
                     copy_gm_to_l1_mx(l1_sfb[sf_stage_idx],
-                                     gm_ptr<int16_t, Major::K>(num_sf_pairs, reinterpret_cast<uintptr_t>(task_weights.sf + sf_offset + sf_pair_idx)),
+                                     gm_ptr<int16_t, Major::MN>(BLOCK_N, reinterpret_cast<uintptr_t>(task_weights.sf + sf_offset + sf_pair_idx * BLOCK_N)),
                                      BLOCK_N, num_chunk_pairs, weight_sf_l2_hint);
                 }
 
@@ -583,7 +583,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                                          valid_m, num_chunk_pairs, asc_load_l2_cache_mode::NORMAL_LAST_VICTIM);
                     } else {
                         copy_gm_to_l1_mx(l1_sfa[sf_stage_idx],
-                                         gm_ptr<int16_t, Major::MN>(BLOCK_M, reinterpret_cast<uintptr_t>(input_sf + sf_pair_idx * BLOCK_M)),
+                                         gm_ptr<int16_t, Major::K>(num_sf_pairs, reinterpret_cast<uintptr_t>(input_sf + sf_pair_idx)),
                                          valid_m, num_chunk_pairs, asc_load_l2_cache_mode::NORMAL_LAST_VICTIM);
                     }
 
@@ -734,7 +734,7 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
     // Source begin and push tokens start at 32-byte boundaries
     constexpr ub_ptr<bfloat16_t> ub_accum(STORE_BLOCK_M, BLOCK_N);
     constexpr ub_ptr<float> ub_route_weights(1, STORE_BLOCK_M, ub_accum.offset(kNumEpilogueStages));
-    constexpr ub_ptr<int16_t> ub_output_sf(kNumOutputSFPairs, STORE_BLOCK_M, ub_route_weights.offset(1));
+    constexpr ub_ptr<int16_t> ub_output_sf(STORE_BLOCK_M, kNumOutputSFPairs, ub_route_weights.offset(1));
 
     // Dispatch inputs and source ranges
     constexpr ub_ptr<float8_e4m3_t> ub_pull_token(1, config.hidden, ub_output_sf.offset(kNumEpilogueStages));
@@ -982,7 +982,7 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
             const auto input = ub_accum[stage_idx].ptr() + m_idx_in_stage * BLOCK_N;
             const auto output = reinterpret_cast<__ubuf__ float8_e4m3_t*>(ub_accum[stage_idx].ptr()) +
                                 m_idx_in_stage * (BLOCK_N / 2);
-            const auto output_sf = ub_output_sf[stage_idx].ptr() + m_idx_in_stage;
+            const auto output_sf = ub_output_sf[stage_idx].ptr() + m_idx_in_stage * kNumOutputSFPairs;
             if (is_shared) {
                 vf_swiglu_quant<false, STORE_BLOCK_M>(input, output, output_sf, nullptr, step_m, activation_clamp);
             } else {
@@ -1006,12 +1006,12 @@ __aicore__ inline void aiv1_epilogue_comm(__gm__ uint8_t* buffer, __gm__ bfloat1
                 const auto dst = dst_layout.data.get_ptr(buffer,
                     (output_m_idx + stage_m_begin) * num_cols + n_block_idx * (BLOCK_N / 2));
                 const auto dst_sf = dst_layout.sf.get_ptr(buffer,
-                    output_m_idx * num_sf_pairs + n_block_idx * kNumOutputSFPairs * BLOCK_M + stage_m_begin);
+                    (output_m_idx + stage_m_begin) * num_sf_pairs + n_block_idx * kNumOutputSFPairs);
 
                 copy_ub_to_gm(dst, ub_ptr<float8_e4m3_t>(STORE_BLOCK_M, BLOCK_N / 2, ub_accum[stage_idx].addr),
                               stage_valid_m, BLOCK_N / 2, num_cols, kWriteThroughShare);
                 copy_ub_to_gm(dst_sf, ub_output_sf[stage_idx],
-                              kNumOutputSFPairs, stage_valid_m, BLOCK_M * sizeof(int16_t), kWriteThroughShare);
+                              stage_valid_m, kNumOutputSFPairs, num_sf_pairs * sizeof(int16_t), kWriteThroughShare);
                 notify_intra_block<PIPE_MTE3, 1>(kEpilogueEmpty, stage_idx);
             }
             if (epi.m_idx_in_block != epi.valid_m)

@@ -1,6 +1,6 @@
 {
-  "weight_sf_layout": "n_major",
-  "activation_sf_layout": "pair_major",
+  "weight_sf_layout": "pair_major",
+  "activation_sf_layout": "row_major",
   "numeric_contract": "DS",
-  "change": "Reverse ablation: restore our N-major weight SF storage inside full DS; no numerical change"
+  "change": "Reverse ablation: restore our row-major activation SF through producer UB, GM and GMM2 reader; no numerical change"
 }
