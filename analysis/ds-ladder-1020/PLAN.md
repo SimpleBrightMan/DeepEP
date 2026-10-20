@@ -20,6 +20,7 @@
 |L9|Dispatch route index直接Scalar读取|隔离小批DMA索引与MTE2_S成本|仍按真实prefix/ordinal取数，不改变源/目的排列|
 |L10|DS strided通信owner|先隔离物理core→目标行分配，不混入源行置换|仅actual M≤128的small-linear；按真实行数贡献ready，第0个M256槽；M128仍一次最多4行，未宣称完整DS两行yield|
 |L11|DS源行互素置换|在strided owner上单独验证跨peer打散|目标行不变；按新源行解析peer/ordinal并写metadata；不能把source与destination混淆|
+|L12|小M L0C半槽固定64KiB间距|补齐DS物理地址差异；不同时增加M计算量|只改unit-flag独立半块FIX路径；实际M/MAC及scale不变；收益若存在仍须区分地址计算与物理布局|
 |待续|紧凑metadata、两行通信yield、输入/scale布局、计算后端及数学合同差异|仍未全部迁移，不能宣称已闭合DS|源/目的映射与数据可见性；数学变化单列，不冒充逐位等价优化|
 |终点对照|完整冻结DS|用于检查测量链和差距能否闭合，不冒充单项收益|若舍入/加权等合同不同，单独列为语义变更，不能称等价优化|
 

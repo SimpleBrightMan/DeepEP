@@ -711,7 +711,7 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
         return;
     }
     // 按实际单卡 BS 选择，不能用专家 slice 行数：Prefill 恢复两槽以限制并发搬运，Decode 保留六槽。
-    // AIV1 任务不抢占；Dispatch/Combine 均排空后才交还 UB 和事件 0..5。
+    // 常驻调用跨任务保留行环/credit；非持久调用在返回前排空，不得混用两种生命周期。
     auto buffers = residentBuffers != nullptr ? *residentBuffers :
         (common.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS ? InitWaveCombineBuffers(common, scratch)
                                                       : InitWaveCombineBuffers<false, 2U>(common, scratch));

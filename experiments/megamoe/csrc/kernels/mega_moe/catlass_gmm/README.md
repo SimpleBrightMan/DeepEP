@@ -59,3 +59,13 @@ GMM1 stage 入口直接选择计算或兼容向量后处理，不再经过 `Gmm1
 
 CPU 模型不能证明设备可见性。验收需覆盖尾 K/N/M、空/偏斜专家、跨 Wave/阶段 handoff、重复 launch、
 共享专家和兼容路径，并分开报告输出等价、独立 Golden、性能与 timer 开销。
+
+## DS累计迁移实验的small-linear路径
+
+本实验分支在实际每专家M≤128、无共享专家等条件下使用DS lookahead task流，参见
+`../mega_moe_wave_a8w4.hpp::ProcessSmallLinearTasks/ProcessSmallLinearAiv1`。
+这一路径与上面的兼容Wave不同：GMM1/GMM2共享epilogue序号及两份full12/13、empty14/15；
+GMM1由V等FIX full、MTE3写出后归还empty，GMM2由AIV1 Scalar等真正FIX full后发布ready/归还empty。
+不再逐GMM2 phase执行生产端DrainOutput；最终唯一owner仍负责End和全部credit收尾。
+CV输出在已消费输入前缀内压缩，stage末尾统一写出，scale槽独立。没有把整个CATLASS计算叶子替换为DS C API。
+原生性能身份以`analysis/ds-ladder-1020/README.md`的设备提交为准，后续注释整理不冒充重新测量。

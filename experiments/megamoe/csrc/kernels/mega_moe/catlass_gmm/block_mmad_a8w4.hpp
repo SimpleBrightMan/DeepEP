@@ -693,7 +693,11 @@ protected:
                                    tla::MakeShape(CeilDiv<MX_SCALE_GROUP_NUM>(kk), nn));
                 // GetTile 只记录逻辑 coord，而 TileMmad 直接使用 data()。
                 // L0C 必须显式偏移，否则第二半会覆盖第一半。
-                auto tc = tla::MakeTensor(c.data()[c.layout()(tla::MakeCoord(0, no))],
+                // unit-flag路径每半块独立FIX；采用DS固定64KiB间距，不把M64补算成M128。
+                // 非unit-flag路径仍需后续整块copy，保留原父layout，不能只改写入地址。
+                const auto cOffset = ENABLE_UNIT_FLAG ? no / 128U * Buffers::SmallL0CHalfElements
+                                                     : c.layout()(tla::MakeCoord(0, no));
+                auto tc = tla::MakeTensor(c.data()[cOffset],
                                           tla::MakeLayoutL0C(m, nn), Arch::PositionL0C{});
                 AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
                 copyL1ToL0B(l0b, tb, tsb);

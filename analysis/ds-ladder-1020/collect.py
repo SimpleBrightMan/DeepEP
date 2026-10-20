@@ -49,7 +49,7 @@ def validate(node,label,method,identity):
     return dict(label=str(folder.relative_to(root)),mean_us=report['mean_us'],rank_max_mean_us=report['rank_max_mean_us'])
 
 for node in sorted(root.iterdir()):
-    if not node.is_dir() or node.name=='native': continue
+    if not node.is_dir() or node.name in ('native','screen'): continue
     rc=node/'campaign.rc'
     if not rc.exists() or rc.read_text().strip()!='0':
         summary['incomplete'].append(dict(name=node.name,build_rc=(node/'build.rc').read_text().strip() if (node/'build.rc').exists() else None,

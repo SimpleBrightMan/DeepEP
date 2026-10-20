@@ -28,6 +28,8 @@ int main() {
   static_assert(B::BBase == B::ABase + B::AStages*B::ABytes);
   static_assert(B::ScaleABase == B::BBase + B::BStages*B::BBytes);
   static_assert(B::ScaleBBase + B::ScaleStages*B::ScaleBytes == 512*1024);
+  static_assert(B::SmallL0CHalfElements*4 == 64*1024);
+  static_assert(B::SmallL0CHalfElements*2*4 <= 256*1024);
   for (unsigned m : {1,4,12,32,64,127,128,129,256})
     for (unsigned n : {64,128,192,256}) {
       auto p = MakeA8W4KPlan(m);
@@ -35,6 +37,7 @@ int main() {
       assert(p.kb*p.bColumns <= B::BBytes);
       assert(p.ka==p.kb && 2048%p.kb==0);
       assert((n+p.bColumns-1)/p.bColumns <= B::BStages);
+      if(m<=128)assert(((m+15)/16*16)*128 <= B::SmallL0CHalfElements);
       std::cout << m << " " << n << " " << p.ka << " " << p.kb << " " << p.bColumns << "\\n";
     }
 }

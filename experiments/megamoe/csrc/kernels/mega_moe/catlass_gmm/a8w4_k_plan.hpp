@@ -10,6 +10,8 @@ struct A8W4BufferPlan {
     static constexpr uint32_t AStages = 3, BStages = 4, ScaleStages = 2;
     static constexpr uint32_t ABytes = 64U * 1024U, BBytes = 64U * 1024U;
     static constexpr uint32_t ScaleBytes = 16U * 1024U;
+    // 对齐DS的小M输出槽间距；物理半槽128x128 FP32，实际MMAD的M仍由问题给出。
+    static constexpr uint32_t SmallL0CHalfElements = 128U * 128U;
     static constexpr uint32_t ABase = 0, BBase = AStages * ABytes;
     static constexpr uint32_t ScaleABase = BBase + BStages * BBytes;
     static constexpr uint32_t ScaleBBase = ScaleABase + ScaleStages * ScaleBytes;

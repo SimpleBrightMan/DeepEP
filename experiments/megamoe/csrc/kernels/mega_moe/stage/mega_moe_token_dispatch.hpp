@@ -14,8 +14,8 @@
 
 /*
  * 功能：按真实路由搬运 Dispatch 数据并发布 GMM1 ready；输入为专家 slice 和本核行范围。
- * 输出：与原 balance+rotate 一致的 token/scale/metadata 落位。
- * 保留 Prefill 的规则配额快路径；索引批量预取、token 环跨 peer 复用，不增加 UB 或核间同步。
+ * 输出：真实路由对应的token/scale/metadata；small-linear可置换物理行，metadata随源行移动。
+ * 保留 Prefill 的规则配额快路径；本累计版索引由Scalar直读GM，token环跨peer/任务复用。
  */
 
 #include "../common/mega_moe_utils.hpp"
@@ -51,7 +51,7 @@ struct TokenDispatchScratch {
     LocalTensor<int32_t> cumsumInfoTensor;
     // Contiguous runtime-sized ring. A slot view is built from this UB base on demand.
     uint32_t copyTmpBaseAddr;
-    LocalTensor<int32_t> metaInfoTensor;
+    LocalTensor<int32_t> metaInfoTensor; // 保留现有UB装配ABI；Scalar metadata路径不再读写该视图。
     LocalTensor<int32_t> expertTokenNumsOutTensor;
     int64_t revTokenElemCnt;
     int64_t revScaleElemCnt;
@@ -64,7 +64,7 @@ struct ExpertDispatchCoreRange {
     uint32_t localExpertRowEnd;
 };
 
-// 状态仅活到当前专家的 owner 范围结束；发布 ready 前必须排空，不能带入 SwiGLU 的 UB。
+// 行槽/credit跨专家owner范围存活；真正完成后才能发布ready，三类任务的常驻UB互不覆盖。
 struct DispatchCopyProgress {
     uint32_t issuedRows = 0U;
     int32_t pendingRow = -1;
@@ -287,8 +287,8 @@ __aicore__ inline void ConsumeRouteBatch(const TokenDispatchConfig& context, con
     batch.usedItems = 0U;
 }
 
-// 单个 owner 区间的唯一收尾：消费剩余索引、排空 token/scale/metadata 写出，最后才发布 ready。
-// 不能省略末行补写，也不能把 UB 或事件带入后续 SwiGLU；不增加全核/跨卡屏障。
+// 单个owner区间的唯一收尾：不能省略末行补写。同步调用排空后发布ready；
+// 异步调用保留行环，下一轮Retire观察真正MTE3完成后才发布，不增加全核/跨卡屏障。
 template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTileM, bool TopkWeightsPrefetch>
 __aicore__ inline void FinishDispatchOwnedRows(const TokenDispatchConfig& context,
                                                 const MoeSyncWorkspaceLayout& syncLayout, const Params& params,

@@ -43,6 +43,7 @@ with (out/'cpu-tests.log').open('x') as log:
     if (tests/'test_small_linear_task_schedule.py').exists(): selected.append(str(tests/'test_small_linear_task_schedule.py'))
     if (tests/'test_shared_epilogue_credit.py').exists(): selected.append(str(tests/'test_shared_epilogue_credit.py'))
     if (tests/'test_strided_row_owner.py').exists(): selected.append(str(tests/'test_strided_row_owner.py'))
+    if (tests/'test_strided_row_owner.py').exists(): selected.append(str(tests/'test_paired_supply_cpu.py'))
     subprocess.run([sys.executable, '-I', '-m', 'pytest', '-q', *selected],
         stdout=log, stderr=subprocess.STDOUT, check=True, timeout=180)
 cann = Path(os.environ['ASCEND_HOME_PATH'])

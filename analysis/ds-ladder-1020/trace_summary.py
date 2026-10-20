@@ -38,5 +38,12 @@ def summarize(path):
 if __name__=='__main__':
     p=argparse.ArgumentParser()
     p.add_argument('events',nargs='+')
+    p.add_argument('--brief',action='store_true')
+    p.add_argument('--output',type=Path)
     a=p.parse_args()
-    print(json.dumps([summarize(f) for f in a.events],indent=2))
+    results=[summarize(f) for f in a.events]
+    if a.brief:
+        for r in results:r.pop('per_group')
+    serialized=json.dumps(results,indent=2)
+    if a.output:a.output.write_text(serialized,encoding='utf-8')
+    print(serialized)

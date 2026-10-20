@@ -219,7 +219,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
                                            : dispatchJob.jobIndex + dispatchJob.totalJobs - shift;
             }
         }
-        // 小 batch 每核仅几行，直接二分源 rank，避免空 peer 的配额统计/扫描；索引预取仍保留。
+        // 小batch每核仅几行，直接二分源rank，避免空peer配额扫描；索引供给由公共Dispatch叶子负责。
         // 只改变行排列，token metadata 随行写出；GMM 和 Combine 的 slice/ready 边界不变。
         if (stridedSmall) {
             DispatchStridedSmallExpertSlice<ActivationType,QuantScaleOutType,GMM1_TILE_M>(
@@ -421,7 +421,7 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     // 只轮换当前 AIV1 的通信任务，不修改成员中的物理核编号。
     // 输入是 Combine 自己的逻辑 wave（cursor.wave），不是当前 Dispatch/GMM1 的进度；
     // BS>=4096 时 GMM2 滞后一轮，使用其他阶段的 wave 会把同一批输出分给错误的 owner。
-    // GMM2 反向分核、通信 owner 轮换都不改变 slice 的身份和实际生产核数量。
+    // GMM2计算核方向与通信owner轮换都不改变slice身份和实际生产核数量。
     auto combineJob = waveCombineJob_;
     if (combineJob.totalJobs != 0U && combineJob.jobIndex < combineJob.totalJobs) {
         uint32_t shift = static_cast<uint32_t>(cursor.wave % combineJob.totalJobs);
