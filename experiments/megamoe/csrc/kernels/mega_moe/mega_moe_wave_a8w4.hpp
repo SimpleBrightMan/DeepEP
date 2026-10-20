@@ -41,6 +41,8 @@ private:
     // 一个逻辑任务对应一对 gate/up；生产、SwiGLU 和 GMM2 ready 必须使用同一粒度。
     static constexpr uint32_t GMM1_TASK_N = FuseGateUp ? GMM1_FUSED_TILE_N : L1_TILE_N;
     static constexpr bool ASYNC_GMM1 = true;
+    // 本消融对齐DS两层同向分核；执行、空任务判断与完成通知必须共用这个方向。
+    static constexpr bool GMM2_REVERSE_BLOCKS = false;
     static_assert(!UseCv || FuseGateUp, "CV requires paired weights");
 
     using Gmm1Config = GmmKernel::Config<true, QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType,
@@ -551,7 +553,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm2
             GetExpertSliceInWave(wave, expertIdx, expertTokenCount, gmm2ExpertContext.globalTokenStartIndex);
         if (slice.rowCount != 0U) {
             this->template RunGmm2CombineForExpert<FuseGateUp>(gmm2ExpertContext, slice, gmm2AddrInfo, startBlockIdx,
-                                                               gmm2WaveContext_);
+                                                               gmm2WaveContext_, GMM2_REVERSE_BLOCKS);
         }
     }
     {
@@ -575,7 +577,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm2
                         : GetExpertTokenCountFromWorkspace(params_.workspaceInfo.expertRevTokenNumsPtr, countWorkspace_,
                                                            commonConfig_.moeExpertPerRank, expert);
                 const uint32_t tiles = GetMGroupCountForRows(rowEnd - rowBegin, GMM1_TILE_M) * nTiles;
-                if (GetGmmFirstOwnedTile(job.jobIndex, job.totalJobs, notifyStartBlockIdx, true) < tiles) {
+                if (GetGmmFirstOwnedTile(job.jobIndex, job.totalJobs, notifyStartBlockIdx, GMM2_REVERSE_BLOCKS) < tiles) {
                     NotifyTokenCombineSliceReady(params_, expert, rowBegin);
                 }
                 notifyStartBlockIdx = (notifyStartBlockIdx + tiles) % job.totalJobs;
@@ -665,7 +667,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     GMMAddrInfo gmm2AddrInfo{};
 
     // 两阶段各自跨专家、跨 Wave 轮转。GMM1 从物理核 0 正向分配，
-    // GMM2 的逻辑核号反转，从物理核 blockNum-1 反向分配。
+    // GMM2 在本消融中也同向分配；完成发布使用同一个方向常量。
     uint32_t gmm1StartBlockIdx = 0U;
     uint32_t gmm2StartBlockIdx = 0U;
 

@@ -11,13 +11,13 @@
 |L0|当前统一CV/GM候选|同窗口起点|真实通信、同输入、同数学实现|
 |L1|Combine metadata由GM直接Scalar读取，替代小批DMA→UB→Scalar|独立叶子边界，先隔离短任务控制成本|保留既有GMM2 ready；目的rank/token/topk不变；先不改metadata ABI|
 |L2|小M最后K的N半块完成后直接发FIX|验证MMAD/FIX接续，而非再删外层等待|每N半块unit flag，真正FIX full；不能覆盖未释放UB|
-|L3|同一L0A/B就绪边界覆盖A/B/scale，缩减重复发射控制|DS用B ready覆盖同队列先发的A；核对当前已一致部分|不删除真实输入依赖，不把模板数量当运行成本|
+|L3|GMM2与GMM1同向分核|DS采用同向全局task分配；先独立验证反向分核差异|执行、空任务与完成通知必须同方向；其他兼容路径维持原默认|
 |L4|统一计算task流/DS lookahead顺序|重叠关键的较大协议修改放在独立叶子验证之后|AIC/AIV0/AIV1同序；各自唯一cursor；空专家/尾块/跨wave|
 |L5|SwiGLU+MX融合VF、stage内累计|剩余消费者差异，必须与数学契约分开|保留BF16舍入与后GMM2加权；不直接复制DS前置route weight|
 |L6|DS通信row cursor、紧凑metadata及readiness协议|牵涉布局和三角色依赖，作为闭合协议迁移|源/目的映射与数据可见性；不能仅换flag编号|
 |终点对照|完整冻结DS|用于检查测量链和差距能否闭合，不冒充单项收益|若舍入/加权等合同不同，单独列为语义变更，不能称等价优化|
 
-已接近一致、不重复计功：L1 A3/B4、小M K512/N128和L0A跨N复用、双128行CV槽、32行VF推进、2pull/4push与常驻通信UB。
+已接近一致、不重复计功：L1 A3/B4、小M K512/N128和L0A跨N复用、同MTE1队列上B ready覆盖此前A/scale、双128行CV槽、32行VF推进、2pull/4push与常驻通信UB。
 
 ## 测量
 

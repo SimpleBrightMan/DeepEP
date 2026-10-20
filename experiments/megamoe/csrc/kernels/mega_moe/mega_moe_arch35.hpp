@@ -101,7 +101,7 @@ protected:
     template <bool SourceGmm1Fused, typename WaveKernel>
     __aicore__ inline void RunGmm2CombineForExpert(const ExpertContext& expertContext, const ExpertSlice& slice,
                                                    GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx,
-                                                   WaveKernel& gmm2WaveContext);
+                                                   WaveKernel& gmm2WaveContext, bool reverseBlocks = true);
 
     __aicore__ inline void PrepareGmmExpertContext(ExpertContext& expertContext, uint32_t expertIdx);
     __aicore__ inline void ProcessSharedExpertGmm1(int32_t& gmm1TileReadySequence);
@@ -671,11 +671,12 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
                                                                                  const ExpertSlice& slice,
                                                                                  GMMAddrInfo& gmmAddrInfo,
                                                                                  uint32_t& startBlockIdx,
-                                                                                 WaveKernel& gmm2WaveContext)
+                                                                                 WaveKernel& gmm2WaveContext,
+                                                                                 bool reverseBlocks)
 {
     const uint32_t nTiles = Ops::Base::CeilDiv(commonConfig_.tokenHiddenDim, uint32_t(L1_TILE_N));
     const uint32_t tileCount = GetMGroupCountForRows(slice.rowCount, GMM1_TILE_M) * nTiles;
-    if (HandleWaveProblemWithoutWork(tileCount, gmmExecutionConfig_.blockJob, startBlockIdx, true)) return;
+    if (HandleWaveProblemWithoutWork(tileCount, gmmExecutionConfig_.blockJob, startBlockIdx, reverseBlocks)) return;
 
     UpdateMoeExpertGmm2GlobalBuffer<Weight1Type, ActivationQuantOutType, QuantScaleOutType>(
         gmmExecutionConfig_, syncWorkspaceLayout_, params_.workspaceInfo, moeWeightTensorListAddrs_, gmmAddrInfo,
@@ -691,7 +692,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
                 false, true, false, true, SourceGmm1Fused>(
         shape, gmmAddrInfo, startBlockIdx, gmmExecutionConfig_.blockJob,
         static_cast<uint32_t>(Get<M_VALUE>(expertContext.problemShape)), slice.rowStartInExpert, &params_, nullptr,
-        true, &gmm2WaveContext);
+        reverseBlocks, &gmm2WaveContext);
     if constexpr (g_coreType == AIV) {
         if (GetSubBlockIdx() == 0U) timer_.EndSpan(AscendTimer::AIV_GMM2_PROLOGUE);
     }
