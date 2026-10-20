@@ -1,6 +1,6 @@
 #include <cassert>
 #include <vector>
-#include "small_linear_task_schedule.hpp"
+#include "common/small_linear_task_schedule.hpp"
 int main()
 {
     using namespace MegaMoeImpl;

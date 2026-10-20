@@ -64,6 +64,10 @@ struct WaveHarness {
     static constexpr uint32_t GMM1_TASK_N = FuseGateUp ? 128 : 256;
     static constexpr bool ENABLE_A8W4 = true;
     static constexpr bool ASYNC_GMM1 = CombineQuantMode == COMBINE_NO_QUANT;
+    static constexpr bool UseCv = false;
+    static constexpr bool GMM2_REVERSE_BLOCKS = false;
+    uint32_t SmallLinearBlockCount() { return uint32_t(-1); }
+    void ProcessSmallLinearTasks(uint32_t, int32_t&) { assert(false); }
     PipelineStub gmm1CatlassContext_, gmm2WaveContext_;
     struct { struct { uint32_t jobIndex = 0, totalJobs = 32; } blockJob; } gmmExecutionConfig_;
     int countWorkspace_ = 0;
@@ -167,7 +171,7 @@ struct WaveHarness {
     }
     template <bool SourceFused>
     void RunGmm2CombineForExpert(const ExpertContext& context, const ExpertSlice& slice, GMMAddrInfo&,
-                                uint32_t& start, PipelineStub&) {
+                                uint32_t& start, PipelineStub&, bool = true) {
         const bool final = false;
         assert(context.expertIdx == slice.expertIdx);
         assert(context.globalTokenStartIndex + slice.rowStartInExpert == slice.globalRowStart);
