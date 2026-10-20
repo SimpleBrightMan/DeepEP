@@ -19,7 +19,8 @@
 |L8|Dispatch metadata由Scalar写GM，去掉逐槽S/MTE3元数据事件|迁移DS轻量控制面；先不改256B/row ABI|payload仍受双槽MTE credit保护；发布ready前DDR barrier覆盖Scalar metadata|
 |L9|Dispatch route index直接Scalar读取|隔离小批DMA索引与MTE2_S成本|仍按真实prefix/ordinal取数，不改变源/目的排列|
 |L10|DS strided通信owner|先隔离物理core→目标行分配，不混入源行置换|仅actual M≤128的small-linear；按真实行数贡献ready，第0个M256槽；M128仍一次最多4行，未宣称完整DS两行yield|
-|L11|DS源行互素置换、紧凑metadata及readiness协议|牵涉布局和三角色依赖，作为闭合协议迁移|源/目的映射与数据可见性；不能仅换flag编号|
+|L11|DS源行互素置换|在strided owner上单独验证跨peer打散|目标行不变；按新源行解析peer/ordinal并写metadata；不能把source与destination混淆|
+|待续|紧凑metadata、两行通信yield、输入/scale布局、计算后端及数学合同差异|仍未全部迁移，不能宣称已闭合DS|源/目的映射与数据可见性；数学变化单列，不冒充逐位等价优化|
 |终点对照|完整冻结DS|用于检查测量链和差距能否闭合，不冒充单项收益|若舍入/加权等合同不同，单独列为语义变更，不能称等价优化|
 
 已接近一致、不重复计功：L1 A3/B4、小M K512/N128和L0A跨N复用、同MTE1队列上B ready覆盖此前A/scale、双128行CV槽、32行VF推进、2pull/4push与常驻通信UB。

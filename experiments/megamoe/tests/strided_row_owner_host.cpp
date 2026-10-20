@@ -20,6 +20,15 @@ int main() {
         for(auto count:seen)assert(count==1);
     }
     uint32_t row=0;
+    for(uint32_t rows=1;rows<=128;++rows)for(uint32_t sources=1;sources<=rows;++sources) {
+        const auto map=MegaMoeImpl::CoprimeRowPermutation::Make(rows,sources);
+        std::vector<uint32_t> seen(rows,0);
+        for(uint32_t r=0;r<rows;++r)++seen.at(map.Map(r));
+        for(auto count:seen)assert(count==1);
+        assert(map.stride<rows);
+    }
+    const auto ds64=MegaMoeImpl::CoprimeRowPermutation::Make(64,8);
+    assert(ds64.stride==9 && ds64.Map(1)==9 && ds64.Map(8)==8);
     MegaMoeImpl::StridedRowOwner invalid{0,128,0};
     assert(!invalid.Next(row));
 }

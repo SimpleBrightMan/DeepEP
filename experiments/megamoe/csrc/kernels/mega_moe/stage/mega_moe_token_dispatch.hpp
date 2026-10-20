@@ -518,7 +518,7 @@ __aicore__ inline void DispatchExpertSlice(const TokenDispatchConfig& context, c
 
 // 只供已验证每专家M<=128的small-linear闭合协议：一个专家只占M256的第0个ready槽。
 // 所有core贡献其真实行数，零行不贡献；sum(ownerRows)==专家实际行数后GMM1才可启动。
-// 此节点只迁移strided owner，不迁移DS的源行互素置换；metadata与数学输出均保持原映射。
+// 源行做DS式互素置换；目标行仍由strided owner分配，metadata记录置换后的真实源token。
 template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTileM>
 __aicore__ inline void DispatchStridedSmallExpertSlice(
     const TokenDispatchConfig& context, const MoeStageCommonConfig& common, const BlockJobContext& job,
@@ -528,15 +528,25 @@ __aicore__ inline void DispatchStridedSmallExpertSlice(
     if (job.totalJobs==0U || slice.globalRowStart>=context.maxOutputSize) return;
     const uint64_t available=context.maxOutputSize-slice.globalRowStart;
     const uint32_t rows=static_cast<uint32_t>(min(uint64_t(slice.rowCount),available));
+    const uint32_t expertPrefix=slice.expertIdx*common.worldSize;
+    uint32_t previous=expertPrefix==0U?0U:static_cast<uint32_t>(scratch.cumsumInfoTensor.GetValue(expertPrefix-1U));
+    uint32_t sources=0U;
+    for(uint32_t peer=0U;peer<common.worldSize;++peer) {
+        const uint32_t end=static_cast<uint32_t>(scratch.cumsumInfoTensor.GetValue(expertPrefix+peer));
+        sources+=end>previous;
+        previous=end;
+    }
+    const auto permutation=CoprimeRowPermutation::Make(rows,sources);
     StridedRowOwner owner{job.jobIndex,rows,job.totalJobs};
     DispatchRouteBatch batch{};
     uint32_t row=0U,contribution=0U;
     while (owner.Next(row)) {
-        const uint32_t global=static_cast<uint32_t>(slice.globalRowStart)+row;
-        const uint32_t peer=FindDispatchSourceRank(common,scratch,slice.expertIdx,global);
+        const uint32_t source=static_cast<uint32_t>(slice.globalRowStart)+permutation.Map(row);
+        const uint32_t destination=static_cast<uint32_t>(slice.globalRowStart)+row;
+        const uint32_t peer=FindDispatchSourceRank(common,scratch,slice.expertIdx,source);
         const uint32_t prefix=slice.expertIdx*common.worldSize+peer;
         const uint32_t begin=prefix==0U ? 0U : static_cast<uint32_t>(scratch.cumsumInfoTensor.GetValue(prefix-1U));
-        const PeerTransfer transfer{peer,global-begin,1U,global};
+        const PeerTransfer transfer{peer,source-begin,1U,destination};
         AppendPeerRouteSegment<ActivationType,QuantScaleType,false>(
             context,common,params,winRankAddr,scratch,slice.expertIdx,transfer,batch,async.progress);
         ++contribution;
