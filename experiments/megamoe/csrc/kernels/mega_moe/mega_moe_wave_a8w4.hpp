@@ -846,8 +846,8 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         if (!hasTask || !task.gmm1) return;
         AdvanceSmallLinearExpert(first,task.index/n1,firstEnd,firstNext);
         const uint32_t rows=static_cast<uint32_t>(Get<M_VALUE>(first.problemShape));
-        activation.slice={{first.expertIdx,0U,first.globalTokenStartIndex},
-            {first.expertIdx,rows,first.globalTokenStartIndex+rows}};
+        const uint64_t globalStart=static_cast<uint64_t>(first.globalTokenStartIndex);
+        activation.slice={{first.expertIdx,0U,globalStart},{first.expertIdx,rows,globalStart+rows}};
         activation.nextTile=task.index%n1;
         activation.nextRow=0U;
         activation.wave=task.index/job.totalJobs;
