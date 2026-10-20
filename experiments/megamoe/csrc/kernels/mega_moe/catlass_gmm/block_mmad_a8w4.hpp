@@ -353,9 +353,16 @@ public:
         const uint32_t stride = tla::get<1>(sb.stride()) / 2U;
         l1_ptr<int16_t> dst(256U, 32U, reinterpret_cast<uintptr_t>(l1MxScaleBTensorList[0].GetPhyAddr()));
         asc_sync_wait(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(3U + l1MxScaleAListId));
-        copy_gm_to_l1_mx(dst[l1MxScaleAListId],
-            gm_ptr<int16_t, Major::K>(stride, reinterpret_cast<uintptr_t>(base)),
-            256U, Min(32U,k / 64U), asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
+        using PairMajor = decltype(tla::MakeMxScaleLayout<ElementMxScaleB,Catlass::layout::RowMajor,true>(uint32_t{},uint32_t{}));
+        if constexpr (std::is_same_v<typename std::remove_const_t<SB>::Layout,PairMajor>) {
+            copy_gm_to_l1_mx(dst[l1MxScaleAListId],
+                gm_ptr<int16_t, Major::MN>(256U,reinterpret_cast<uintptr_t>(base)),
+                256U,Min(32U,k / 64U),asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
+        } else {
+            copy_gm_to_l1_mx(dst[l1MxScaleAListId],
+                gm_ptr<int16_t, Major::K>(stride,reinterpret_cast<uintptr_t>(base)),
+                256U,Min(32U,k / 64U),asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
+        }
         sfBPrimed_ = true;
     }
 
@@ -708,6 +715,8 @@ protected:
         const uint32_t aStride = tla::get<0>(a.stride());
         const uint32_t saStride = tla::get<0>(sa.stride()) / 2U;
         const uint32_t sbStride = tla::get<1>(sb.stride()) / 2U;
+        using PairMajor = decltype(tla::MakeMxScaleLayout<ElementMxScaleB,Catlass::layout::RowMajor,true>(uint32_t{},uint32_t{}));
+        constexpr bool PairMajorB = std::is_same_v<typename std::remove_const_t<SB>::Layout,PairMajor>;
         l1_ptr<float8_e4m3_t> la(128U, BlockK, reinterpret_cast<uintptr_t>(l1ATensorList[0].GetPhyAddr()));
         l1_ptr<float8_e4m3_t> lb(MadN, BlockK, reinterpret_cast<uintptr_t>(l1BTensorList[0].GetPhyAddr()));
         l1_ptr<int16_t> lsa(256U, SfPairs, reinterpret_cast<uintptr_t>(l1MxScaleATensorList[0].GetPhyAddr()));
@@ -723,9 +732,15 @@ protected:
                 if (ki == 0U && sfBPrimed_) sfBPrimed_ = false;
                 else {
                     asc_sync_wait(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(3U + sfSlot));
-                    copy_gm_to_l1_mx(lsb[sfSlot],
-                        gm_ptr<int16_t, Major::K>(sbStride, reinterpret_cast<uintptr_t>(gmSb + pair)),
-                        256U, pairs, asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
+                    if constexpr (PairMajorB) {
+                        copy_gm_to_l1_mx(lsb[sfSlot],
+                            gm_ptr<int16_t, Major::MN>(256U,reinterpret_cast<uintptr_t>(gmSb + pair * 256U)),
+                            256U,pairs,asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
+                    } else {
+                        copy_gm_to_l1_mx(lsb[sfSlot],
+                            gm_ptr<int16_t, Major::K>(sbStride,reinterpret_cast<uintptr_t>(gmSb + pair)),
+                            256U,pairs,asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM);
+                    }
                 }
             }
             asc_sync_wait(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(l1AListId));

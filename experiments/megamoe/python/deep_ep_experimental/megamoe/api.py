@@ -307,6 +307,18 @@ def _interleave_gate_up_128(tensor):
     )
 
 
+def _pack_weight_scale_blocks(scale):
+    """N256内按SF pair-major排列；只改变位模式位置，在计时区外完成。"""
+    import torch
+
+    e,n,pairs,two = scale.shape
+    if n % 256 or two != 2:
+        raise ValueError("FP4 blocked weight scales require N divisible by 256 and two UE8M0 per pair")
+    shape = scale.shape
+    raw = scale.view(torch.uint8).reshape((e,n // 256,256,pairs,2))
+    return raw.transpose(2,3).contiguous().reshape(shape).view(torch.float8_e8m0fnu)
+
+
 class _RoutedWeightPair(tuple):
     """Tuple-compatible immutable prepared weights; both layouts are built off the hot path."""
 
@@ -327,7 +339,9 @@ def transform_weights_for_mega_moe(
 ) -> tuple[WeightPair, WeightPair]:
     """Convert raw Ascend packed weights to NZ once, without quantizing again.
 
-    Raw inputs use [gate | up]. Routed FP4 GMM1 prepares both planar Prefill and
+    Prepared weights from earlier branches must be regenerated: FP4 GMM2 and paired
+    GMM1 now use N256-block SF pair-major storage, without changing external tensor shapes.
+    Planar GMM1 retains its original SF layout. Raw inputs use [gate | up]. Routed FP4 GMM1 prepares both planar Prefill and
     [gate128, up128] Decode layouts. Keep the returned l1 pair intact and immutable;
     the API selects its layout by actual BS without a timed conversion. Pass shared=True for
     shared experts, whose GMM1 remains planar. FP8 and GMM2 keep their layout.
@@ -373,7 +387,8 @@ def transform_weights_for_mega_moe(
                     )
                     planar_scale = scale.view(torch.uint8).clone().view(torch.float8_e8m0fnu)
                     weight = _interleave_gate_up_128(weight)
-                    scale = _interleave_gate_up_128(scale.view(torch.uint8)).view(torch.float8_e8m0fnu)
+                    scale = _pack_weight_scale_blocks(
+                        _interleave_gate_up_128(scale.view(torch.uint8)).view(torch.float8_e8m0fnu))
                     weight = torch_npu.npu_format_cast(
                         weight, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
                     )
@@ -389,6 +404,8 @@ def transform_weights_for_mega_moe(
                 input_dtype=torch_npu.float4_e2m1fn_x2,
             )
             _check_fp4_weight_format(weight, name)
+            if name == "l2_weights":
+                scale = _pack_weight_scale_blocks(scale)
         transformed.append((weight, scale))
     return tuple(transformed)
 

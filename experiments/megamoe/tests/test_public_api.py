@@ -297,7 +297,8 @@ def test_fp4_and_packed_e8m0_are_reinterpreted_without_numeric_cast(backend, dty
     for idx, (weight, scale) in enumerate(prepared):
         rows = order if idx == 0 else np.arange(512)
         np.testing.assert_array_equal(weight.data, raw[:, rows])
-        np.testing.assert_array_equal(scale.data, sf[:, rows].reshape(1, 512, 2, 2))
+        expected_sf = sf[:, rows].reshape(1,2,256,2,2).transpose(0,1,3,2,4).reshape(1,512,2,2)
+        np.testing.assert_array_equal(scale.data, expected_sf)
         assert weight.dtype == "uint8" and scale.dtype == "float8_e8m0fnu"
         assert weight.npu_format == 50
     assert sum(isinstance(event, tuple) and event[0] == "format_cast" for event in backend.events) == 3
@@ -306,13 +307,28 @@ def test_fp4_and_packed_e8m0_are_reinterpreted_without_numeric_cast(backend, dty
     np.testing.assert_array_equal(planar_scale.data, sf.reshape(1, 512, 2, 2))
 
 
-def test_shared_fp4_preparation_retains_planar_weights_and_scales(backend):
+def test_shared_fp4_preparation_retains_planar_gmm1_and_blocks_gmm2_scales(backend):
     raw = np.arange(512 * 64, dtype=np.uint8).reshape(1, 512, 64)
     sf = np.arange(512 * 4, dtype=np.uint8).reshape(1, 512, 2, 2)
     pair = Tensor(raw, "uint8"), Tensor(sf, "float8_e8m0fnu")
-    for weight, scale in api.transform_weights_for_mega_moe(pair, pair, shared=True):
+    for idx, (weight, scale) in enumerate(api.transform_weights_for_mega_moe(pair, pair, shared=True)):
         np.testing.assert_array_equal(weight.data, raw)
-        np.testing.assert_array_equal(scale.data, sf)
+        expected_sf = sf if idx == 0 else sf.reshape(1,2,256,2,2).transpose(0,1,3,2,4).reshape(sf.shape)
+        np.testing.assert_array_equal(scale.data, expected_sf)
+
+
+@pytest.mark.parametrize("n,pairs", [(256,48),(512,112),(1024,2)])
+def test_production_weight_scale_block_mapping_is_lossless(backend,n,pairs):
+    raw = np.arange(2*n*pairs*2,dtype=np.uint32).astype(np.uint8).reshape(2,n,pairs,2)
+    packed = api._pack_weight_scale_blocks(Tensor(raw,"float8_e8m0fnu"))
+    recovered = packed.data.reshape(2,n//256,pairs,256,2).transpose(0,1,3,2,4).reshape(raw.shape)
+    np.testing.assert_array_equal(recovered,raw)
+    assert packed.dtype == "float8_e8m0fnu" and packed.shape == raw.shape
+
+
+def test_weight_scale_block_mapping_rejects_incomplete_n(backend):
+    with pytest.raises(ValueError,match="N divisible by 256"):
+        api._pack_weight_scale_blocks(Tensor(np.zeros((1,128,2,2)),"float8_e8m0fnu"))
 
 
 @pytest.mark.parametrize("bf16", [False, True])

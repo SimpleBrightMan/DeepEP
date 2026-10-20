@@ -130,6 +130,7 @@ class A8W4MatmulPipeline {
     } addr_;
     GM_ADDR output_ = nullptr;
     bool active_ = false;
+    bool blockedWeightScales_ = false;
     AscendTimerDevice* timer_ = nullptr;
 
     template <class Element, class Layout>
@@ -204,6 +205,8 @@ public:
         config_.n = config.n;
         config_.k = config.k;
         config_.scaleK = config.scaleK;
+        if constexpr (IsGmm2) blockedWeightScales_ = true;
+        else blockedWeightScales_ = ProblemConfig::FUSED_GATE_UP;
         addr_ = {addr.aGlobal, addr.bGlobal, addr.aScaleGlobal, addr.bScaleGlobal};
         output_ = output;
         if constexpr (g_coreType == AscendC::AIV) {
@@ -253,6 +256,13 @@ public:
 protected:
     __aicore__ inline void PrimeWeightScales(uint32_t weightN, uint32_t rows, uint32_t cols)
     {
+        if (blockedWeightScales_) {
+            auto sb = Tensor<SB>(addr_.bScaleGlobal + static_cast<uint64_t>(weightN) * config_.scaleK,
+                tla::MakeMxScaleLayout<SB,Catlass::layout::RowMajor,true>(config_.scaleK,256U));
+            auto tile = tla::GetTile(sb,tla::MakeCoord(0U,0U),tla::MakeShape(config_.scaleK,cols));
+            block_.PrimeWeightScales(tile,rows,cols,config_.k);
+            return;
+        }
         auto sb = Tensor<SB>(addr_.bScaleGlobal,
             tla::MakeMxScaleLayout<SB,LayoutScaleB,true>(config_.scaleK,config_.n));
         auto tile = tla::GetTile(sb,tla::MakeCoord(0U,weightN),tla::MakeShape(config_.scaleK,cols));
@@ -273,17 +283,28 @@ protected:
         auto c = Tensor<Out>(output_, tla::MakeLayout<Out, LayoutC>(config_.m, config_.n));
         auto tileA = tla::GetTile(a, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.k));
         auto tileSA = tla::GetTile(sa, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.scaleK));
-        auto tileSB = tla::GetTile(sb, tla::MakeCoord(0, weightN), tla::MakeShape(config_.scaleK, cols));
-        if (outputIssued != nullptr) {
+        auto compute = [&](auto& tileSB) __aicore__ {
+          if (outputIssued != nullptr) {
             AscendC::LocalTensor<Out> ub(AscendC::TPosition::VECCALC, 0U,
                 Gmm1CvPlan::SlotBytes / sizeof(Out));
             auto cv = tla::MakeTensor(ub, tla::MakeLayout<Out, LayoutC>(rows, cols), Catlass::Arch::PositionUB{});
             block_(tileA, cv, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U,
                    Catlass::EmptyClass{}, outputSequence, outputIssued);
-            return;
+          } else {
+            auto tileC = tla::GetTile(c, tla::MakeCoord(m, outputN), tla::MakeShape(rows, cols));
+            block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U);
+          }
+        };
+        if (blockedWeightScales_) {
+            // 所有blocked调用均为N256任务；planar GMM1仍允许原N192策略。
+            auto packed = Tensor<SB>(addr_.bScaleGlobal + static_cast<uint64_t>(weightN) * config_.scaleK,
+                tla::MakeMxScaleLayout<SB,Catlass::layout::RowMajor,true>(config_.scaleK,256U));
+            auto tile = tla::GetTile(packed,tla::MakeCoord(0U,0U),tla::MakeShape(config_.scaleK,cols));
+            compute(tile);
+        } else {
+            auto tile = tla::GetTile(sb,tla::MakeCoord(0,weightN),tla::MakeShape(config_.scaleK,cols));
+            compute(tile);
         }
-        auto tileC = tla::GetTile(c, tla::MakeCoord(m, outputN), tla::MakeShape(rows, cols));
-        block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U);
     }
 
     __aicore__ inline void DequantizeWeight(uint32_t weightN, uint32_t rows, uint32_t cols)

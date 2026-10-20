@@ -37,3 +37,4 @@ EP8，H7168/I3072/E384/topk6/shared0，FP8/FP4，balanced，seed20260922。真�
 - 新核对：原工程权重SF的ColumnMajor MX布局实际是每N行连续K-SF；DS权重SF是pair-major。后续布局节点须同时修改离线权重准备和AIC读取，不仅是SwiGLU的激活scale布局。
 - D1/D2/D3：在完整DS终点中，分别恢复原工程权重SF的N-major、激活SF的row-major、两者组合。三者都保持DS数学、任务顺序和完成协议，用DS冻结输出逐位差分；这先闭合混合包的数据ABI，不把它称为已完成完整OO/DO/OD/DD控制矩阵。
 - C2：在C1上把首chunk权重SF预取放到激活readiness等待之前；SF EMPTY只取一次，后续A SF提交后才发布SFFull。保持原GM布局和数学，独立检验DS中“权重供数早于输入等待”的差异。
+- C3：在C2上正向迁移权重SF的N256-block pair-major。配对GMM1/GMM2离线打包与AIC读取成对修改；planar GMM1保留原布局以支持原N192任务。旧prepared权重必须从raw重新准备，N不满256尽早报错；不改变FP4/SF位模式和FIX补偿。本节点需新API行为测试及原生逐位差分，不能由D1反向收益直接推算。

@@ -11,4 +11,6 @@ rc=$?
 set -e
 if test -d "$campaign/$node"; then printf '%s\n' "$rc" > "$campaign/$node/build.rc"; fi
 if test "$rc" != 0; then exit "$rc"; fi
+python -I -m pytest -q "$campaign/$node/source/experiments/megamoe/tests/test_public_api.py" \
+    > "$campaign/$node/api-cpu-tests.log" 2>&1
 exec bash "$campaign/compare_ours.sh" "$node" "$parent"
