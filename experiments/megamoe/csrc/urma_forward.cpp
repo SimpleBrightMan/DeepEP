@@ -3,6 +3,7 @@
 #include "urma_forward.hpp"
 #include "kernels/mega_moe/urma/compute_contract.hpp"
 #include "kernels/mega_moe/urma/expert_plan.hpp"
+#include "kernels/mega_moe/urma/reduce_ready_plan.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -153,6 +154,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     activation_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
     gmm2_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
     local_flags_ = allocate(16 * MegaMoeUrma::kFlagBytes);
+    token_ready_ = allocate(static_cast<uint64_t>(config.bs) * MegaMoeUrma::kFlagBytes);
     system_workspace_ = allocate(platform_.system_workspace + (2ULL << 20));
 
     args_.expandedX = Address(expanded_x_);
@@ -173,6 +175,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     args_.activationDone = Address(activation_done_);
     args_.gmm2Done = Address(gmm2_done_);
     args_.localFlags = Address(local_flags_);
+    args_.tokenReady = Address(token_ready_);
     args_.systemWorkspace = Address(system_workspace_);
 }
 
@@ -187,13 +190,30 @@ void UrmaPlan::bind_reduce_dependencies(torch::Tensor reduce_index)
     // One NPU gather per route preparation avoids a second per-route GM lookup
     // in the Reduce loop. Values are opaque int64 bit patterns: the high bit
     // distinguishes direct-self GMM2 completion from remote producer/CV flags.
-    reduce_dependencies_ =
+    auto token_dependencies =
         expanded_reduce_dependencies_.index_select(0, reduce_index.reshape({-1})).reshape({config.bs, config.topk});
+    // This route-preparation-only D2H builds the reverse dependency CSR from
+    // actual routes. Cached forward launches reuse its device copy unchanged.
+    const auto dependency_cpu = token_dependencies.cpu().contiguous();
+    const auto ready_plan = MegaMoeUrma::BuildReduceReadyPlan(
+        reinterpret_cast<const uint64_t*>(dependency_cpu.data_ptr<int64_t>()), config);
+    const auto options = expanded_x_.options();
+    auto ready_owners = Upload(ready_plan.owners, options);
+    auto ready_dependencies = Upload(ready_plan.dependencies, options);
+    auto ready_edges = Upload(ready_plan.edges, options);
+    reduce_dependencies_ = token_dependencies;
+    reduce_ready_owners_ = ready_owners;
+    reduce_ready_dependencies_ = ready_dependencies;
+    reduce_ready_edges_ = ready_edges;
     bound_reduce_index_ = reduce_index;
     bound_reduce_index_version_ = reduce_index._version();
     args_.reduceDependencies = Address(reduce_dependencies_);
+    args_.reduceReadyOwners = Address(reduce_ready_owners_);
+    args_.reduceReadyDependencies = Address(reduce_ready_dependencies_);
+    args_.reduceReadyEdges = Address(reduce_ready_edges_);
     const auto stream = c10_npu::getCurrentNPUStream();
-    for (const auto* tensor : {&expanded_reduce_dependencies_, &reduce_dependencies_, &bound_reduce_index_}) {
+    for (const auto* tensor : {&expanded_reduce_dependencies_, &reduce_dependencies_, &bound_reduce_index_,
+                               &reduce_ready_owners_, &reduce_ready_dependencies_, &reduce_ready_edges_}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }
 }
@@ -206,7 +226,8 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
 {
     const auto& c = args_.config;
     const auto device = expanded_x_.device();
-    TORCH_CHECK(reduce_dependencies_.defined() && bound_reduce_index_.defined(),
+    TORCH_CHECK(reduce_dependencies_.defined() && bound_reduce_index_.defined() && reduce_ready_owners_.defined() &&
+                    reduce_ready_dependencies_.defined() && reduce_ready_edges_.defined(),
                 "URMA Reduce dependencies must be bound before forward");
     TORCH_CHECK(reduce_index.defined() && reduce_index.data_ptr() == bound_reduce_index_.data_ptr() &&
                     reduce_index._version() == bound_reduce_index_version_ &&
@@ -273,7 +294,8 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     CheckTensor(output, 2, "out", device);
     TORCH_CHECK(output.scalar_type() == torch::kBFloat16 && output.sizes() == x.sizes(), "out must be BF16 [BS,H]");
     auto stream = c10_npu::getCurrentNPUStream();
-    for (auto* tensor : {&gmm1_done_, &input_scale_done_, &activation_done_, &gmm2_done_, &local_flags_}) {
+    for (auto* tensor :
+         {&gmm1_done_, &input_scale_done_, &activation_done_, &gmm2_done_, &local_flags_, &token_ready_}) {
         ASCEND_DEEPEP_CHECK_ACL(
             aclrtMemsetAsync(tensor->data_ptr(), tensor->numel(), 0, tensor->numel(), stream.stream()));
     }
@@ -324,6 +346,10 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
                                &chunk_group_indices_,
                                &expanded_reduce_dependencies_,
                                &reduce_dependencies_,
+                               &reduce_ready_owners_,
+                               &reduce_ready_dependencies_,
+                               &reduce_ready_edges_,
+                               &token_ready_,
                                &bound_reduce_index_,
                                &send_chunks_,
                                &recv_chunks_,
@@ -356,6 +382,10 @@ int64_t UrmaPlan::workspace_bytes() const
                                &chunk_group_indices_,
                                &expanded_reduce_dependencies_,
                                &reduce_dependencies_,
+                               &reduce_ready_owners_,
+                               &reduce_ready_dependencies_,
+                               &reduce_ready_edges_,
+                               &token_ready_,
                                &send_chunks_,
                                &recv_chunks_,
                                &gmm1_done_,

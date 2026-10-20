@@ -31,6 +31,7 @@ private:
     torch::Tensor fragments_, send_chunks_, recv_chunks_, gmm1_done_, activation_done_, gmm2_done_, local_flags_;
     torch::Tensor segments_, compute_batches_, chunk_group_indices_;
     torch::Tensor expanded_reduce_dependencies_, reduce_dependencies_, bound_reduce_index_;
+    torch::Tensor reduce_ready_owners_, reduce_ready_dependencies_, reduce_ready_edges_, token_ready_;
     torch::Tensor system_workspace_;
     int64_t bound_reduce_index_version_ = -1;
     int64_t last_epoch_ = 0;

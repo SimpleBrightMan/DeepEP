@@ -69,7 +69,7 @@ def test_every_event_id_has_a_name_and_no_fabricated_async_events():
     for event_id, name in enumerate(EVENTS):
         add_record(raw, engine=event_id, event=name)
     result = decode_trace(raw, rank=0, clock_mhz=1000)
-    assert len(events(result)) == len(EVENTS) == 33
+    assert len(events(result)) == len(EVENTS) == 35
     assert {row["ph"] for row in result["traceEvents"]} == {"M", "X"}
     assert {row["args"]["event_id"] for row in events(result)} == set(range(len(EVENTS)))
 
@@ -99,6 +99,29 @@ def test_reduce_envelope_is_one_visible_interval_including_internal_waits():
     assert event["name"] == "Reduce" and event["dur"] == 900.0
     assert event["args"]["rows"] == 100 and event["args"]["bytes"] == 716800
     assert "readiness waits" in event["args"]["meaning"] and "output drain" in event["args"]["meaning"]
+
+
+def test_token_ready_monitors_keep_new_ids_and_remain_visible_with_waits_hidden():
+    from deep_ep_experimental.megamoe.urma_trace import filter_trace_waits
+
+    raw = trace_buffer(6)
+    add_record(raw, event="CombinePut", start=1000, end=1010, peer=1, cv=0)
+    add_record(raw, event="CombineReadyMonitor", start=1010, end=1020, peer=1, cv=0)
+    add_record(raw, event="CombineQuiet", start=1020, end=1050, peer=1, cv=0)
+    add_record(raw, event="CombinePublish", start=1050, end=1060, peer=1, cv=0)
+    add_record(raw, event="TailReadyMonitor", start=1060, end=1200, row=0, rows=137)
+    add_record(raw, event="LocalSync", start=1200, end=1230, cv=3)
+    decoded = decode_trace(raw, rank=0, clock_mhz=1000)
+    filtered = events(filter_trace_waits(decoded))
+    assert [row["args"]["event_id"] for row in filtered] == [10, 33, 11, 30, 34]
+    combine, tail = filtered[1], filtered[4]
+    assert combine["cat"] == tail["cat"] == "readiness.monitor"
+    assert "nonblocking" in combine["args"]["meaning"]
+    assert "not PUT completion" in combine["args"]["meaning"]
+    assert "polling backoff" in tail["args"]["meaning"]
+    assert tail["args"]["rows"] == 137
+    assert len(events(decoded)) == len(filtered) + 1
+    assert decoded["metadata"]["record_count"] == 6
 
 
 def test_expert_group_trace_keeps_multisource_identity_and_scale_preparation():

@@ -15,6 +15,8 @@ constexpr uint64_t kFlagBytes = 128;
 // Low values address a producer/CV completion flag; tagged values address a
 // local GMM2 group that writes its self return rows directly.
 constexpr uint64_t kReduceSelfDependency = uint64_t{1} << 63U;
+constexpr uint32_t kMaxReadyOwnerTokens = (8192U + kCommunicationWorkers - 1U) / kCommunicationWorkers;
+constexpr uint32_t kMaxReadyOwnerEdges = kMaxReadyOwnerTokens * 8U;
 constexpr uint32_t kProtocol = 1;
 constexpr uint32_t kTimerCores = kAic * 3U;
 constexpr uint32_t kTimerPhases = 8U;
@@ -62,7 +64,9 @@ enum class TraceEvent : uint32_t {
     WaitInputScale,
     CombinePublish,
     WaitReduceReady,  // Reserved for historical per-token Reduce traces.
-    ReduceDrain       // Reserved: the Reduce envelope now includes its drain.
+    ReduceDrain,      // Reserved: the Reduce envelope now includes its drain.
+    CombineReadyMonitor,
+    TailReadyMonitor
 };
 
 struct TraceMeta {
@@ -124,6 +128,33 @@ struct Chunk {
     uint32_t reserved;
 };
 
+// One communication worker owns a contiguous token interval and its counters.
+// Begins address the global padded record arrays; counts exclude DMA padding.
+struct ReadyOwner {
+    uint32_t tokenBegin;
+    uint32_t tokenCount;
+    uint32_t dependencyBegin;
+    uint32_t dependencyCount;
+    uint32_t edgeBegin;
+    uint32_t edgeCount;
+    uint32_t reserved0;
+    uint32_t reserved1;
+};
+
+// edgeBegin is relative to this owner's edge array, not the global array.
+struct ReadyDependency {
+    uint64_t dependency;
+    uint32_t edgeBegin;
+    uint32_t edgeCount;
+};
+
+// Several TopK routes may share one dependency, so each edge carries its
+// complete contribution. A token's edge multiplicities sum to exactly eight.
+struct ReadyEdge {
+    uint16_t token;
+    uint16_t multiplicity;
+};
+
 struct Config {
     uint32_t bs;
     uint32_t hidden;
@@ -164,6 +195,10 @@ struct Arguments {
     uint64_t order;
     uint64_t reduceIndex;
     uint64_t reduceDependencies;  // Cached token-major [BS,K] ready descriptors.
+    uint64_t reduceReadyOwners;
+    uint64_t reduceReadyDependencies;
+    uint64_t reduceReadyEdges;
+    uint64_t tokenReady;
     uint64_t weights;
     uint64_t weight1;
     uint64_t weight2;
@@ -198,6 +233,9 @@ static_assert(sizeof(Fragment) == 40);
 static_assert(sizeof(RowSegment) == 40);
 static_assert(sizeof(ComputeBatch) == 8);
 static_assert(sizeof(Chunk) == 40);
+static_assert(sizeof(ReadyOwner) == 32);
+static_assert(sizeof(ReadyDependency) == 16);
+static_assert(sizeof(ReadyEdge) == 4);
 }  // namespace MegaMoeUrma
 
 extern "C" void mega_moe_urma_kernel_do(uint32_t block_dim, uint32_t ub_bytes, void* stream,

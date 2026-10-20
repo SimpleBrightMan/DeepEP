@@ -19,29 +19,32 @@ GMM按专家聚合不同来源的行，使用M256计算块，仅专家尾块不�
 5. GMM1按Segment把X分段加载到同一L1计算块，只等待该组实际涉及的Dispatch CV及scale准备。scale由13个AIV1独立准备，每个M组只聚合一次到expert-major GM；AIC沿用连续MX scale加载。GMM1输出、SwiGLU及GMM2输入使用连续的expert-major计算行序。GMM2按同一映射将远端结果分段写回原source-major连续输出区，self结果直接写Reduce最终读取的位置。各peer的Combine CV等待所有覆盖它的M组完成全部H列，再按原连续区间PUT。
 6. 本rank的15个远端Dispatch全部完成且self接收区已就绪后才提交Combine PUT。每个Combine CV执行 `PUT → quiet(peer) → MTE DataCopy发布epoch flag`。计算侧AIV完成自己的任务后即可按token依赖Reduce，不再等待最终全卡同步。
 
-15个通信AIV1各独占一个远端rank。通信worker `w` 的peer为 `w < rank ? w : w+1`；剩余13个AIV1执行SwiGLU。self就绪标志在Pack本地同步后发布，原来承担self拷贝的block15随后直接进入SwiGLU。远端两个阶段都只使用PUT，队列同一peer始终只有一个提交者。
+15个通信AIV1各独占一个远端rank。通信worker `w` 的peer为 `w < rank ? w : w+1`；它同时负责本rank一个连续token区间的结果就绪统计。剩余13个AIV1执行SwiGLU。self就绪标志在Pack本地同步后发布，原来承担self拷贝的block15随后直接进入SwiGLU。远端两个阶段都只使用PUT，队列同一peer始终只有一个提交者。
 
 Pack使用全部56个AIV，任务编号为`block*2+subblock`。Reduce只使用28个AIV0和block15～27的13个AIV1，共41核；15个通信AIV1不参与Reduce。计算侧每核结束自己的反量化或scale/SwiGLU任务后，先排空本核流水以交还UB/event，再独立进入Reduce。当前内核固定启动28组；即使物理设备有64个AIV，也只使用已启动的56个。
 
-本地阶段使用多槽流水，benchmark打印`local_pipeline=pack6-reduce6-output2 tail=combine-cv-flag-reduce41`。Pack按56核、Reduce按41核分配连续行区间：
+本地阶段使用多槽流水，benchmark打印`local_pipeline=pack6-reduce6-output2 tail=combine-token-ready-reduce41`。Pack按56核、Reduce按41核分配连续行区间：
 
 - Pack使用6个token/scale槽，按槽等待上一次MTE3完成，再下发新的MTE2；不同槽的读取与写出可以重叠。`order`批量DMA到UB，当前支持的最大BS8192每核最多1171行，一次预取即可，payload循环不再从GM逐行标量读取路由。UB占用65.5 KiB。
-- Reduce使用6个BF16/FP32输入槽、独立FP32累加器和2个BF16输出槽。`inverse + weights + readiness dependencies`按最多128个token批量搬入UB，UB占用174 KiB，低于现有192 KiB最低要求。每个token的8路结果全部就绪后才预取payload，6槽在这个token内部流水；不预取尚未就绪的下一个token。
+- Reduce使用6个BF16/FP32输入槽、独立FP32累加器和2个BF16输出槽。`inverse + weights`按最多128个token批量搬入UB，每批2条metadata DMA，UB占用166 KiB，低于现有192 KiB最低要求。Reducer只轮询该token独立128B槽中的`tokenReady == epoch`；通信owner确认它的8路结果全部就绪后才发布该值。6槽在当前token内部流水，不预取尚未就绪的下一个token。
 - 返回布局、FP32乘加顺序和最终BF16舍入不变。self直接写receive/return，远端PUT的CV粒度和数量不变。Pack仍全部完成后才进入Dispatch；Reduce可以与其他核心的计算和Combine重叠。
 
 Python会拒绝不含本分支tail调度标记的native扩展。正式耗时仍取关闭timer/trace的`CACHED_FORWARD`。Pack跨度覆盖56核；本分支Reduce跨度覆盖41核且包含等待结果就绪的时间，不能直接当作纯本地Reduce耗时，也不能与Combine跨度相加。原timer的Pack字节统计写入的FP8+scale，Reduce字节仅统计输出BF16，均不是完整HBM读写流量。
 
 ### Combine 完成信号与 Reduce 重叠
 
-- 路由准备时为每个expanded row生成依赖：远端为`producer_rank * maxPeerChunks + cv_id`，self为带高位标记的GMM2组编号。再用已有`reduce_index`在NPU上执行一次`index_select`，缓存token-major `[BS,8]`依赖表。forward不重建它；native绑定inverse的地址和版本，修改后必须重新准备路由。
-- 远端每CV的`quiet`完成后，通信owner用MTE发布32B信号到独立128B槽。Reducer只在本地轮询槽，要求epoch精确相等；self等待对应组的全部GMM2列tile完成计数。AIV0结束不能代替self结果完成。
+- 路由准备时为每个expanded row生成依赖：远端为`producer_rank * maxPeerChunks + cv_id`，self为带高位标记的GMM2组编号。再用已有`reduce_index`在NPU上执行一次`index_select`得到token-major `[BS,8]`依赖表，复制到CPU并反建“依赖→token及贡献次数”的CSR，随后把15个owner描述符和CSR上传NPU。每个token只有一个owner；同一token的多个TopK路由若依赖同一CV或GMM2组，合并为一条带multiplicity的边，贡献次数合计仍为8。这个D2H、CPU构表及上传属于路由准备开销，cached forward不重建；native绑定inverse的地址和版本，修改后必须重新准备路由。
+- 远端每CV的`quiet`完成后，通信owner用MTE发布32B信号到独立128B槽。15个owner在本地监视这些CV槽，要求epoch精确相等；self依赖检查对应组全部GMM2列tile完成计数，AIV0结束不能代替self结果完成。每个owner把自己的CSR和计数保存在UB，已消费依赖只计一次；某个token累计8份贡献后，通过MTE把当前epoch写入它的本地`tokenReady`槽。Reducer不再逐token轮询8个CV/GMM2依赖，只等待一个token-ready槽；失败轮询保留200-cycle退避。
+- 每次Combine CV提交PUT后、执行quiet前，owner做一次有限的非阻塞就绪扫描：未就绪的依赖直接跳过，不能在这里等输入，以免阻止当前PUT完成信号的发布。全部CV发送完成后，owner继续扫描直到自己的token全部发布ready，然后参加已有的本机退出汇合，不参与Reduce。通信peer分工、ready owner分工和41核Reduce分工相互独立，owner负责的token可能依赖任意远端和self。
 - 删除原来的尾部peer完成握手、全卡barrier以及Reduce之前的全本机汇合。只保留Pack后的本机汇合和函数退出前的本机MIX汇合；后者包括28 AIC、56 AIV，保护workspace及下一轮复用，不产生跨rank同步。
 - 下一次调用仍在Pack完成后进行peer Start握手。Start接受`>= epoch`，防止双向空路由的peer提前进入下一轮、覆盖旧Start而造成死等。有效CV的ready仍使用`== epoch`，并且不逐轮清空对称ready区。
-- 这是每个worker顺序处理自己token区间的实现：若当前token缺任意一路结果，先等它，不扫描后面的就绪token。每CV新增quiet/MTE发布有成本；41核分工和token内部6槽也可能改变本地吞吐，应以完整`CACHED_FORWARD`和trace实测判断收益。
+- Reducer仍顺序处理自己token区间：当前token未ready就先等它，不扫描后面的token。通信owner的监视则扫描全部未完成依赖，不会被第一个未就绪CV阻塞。每CV的quiet、监视扫描和MTE发布都有成本；新增每token ready发布也不是零开销，应以完整`CACHED_FORWARD`和trace实测判断收益。
 
-trace保留每CV的`CombinePublish`。Reduce在每个有任务的reducer上只记录一条：从Reduce函数入口到既有的最终流水排空完成，包含metadata预取、token结果就绪等待、计算及输出写回；在当前三个BS下共41条Reduce。这条跨度不能解释为纯Vector工作时间，也不能通过隐藏等待条扣除其中的ready等待。
+trace保留每CV的`CombinePublish`，新增`CombineReadyMonitor`（编号33）和`TailReadyMonitor`（编号34）。前者是PUT提交后、quiet前的一次非阻塞扫描及本地ready发布；后者覆盖发送完全部CV后的监视循环，包含轮询退避和本地ready发布。两者作为可见工作区间保留，不随默认Wait过滤隐藏；它们不能解释为网络传输完成耗时或纯计算时间。Reduce在每个有任务的reducer上仍只记录一条：从Reduce函数入口到既有的最终流水排空完成，包含metadata预取、token结果就绪等待、计算及输出写回；在当前三个BS下共41条Reduce。这条跨度不能解释为纯Vector工作时间，也不能通过隐藏等待条扣除其中的ready等待。
 
-新版不再逐token记录`WaitReduceReady`和`Reduce`，也不单独记录`ReduceDrain`，减少循环中的scalar日志写出与cache flush。计时结束使用原有排空位置，不添加同步；其它trace事件不变。`WaitReduceReady`和`ReduceDrain`编号仍保留供历史bin解码，当前设备不会生成这两类事件。`--trace-include-waits`只显示实际记录的等待，不能恢复新版已不记录的逐token等待。旧版本尾部同步事件仍可解码，本分支不会生成已删除的全卡同步事件。
+`TailReadyMonitor`结束表示最后的token-ready写指令已经提交，最终MTE写入由随后已有的本核`PIPE_ALL`排空；Reducer仍以实际观察到epoch为准。监视器初始化和尾部维护在aggregate `Combine`区间之外，但都包含在完整算子耗时中，评估成本需要结合新增trace和`CACHED_FORWARD`，不能只看Combine汇总。
+
+新版不再逐token记录`WaitReduceReady`和`Reduce`，也不单独记录`ReduceDrain`，减少循环中的scalar日志写出与cache flush。计时结束使用原有排空位置，不添加同步；除新增monitor事件外，其它trace事件不变。`WaitReduceReady`和`ReduceDrain`编号仍保留供历史bin解码，当前设备不会生成这两类事件。`--trace-include-waits`只显示实际记录的等待，不能恢复新版已不记录的逐token等待。旧版本尾部同步事件仍可解码，本分支不会生成已删除的全卡同步事件。
 
 self直接写地址按现有`send_base/receive_base`映射；同一计算组可同时含self和远端行，逐Segment决定输出地址。远端PUT的地址、顺序、CV和数量不变，计算按expert顺序推进多个peer的返回结果。当前Pack完成前不会对peer发布新epoch的Start；上一轮本地计算/返回/Reduce由同一runtime stream串行完成，因此self直接写不会覆盖尚在使用的上一轮数据。
 
@@ -113,11 +116,11 @@ y = buffer.forward_prepared(x, topk_weights, weights1, weights2, prepared)
 buffer.destroy()
 ```
 
-`prepare_routes`每次在输入NPU上执行排序、计数、前缀和及逆映射。随后把384个counts复制到CPU，经Store交换完整计数表，native据此生成通信CV、专家M组、Segment及CV输出依赖表并送回NPU。它包含设备同步和host控制开销，是后续需要优化的一部分。
+`prepare_routes`每次在输入NPU上执行排序、计数、前缀和及逆映射。随后把384个counts复制到CPU，经Store交换完整计数表，native据此生成通信CV、专家M组、Segment及CV输出依赖表并送回NPU。当前token-ready方案还把`[BS,8]`的int64依赖表复制到CPU，构建15个owner的反向CSR后上传；该次D2H的有效数据量为`BS*8*8`字节，BS2048/4096/8192分别为128/256/512 KiB。它包含设备同步和host控制开销，`ROUTE_PREP`及`FULL_E2E`会计入，`CACHED_FORWARD`不计入。
 
 `forward`始终包含这一步。`forward_prepared`只允许复用同一buffer的不变路由。修改prepared中的任何路由tensor后拒绝继续使用。默认`max_recv_rows=2*max_BS*topk`；非均衡路由可能需要在所有rank一致增大该参数，并承担额外HBM占用。
 
-同一buffer的native调用统一入队到owner专用NPU stream。准备Reduce依赖表的异步`index_select`也在owner stream运行，避免在另一条caller stream使用prepared plan时读取尚未生成的依赖。调用前等待caller stream的输入/描述符写入，返回时在caller stream插入输出就绪等待；不同caller stream也不会并发覆盖同一对称workspace。`destroy()`同步专用stream后再集体清理。
+同一buffer的native调用统一入队到owner专用NPU stream。准备Reduce依赖表的`index_select`、D2H及CSR上传也在这个准备路径内完成，避免在另一条caller stream使用prepared plan时读取尚未生成的依赖。调用前等待caller stream的输入/描述符写入，返回时在caller stream插入输出就绪等待；不同caller stream也不会并发覆盖同一对称workspace。`destroy()`同步专用stream后再集体清理。
 
 校验或启动异常会向Store发布abort，并禁止再次使用该buffer，避免各rank的epoch或调用序列分叉。Store abort能唤醒host协调等待，不能取消已经运行的NPU kernel；发生异常后应由启动器终止整个作业，不应捕获异常后继续调用或让单个rank进入清理屏障。正常cached forward不插入额外host集合通信。
 
@@ -175,7 +178,7 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib${CONDA_PREFIX:+:$CONDA_PREFIX/lib}${LD_L
 
 | 指标 | 计入范围 | 时钟 |
 |---|---|---|
-| `ROUTE_PREP` | NPU路由操作、D2H计数、Store交换、native描述符构建/拷贝 | Host wall time，完成后同步 |
+| `ROUTE_PREP` | NPU路由操作、D2H计数与token依赖表、Store交换、native描述符及ready CSR构建/拷贝 | Host wall time，完成后同步 |
 | `CACHED_FORWARD` | 本地展开、两次GMM、SwiGLU、双向阶段PUT、Reduce与本机退出汇合 | NPU Event区间，不含预先准备路由 |
 | `FULL_E2E` | 每次全新路由准备 + 完整forward + 完成同步 | Host wall time |
 
@@ -245,6 +248,8 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 |---|---|
 | `DispatchPutX/DispatchPutScale/CombinePut [PUT submit]` | PUT指令提交区间，不代表远端数据已经完成写入 |
 | `DispatchQuiet/CombineQuiet [completion wait]` | 等待之前peer PUT完成的区间 |
+| `CombineReadyMonitor` | PUT提交后、quiet前的一次非阻塞就绪扫描及本地token-ready发布；不等待未就绪的入站CV |
+| `TailReadyMonitor` | 全部CV发送完后的监视循环，包含轮询退避和本地token-ready发布；默认保留可见 |
 | `Gmm1Tile/Gmm2Tile [Cube submit]` | Cube任务提交区间，不伪造异步Cube执行完成时刻 |
 | `Gmm1TileDrain/Gmm1Drain/Gmm2Drain [drain]` | 显式等待计算流水排空的区间 |
 | `Wait*`、`LocalSync`、`RankBarrier`等灰色条 | 数据依赖、核间或rank间同步等待 |

@@ -24,14 +24,13 @@ struct ReduceUbContract {
     static constexpr uint32_t outputOffset = accumulatorOffset + fp32RowBytes;
     static constexpr uint32_t inverseOffset = outputOffset + outputs * bf16RowBytes;
     static constexpr uint32_t weightsOffset = inverseOffset + batchTokens * topk * sizeof(int64_t);
-    static constexpr uint32_t dependenciesOffset = weightsOffset + batchTokens * topk * sizeof(float);
-    static constexpr uint32_t end = dependenciesOffset + batchTokens * topk * sizeof(uint64_t);
+    static constexpr uint32_t end = weightsOffset + batchTokens * topk * sizeof(float);
 };
-static_assert(ReduceUbContract::end == 174U * 1024U);
+static_assert(ReduceUbContract::end == 166U * 1024U);
 static_assert(ReduceUbContract::end <= kRequiredUbBytes);
 static_assert(ReduceUbContract::inputFp32Offset % 32U == 0U && ReduceUbContract::accumulatorOffset % 32U == 0U &&
               ReduceUbContract::outputOffset % 32U == 0U && ReduceUbContract::inverseOffset % 32U == 0U &&
-              ReduceUbContract::weightsOffset % 32U == 0U && ReduceUbContract::dependenciesOffset % 32U == 0U);
+              ReduceUbContract::weightsOffset % 32U == 0U);
 
 template <typename Element>
 __aicore__ inline void IssueReduceInput(AscendC::LocalTensor<Element>& inputs,
@@ -48,33 +47,17 @@ __aicore__ inline void IssueReduceInput(AscendC::LocalTensor<Element>& inputs,
     SetFlag<HardEvent::MTE2_V>(event);
 }
 
-// The caller checks all eight dependencies before it issues this token's
-// first payload DMA. Flags are read locally with cache bypass; no remote GET.
+// The token's sole communication owner aggregates all eight contributions
+// before publishing this local epoch. Reducers never poll per-CV/group flags.
 // Back off only after a failed poll, matching the main MegaMoE's 200 cycles.
-__aicore__ inline void WaitReduceToken(const Arguments& args, AscendC::LocalTensor<uint64_t>& dependencies,
-                                       uint32_t firstRoute)
+__aicore__ inline void WaitReduceToken(const Arguments& args, uint64_t token)
 {
     using namespace AscendC;
     constexpr uint64_t pollBackoffCycles = 200U;
-    constexpr uint32_t expectedSelfTiles = (ReduceUbContract::hidden + kComputeTileN - 1U) / kComputeTileN;
-    for (uint32_t slot = 0U; slot < ReduceUbContract::topk; ++slot) {
-        const uint64_t dependency = dependencies.GetValue(firstRoute + slot);
-        const uint64_t index = dependency & ~kReduceSelfDependency;
-        if ((dependency & kReduceSelfDependency) != 0U) {
-            auto* flag = reinterpret_cast<__gm__ int32_t*>(args.gmm2Done + index * kFlagBytes);
-            while (ReadGmByPassDCache(flag) < static_cast<int32_t>(expectedSelfTiles)) {
-                const uint64_t start = GetSystemCycle();
-                while (GetSystemCycle() - start < pollBackoffCycles) {
-                }
-            }
-        } else {
-            auto* flag = reinterpret_cast<__gm__ uint64_t*>(args.symmetric + args.config.combineReadyOffset +
-                                                            index * kFlagBytes);
-            while (ReadGmByPassDCache(flag) != args.config.epoch) {
-                const uint64_t start = GetSystemCycle();
-                while (GetSystemCycle() - start < pollBackoffCycles) {
-                }
-            }
+    auto* flag = reinterpret_cast<__gm__ uint64_t*>(args.tokenReady + token * kFlagBytes);
+    while (ReadGmByPassDCache(flag) != args.config.epoch) {
+        const uint64_t start = GetSystemCycle();
+        while (GetSystemCycle() - start < pollBackoffCycles) {
         }
     }
     // Payload reads follow Scalar's observation of every ready flag. Reuse
@@ -102,13 +85,11 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
     GlobalTensor<bfloat16_t> returned, output;
     GlobalTensor<int64_t> inverse;
     GlobalTensor<float> weights;
-    GlobalTensor<uint64_t> dependencies;
     returned.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(args.symmetric + args.config.returnYOffset));
     returned.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
     output.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(args.output));
     inverse.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(args.reduceIndex));
     weights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(args.weights));
-    dependencies.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(args.reduceDependencies));
 
     LocalTensor<bfloat16_t> inputs(TPosition::VECCALC, Ub::inputBf16Offset, Ub::inputs * Ub::hidden);
     LocalTensor<float> terms(TPosition::VECCALC, Ub::inputFp32Offset, Ub::inputs * Ub::hidden);
@@ -116,7 +97,6 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
     LocalTensor<bfloat16_t> outputs(TPosition::VECCALC, Ub::outputOffset, Ub::outputs * Ub::hidden);
     LocalTensor<int64_t> inverseUb(TPosition::VECCALC, Ub::inverseOffset, Ub::batchTokens * Ub::topk);
     LocalTensor<float> weightsUb(TPosition::VECCALC, Ub::weightsOffset, Ub::batchTokens * Ub::topk);
-    LocalTensor<uint64_t> dependenciesUb(TPosition::VECCALC, Ub::dependenciesOffset, Ub::batchTokens * Ub::topk);
 
     for (uint32_t slot = 0U; slot < Ub::inputs; ++slot) {
         SetFlag<HardEvent::V_MTE2>(static_cast<TEventID>(slot));
@@ -137,14 +117,13 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
         WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
         DataCopy(inverseUb, inverse[firstRoute], routes);
         DataCopy(weightsUb, weights[firstRoute], routes);
-        DataCopy(dependenciesUb, dependencies[firstRoute], routes);
         SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
 
         for (uint32_t token = 0U; token < tokens; ++token) {
             const uint32_t tokenRoute = token * Ub::topk;
             const uint64_t localToken = batch + token;
-            WaitReduceToken(args, dependenciesUb, tokenRoute);
+            WaitReduceToken(args, firstToken + localToken);
 
             for (uint32_t slot = 0U; slot < Ub::inputs; ++slot) {
                 IssueReduceInput(inputs, returned, inverseUb, tokenRoute + slot);
