@@ -50,10 +50,12 @@ __aicore__ inline void IssueReduceInput(AscendC::LocalTensor<Element>& inputs,
 
 // The caller checks all eight dependencies before it issues this token's
 // first payload DMA. Flags are read locally with cache bypass; no remote GET.
+// Back off only after a failed poll, matching the main MegaMoE's 200 cycles.
 __aicore__ inline void WaitReduceToken(const Arguments& args, AscendC::LocalTensor<uint64_t>& dependencies,
                                        uint32_t firstRoute)
 {
     using namespace AscendC;
+    constexpr uint64_t pollBackoffCycles = 200U;
     constexpr uint32_t expectedSelfTiles = (ReduceUbContract::hidden + kComputeTileN - 1U) / kComputeTileN;
     for (uint32_t slot = 0U; slot < ReduceUbContract::topk; ++slot) {
         const uint64_t dependency = dependencies.GetValue(firstRoute + slot);
@@ -61,11 +63,17 @@ __aicore__ inline void WaitReduceToken(const Arguments& args, AscendC::LocalTens
         if ((dependency & kReduceSelfDependency) != 0U) {
             auto* flag = reinterpret_cast<__gm__ int32_t*>(args.gmm2Done + index * kFlagBytes);
             while (ReadGmByPassDCache(flag) < static_cast<int32_t>(expectedSelfTiles)) {
+                const uint64_t start = GetSystemCycle();
+                while (GetSystemCycle() - start < pollBackoffCycles) {
+                }
             }
         } else {
             auto* flag = reinterpret_cast<__gm__ uint64_t*>(args.symmetric + args.config.combineReadyOffset +
                                                             index * kFlagBytes);
             while (ReadGmByPassDCache(flag) != args.config.epoch) {
+                const uint64_t start = GetSystemCycle();
+                while (GetSystemCycle() - start < pollBackoffCycles) {
+                }
             }
         }
     }

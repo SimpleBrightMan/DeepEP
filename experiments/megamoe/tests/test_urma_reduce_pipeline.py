@@ -97,6 +97,10 @@ inline void Drain() {
         assert(Step() && "pipeline event deadlock");
     }
 }
+inline uint64_t GetSystemCycle() {
+    static uint64_t cycle = 0;
+    return cycle += 200U;
+}
 template <typename T> T ReadGmByPassDCache(T* address) {
     assert(readFlag);
     return static_cast<T>(readFlag(reinterpret_cast<uintptr_t>(address)));
