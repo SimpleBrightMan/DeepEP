@@ -9,6 +9,7 @@ namespace MegaMoeUrma {
 // Pure host/device scheduling arithmetic. Compute groups contain at most M256
 // rows of one expert, independently of the peer/CV communication boundaries.
 constexpr uint32_t kComputeCores = kAic;
+constexpr uint32_t kReduceWorkers = kLocalWorkers - kCommunicationWorkers;
 constexpr uint32_t kComputeTileM = 256U;
 constexpr uint32_t kComputeTileN = 256U;
 // Keep matrix scheduling at M256; only the AIV1 epilogue works in M128
@@ -74,12 +75,32 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t LocalOwnedRows(uint64_t rows, uin
 }
 
 // Contiguous partitions preserve the old strided schedule's per-worker count,
-// including empty workers and remainder rows. Pack/Reduce can therefore DMA
+// including empty workers and remainder rows. Pack can therefore DMA
 // their route metadata in batches without changing timer payload accounting.
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t LocalRowBegin(uint64_t rows, uint32_t worker)
 {
     const uint64_t remainder = rows % kLocalWorkers;
     return static_cast<uint64_t>(worker) * (rows / kLocalWorkers) + (worker < remainder ? worker : remainder);
+}
+
+// The 15 peer owners never reduce. All AIV0 and the 13 activation AIV1
+// workers enter Reduce independently after releasing their compute resources.
+// Return kReduceWorkers as the sentinel for a communication worker.
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ReduceWorkerIndex(uint32_t block, uint32_t subblock)
+{
+    return subblock == 0U ? block
+                          : (block >= kCommunicationWorkers ? kAic + block - kCommunicationWorkers : kReduceWorkers);
+}
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ReduceOwnedRows(uint64_t rows, uint32_t worker)
+{
+    return worker < kReduceWorkers && worker < rows ? (rows - 1U - worker) / kReduceWorkers + 1U : 0U;
+}
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ReduceRowBegin(uint64_t rows, uint32_t worker)
+{
+    const uint64_t remainder = rows % kReduceWorkers;
+    return static_cast<uint64_t>(worker) * (rows / kReduceWorkers) + (worker < remainder ? worker : remainder);
 }
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr bool IsSelfExpandedRow(uint64_t row, const Config& config)

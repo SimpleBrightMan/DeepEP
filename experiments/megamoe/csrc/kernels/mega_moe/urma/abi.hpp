@@ -11,6 +11,10 @@ constexpr uint32_t kLocalWorkers = 2U * kAic;
 constexpr uint32_t kCommunicationWorkers = 15;
 constexpr uint32_t kActivationWorkers = 13;
 constexpr uint64_t kFlagBytes = 128;
+// Reduce dependency values are uint64 bit patterns stored in an int64 tensor.
+// Low values address a producer/CV completion flag; tagged values address a
+// local GMM2 group that writes its self return rows directly.
+constexpr uint64_t kReduceSelfDependency = uint64_t{1} << 63U;
 constexpr uint32_t kProtocol = 1;
 constexpr uint32_t kTimerCores = kAic * 3U;
 constexpr uint32_t kTimerPhases = 8U;
@@ -55,7 +59,10 @@ enum class TraceEvent : uint32_t {
     LocalSync,
     Gmm1Drain,
     InputScaleGather,
-    WaitInputScale
+    WaitInputScale,
+    CombinePublish,
+    WaitReduceReady,
+    ReduceDrain
 };
 
 struct TraceMeta {
@@ -138,6 +145,7 @@ struct Config {
     uint64_t receiveScaleOffset;
     uint64_t returnYOffset;
     uint64_t dispatchReadyOffset;
+    uint64_t combineReadyOffset;
     uint64_t barrierOffset;
     uint64_t symmetricBytes;
     // One rank's self routes form a contiguous interval in each row layout.
@@ -155,6 +163,7 @@ struct Arguments {
     uint64_t xScale;
     uint64_t order;
     uint64_t reduceIndex;
+    uint64_t reduceDependencies;  // Cached token-major [BS,K] ready descriptors.
     uint64_t weights;
     uint64_t weight1;
     uint64_t weight2;

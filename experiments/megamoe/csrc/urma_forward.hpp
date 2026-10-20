@@ -15,6 +15,7 @@ public:
     UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t intermediate, int64_t topk, int64_t cv_rows,
              int64_t max_recv_rows, int64_t max_tokens, int64_t rank, uint64_t ffts, uint64_t symmetric_address,
              int64_t symmetric_bytes);
+    void bind_reduce_dependencies(torch::Tensor reduce_index);
     torch::Tensor forward(torch::Tensor x, torch::Tensor x_scales, torch::Tensor order, torch::Tensor reduce_index,
                           torch::Tensor topk_weights, torch::Tensor weight1, torch::Tensor weight2,
                           torch::Tensor weight_scales1, torch::Tensor weight_scales2,
@@ -29,7 +30,9 @@ private:
     torch::Tensor gathered_input_scale_, input_scale_done_;
     torch::Tensor fragments_, send_chunks_, recv_chunks_, gmm1_done_, activation_done_, gmm2_done_, local_flags_;
     torch::Tensor segments_, compute_batches_, chunk_group_indices_;
+    torch::Tensor expanded_reduce_dependencies_, reduce_dependencies_, bound_reduce_index_;
     torch::Tensor system_workspace_;
+    int64_t bound_reduce_index_version_ = -1;
     int64_t last_epoch_ = 0;
 };
 }  // namespace deepep::megamoe

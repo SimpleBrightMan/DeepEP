@@ -45,9 +45,12 @@ EVENTS = (
     "Gmm1Drain",
     "InputScaleGather",
     "WaitInputScale",
+    "CombinePublish",
+    "WaitReduceReady",
+    "ReduceDrain",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
-SYNC_STAGES = {0: "pack", 1: "compute/return", 2: "rank barrier", 3: "reduce"}
+SYNC_STAGES = {0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
 
 
 class TraceOverflowError(ValueError):
@@ -75,7 +78,7 @@ def event_style(event):
         return event + " [drain]", "compute.drain", "thread_state_iowait", "explicit pipeline drain scope"
     if event.startswith("Wait") or event in ("RankBarrier", "LocalSync", "FinalPeerHandshake"):
         return event, "wait.sync", "thread_state_iowait", "dependency or synchronization wait"
-    if event in ("DispatchPublish", "PublishStart"):
+    if event in ("DispatchPublish", "CombinePublish", "PublishStart"):
         return event, "signal.publish", "rail_response", "signal publication scope"
     return event, "compute.copy", "rail_animation", "recorded device scope"
 

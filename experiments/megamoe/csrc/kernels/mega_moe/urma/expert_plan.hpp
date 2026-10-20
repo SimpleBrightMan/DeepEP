@@ -22,6 +22,9 @@ struct ExpertPlan {
     std::vector<Chunk> sendChunks;
     std::vector<Chunk> recvChunks;
     std::vector<uint32_t> chunkGroupIndices;
+    // Original expanded-row order. UrmaPlan binds this once through the NPU
+    // inverse map to cache token-major descriptors consumed by Reduce.
+    std::vector<uint64_t> reduceDependencies;
 };
 
 inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, uint64_t maxReceiveRows)
@@ -39,6 +42,8 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
     constexpr uint32_t kExperts = kWorld * 24U;
     constexpr uint32_t kRowsPerGroup = 256;
     const uint64_t expandedRows = static_cast<uint64_t>(config.bs) * config.topk;
+    constexpr uint64_t kUnassignedDependency = std::numeric_limits<uint64_t>::max();
+    plan.reduceDependencies.assign(expandedRows, kUnassignedDependency);
     using RankMatrix = std::array<std::array<uint64_t, kWorld>, kWorld>;
     RankMatrix peerRows{}, sendBase{}, receiveBase{};
     for (uint32_t source = 0; source < kWorld; ++source) {
@@ -86,6 +91,12 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
                                        receiveBase[peer][config.rank] + begin,
                                        static_cast<uint32_t>(std::min<uint64_t>(config.cvRows, outgoing - begin)), 0, 0,
                                        0});
+            if (peer != config.rank) {
+                const uint64_t end = sendBase[config.rank][peer] + std::min<uint64_t>(begin + config.cvRows, outgoing);
+                const uint64_t ready = static_cast<uint64_t>(peer) * config.maxPeerChunks + cv;
+                std::fill(plan.reduceDependencies.begin() + sendBase[config.rank][peer] + begin,
+                          plan.reduceDependencies.begin() + end, ready);
+            }
         }
         const uint64_t incoming = peerRows[peer][config.rank];
         for (uint64_t begin = 0, cv = 0; begin < incoming; begin += config.cvRows, ++cv) {
@@ -131,6 +142,15 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
                     plan.segments.push_back({source, cv, receiveBase[config.rank][source] + peerRow,
                                              sendBase[source][config.rank] + peerRow, static_cast<uint32_t>(lo - begin),
                                              count, ready, 0});
+                    if (source == config.rank) {
+                        const uint64_t first = sendBase[source][config.rank] + peerRow;
+                        for (uint64_t row = first; row < first + count; ++row) {
+                            if (plan.reduceDependencies[row] != kUnassignedDependency) {
+                                throw std::logic_error("URMA self Reduce dependency assigned more than once");
+                            }
+                            plan.reduceDependencies[row] = kReduceSelfDependency | groupIndex;
+                        }
+                    }
                     const uint32_t chunkIndex = readyToChunk[ready];
                     if (chunkIndex == kNoChunk) {
                         throw std::logic_error("URMA compute segment has no transport chunk");
@@ -162,6 +182,10 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
     }
     if (compactRow != config.receiveRows) {
         throw std::logic_error("URMA expert-major rows do not cover the receive layout");
+    }
+    if (std::find(plan.reduceDependencies.begin(), plan.reduceDependencies.end(), kUnassignedDependency) !=
+        plan.reduceDependencies.end()) {
+        throw std::logic_error("URMA Reduce dependencies do not cover all expanded rows");
     }
     config.fragmentCount = static_cast<uint32_t>(plan.fragments.size());
     config.sendChunkCount = static_cast<uint32_t>(plan.sendChunks.size());

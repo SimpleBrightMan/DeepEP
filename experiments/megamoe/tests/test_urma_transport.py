@@ -102,6 +102,8 @@ int main() {
     PublishDone(base, 128, 9, 123, {signal}, 3);
     assert((events == std::vector<int>{1,2,3,4,5}));
     WaitLocalDone(windows[9] + 128, 123);
+    WaitStartAtLeast(windows[9] + 128, 122);
+    WaitStartAtLeast(windows[9] + 128, 123);
     for (uint32_t i = 32; i < 128; ++i) assert(windows[9][128 + i] == 0xab);
     Put(base, 0, x, 0, 9); assert(submitted == 2);
     bool rejected = false;

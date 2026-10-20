@@ -93,6 +93,14 @@ int main(int argc, char**) {
         std::cout << 'D';
         for (auto group : p.chunkGroupIndices) std::cout << ' ' << group;
         std::cout << '\n';
+        assert(p.reduceDependencies.size() == uint64_t(bs) * 8);
+        for (uint64_t begin = 0; begin < p.reduceDependencies.size();) {
+            uint64_t end = begin + 1;
+            while (end < p.reduceDependencies.size() &&
+                   p.reduceDependencies[end] == p.reduceDependencies[begin]) ++end;
+            std::cout << "Q " << begin << ' ' << end - begin << ' ' << p.reduceDependencies[begin] << '\n';
+            begin = end;
+        }
     }
 }
 """
@@ -166,6 +174,7 @@ def check_plans(ids, cv_rows, routes, plans):
         compact = np.zeros(rows, dtype=np.int8)
         used_segments = np.zeros(len(plan["S"]), dtype=np.int8)
         expected_dependencies = defaultdict(set)
+        expected_reduce_dependencies = np.full(ids[rank].size, (1 << 64) - 1, dtype=np.uint64)
         expected_compact_rows = []
         for expert in range(24):
             global_expert = rank * 24 + expert
@@ -203,6 +212,9 @@ def check_plans(ids, cv_rows, routes, plans):
                     if source == rank:
                         assert return_row - self_send == receive_row - self_recv
                 assert mapping == expert_rows[cursor : cursor + group_rows]
+                for source, _, return_row in expert_rows[cursor : cursor + group_rows]:
+                    if source == rank:
+                        expected_reduce_dependencies[return_row] = (1 << 63) | group_index
                 cursor += group_rows
             assert cursor == len(expert_rows)
             expected_compact_rows.extend(expert_rows)
@@ -213,6 +225,10 @@ def check_plans(ids, cv_rows, routes, plans):
         expected_receive = []
         for peer in range(16):
             for offset in range(0, int(counts[rank, peer]), cv_rows):
+                if peer != rank:
+                    lo = int(routes[rank].peer_offsets[peer]) + offset
+                    hi = lo + min(cv_rows, int(counts[rank, peer]) - offset)
+                    expected_reduce_dependencies[lo:hi] = peer * max_chunks + offset // cv_rows
                 expected_send.append(
                     [
                         peer,
@@ -245,6 +261,24 @@ def check_plans(ids, cv_rows, routes, plans):
             assert len(actual) == len(set(actual)) > 0
             dependency_cursor += count
         assert dependency_cursor == len(plan["D"][0])
+        actual_reduce_dependencies = np.empty(ids[rank].size, dtype=np.uint64)
+        dependency_cursor = 0
+        for begin, length, encoded in plan["Q"]:
+            assert begin == dependency_cursor and length > 0
+            assert begin + length <= actual_reduce_dependencies.size
+            actual_reduce_dependencies[begin : begin + length] = encoded
+            dependency_cursor += length
+        assert dependency_cursor == actual_reduce_dependencies.size
+        assert not np.any(expected_reduce_dependencies == np.uint64((1 << 64) - 1))
+        np.testing.assert_array_equal(actual_reduce_dependencies, expected_reduce_dependencies)
+        # This is the index_select contract used by native bind on the NPU:
+        # each token/top-k entry receives the dependency for its original row.
+        token_dependencies = actual_reduce_dependencies[routes[rank].reduce_index]
+        destinations = ids[rank] // 24
+        self_entries = (token_dependencies & np.uint64(1 << 63)) != 0
+        np.testing.assert_array_equal(self_entries, destinations == rank)
+        np.testing.assert_array_equal(token_dependencies[~self_entries] // max_chunks, destinations[~self_entries])
+        assert np.all((token_dependencies[self_entries] & np.uint64((1 << 63) - 1)) < groups)
         # The transport workload is unchanged, regardless of compute grouping.
         assert sum(c[4] for c in plan["T"] if c[0] != rank) == counts[rank].sum() - self_rows
         assert sum(c[4] for c in plan["R"] if c[0] != rank) == counts[:, rank].sum() - self_rows

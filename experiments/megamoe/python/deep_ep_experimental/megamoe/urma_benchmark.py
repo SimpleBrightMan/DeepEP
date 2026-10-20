@@ -225,6 +225,7 @@ def run(args, config, group):
         native_urma_protocol=int(_extension().urma_api_protocol),
         compute_schedule=getattr(_extension(), "urma_compute_schedule", "source-cv"),
         local_pipeline=getattr(_extension(), "urma_local_pipeline", "single-slot"),
+        tail_schedule=_extension().urma_tail_schedule,
         timer_clock_mhz=args.timer_clock_mhz,
         timer_clock_source="explicit assumption; default follows legacy timer/protocol.py CYCLE_TO_US=1000",
         detailed_trace=args.trace,
@@ -237,7 +238,7 @@ def run(args, config, group):
     if rank == 0:
         print(
             f"[URMA SCHEDULE] compute={manifest['compute_schedule']} communication_cv_rows={args.cv_rows} "
-            f"local_pipeline={manifest['local_pipeline']}",
+            f"local_pipeline={manifest['local_pipeline']} tail={manifest['tail_schedule']}",
             flush=True,
         )
     all_reports = []

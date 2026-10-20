@@ -28,6 +28,8 @@ def _extension():
     extension = importlib.import_module(__package__ + "._C")
     if getattr(extension, "urma_api_protocol", None) != 1:
         raise RuntimeError("URMA Python/native versions differ; rebuild and reinstall the complete wheel")
+    if getattr(extension, "urma_tail_schedule", None) != "combine-cv-flag-reduce41":
+        raise RuntimeError("URMA tailCover needs its matching native wheel; rebuild and reinstall the complete wheel")
     return extension
 
 
@@ -128,6 +130,7 @@ class UrmaBuffer:
                 max_recv_rows,
                 timeout,
                 allow_multi_host,
+                "combine-cv-flag-reduce41",
             ),
         )
         self.group = group
@@ -223,6 +226,18 @@ class UrmaBuffer:
         result.record_stream(caller)
         return result
 
+    def _bind_reduce_dependencies(self, plan, reduce_index):
+        """Keep the asynchronous route gather ordered before every forward.
+
+        A prepared plan may be used from a different caller stream. Its hidden
+        dependency table must therefore be produced on the owner stream too.
+        """
+        runtime = self._runtime
+        npu = npu_api()
+        runtime.stream.wait_stream(npu.current_stream(runtime.device))
+        with npu.stream(runtime.stream):
+            plan.bind_reduce_dependencies(reduce_index)
+
     def prepare_routes(self, topk_idx):
         """NPU sort/count/inverse, CPU count exchange, and native descriptor build.
 
@@ -288,6 +303,7 @@ class UrmaBuffer:
                     address,
                     self._runtime.native.capacity,
                 )
+                self._bind_reduce_dependencies(plan, routing.reduce_index)
             except Exception as failure:
                 error = str(failure)
             collective_check(self.group, "URMA descriptor preparation", error)
@@ -297,7 +313,7 @@ class UrmaBuffer:
             )
 
     def forward_prepared(self, x, topk_weights, l1_weights, l2_weights, prepared, *, timer=None, out=None, trace=None):
-        """Expand/Dispatch/GMM1/SwiGLU/GMM2/return PUT/barrier/weighted reduction."""
+        """Expand/Dispatch/GMM1/SwiGLU/GMM2/return PUT and flag-gated weighted reduction."""
         import torch
         from .api import _check_fp4_weight_format, _RoutedWeightPair
 

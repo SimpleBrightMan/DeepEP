@@ -69,9 +69,23 @@ def test_every_event_id_has_a_name_and_no_fabricated_async_events():
     for event_id, name in enumerate(EVENTS):
         add_record(raw, engine=event_id, event=name)
     result = decode_trace(raw, rank=0, clock_mhz=1000)
-    assert len(events(result)) == 30
+    assert len(events(result)) == len(EVENTS) == 33
     assert {row["ph"] for row in result["traceEvents"]} == {"M", "X"}
-    assert {row["args"]["event_id"] for row in events(result)} == set(range(30))
+    assert {row["args"]["event_id"] for row in events(result)} == set(range(len(EVENTS)))
+
+
+def test_tail_cover_events_keep_completion_signal_and_hide_only_ready_wait():
+    from deep_ep_experimental.megamoe.urma_trace import filter_trace_waits
+
+    raw = trace_buffer(4)
+    add_record(raw, engine=2, event="CombinePublish", start=1000, end=1010, peer=3, cv=2)
+    add_record(raw, engine=1, event="WaitReduceReady", start=1000, end=1015, row=7, rows=1)
+    add_record(raw, engine=1, event="Reduce", start=1015, end=1020, row=7, rows=1)
+    add_record(raw, engine=1, event="ReduceDrain", start=1020, end=1030)
+    filtered = events(filter_trace_waits(decode_trace(raw, rank=0, clock_mhz=1000)))
+    assert [row["args"]["event_id"] for row in filtered] == [30, 25, 32]
+    assert filtered[0]["cat"] == "signal.publish"
+    assert filtered[1]["ts"] == 0.015
 
 
 def test_expert_group_trace_keeps_multisource_identity_and_scale_preparation():
@@ -207,7 +221,7 @@ def test_overflow_lists_all_affected_engines_and_writes_no_partial_trace(tmp_pat
         (1, 999, "ticks"),
         (0, UNKNOWN, "ticks"),
         (1, UNKNOWN, "ticks"),
-        (2, 30, "event id"),
+        (2, len(EVENTS), "event id"),
         (3, 16, "peer"),
         (13, 1, "reserved record"),
     ],

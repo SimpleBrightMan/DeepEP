@@ -77,6 +77,17 @@ __aicore__ inline void WaitLocalDone(__gm__ uint8_t* localSlot, uint64_t sequenc
     }
 }
 
+// Empty peer edges may advance to the next invocation before the slow owner
+// observes the old start. Accept a later start only here; CV data readiness
+// still requires the exact epoch. Any nonempty edge prevents such advancement
+// until its old payload has been consumed and locally reduced.
+__aicore__ inline void WaitStartAtLeast(__gm__ uint8_t* localSlot, uint64_t sequence)
+{
+    auto* value = reinterpret_cast<__gm__ uint64_t*>(localSlot);
+    while (AscendC::ReadGmByPassDCache(value) < sequence) {
+    }
+}
+
 // Only one local leader enters this function AFTER joining all local workers
 // and their per-peer Quiet calls. All remote reads are of this rank's own flag
 // slots. Each source rank owns one cache line in every destination rank.

@@ -70,8 +70,10 @@ inline std::array<std::deque<Command>, 4> queues;
 inline bool events[6][8]{};
 alignas(64) inline std::array<unsigned char, 192 * 1024> ub;
 inline unsigned priority;
-inline uint64_t inputCopies, outputCopies, metadataCopies;
+inline uint64_t inputCopies, outputCopies, metadataCopies, completedOutputs;
 inline bool bypass;
+inline std::function<void(uintptr_t)> beforePayload;
+inline std::function<uint64_t(uintptr_t)> readFlag;
 inline constexpr uintptr_t returnedBase = uintptr_t(1) << 40U;
 inline constexpr uintptr_t returnedEnd = returnedBase + (uintptr_t(1) << 36U);
 inline bfloat16_t Returned(uint64_t row, uint32_t column) {
@@ -93,6 +95,10 @@ inline void Drain() {
     while (!queues[Mte2].empty() || !queues[Vector].empty() || !queues[Mte3].empty()) {
         assert(Step() && "pipeline event deadlock");
     }
+}
+template <typename T> T ReadGmByPassDCache(T* address) {
+    assert(readFlag);
+    return static_cast<T>(readFlag(reinterpret_cast<uintptr_t>(address)));
 }
 template <HardEvent Event> void SetFlag(TEventID id) {
     assert(id < 8);
@@ -148,6 +154,8 @@ template <typename T> void DataCopy(LocalTensor<T> destination, GlobalTensor<T> 
     assert(count * sizeof(T) % 32U == 0U);
     const uintptr_t address = reinterpret_cast<uintptr_t>(source.data);
     if (address >= returnedBase && address < returnedEnd) {
+        assert(beforePayload);
+        beforePayload(address);
         ++inputCopies;
         Enqueue(Mte2, [=] {
             const uint64_t index = (address - returnedBase) / sizeof(bfloat16_t);
@@ -171,6 +179,7 @@ template <typename T> void DataCopy(GlobalTensor<T> destination, LocalTensor<T> 
     ++outputCopies;
     Enqueue(Mte3, [=] {
         std::copy_n(source.Data(), count, destination.data);
+        ++completedOutputs;
         return true;
     });
 }
@@ -203,19 +212,55 @@ DRIVER = r"""
 #include <random>
 using namespace MegaMoeUrma;
 using namespace AscendC;
+struct TraceSink {
+    uint64_t tick{}, waits{}, work{}, drains{};
+    uint64_t TraceBegin() { return ++tick; }
+    void TraceEnd(TraceEvent event, uint64_t, const TraceMeta& meta = TraceMeta{}) {
+        if (event == TraceEvent::WaitReduceReady) { ++waits; assert(meta.rows == 1U); }
+        else if (event == TraceEvent::Reduce) { ++work; assert(meta.rows == 1U); }
+        else { assert(event == TraceEvent::ReduceDrain); ++drains; }
+    }
+};
 int main(int argc, char** argv) {
-    assert(argc == 5);
+    if (argc == 2) {
+        for (uint32_t rows : {1U, 40U, 41U, 42U, 2048U, 4096U, 8192U}) {
+            std::vector<uint32_t> coverage(rows), workers(kReduceWorkers);
+            for (uint32_t block = 0; block < 28; ++block) {
+                const auto first = ReduceWorkerIndex(block, 0);
+                assert(first == block && ++workers[first] == 1);
+                if (block >= 15) {
+                    const auto second = ReduceWorkerIndex(block, 1);
+                    assert(second == 28U + block - 15U && ++workers[second] == 1);
+                }
+            }
+            for (uint32_t worker = 0; worker < kReduceWorkers; ++worker) {
+                const auto start = ReduceRowBegin(rows, worker), count = ReduceOwnedRows(rows, worker);
+                for (uint64_t row = start; row < start + count; ++row) assert(++coverage[row] == 1);
+            }
+            for (auto n : coverage) assert(n == 1U);
+            for (auto n : workers) assert(n == 1U);
+        }
+        return 0;
+    }
+    assert(argc == 5 || argc == 6);
+    const bool initiallyReady = argc == 6;
     const uint32_t bs = std::stoul(argv[1]), worker = std::stoul(argv[2]);
     priority = std::stoul(argv[3]);
     std::mt19937 random(std::stoul(argv[4]));
     const uint32_t rows = bs * 8U;
+    const auto count = ReduceOwnedRows(bs, worker), begin = ReduceRowBegin(bs, worker);
     std::vector<int64_t> inverse(rows);
     std::vector<float> weights(rows);
+    std::vector<uint64_t> dependencies(rows), routeForRow(rows), payloadVisits(rows);
     for (uint32_t i = 0; i < rows; ++i) {
         inverse[i] = i;
         weights[i] = float(int(random() % 2001U) - 1000) / 997.0F;
     }
     std::shuffle(inverse.begin(), inverse.end(), random);
+    for (uint32_t route = 0; route < rows; ++route) {
+        routeForRow[inverse[route]] = route;
+        dependencies[route] = route % 4U == 0 ? kReduceSelfDependency | route : route;
+    }
     std::vector<bfloat16_t> output(uint64_t(bs) * 3584U);
     for (auto& value : output) value.bits = 0x7fc1;
     ub.fill(0xa5);
@@ -223,14 +268,55 @@ int main(int argc, char** argv) {
     args.config.hidden = 3584;
     args.config.topk = 8;
     args.config.bs = bs;
+    args.config.epoch = 7;
     args.symmetric = returnedBase;
+    args.config.combineReadyOffset = uintptr_t(1) << 35U;
+    args.gmm2Done = uintptr_t(1) << 42U;
     args.output = reinterpret_cast<uint64_t>(output.data());
     args.reduceIndex = reinterpret_cast<uint64_t>(inverse.data());
     args.weights = reinterpret_cast<uint64_t>(weights.data());
-    Reduce(args, worker);
-    const auto count = LocalOwnedRows(bs, worker), begin = LocalRowBegin(bs, worker);
+    args.reduceDependencies = reinterpret_cast<uint64_t>(dependencies.data());
+    uint64_t pollClock = 0, remotePolls = 0, selfPolls = 0, outputDuringWait = 0;
+    auto readyAt = [&](uint64_t route) {
+        if (initiallyReady) return uint64_t(0);
+        const uint64_t token = route / 8U;
+        return 100U + (token >= begin ? token - begin : 0U) * 256U + route % 8U * 7U;
+    };
+    readFlag = [&](uintptr_t address) {
+        ++pollClock;
+        Step();  // Other engines may progress while Scalar polls a late producer.
+        outputDuringWait += completedOutputs != 0U;
+        if (address >= args.gmm2Done && address < args.gmm2Done + uint64_t(rows) * 128U) {
+            ++selfPolls;
+            const uint64_t route = (address - args.gmm2Done) / 128U;
+            // An incomplete self GMM2 group must not be accepted.
+            return uint64_t(pollClock >= readyAt(route) ? 14U : 13U);
+        }
+        const uintptr_t remote = args.symmetric + args.config.combineReadyOffset;
+        assert(address >= remote && address < remote + uint64_t(rows) * 128U);
+        ++remotePolls;
+        const uint64_t route = (address - remote) / 128U;
+        // Previous invocation's epoch is deliberately already nonzero.
+        return pollClock >= readyAt(route) ? args.config.epoch : args.config.epoch - 1U;
+    };
+    beforePayload = [&](uintptr_t address) {
+        const auto row = (address - returnedBase) / sizeof(bfloat16_t) / 3584U;
+        const auto route = routeForRow[row], token = route / 8U;
+        assert(token >= begin && token - begin < count);
+        for (uint32_t slot = 0; slot < 8; ++slot) {
+            assert(pollClock >= readyAt(token * 8U + slot) &&
+                   "payload submitted before all eight token dependencies are ready");
+        }
+        assert(++payloadVisits[route] == 1U);
+    };
+    TraceSink timer;
+    Reduce(args, worker, timer);
     assert(inputCopies == count * 8U && outputCopies == count);
-    assert(metadataCopies == 2U * ((count + 127U) / 128U));
+    assert(metadataCopies == 3U * ((count + 127U) / 128U));
+    assert(timer.waits == count && timer.work == count && timer.drains == (count != 0U));
+    assert(completedOutputs == count);
+    if (count > 1U && !initiallyReady) assert(outputDuringWait > 0);
+    if (count != 0U) assert(remotePolls && selfPolls);
     assert(bypass == (count != 0U));
     for (const auto& queue : queues) assert(queue.empty());
     for (const auto& kind : events) for (auto event : kind) assert(!event);
@@ -287,7 +373,7 @@ def reduce_binary(tmp_path_factory):
     return binary
 
 
-@pytest.mark.parametrize("bs,worker", [(1, 0), (1, 55), (55, 54), (56, 55), (57, 0), (57, 55)])
+@pytest.mark.parametrize("bs,worker", [(1, 0), (1, 40), (40, 39), (41, 40), (42, 0), (42, 40)])
 @pytest.mark.parametrize("priority", [0, 1, 2])
 def test_reduce_short_and_empty_workers(reduce_binary, bs, worker, priority):
     result = subprocess.run(
@@ -300,11 +386,28 @@ def test_reduce_short_and_empty_workers(reduce_binary, bs, worker, priority):
 
 
 @pytest.mark.parametrize("bs", [2048, 4096, 8192])
-@pytest.mark.parametrize("worker", [0, 55])
+@pytest.mark.parametrize("worker", [0, 40])
 @pytest.mark.parametrize("priority", [0, 1, 2])
 def test_reduce_full_cases_preserve_arithmetic_and_events(reduce_binary, bs, worker, priority):
     result = subprocess.run(
         [str(reduce_binary), str(bs), str(worker), str(priority), str(bs + worker)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_reduce_41_worker_partition_covers_every_token(reduce_binary):
+    result = subprocess.run([str(reduce_binary), "coverage"], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("bs", [42, 2048, 4096, 8192])
+@pytest.mark.parametrize("priority", [0, 1, 2])
+def test_ready_tokens_do_not_overwrite_unconsumed_gate_events(reduce_binary, bs, priority):
+    result = subprocess.run(
+        [str(reduce_binary), str(bs), "0", str(priority), "29", "all-ready"],
         capture_output=True,
         text=True,
         timeout=30,

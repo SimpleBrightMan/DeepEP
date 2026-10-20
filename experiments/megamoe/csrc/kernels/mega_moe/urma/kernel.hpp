@@ -31,7 +31,7 @@ __aicore__ inline TraceMeta ChunkTraceMeta(const Chunk& chunk)
 __aicore__ inline void TraceLocalSync(Timer& timer, uint32_t stage)
 {
     TraceMeta meta;
-    meta.cv = stage;  // 0=pack, 1=compute/return, 2=rank barrier, 3=reduce.
+    meta.cv = stage;  // 0=pack, 3=local invocation completion; 1/2 reserved.
     const uint64_t start = timer.TraceBegin();
     SyncAll<false>();
     timer.TraceEnd(TraceEvent::LocalSync, start, meta);
@@ -94,7 +94,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     PublishDone(symmetric, PeerPhaseSlot(args, 0U, args.config.rank), peer, args.config.epoch, signal, EVENT_ID0);
     timer.TraceEnd(TraceEvent::PublishStart, start, peerMeta);
     start = timer.TraceBegin();
-    WaitLocalDone(symmetric + PeerPhaseSlot(args, 0U, peer), args.config.epoch);
+    WaitStartAtLeast(symmetric + PeerPhaseSlot(args, 0U, peer), args.config.epoch);
     timer.TraceEnd(TraceEvent::WaitStartPeer, start, peerMeta);
     timer.End(Phase::Barrier);
 
@@ -128,7 +128,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         timer.TraceEnd(TraceEvent::DispatchPublish, start, meta);
         timer.End(Phase::Dispatch, chunk.rows * (h + scales));
     }
-    // Empty peers must still join the dispatch phase and final handshake.
+    // Empty peers must still join the local dispatch phase.
     AtomicAdd(ComputeFlag(args.localFlags, 0U), 1);
     start = timer.TraceBegin();
     WaitComputeFlag(args.localFlags, 0U, kWorld);
@@ -152,24 +152,21 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             reinterpret_cast<__gm__ uint8_t*>(args.gmm2Output + chunk.localRow * rowBytes),
             static_cast<uint32_t>(chunk.rows * rowBytes), peer);
         timer.TraceEnd(TraceEvent::CombinePut, start, meta);
+        meta.bytes = 0U;
+        start = timer.TraceBegin();
+        Quiet(peer);
+        timer.TraceEnd(TraceEvent::CombineQuiet, start, meta);
+        const uint64_t readyIndex = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + chunk.cv;
+        start = timer.TraceBegin();
+        PublishDone(symmetric, args.config.combineReadyOffset + readyIndex * kFlagBytes, peer, args.config.epoch,
+                    signal, EVENT_ID0);
+        timer.TraceEnd(TraceEvent::CombinePublish, start, meta);
         combineBytes += chunk.rows * rowBytes;
     }
-    // GMM2 rows are never reused within this invocation. Keep the peer's PUT
-    // queue in flight across chunks; only the final quiet releases the source
-    // lifetime and certifies all returned rows. The recorded envelope includes
-    // producer gaps between the first submission and this final completion.
-    start = timer.TraceBegin();
-    Quiet(peer);
-    timer.TraceEnd(TraceEvent::CombineQuiet, start, peerMeta);
+    // Every CV now has its own completion flag, so the source can reduce
+    // completed tokens while other peers are still computing/returning rows.
+    // The aggregate envelope includes producer gaps between CVs.
     if (combineStarted) timer.End(Phase::Combine, combineBytes);
-    // Each source's completion is independent. The following local MIX
-    // barrier joins all 15 incoming peers before any core runs Reduce.
-    timer.Begin(Phase::Barrier);
-    start = timer.TraceBegin();
-    PublishDone(symmetric, PeerPhaseSlot(args, 1U, args.config.rank), peer, args.config.epoch, signal, EVENT_ID0);
-    WaitLocalDone(symmetric + PeerPhaseSlot(args, 1U, peer), args.config.epoch);
-    timer.TraceEnd(TraceEvent::FinalPeerHandshake, start, peerMeta);
-    timer.End(Phase::Barrier);
 }
 
 __aicore__ inline void Process(const Arguments& args)
@@ -206,39 +203,21 @@ __aicore__ inline void Process(const Arguments& args)
         if (block == kCommunicationWorkers) PublishSelfDispatchReady(args);
         RunActivation(args, block - kCommunicationWorkers, timer);
     }
-    if constexpr (g_coreType == AIV) PipeBarrier<PIPE_ALL>();
-    // All GMM2 FIX stores, including direct self returns, complete before this
-    // full local join. The following rank barrier still precedes every Reduce.
-    TraceLocalSync(timer, 1U);
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() == 1U && block == 0U) {
-            // The peer handshakes certify every local send/receive. Join all
-            // ranks as well, so Reduce starts only after the entire operation's
-            // return traffic has completed, including traffic between others.
-            LocalTensor<uint64_t> signal(TPosition::VECCALC, 0U, 4U);
-            timer.Begin(Phase::Barrier);
-            const uint64_t start = timer.TraceBegin();
-            RankBarrier(reinterpret_cast<__gm__ uint8_t*>(args.symmetric), PeerPhaseSlot(args, 2U, 0U),
-                        args.config.rank, args.config.epoch, signal, EVENT_ID0);
-            timer.TraceEnd(TraceEvent::RankBarrier, start);
-            timer.End(Phase::Barrier);
+        // Only this engine releases its phase-private UB/events. Other
+        // compute and communication engines may still be producing rows.
+        PipeBarrier<PIPE_ALL>();
+        const uint32_t worker = ReduceWorkerIndex(block, GetSubBlockIdx());
+        if (worker < kReduceWorkers) {
+            timer.Begin(Phase::ReducePhase);
+            Reduce(args, worker, timer);
+            const uint64_t owned = ReduceOwnedRows(args.config.bs, worker);
+            timer.End(Phase::ReducePhase, owned * args.config.hidden * sizeof(bfloat16_t));
+            PipeBarrier<PIPE_ALL>();
         }
-        PipeBarrier<PIPE_ALL>();
     }
-    TraceLocalSync(timer, 2U);
-    if constexpr (g_coreType == AIV) {
-        const uint32_t worker = LocalWorkerIndex(block, GetSubBlockIdx());
-        timer.Begin(Phase::ReducePhase);
-        const uint64_t start = timer.TraceBegin();
-        Reduce(args, worker);
-        const uint64_t owned = LocalOwnedRows(args.config.bs, worker);
-        TraceMeta meta;
-        meta.rows = owned;
-        meta.bytes = owned * args.config.hidden * sizeof(bfloat16_t);
-        timer.TraceEnd(TraceEvent::Reduce, start, meta);
-        timer.End(Phase::ReducePhase, owned * args.config.hidden * sizeof(bfloat16_t));
-        PipeBarrier<PIPE_ALL>();
-    }
+    // A local MIX join, not a rank barrier: every reducer, peer owner and AIC
+    // must finish before returning and reusing this invocation's workspaces.
     TraceLocalSync(timer, 3U);
     timer.FinishTrace();
     SetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL, MegaMoeImpl::OVERFLOW_MODE_CTRL>(originalOverflow);

@@ -40,7 +40,9 @@ Config Layout(int64_t world, int64_t max_tokens, int64_t topk, int64_t hidden, i
     config.receiveScaleOffset = Align(static_cast<uint64_t>(max_recv_rows) * hidden);
     config.returnYOffset = Align(config.receiveScaleOffset + static_cast<uint64_t>(max_recv_rows) * (hidden / 32));
     config.dispatchReadyOffset = Align(config.returnYOffset + static_cast<uint64_t>(max_tokens) * topk * hidden * 2);
-    config.barrierOffset = Align(config.dispatchReadyOffset + 16ULL * config.maxPeerChunks * MegaMoeUrma::kFlagBytes);
+    config.combineReadyOffset =
+        Align(config.dispatchReadyOffset + 16ULL * config.maxPeerChunks * MegaMoeUrma::kFlagBytes);
+    config.barrierOffset = Align(config.combineReadyOffset + 16ULL * config.maxPeerChunks * MegaMoeUrma::kFlagBytes);
     config.symmetricBytes = Align(config.barrierOffset + 4ULL * 16 * MegaMoeUrma::kFlagBytes, 2ULL << 20);
     return config;
 }
@@ -140,6 +142,10 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     segments_ = Upload(plan.segments, options);
     compute_batches_ = Upload(plan.computeBatches, options);
     chunk_group_indices_ = Upload(plan.chunkGroupIndices, options);
+    auto dependency_cpu = torch::empty({static_cast<int64_t>(expanded_rows)},
+                                       torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64));
+    std::memcpy(dependency_cpu.data_ptr(), plan.reduceDependencies.data(), expanded_rows * sizeof(uint64_t));
+    expanded_reduce_dependencies_ = dependency_cpu.to(options.device());
     send_chunks_ = Upload(plan.sendChunks, options);
     recv_chunks_ = Upload(plan.recvChunks, options);
     gmm1_done_ = allocate(config.gmm1Tiles * MegaMoeUrma::kFlagBytes);
@@ -170,6 +176,28 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     args_.systemWorkspace = Address(system_workspace_);
 }
 
+void UrmaPlan::bind_reduce_dependencies(torch::Tensor reduce_index)
+{
+    TORCH_CHECK(!reduce_dependencies_.defined(), "URMA Reduce dependencies have already been bound");
+    CheckTensor(reduce_index, 2, "reduce_index", expanded_x_.device());
+    const auto& config = args_.config;
+    TORCH_CHECK(reduce_index.scalar_type() == torch::kInt64 &&
+                    reduce_index.sizes() == torch::IntArrayRef({config.bs, config.topk}),
+                "reduce_index must be int64 [BS,topk]");
+    // One NPU gather per route preparation avoids a second per-route GM lookup
+    // in the Reduce loop. Values are opaque int64 bit patterns: the high bit
+    // distinguishes direct-self GMM2 completion from remote producer/CV flags.
+    reduce_dependencies_ =
+        expanded_reduce_dependencies_.index_select(0, reduce_index.reshape({-1})).reshape({config.bs, config.topk});
+    bound_reduce_index_ = reduce_index;
+    bound_reduce_index_version_ = reduce_index._version();
+    args_.reduceDependencies = Address(reduce_dependencies_);
+    const auto stream = c10_npu::getCurrentNPUStream();
+    for (const auto* tensor : {&expanded_reduce_dependencies_, &reduce_dependencies_, &bound_reduce_index_}) {
+        c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
+    }
+}
+
 torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::Tensor order,
                                 torch::Tensor reduce_index, torch::Tensor topk_weights, torch::Tensor weight1,
                                 torch::Tensor weight2, torch::Tensor weight_scales1, torch::Tensor weight_scales2,
@@ -178,6 +206,12 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
 {
     const auto& c = args_.config;
     const auto device = expanded_x_.device();
+    TORCH_CHECK(reduce_dependencies_.defined() && bound_reduce_index_.defined(),
+                "URMA Reduce dependencies must be bound before forward");
+    TORCH_CHECK(reduce_index.defined() && reduce_index.data_ptr() == bound_reduce_index_.data_ptr() &&
+                    reduce_index._version() == bound_reduce_index_version_ &&
+                    bound_reduce_index_._version() == bound_reduce_index_version_,
+                "URMA reduce_index differs from its bound inverse or was modified; prepare a new route plan");
     CheckTensor(x, 2, "x", device);
     CheckTensor(x_scales, 3, "x_scales", device);
     CheckTensor(order, 1, "order", device);
@@ -288,6 +322,9 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
                                &segments_,
                                &compute_batches_,
                                &chunk_group_indices_,
+                               &expanded_reduce_dependencies_,
+                               &reduce_dependencies_,
+                               &bound_reduce_index_,
                                &send_chunks_,
                                &recv_chunks_,
                                &gmm1_done_,
@@ -306,11 +343,28 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
 int64_t UrmaPlan::workspace_bytes() const
 {
     int64_t bytes = 0;
-    for (const auto* tensor :
-         {&expanded_x_, &expanded_scale_, &gathered_input_scale_, &gmm1_, &activation_, &activation_scale_, &gmm2_,
-          &fragments_, &segments_, &compute_batches_, &chunk_group_indices_, &send_chunks_, &recv_chunks_, &gmm1_done_,
-          &input_scale_done_, &activation_done_, &gmm2_done_, &local_flags_, &system_workspace_})
-        bytes += tensor->nbytes();
+    for (const auto* tensor : {&expanded_x_,
+                               &expanded_scale_,
+                               &gathered_input_scale_,
+                               &gmm1_,
+                               &activation_,
+                               &activation_scale_,
+                               &gmm2_,
+                               &fragments_,
+                               &segments_,
+                               &compute_batches_,
+                               &chunk_group_indices_,
+                               &expanded_reduce_dependencies_,
+                               &reduce_dependencies_,
+                               &send_chunks_,
+                               &recv_chunks_,
+                               &gmm1_done_,
+                               &input_scale_done_,
+                               &activation_done_,
+                               &gmm2_done_,
+                               &local_flags_,
+                               &system_workspace_})
+        if (tensor->defined()) bytes += tensor->nbytes();
     return bytes;
 }
 }  // namespace deepep::megamoe

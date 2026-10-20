@@ -135,6 +135,42 @@ def test_native_failure_restores_caller_and_poison_prevents_retry_or_teardown(mo
     owner._runtime.closed = True  # Model launcher process termination, not a collective cleanup.
 
 
+def test_dependency_gather_stays_ordered_when_forward_switches_caller_stream(monkeypatch):
+    events = []
+    caller_a, caller_b, execution = (Stream(name, events) for name in ("a", "b", "owner"))
+    npu = Npu(caller_a, events)
+    monkeypatch.setattr(urma, "npu_api", lambda: npu)
+    owner, _ = owner_for(execution)
+    inverse = object()
+
+    def bind(value):
+        assert value is inverse and npu.current is execution
+        events.append(("gather", npu.current.name))
+
+    def forward(*_):
+        assert npu.current is execution
+        events.append(("forward", npu.current.name))
+        return SimpleNamespace(record_stream=lambda stream: events.append(("record", stream.name)))
+
+    plan = SimpleNamespace(bind_reduce_dependencies=bind, forward=forward)
+    owner._bind_reduce_dependencies(plan, inverse)
+    npu.current = caller_b
+    owner._enqueue_forward(SimpleNamespace(native=plan), ())
+    assert events == [
+        ("wait", "owner", "a"),
+        ("enter", "owner"),
+        ("gather", "owner"),
+        ("restore", "a"),
+        ("wait", "owner", "b"),
+        ("enter", "owner"),
+        ("forward", "owner"),
+        ("restore", "b"),
+        ("wait", "b", "owner"),
+        ("record", "b"),
+    ]
+    owner.destroy()
+
+
 def test_closed_buffer_rejects_reuse_and_destroy_is_idempotent():
     events = []
     owner, _ = owner_for(Stream("owner", events))
@@ -249,7 +285,24 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
     buffer = urma.UrmaBuffer(StoreGroup(None, 0, 16, prefix="test"), allow_multi_host=allow)
     assert buffer.allow_multi_host is allow
     assert created == [allow]
-    assert checks[0][1][-1] is allow
+    assert checks[0][1][-2] is allow
+    assert checks[0][1][-1] == "combine-cv-flag-reduce41"
+
+
+@pytest.mark.parametrize("tail", [None, "combine-cv-flag-reduce41"])
+def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, tail):
+    monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
+    extension = SimpleNamespace(urma_api_protocol=1, urma_tail_schedule=tail)
+    monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
+    urma._extension.cache_clear()
+    try:
+        if tail is None:
+            with pytest.raises(RuntimeError, match="tailCover needs its matching native wheel"):
+                urma._extension()
+        else:
+            assert urma._extension() is extension
+    finally:
+        urma._extension.cache_clear()
 
 
 def test_benchmark_summaries_preserve_two_eight_rank_nodes():

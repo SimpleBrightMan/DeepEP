@@ -1,6 +1,8 @@
 # MegaMoE URMA 固定 CV 实验
 
-本实验是完整的 Prefill 算子：真实路由准备、本地展开、Dispatch、GMM1、SwiGLU/MXFP8 量化、GMM2、Combine PUT、最终同步和加权 Reduce。没有屏蔽计算，也没有使用预置 balanced 专用路由。
+本实验是完整的 Prefill 算子：真实路由准备、本地展开、Dispatch、GMM1、SwiGLU/MXFP8 量化、GMM2、Combine PUT 和加权 Reduce。没有屏蔽计算，也没有使用预置 balanced 专用路由。
+
+本分支为 `megamoe-urma-tailCover`，基于 `megamoe-urma` 的多槽版本 `a35b4d3`。原分支保留尾部全卡同步和56核Reduce；本分支采用每CV完成信号和41核Reduce，详见下文。两版均须各自重新编译安装完整wheel，不能混用rank或Python/native版本。
 
 首版范围：默认单机 EP16，固定使用28个AIC / 56个AIV、每个AIV至少192 KiB UB、H=3584、I=1280、384个专家、TopK=8、无共享专家、FP8输入/FP4权重、BS=2048/4096/8192。物理核心数更多的兼容机型仍只启动这28组计算核。任意合法路由均走同一流程；超过配置接收容量的偏斜路由会在启动计算前明确报错。
 
@@ -15,19 +17,29 @@ GMM按专家聚合不同来源的行，使用M256计算块，仅专家尾块不�
 3. 每个目标rank的连续行流按 `cv_rows` 截断，通过 URMA PUT 发送。token与scale使用各自连续平面。
 4. 对每个本地expert，把16个来源的行按source编号连接，按M256划分计算组；专家尾组可以不足256，不与下一个专家混算。每组的Segment记录来源、CV、接收行、组内行和返回展开行。Segment在source/CV边界切分，但这些边界不再切分矩阵计算。
 5. GMM1按Segment把X分段加载到同一L1计算块，只等待该组实际涉及的Dispatch CV及scale准备。scale由13个AIV1独立准备，每个M组只聚合一次到expert-major GM；AIC沿用连续MX scale加载。GMM1输出、SwiGLU及GMM2输入使用连续的expert-major计算行序。GMM2按同一映射将远端结果分段写回原source-major连续输出区，self结果直接写Reduce最终读取的位置。各peer的Combine CV等待所有覆盖它的M组完成全部H列，再按原连续区间PUT。
-6. 本rank的15个远端Dispatch全部完成且self接收区已就绪后才提交Combine PUT，此处不插入全卡同步。Combine延后quiet，所有PUT完成后参加最终全卡同步，再由56个AIV按`reduce_index`读取各top-k结果、乘路由权重并求和。
+6. 本rank的15个远端Dispatch全部完成且self接收区已就绪后才提交Combine PUT。每个Combine CV执行 `PUT → quiet(peer) → MTE DataCopy发布epoch flag`。计算侧AIV完成自己的任务后即可按token依赖Reduce，不再等待最终全卡同步。
 
 15个通信AIV1各独占一个远端rank。通信worker `w` 的peer为 `w < rank ? w : w+1`；剩余13个AIV1执行SwiGLU。self就绪标志在Pack本地同步后发布，原来承担self拷贝的block15随后直接进入SwiGLU。远端两个阶段都只使用PUT，队列同一peer始终只有一个提交者。
 
-Pack和Reduce是计算前后的独立本地阶段，使用28组中的全部AIV0/AIV1，共56个AIV；任务编号为`block*2+subblock`，按56核划分行。阶段结束仍保留原有DMA完成及本地同步，再复用UB进行计算或结束调用。当前内核固定启动28组；即使物理设备有64个AIV，也只使用已启动的56个，不扩大计算/通信核数量。
+Pack使用全部56个AIV，任务编号为`block*2+subblock`。Reduce只使用28个AIV0和block15～27的13个AIV1，共41核；15个通信AIV1不参与Reduce。计算侧每核结束自己的反量化或scale/SwiGLU任务后，先排空本核流水以交还UB/event，再独立进入Reduce。当前内核固定启动28组；即使物理设备有64个AIV，也只使用已启动的56个。
 
-本地阶段使用多槽流水，benchmark打印`local_pipeline=pack6-reduce6-output2`。每核分配连续行区间，各核行数与原来的跨步分配完全一致：
+本地阶段使用多槽流水，benchmark打印`local_pipeline=pack6-reduce6-output2 tail=combine-cv-flag-reduce41`。Pack按56核、Reduce按41核分配连续行区间：
 
 - Pack使用6个token/scale槽，按槽等待上一次MTE3完成，再下发新的MTE2；不同槽的读取与写出可以重叠。`order`批量DMA到UB，当前支持的最大BS8192每核最多1171行，一次预取即可，payload循环不再从GM逐行标量读取路由。UB占用65.5 KiB。
-- Reduce使用6个BF16/FP32输入槽、独立FP32累加器和2个BF16输出槽。`inverse + weights`按最多128个token批量搬入UB，输入预取与向量乘加、前一个token输出写入可以重叠。UB占用166 KiB，低于现有192 KiB最低要求。
-- 返回布局、FP32乘加顺序和最终BF16舍入不变。self直接写receive/return，远端PUT和通信CV不变。Pack仍全部完成后才进入Dispatch，Reduce仍在尾部全卡同步后执行；本次不将它们融入通信/计算阶段。
+- Reduce使用6个BF16/FP32输入槽、独立FP32累加器和2个BF16输出槽。`inverse + weights + readiness dependencies`按最多128个token批量搬入UB，UB占用174 KiB，低于现有192 KiB最低要求。每个token的8路结果全部就绪后才预取payload，6槽在这个token内部流水；不预取尚未就绪的下一个token。
+- 返回布局、FP32乘加顺序和最终BF16舍入不变。self直接写receive/return，远端PUT的CV粒度和数量不变。Pack仍全部完成后才进入Dispatch；Reduce可以与其他核心的计算和Combine重叠。
 
-若打印`local_pipeline=single-slot`，加载的native扩展仍为旧版，需重新编译安装。正式耗时仍取关闭timer/trace的`CACHED_FORWARD`；比较Pack/Reduce阶段时使用同rank全部56个AIV记录的`max(last_tick)-min(first_tick)`。原timer的Pack字节统计写入的FP8+scale，Reduce字节仅统计输出BF16，均不是完整HBM读写流量。
+Python会拒绝不含本分支tail调度标记的native扩展。正式耗时仍取关闭timer/trace的`CACHED_FORWARD`。Pack跨度覆盖56核；本分支Reduce跨度覆盖41核且包含等待结果就绪的时间，不能直接当作纯本地Reduce耗时，也不能与Combine跨度相加。原timer的Pack字节统计写入的FP8+scale，Reduce字节仅统计输出BF16，均不是完整HBM读写流量。
+
+### Combine 完成信号与 Reduce 重叠
+
+- 路由准备时为每个expanded row生成依赖：远端为`producer_rank * maxPeerChunks + cv_id`，self为带高位标记的GMM2组编号。再用已有`reduce_index`在NPU上执行一次`index_select`，缓存token-major `[BS,8]`依赖表。forward不重建它；native绑定inverse的地址和版本，修改后必须重新准备路由。
+- 远端每CV的`quiet`完成后，通信owner用MTE发布32B信号到独立128B槽。Reducer只在本地轮询槽，要求epoch精确相等；self等待对应组的全部GMM2列tile完成计数。AIV0结束不能代替self结果完成。
+- 删除原来的尾部peer完成握手、全卡barrier以及Reduce之前的全本机汇合。只保留Pack后的本机汇合和函数退出前的本机MIX汇合；后者包括28 AIC、56 AIV，保护workspace及下一轮复用，不产生跨rank同步。
+- 下一次调用仍在Pack完成后进行peer Start握手。Start接受`>= epoch`，防止双向空路由的peer提前进入下一轮、覆盖旧Start而造成死等。有效CV的ready仍使用`== epoch`，并且不逐轮清空对称ready区。
+- 这是每个worker顺序处理自己token区间的实现：若当前token缺任意一路结果，先等它，不扫描后面的就绪token。每CV新增quiet/MTE发布有成本；41核分工和token内部6槽也可能改变本地吞吐，应以完整`CACHED_FORWARD`和trace实测判断收益。
+
+trace新增`CombinePublish`、`WaitReduceReady`及`ReduceDrain`；默认隐藏`WaitReduceReady`，保留真正执行的token Reduce片段及最终排空。打点没有增加每token全流水排空。原始bin保留所有等待，`--trace-include-waits`可以显示它们。旧版本尾部同步事件仍可解码，本分支不会生成已删除的全卡同步事件。
 
 self直接写地址按现有`send_base/receive_base`映射；同一计算组可同时含self和远端行，逐Segment决定输出地址。远端PUT的地址、顺序、CV和数量不变，计算按expert顺序推进多个peer的返回结果。当前Pack完成前不会对peer发布新epoch的Start；上一轮本地计算/返回/Reduce由同一runtime stream串行完成，因此self直接写不会覆盖尚在使用的上一轮数据。
 
@@ -71,7 +83,7 @@ Scale准备只在详细trace中独立计时，未归入原有8个aggregate phase
 
 ### 本地多槽流水 A/B 验证（2026-10-20）
 
-在两台Ascend950DT（每机8卡）上对比本次修改与`e319740`对应的单槽本地实现，通信和专家M256计算不变。H3584/I1280/E384/TopK8、balanced、CV256，每次调用仍启动28 AIC/56 AIV。两机全部设备健康OK且空闲后才运行，旧新分别创建独立通信域。
+以下数据属于原分支 `megamoe-urma` 的多槽版本 `a35b4d3`，不是本分支tailCover结果。在两台Ascend950DT（每机8卡）上对比该版本与`e319740`对应的单槽本地实现，通信和专家M256计算不变。H3584/I1280/E384/TopK8、balanced、CV256，每次调用仍启动28 AIC/56 AIV。两机全部设备健康OK且空闲后才运行，旧新分别创建独立通信域。
 
 | BS | Pack：旧→新 μs | Reduce：旧→新 μs | 完整forward：旧→新 μs | forward耗时下降 |
 |---:|---:|---:|---:|---:|
@@ -103,7 +115,7 @@ buffer.destroy()
 
 `forward`始终包含这一步。`forward_prepared`只允许复用同一buffer的不变路由。修改prepared中的任何路由tensor后拒绝继续使用。默认`max_recv_rows=2*max_BS*topk`；非均衡路由可能需要在所有rank一致增大该参数，并承担额外HBM占用。
 
-同一buffer的native调用统一入队到owner专用NPU stream。调用前等待caller stream的输入/描述符写入，返回时在caller stream插入输出就绪等待；不同caller stream也不会并发覆盖同一对称workspace。`destroy()`同步专用stream后再集体清理。
+同一buffer的native调用统一入队到owner专用NPU stream。准备Reduce依赖表的异步`index_select`也在owner stream运行，避免在另一条caller stream使用prepared plan时读取尚未生成的依赖。调用前等待caller stream的输入/描述符写入，返回时在caller stream插入输出就绪等待；不同caller stream也不会并发覆盖同一对称workspace。`destroy()`同步专用stream后再集体清理。
 
 校验或启动异常会向Store发布abort，并禁止再次使用该buffer，避免各rank的epoch或调用序列分叉。Store abort能唤醒host协调等待，不能取消已经运行的NPU kernel；发生异常后应由启动器终止整个作业，不应捕获异常后继续调用或让单个rank进入清理屏障。正常cached forward不插入额外host集合通信。
 
@@ -162,7 +174,7 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib${CONDA_PREFIX:+:$CONDA_PREFIX/lib}${LD_L
 | 指标 | 计入范围 | 时钟 |
 |---|---|---|
 | `ROUTE_PREP` | NPU路由操作、D2H计数、Store交换、native描述符构建/拷贝 | Host wall time，完成后同步 |
-| `CACHED_FORWARD` | 本地展开、两次GMM、SwiGLU、双向阶段PUT、最终同步和Reduce | NPU Event区间，不含预先准备路由 |
+| `CACHED_FORWARD` | 本地展开、两次GMM、SwiGLU、双向阶段PUT、Reduce与本机退出汇合 | NPU Event区间，不含预先准备路由 |
 | `FULL_E2E` | 每次全新路由准备 + 完整forward + 完成同步 | Host wall time |
 
 输入/权重生成、权重格式转换、通信域创建、计时前的host对齐屏障均不计入上述区间。输入契约是预量化FP8，BF16到FP8输入量化不在本接口内。`FULL_E2E`是单独执行的完整测量，不是将前两项相加。
@@ -186,7 +198,7 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib${CONDA_PREFIX:+:$CONDA_PREFIX/lib}${LD_L
 
 增加`--trace`会隐含开启`--timer`。每种BS先完成关闭timer和trace的正式测量，再单独执行一次原有aggregate timer诊断，最后额外执行一次详细trace诊断。因此，详细打点开销不会混入正式耗时或原有带宽统计。它会改变诊断调用自身的耗时，应使用正式测量判断优化收益。
 
-`--trace`现在自动合并全部rank，每种BS生成`$OUT/bs_<BS>/allrank.json`，可直接在Perfetto/Chrome Trace Viewer打开。每个rank作为独立process，内部保留84条AIC/AIV轨道，按rank编号排列；原有每rank JSON也保留。默认导出的两种JSON均隐藏`Wait*`及普通`LocalSync`，保留尾部`FinalPeerHandshake`、`RankBarrier`和`LocalSync(sync_stage=2)`。`Quiet/Drain`继续显示实际通信完成等待和流水排空。过滤不移动时间戳、不压缩空白，不修改设备同步、原始bin或带宽统计。
+`--trace`现在自动合并全部rank，每种BS生成`$OUT/bs_<BS>/allrank.json`，可直接在Perfetto/Chrome Trace Viewer打开。每个rank作为独立process，内部保留84条AIC/AIV轨道，按rank编号排列；原有每rank JSON也保留。默认导出的两种JSON均隐藏`Wait*`及普通`LocalSync`；解析旧trace时仍保留尾部`FinalPeerHandshake`、`RankBarrier`和`LocalSync(sync_stage=2)`，本分支已不生成这三类尾部同步事件。`Quiet/Drain`继续显示实际通信完成等待和流水排空。过滤不移动时间戳、不压缩空白，不修改设备同步、原始bin或带宽统计。
 
 如需完整等待条，运行时增加`--trace-include-waits`；也可从已有bin通过下方离线导出命令增加`--include-waits`恢复。只传`--timer`仍仅导出aggregate统计，逐事件流水及`allrank.json`需要`--trace`。
 
