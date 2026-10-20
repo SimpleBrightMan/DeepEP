@@ -28,6 +28,7 @@
 #include "activation/activation_common.hpp"
 #include "activation/situglu_activation.hpp"
 #include "activation/swiglu_activation.hpp"
+#include "activation/swiglu_mx_fused.hpp"
 #include "activation/swigluoai_activation.hpp"
 #include "block_epilogue_ub_layout.hpp"
 #include "../common/aiv1_activation_ub.hpp"
@@ -473,9 +474,19 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
         step.ScaleOffset() - Gmm1CvPlan::ScaleOffset(step.sequence));
     p.maxExp = (__ubuf__ uint16_t*)maxExp_.GetPhyAddr();
     p.reciprocalScale = (__ubuf__ uint16_t*)halfScale_.GetPhyAddr();
-    RunGatedActivationTile(p.firstInput, p.secondInput, p.activationOutput,
-                          static_cast<uint16_t>(step.rows), columns, columns);
-    RunMxQuantTile(p, static_cast<uint16_t>(step.rows), columns);
+    if constexpr (IsSameType<DataTypeOut, fp8_e4m3fn_t>::value && IsSameType<DataTypeIn, bfloat16_t>::value) {
+        if (actMode_ == static_cast<uint8_t>(ActMode::SWIGLU)) {
+            Activation::SwiGluMxFused(p.firstInput, p.quantOutput, p.quantScale, step.rows, clampLimit_);
+        } else {
+            RunGatedActivationTile(p.firstInput, p.secondInput, p.activationOutput,
+                                  static_cast<uint16_t>(step.rows), columns, columns);
+            RunMxQuantTile(p, static_cast<uint16_t>(step.rows), columns);
+        }
+    } else {
+        RunGatedActivationTile(p.firstInput, p.secondInput, p.activationOutput,
+                              static_cast<uint16_t>(step.rows), columns, columns);
+        RunMxQuantTile(p, static_cast<uint16_t>(step.rows), columns);
+    }
     if (!step.Last()) return;
     SetFlag<HardEvent::V_MTE3>(0);
     WaitFlag<HardEvent::V_MTE3>(0);

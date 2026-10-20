@@ -15,7 +15,7 @@
 |L4|统一计算task流/DS lookahead顺序|先对齐实际每专家M≤128、无共享专家的闭合协议|AIC/AIV0同序，GMM1分核不变供AIV1重放；保留GMM2 phase级FIX完成发布，明确尚未等于DS异步GMM2 epilogue|
 |L5|两层共享epilogue task序列与FIX full/empty；AIV1确认GMM2完成|在L4上单独移除GMM2 phase生产端排空，闭合DS式生命周期|两层共用issued/credit，GMM1由V/MTE3消费释放，GMM2由Scalar消费释放；不新增GM空间|
 |L6|CV输入槽原地压缩＋stage末尾累计写出|先隔离32行量化scratch credit与多次DMA，不混入VF数学变化|保留BF16舍入和原有多VF；已读前缀才可覆盖；EMPTY保护MTE3写出|
-|L7|SwiGLU+MX融合VF|剩余消费者差异，必须与数学契约分开|保留BF16舍入与后GMM2加权；不直接复制DS前置route weight|
+|L7|SwiGLU+MX寄存器驻留融合VF|迁移DS的融合结构，不混入数值合同变化|显式保留两次BF16 RN、最大指数scale与后GMM2加权；其他激活模式和FP8格式沿用原计算|
 |L8|DS通信row cursor、紧凑metadata及readiness协议|牵涉布局和三角色依赖，作为闭合协议迁移|源/目的映射与数据可见性；不能仅换flag编号|
 |终点对照|完整冻结DS|用于检查测量链和差距能否闭合，不冒充单项收益|若舍入/加权等合同不同，单独列为语义变更，不能称等价优化|
 
