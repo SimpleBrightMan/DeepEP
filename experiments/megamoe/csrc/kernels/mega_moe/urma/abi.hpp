@@ -7,6 +7,7 @@
 namespace MegaMoeUrma {
 constexpr uint32_t kWorld = 16;
 constexpr uint32_t kAic = 28;
+constexpr uint32_t kLocalWorkers = 2U * kAic;
 constexpr uint32_t kCommunicationWorkers = 15;
 constexpr uint32_t kActivationWorkers = 13;
 constexpr uint64_t kFlagBytes = 128;
@@ -30,14 +31,14 @@ enum class TraceEvent : uint32_t {
     DispatchPutScale,
     DispatchQuiet,
     DispatchPublish,
-    SelfDispatch,
+    SelfDispatch,  // Reserved: Pack now writes self input directly.
     WaitStartPeer,
     PublishStart,
     WaitLocalDispatch,
     WaitCombineReady,
     CombinePut,
     CombineQuiet,
-    SelfCombine,
+    SelfCombine,  // Reserved: GMM2 now writes self return rows directly.
     FinalPeerHandshake,
     WaitDispatch,
     Gmm1Tile,
@@ -115,6 +116,11 @@ struct Config {
     uint64_t dispatchReadyOffset;
     uint64_t barrierOffset;
     uint64_t symmetricBytes;
+    // One rank's self routes form a contiguous interval in each row layout.
+    // They need no intermediate expanded/GMM2-output copy.
+    uint64_t selfSendRow;
+    uint64_t selfRecvRow;
+    uint64_t selfRows;
 };
 
 // This POD is copied as kernel launch arguments; every address is device GM.

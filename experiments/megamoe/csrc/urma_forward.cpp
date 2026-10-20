@@ -150,6 +150,9 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
                     " receive rows; increase max_recv_rows (capacity ", max_recv_rows, ")");
         if (dst == rank) config.receiveRows = row;
     }
+    config.selfSendRow = send_base[rank][rank];
+    config.selfRecvRow = receive_base[rank][rank];
+    config.selfRows = peer_rows[rank][rank];
 
     std::vector<Chunk> send_chunks, recv_chunks;
     std::vector<Fragment> fragments;

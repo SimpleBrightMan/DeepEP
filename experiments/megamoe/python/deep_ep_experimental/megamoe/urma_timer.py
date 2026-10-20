@@ -15,7 +15,8 @@ def communication_bandwidth(raw, rank, *, clock_mhz=1000.0):
 
     1000 ticks/us follows the existing MegaMoE timer protocol. It is an explicit
     assumption, not a device-frequency measurement. Pass None for raw ticks.
-    INTRA includes local self-copy; it is not a pure remote-link bandwidth.
+    Older records may include self-copy in INTRA. Detect it from recorded
+    payload; direct self Pack/GMM2 writes are not communication payload.
     """
     import numpy as np
 
@@ -39,7 +40,7 @@ def communication_bandwidth(raw, rank, *, clock_mhz=1000.0):
         clock_source="caller supplied; default 1000 follows legacy MegaMoE protocol",
         metric="single_direction_aggregate_effective_payload_gbps",
         denominator="same-rank class max(last_tick) - min(first_tick)",
-        includes_self_copy_in_intra=True,
+        includes_self_copy_in_intra=False,
         classes=[],
     )
     for phase in ("Dispatch", "Combine"):
@@ -55,6 +56,8 @@ def communication_bandwidth(raw, rank, *, clock_mhz=1000.0):
                         raise ValueError("payload without a completed timer record")
                     selected.append((owner, peer, record))
             payload = sum(int(record[3]) for _, _, record in selected)
+            includes_self_copy = any(peer == rank for _, peer, _ in selected)
+            result["includes_self_copy_in_intra"] |= includes_self_copy
             if selected:
                 first = min(int(record[0]) for _, _, record in selected)
                 last = max(int(record[1]) for _, _, record in selected)
@@ -75,6 +78,7 @@ def communication_bandwidth(raw, rank, *, clock_mhz=1000.0):
                     bandwidth_gbps=payload * clock_mhz / (span * 1000) if span and clock_mhz is not None else None,
                     workers=[owner for owner, _, _ in selected],
                     peers=[peer for _, peer, _ in selected],
+                    includes_self_copy=includes_self_copy,
                 )
             )
     return result
@@ -101,6 +105,7 @@ def summarize_bandwidth(records):
                     rank_max_gbps=max(rates) if rates else None,
                     nonempty_ranks=len(rates),
                     bytes_per_rank=[row["payload_bytes"] for row in rows],
+                    includes_self_copy=any(row.get("includes_self_copy", False) for row in rows),
                 )
             )
     return result

@@ -196,7 +196,7 @@ int main() {
         for (auto& ready : readyAt) ready = random() % 53;
         if (chunkCount) readyAt[0] = 80;
         uint32_t activationStart[13]{};
-        activationStart[0] = 95;  // The self-copy owner can reach SwiGLU late.
+        activationStart[0] = 95;  // Stress an independently delayed activation worker.
         uint64_t left = 0;
         for (auto& actor : tasks) left += actor.size();
         const auto totalTasks = left;

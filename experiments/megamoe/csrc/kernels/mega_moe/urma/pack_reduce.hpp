@@ -2,7 +2,7 @@
 // Modified by SimpleBright_Man 2026
 #pragma once
 
-#include "abi.hpp"
+#include "compute_contract.hpp"
 #include "kernel_operator.h"
 
 namespace MegaMoeUrma {
@@ -15,23 +15,31 @@ __aicore__ inline void Expand(const Arguments& args, uint32_t worker)
     const uint32_t h = args.config.hidden;
     const uint32_t scales = h / 32U;
     const uint64_t rows = static_cast<uint64_t>(args.config.bs) * args.config.topk;
-    GlobalTensor<uint8_t> x, xScale, expandedX, expandedScale;
+    GlobalTensor<uint8_t> x, xScale, expandedX, expandedScale, selfX, selfScale;
     GlobalTensor<int64_t> order;
     x.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.x));
     xScale.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.xScale));
     expandedX.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.expandedX));
     expandedScale.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.expandedScale));
+    selfX.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.symmetric + args.config.receiveXOffset));
+    selfScale.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.symmetric + args.config.receiveScaleOffset));
     order.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(args.order));
     LocalTensor<uint8_t> token(TPosition::VECCALC, 0, 8192);
     LocalTensor<uint8_t> scale(TPosition::VECCALC, 8192, 256);
-    for (uint64_t row = worker; row < rows; row += kAic) {
+    for (uint64_t row = worker; row < rows; row += kLocalWorkers) {
         const uint64_t tokenRow = static_cast<uint64_t>(order.GetValue(row)) / args.config.topk;
         DataCopyPad(token, x[tokenRow * h], {1U, h, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
         DataCopyPad(scale, xScale[tokenRow * scales], {1U, scales, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
         SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
         WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-        DataCopyPad(expandedX[row * h], token, {1U, h, 0U, 0U, 0U});
-        DataCopyPad(expandedScale[row * scales], scale, {1U, scales, 0U, 0U, 0U});
+        if (IsSelfExpandedRow(row, args.config)) {
+            const uint64_t receiveRow = SelfReceiveRow(row, args.config);
+            DataCopyPad(selfX[receiveRow * h], token, {1U, h, 0U, 0U, 0U});
+            DataCopyPad(selfScale[receiveRow * scales], scale, {1U, scales, 0U, 0U, 0U});
+        } else {
+            DataCopyPad(expandedX[row * h], token, {1U, h, 0U, 0U, 0U});
+            DataCopyPad(expandedScale[row * scales], scale, {1U, scales, 0U, 0U, 0U});
+        }
         SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
         WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
     }
@@ -54,7 +62,7 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker)
     LocalTensor<bfloat16_t> input(TPosition::VECCALC, 0, 8192);
     LocalTensor<float> term(TPosition::VECCALC, 32768, 8192);
     LocalTensor<float> accumulator(TPosition::VECCALC, 65536, 8192);
-    for (uint32_t token = worker; token < args.config.bs; token += kAic) {
+    for (uint32_t token = worker; token < args.config.bs; token += kLocalWorkers) {
         for (uint32_t slot = 0; slot < topk; ++slot) {
             const uint64_t route = static_cast<uint64_t>(token) * topk + slot;
             const uint64_t row = static_cast<uint64_t>(inverse.GetValue(route));

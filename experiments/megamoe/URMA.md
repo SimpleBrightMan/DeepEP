@@ -11,13 +11,17 @@ GMM保留256行tile；SwiGLU在每个已就绪GMM1 tile内按最多128行处理�
 ## 数据与通信顺序
 
 1. 每个输入 `[token, topk_slot]` 都是独立路由实例。按 `[目标rank][目标本地expert][原始token/topk位置]` 稳定排序，建立 `order` 和逆映射 `reduce_index[token,slot]=expanded_row`。
-2. 本地将 FP8 token 和 E8M0 scale 展开到连续发送区。一个token命中多个expert时复制对应多行，本版不做去重。
+2. 56个AIV共同展开FP8 token和E8M0 scale：远端路由写连续发送区，self路由直接写本rank接收区；不再从发送区执行一次SelfDispatch拷贝。一个token命中多个expert时复制对应多行，本版不做去重。
 3. 每个目标rank的连续行流按 `cv_rows` 截断，通过 URMA PUT 发送。token与scale使用各自连续平面。
 4. 每个CV与expert区间取交集，产生 `source_rank、cv_id、expert、cv_row、expert_row、rows、source_expanded_row` 描述符。GMM1、SwiGLU、GMM2共用行身份；跨expert边界必须分别计算。
-5. 计算按通信CV前瞻一批：先执行首个CV的GMM1，随后交替执行下一个CV的GMM1和上一个CV的GMM2，最后执行末个CV的GMM2。SwiGLU按已完成的gate/up tile独立推进；GMM2仍等待对应CV/expert交集的全部SwiGLU tile完成。返回PUT等待整个CV的完整H列，GMM2直接写按来源rank排列的连续返回区。
-6. 本rank的15个远端及self Dispatch全部完成后才提交Combine PUT，此处不插入全卡同步。Combine延后quiet，所有PUT完成后参加最终全卡同步，再按`reduce_index`读取各top-k结果、乘路由权重并求和。
+5. 计算按通信CV前瞻一批：先执行首个CV的GMM1，随后交替执行下一个CV的GMM1和上一个CV的GMM2，最后执行末个CV的GMM2。SwiGLU按已完成的gate/up tile独立推进；GMM2仍等待对应CV/expert交集的全部SwiGLU tile完成。远端结果写按来源rank排列的连续GMM2输出区，返回PUT等待整个CV的完整H列；self结果直接写Reduce最终读取的返回区，不再执行SelfCombine拷贝。
+6. 本rank的15个远端Dispatch全部完成且self接收区已就绪后才提交Combine PUT，此处不插入全卡同步。Combine延后quiet，所有PUT完成后参加最终全卡同步，再由56个AIV按`reduce_index`读取各top-k结果、乘路由权重并求和。
 
-15个通信AIV1各独占一个远端rank。通信worker `w` 的peer为 `w < rank ? w : w+1`；剩余13个AIV1执行SwiGLU。本卡通路使用本地搬运。两个阶段都只使用PUT，队列同一peer始终只有一个提交者。
+15个通信AIV1各独占一个远端rank。通信worker `w` 的peer为 `w < rank ? w : w+1`；剩余13个AIV1执行SwiGLU。self就绪标志在Pack本地同步后发布，原来承担self拷贝的block15随后直接进入SwiGLU。远端两个阶段都只使用PUT，队列同一peer始终只有一个提交者。
+
+Pack和Reduce是计算前后的独立本地阶段，使用28组中的全部AIV0/AIV1，共56个AIV；任务编号为`block*2+subblock`，按56核划分行。阶段结束仍保留原有DMA完成及本地同步，再复用UB进行计算或结束调用。当前内核固定启动28组；即使物理设备有64个AIV，也只使用已启动的56个，不扩大计算/通信核数量。
+
+self直接写地址按现有`send_base/receive_base`映射，远端PUT的地址、顺序、CV和数量不变，计算仍按来源rank外循环、CV内循环。没有在本次改动中加入跨peer交错。当前Pack完成前不会对peer发布新epoch的Start；上一轮本地计算/返回/Reduce由同一runtime stream串行完成，因此self直接写不会覆盖尚在使用的上一轮数据。
 
 接收数据/中间结果/返回结果不按CV覆盖复用。所有BS共享固定对称heap布局，epoch由`UrmaBuffer`统一递增，不因创建新Plan或切换BS重新归零。
 
@@ -134,7 +138,9 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib${CONDA_PREFIX:+:$CONDA_PREFIX/lib}${LD_L
                              / (该类最晚结束时刻 - 最早开始时刻)
 ```
 
-只使用同一rank的时钟；不平均核时、不乘2、不跨rank相减。INTRA包含本卡copy。不同类别拥有不同时间窗口，不能把两类带宽直接相加。这个数值包含该阶段调度/等待间隙，是单向聚合有效带宽，不是链路瞬时峰值。
+只使用同一rank的时钟；不平均核时、不乘2、不跨rank相减。当前INTRA仅包含同组另外3个rank的远端PUT，CROSS包含其余12个rank；self直接写属于Pack/GMM2，不计入Dispatch/Combine通信字节，输出标为`payload=remote-peers`。绝对均衡时，两种通信阶段分别按原始全量的`3/16`和`12/16`计算这两类payload。不同类别拥有不同时间窗口，不能把两类带宽直接相加。这个数值包含该阶段调度/等待间隙，是单向聚合有效带宽，不是链路瞬时峰值。
+
+解析器仍兼容旧版本含SelfDispatch/SelfCombine的timer：检测到self通信记录时继续计入INTRA，并在JSON中设置`includes_self_copy`、输出标为`payload=remote-peers+self-copy`。因此新旧INTRA带宽的payload范围不同，不应直接横向比较。Pack字节仍统计全部展开行，包含self直接写；GMM2按计算事件计时，不把相同self输出再作为通信payload重复累加。
 
 原始tick始终保留。换算默认沿用现有MegaMoE `timer/protocol.py`的1000 ticks/us；这不是硬件频率自动检测。必要时通过`--timer-clock-mhz`覆盖。
 
@@ -171,7 +177,7 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 | `trace_metadata.json` | rank、容量、各引擎记录数、时钟设置、raw路径或解析错误 |
 | `summary.json` | 正式耗时、aggregate带宽及各rank trace导出信息 |
 
-每条轨道对应`block 00..27`的`AIC/AIV0/AIV1`，引擎编号为`block*3+0/1/2`。事件参数包含可用的peer、CV、fragment、expert、行起点/行数、M/N tile位置、列数和字节数；不适用字段显示null。`LocalSync`的CV字段另解释为`sync_stage`：0=pack、1=compute/return、2=rank barrier、3=reduce。
+每条轨道对应`block 00..27`的`AIC/AIV0/AIV1`，引擎编号为`block*3+0/1/2`。Pack和Reduce现在同时出现在AIV0/AIV1轨道；SelfDispatch/SelfCombine不再产生拷贝事件，旧事件编号保留供历史trace解析。事件参数包含可用的peer、CV、fragment、expert、行起点/行数、M/N tile位置、列数和字节数；不适用字段显示null。`LocalSync`的CV字段另解释为`sync_stage`：0=pack、1=compute/return、2=rank barrier、3=reduce。
 
 编译和trace运行仍使用上面的命令，不增加调度或采样参数。核对前瞻顺序时，在AIC/AIV0轨道按`(peer, cv)`合并同一CV的fragment，观察GMM1与GMM2条的先后；fragment/expert元数据沿用原编号，因此重排后编号可以往回跳。单个核心只记录分给自己的tile，缺少某CV的条不等于该CV未计算。`WaitActivation`仍会出现，表示该核心实际执行GMM2前尚未满足的依赖；aggregate timer阶段与逐事件schema均不变。
 

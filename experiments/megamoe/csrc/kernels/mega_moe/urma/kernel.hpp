@@ -37,52 +37,17 @@ __aicore__ inline void TraceLocalSync(Timer& timer, uint32_t stage)
     timer.TraceEnd(TraceEvent::LocalSync, start, meta);
 }
 
-// Self traffic never enters a remote queue. This UB is used only by AIV1
-// block15 before/after its activation work, with complete DMA drains at the
-// transition; it cannot alias the activation epilogue while live.
-__aicore__ inline void CopyLocalPlane(uint64_t destination, uint64_t source, uint64_t bytes)
+// Pack writes self rows directly into their final receive interval. It drains
+// all AIV DMA before the local pack barrier; only then can this single publisher
+// expose every self CV. This also supplies the one self dispatch contribution,
+// including when this rank has no self routes.
+__aicore__ inline void PublishSelfDispatchReady(const Arguments& args)
 {
-    constexpr uint32_t kCopyBytes = 16U * 1024U;
-    LocalTensor<uint8_t> ub(TPosition::VECCALC, 0U, kCopyBytes);
-    GlobalTensor<uint8_t> input, output;
-    input.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(source));
-    output.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(destination));
-    for (uint64_t offset = 0U; offset < bytes;) {
-        const uint64_t remaining = bytes - offset;
-        const uint32_t count = remaining < kCopyBytes ? static_cast<uint32_t>(remaining) : kCopyBytes;
-        DataCopyPad(ub, input[offset], {1U, count, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-        SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-        DataCopyPad(output[offset], ub, {1U, count, 0U, 0U, 0U});
-        SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-        offset += count;
-    }
-    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-}
-
-__aicore__ inline void SelfDispatch(const Arguments& args, Timer& timer)
-{
-    const uint64_t h = args.config.hidden;
-    const uint64_t scales = h / 32U;
-    for (uint32_t index = 0U; index < args.config.sendChunkCount; ++index) {
-        const Chunk chunk = LoadChunk(args.sendChunks, index);
-        if (chunk.peer != args.config.rank) continue;
-        TraceMeta meta = ChunkTraceMeta(chunk);
-        meta.bytes = chunk.rows * (h + scales);
-        timer.Begin(Phase::Dispatch);
-        const uint64_t start = timer.TraceBegin();
-        CopyLocalPlane(args.symmetric + args.config.receiveXOffset + chunk.remoteRow * h,
-                       args.expandedX + chunk.localRow * h, chunk.rows * h);
-        CopyLocalPlane(args.symmetric + args.config.receiveScaleOffset + chunk.remoteRow * scales,
-                       args.expandedScale + chunk.localRow * scales, chunk.rows * scales);
+    for (uint64_t begin = 0U, cv = 0U; begin < args.config.selfRows; begin += args.config.cvRows, ++cv) {
         auto* ready = reinterpret_cast<__gm__ uint64_t*>(
             args.symmetric + args.config.dispatchReadyOffset +
-            (static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + chunk.cv) * kFlagBytes);
+            (static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + cv) * kFlagBytes);
         WriteGmByPassDCache(ready, args.config.epoch);
-        timer.TraceEnd(TraceEvent::SelfDispatch, start, meta);
-        timer.End(Phase::Dispatch, chunk.rows * (h + scales));
     }
     AtomicAdd(ComputeFlag(args.localFlags, 0U), 1);
 }
@@ -100,28 +65,6 @@ __aicore__ inline void WaitChunkComputed(const Arguments& args, const Chunk& chu
         const uint64_t start = timer.TraceBegin();
         WaitComputeFlag(args.gmm2Done, index, FragmentGmm2Tiles(args, fragment));
         timer.TraceEnd(TraceEvent::WaitCombineReady, start, meta);
-    }
-}
-
-__aicore__ inline void SelfCombine(const Arguments& args, Timer& timer)
-{
-    // The self owner follows the same dispatch-all-before-combine contract.
-    uint64_t start = timer.TraceBegin();
-    WaitComputeFlag(args.localFlags, 0U, kWorld);
-    timer.TraceEnd(TraceEvent::WaitLocalDispatch, start);
-    const uint64_t rowBytes = static_cast<uint64_t>(args.config.hidden) * sizeof(bfloat16_t);
-    for (uint32_t index = 0U; index < args.config.recvChunkCount; ++index) {
-        const Chunk chunk = LoadChunk(args.recvChunks, index);
-        if (chunk.peer != args.config.rank) continue;
-        WaitChunkComputed(args, chunk, timer);
-        TraceMeta meta = ChunkTraceMeta(chunk);
-        meta.bytes = chunk.rows * rowBytes;
-        timer.Begin(Phase::Combine);
-        start = timer.TraceBegin();
-        CopyLocalPlane(args.symmetric + args.config.returnYOffset + chunk.remoteRow * rowBytes,
-                       args.gmm2Output + chunk.localRow * rowBytes, chunk.rows * rowBytes);
-        timer.TraceEnd(TraceEvent::SelfCombine, start, meta);
-        timer.End(Phase::Combine, chunk.rows * rowBytes);
     }
 }
 
@@ -235,18 +178,17 @@ __aicore__ inline void Process(const Arguments& args)
     SetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL, MegaMoeImpl::OVERFLOW_MODE_CTRL>(0);
 
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() == 1U) {
-            timer.Begin(Phase::Pack);
-            const uint64_t start = timer.TraceBegin();
-            Expand(args, block);
-            const uint64_t routes = static_cast<uint64_t>(args.config.bs) * args.config.topk;
-            const uint64_t owned = block < routes ? (routes - 1U - block) / kAic + 1U : 0U;
-            TraceMeta meta;
-            meta.rows = owned;
-            meta.bytes = owned * (args.config.hidden + args.config.hidden / 32U);
-            timer.TraceEnd(TraceEvent::Pack, start, meta);
-            timer.End(Phase::Pack, owned * (args.config.hidden + args.config.hidden / 32U));
-        }
+        const uint32_t worker = LocalWorkerIndex(block, GetSubBlockIdx());
+        timer.Begin(Phase::Pack);
+        const uint64_t start = timer.TraceBegin();
+        Expand(args, worker);
+        const uint64_t routes = static_cast<uint64_t>(args.config.bs) * args.config.topk;
+        const uint64_t owned = LocalOwnedRows(routes, worker);
+        TraceMeta meta;
+        meta.rows = owned;
+        meta.bytes = owned * (args.config.hidden + args.config.hidden / 32U);
+        timer.TraceEnd(TraceEvent::Pack, start, meta);
+        timer.End(Phase::Pack, owned * (args.config.hidden + args.config.hidden / 32U));
         PipeBarrier<PIPE_ALL>();
     }
     // No CV loop contains a rank-wide or local full-core synchronization.
@@ -258,11 +200,12 @@ __aicore__ inline void Process(const Arguments& args)
     } else if (block < kCommunicationWorkers) {
         CommunicatePeer(args, block, timer);
     } else {
-        if (block == kCommunicationWorkers) SelfDispatch(args, timer);
+        if (block == kCommunicationWorkers) PublishSelfDispatchReady(args);
         RunActivation(args, block - kCommunicationWorkers, timer);
-        if (block == kCommunicationWorkers) SelfCombine(args, timer);
     }
     if constexpr (g_coreType == AIV) PipeBarrier<PIPE_ALL>();
+    // All GMM2 FIX stores, including direct self returns, complete before this
+    // full local join. The following rank barrier still precedes every Reduce.
     TraceLocalSync(timer, 1U);
     if constexpr (g_coreType == AIV) {
         if (GetSubBlockIdx() == 1U && block == 0U) {
@@ -281,17 +224,16 @@ __aicore__ inline void Process(const Arguments& args)
     }
     TraceLocalSync(timer, 2U);
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() == 1U) {
-            timer.Begin(Phase::ReducePhase);
-            const uint64_t start = timer.TraceBegin();
-            Reduce(args, block);
-            const uint64_t owned = block < args.config.bs ? (args.config.bs - 1U - block) / kAic + 1U : 0U;
-            TraceMeta meta;
-            meta.rows = owned;
-            meta.bytes = owned * args.config.hidden * sizeof(bfloat16_t);
-            timer.TraceEnd(TraceEvent::Reduce, start, meta);
-            timer.End(Phase::ReducePhase, owned * args.config.hidden * sizeof(bfloat16_t));
-        }
+        const uint32_t worker = LocalWorkerIndex(block, GetSubBlockIdx());
+        timer.Begin(Phase::ReducePhase);
+        const uint64_t start = timer.TraceBegin();
+        Reduce(args, worker);
+        const uint64_t owned = LocalOwnedRows(args.config.bs, worker);
+        TraceMeta meta;
+        meta.rows = owned;
+        meta.bytes = owned * args.config.hidden * sizeof(bfloat16_t);
+        timer.TraceEnd(TraceEvent::Reduce, start, meta);
+        timer.End(Phase::ReducePhase, owned * args.config.hidden * sizeof(bfloat16_t));
         PipeBarrier<PIPE_ALL>();
     }
     TraceLocalSync(timer, 3U);

@@ -338,10 +338,12 @@ def run(args, config, group):
             if rank == 0:
                 for row in reports["bandwidth"]:
                     if row["mean_gbps"] is not None:
+                        payload_scope = "remote-peers+self-copy" if row["includes_self_copy"] else "remote-peers"
                         print(
                             f"[URMA BW] BS={bs} {row['phase']} {row['communication_class']} "
                             f"mean={row['mean_gbps']:.3f} GB/s/card "
                             f"rank-min/max={row['rank_min_gbps']:.3f}/{row['rank_max_gbps']:.3f} "
+                            f"payload={payload_scope} "
                             "(one-way payload / same-rank class envelope)",
                             flush=True,
                         )

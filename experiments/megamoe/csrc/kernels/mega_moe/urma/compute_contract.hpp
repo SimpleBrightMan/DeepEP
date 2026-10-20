@@ -57,6 +57,33 @@ struct ComputeBatchRange {
 #define MEGAMOE_URMA_COMPUTE_INLINE inline
 #endif
 
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t LocalWorkerIndex(uint32_t block, uint32_t subblock)
+{
+    return 2U * block + subblock;
+}
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t LocalOwnedRows(uint64_t rows, uint32_t worker)
+{
+    return worker < rows ? (rows - 1U - worker) / kLocalWorkers + 1U : 0U;
+}
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr bool IsSelfExpandedRow(uint64_t row, const Config& config)
+{
+    return row >= config.selfSendRow && row - config.selfSendRow < config.selfRows;
+}
+
+// Call only for a row in the self interval. Stable expert ordering is identical
+// on both sides, so the inverse transform also maps self GMM2 rows to Reduce.
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t SelfReceiveRow(uint64_t expandedRow, const Config& config)
+{
+    return config.selfRecvRow + (expandedRow - config.selfSendRow);
+}
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t SelfReturnRow(uint64_t receivedRow, const Config& config)
+{
+    return config.selfSendRow + (receivedRow - config.selfRecvRow);
+}
+
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ComputeBatchTaskCount(uint32_t chunkCount)
 {
     return static_cast<uint64_t>(chunkCount) * 2U;

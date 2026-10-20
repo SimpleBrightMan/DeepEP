@@ -13,9 +13,9 @@ namespace MegaMoeUrma {
 using namespace AscendC;
 using MegaMoeImpl::Get;
 
-// Every matrix has exactly the same peer/CV row order. A fragment is the
-// intersection with one expert, so no expert-major permutation or old Wave
-// cursor is used anywhere in this compute path.
+// Fragments keep the peer/CV row order through computation. A fragment is the
+// intersection with one expert; only self GMM2 stores remap directly into their
+// final expanded-row return interval. No old Wave cursor is used here.
 __aicore__ inline Fragment LoadFragment(const Arguments& args, uint32_t index)
 {
     const auto* gm = reinterpret_cast<__gm__ Fragment*>(args.fragments) + index;
@@ -72,7 +72,13 @@ __aicore__ inline MegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& args, 
     addr.aScaleGlobal = reinterpret_cast<GM_ADDR>(args.activationScale + fragment.rowBegin * scaleI);
     addr.bGlobal = reinterpret_cast<GM_ADDR>(args.weight2 + expert * i * h / 2U);
     addr.bScaleGlobal = reinterpret_cast<GM_ADDR>(args.weightScale2 + expert * scaleI * h);
-    addr.gmm2OutGlobal = reinterpret_cast<GM_ADDR>(args.gmm2Output + fragment.rowBegin * h * sizeof(bfloat16_t));
+    if (fragment.sourceRank == args.config.rank) {
+        const uint64_t returnRow = SelfReturnRow(fragment.rowBegin, args.config);
+        addr.gmm2OutGlobal =
+            reinterpret_cast<GM_ADDR>(args.symmetric + args.config.returnYOffset + returnRow * h * sizeof(bfloat16_t));
+    } else {
+        addr.gmm2OutGlobal = reinterpret_cast<GM_ADDR>(args.gmm2Output + fragment.rowBegin * h * sizeof(bfloat16_t));
+    }
     return addr;
 }
 
