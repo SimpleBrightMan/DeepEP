@@ -176,6 +176,28 @@ python3 -m deep_ep_experimental.megamoe.urma_trace \
 
 逐事件schema为每引擎16个uint64 header，后接`capacity*16`个uint64 record。header前五项为`schema,capacity,count,dropped,engine_id`；record前13项为`start_ticks,end_ticks,event_id,peer,cv,fragment,expert,row,rows,tileM,tileN,columns,bytes`，其余保留位为0。未知元数据为`UINT64_MAX`。解析器检查全部引擎的schema、容量、编号、计数、保留位和事件时间；同引擎事件应按平铺顺序不重叠。
 
+### 压缩成便于复制的文本
+
+脚本只用Python标准库，无需重新编译或安装wheel。优先输入原始`urma_trace.json`，保留等待信息用于归因：
+
+```bash
+python3 experiments/megamoe/scripts/urma_trace_to_text.py \
+  "$OUT/rank_0/bs_4096/urma_trace.json"
+```
+
+默认生成同目录`urma_trace.txt`：包含事件字典、各操作的耗时分布、各引擎记录区间的累计时长/并集/跨度、各peer的提交字节数，以及wait/quiet/drain各自最长的8条。默认不列出数万条重复事件。累计核时不当作墙钟耗时，也不以PUT下发耗时计算链路带宽；记录空白不能直接解释成硬件空闲。
+
+需要逐条还原流水时，用`--detail`；字段名和事件名缩写，保留原始起始时间、耗时及CV/tile信息，不拼接或缩短时间轴。可限制block及引擎，减少复制内容：
+
+```bash
+python3 experiments/megamoe/scripts/urma_trace_to_text.py \
+  "$OUT/rank_0/bs_4096/urma_trace.json" \
+  --detail --cores 0,1,15-17 --engines AIC,AIV1 \
+  --output "$OUT/rank_0/bs_4096/selected_cores.txt"
+```
+
+详细列表默认省略`wait.sync`，但摘要与最长等待仍保留这些数据；增加`--include-waits`可输出全部等待条。quiet/drain始终保留。已过滤的JSON仍可读取，源记录数不一致时标注`INCOMPLETE`，不会把缺失的等待误报为0。文本没有同步不同rank的时钟；当前脚本只接受单rank URMA trace，不接受旧Wave合并格式。
+
 ## 下一步优化方向
 
 - 将计数交换、前缀和、CV描述符生成移到设备，减少同步和host工作；完整E2E应始终计入实际准备成本。
