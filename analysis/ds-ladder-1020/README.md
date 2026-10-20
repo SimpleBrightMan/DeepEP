@@ -1,6 +1,6 @@
 # DS逐级迁移/消融实验报告
 
-完成11个有效累计节点。当前本轮BS512候选中，l6相对同窗口L0降低2.32%，仍比同窗口布局优化DS慢11.49%。**尚未追平DS，未合入master。**
+完成12个有效累计节点。当前本轮BS512候选中，l6相对同窗口L0降低2.32%，仍比同窗口布局优化DS慢11.49%。**尚未追平DS，未合入master。**
 
 不是预设迁移必然有效：有效但变慢的节点继续保留在累计链；构建失败和修复重试另记，不计为优化实验。数学舍入、scale算法和route weight位置未悄悄改成DS，不把少做数值工作当成等价收益。
 
@@ -21,6 +21,7 @@
 |L9 Dispatch Scalar读索引|799.50|787.64|787.62|700.51|+0.00%|+1.49%|
 |L10 Dispatch strided owner|798.18|788.22|785.89|700.15|+0.30%|+1.54%|
 |L11 Dispatch源行互素打散|799.08|786.58|787.65|698.51|-0.14%|+1.43%|
+|L12 小M L0C半槽固定64KiB间距|798.47|787.64|785.87|699.58|+0.22%|+1.58%|
 
 各行是不同时间窗口，收益以本行对照为准；不能直接相加单项百分比。小于波动量的差值不宣称稳定收益。本轮最低值也不等于已通过七shape验收的最佳统一版本。
 
@@ -28,40 +29,43 @@
 
 - L4单独迁移DS任务顺序反而变慢；L5配套共享epilogue序列/真正FIX full与empty生命周期后改善，说明任务顺序与完成协议必须作为闭合系统审查，不能把某个flag或排列视为独立“神优化”。L5相对较慢L4的约4%不等于相对初始版的约4%。
 - L6在新协议上整stage写出有小幅额外收益；旧协议上同名策略曾无收益，体现交互作用。
-- 融合VF、Scalar metadata/索引以及通信owner/源行打散的收益必须看表中真实结果。机制更接近DS，并不保证本工程剩余数据布局、完成边界和生成指令也已经相同。
+- 融合VF、Scalar metadata/索引、通信owner/源行打散以及L0C半槽间距的收益必须看表中真实结果。机制更接近DS，并不保证本工程剩余数据布局、完成边界和生成指令也已经相同。
 - 大差距仍未闭合。下一批优先迁移完整AIC compute leaf及GMM2 SF布局/供数协议；不是再盲目增加buffer。具体差异、代码入口与风险见[差异账本](DIFFERENCES.md)。
 
 ## 中间版本与阅读入口
 
-初始版：`50d3ebe`，设备`dd5b2d7`。中间版本均独立分支；总工作分支`codex/megamoe-ds-ladder-1020`。
+初始版：`50d3ebe`，设备`dd5b2d7`。中间版本均独立分支；总工作分支`codex/megamoe-ds-ladder-1020`。原生测量以表中的设备提交为准；总分支随后只补报告和注释，不冒充重测。
 
 |节点|设备提交|独立分支|完整被动timer开销|
 |---|---|---|---:|
-|l1|`be8a290`|`codex/megamoe-ds-ladder-l1-1020`|1.89%|
-|l2-r1|`7fc7fad`|`codex/megamoe-ds-ladder-l2-r1-1020`|1.48%|
-|l3|`95a3de5`|`codex/megamoe-ds-ladder-l3-1020`|2.10%|
-|l4-r2|`d07f258`|`codex/megamoe-ds-ladder-l4-r2-1020`|1.34%|
-|l5-r1|`31794c3`|`codex/megamoe-ds-ladder-l5-r1-1020`|1.13%|
-|l6|`1f44a59`|`codex/megamoe-ds-ladder-l6-1020`|1.36%|
-|l7|`cf804e2`|`codex/megamoe-ds-ladder-l7-1020`|0.89%|
-|l8|`c086a22`|`codex/megamoe-ds-ladder-l8-1020`|1.02%|
-|l9|`db59c66`|`codex/megamoe-ds-ladder-l9-1020`|1.57%|
-|l10|`0fc3df0`|`codex/megamoe-ds-ladder-l10-1020`|1.39%|
-|l11|`1fd5708`|`codex/megamoe-ds-ladder-l11-1020`|0.92%|
+|l1|`be8a290`|[codex/megamoe-ds-ladder-l1-1020](https://gitcode.com/Yancy_/DeepEP/tree/codex/megamoe-ds-ladder-l1-1020)|1.89%|
+|l2-r1|`7fc7fad`|[codex/megamoe-ds-ladder-l2-r1-1020](https://gitcode.com/Yancy_/DeepEP/tree/codex/megamoe-ds-ladder-l2-r1-1020)|1.48%|
+|l3|`95a3de5`|[codex/megamoe-ds-ladder-l3-1020](https://gitcode.com/Yancy_/DeepEP/tree/codex/megamoe-ds-ladder-l3-1020)|2.10%|
+|l4-r2|`d07f258`|[codex/megamoe-ds-ladder-l4-r2-1020](https://gitcode.com/Yancy_/DeepEP/tree/codex/megamoe-ds-ladder-l4-r2-1020)|1.34%|
+|l5-r1|`31794c3`|[codex/megamoe-ds-ladder-l5-r1-1020](https://gitcode.com/Yancy_/DeepEP/tree/codex/megamoe-ds-ladder-l5-r1-1020)|1.13%|
+|l6|`1f44a59`|[codex/megamoe-ds-ladder-l6-1020](https://gitcode.com/Yancy_/DeepEP/tree/codex/megamoe-ds-ladder-l6-1020)|1.36%|
+|l7|`cf804e2`|[codex/megamoe-ds-ladder-l7-1020](https://gitcode.com/Yancy_/DeepEP/tree/codex/megamoe-ds-ladder-l7-1020)|0.89%|
+|l8|`c086a22`|[codex/megamoe-ds-ladder-l8-1020](https://gitcode.com/Yancy_/DeepEP/tree/codex/megamoe-ds-ladder-l8-1020)|1.02%|
+|l9|`db59c66`|[codex/megamoe-ds-ladder-l9-1020](https://gitcode.com/Yancy_/DeepEP/tree/codex/megamoe-ds-ladder-l9-1020)|1.57%|
+|l10|`0fc3df0`|[codex/megamoe-ds-ladder-l10-1020](https://gitcode.com/Yancy_/DeepEP/tree/codex/megamoe-ds-ladder-l10-1020)|1.39%|
+|l11|`1fd5708`|[codex/megamoe-ds-ladder-l11-1020](https://gitcode.com/Yancy_/DeepEP/tree/codex/megamoe-ds-ladder-l11-1020)|0.92%|
+|l12|`8293d6d`|[codex/megamoe-ds-ladder-l12-1020](https://gitcode.com/Yancy_/DeepEP/tree/codex/megamoe-ds-ladder-l12-1020)|1.33%|
 
 每个节点：`candidate-a/timer_trace.json`为完整32组×AIC/AIV0/AIV1的96轨派生图；`timer_all_events.json`保留原始等待事件，派生图仅留白，不重排时间。`candidate-a/setup/rank_i/.../kernel_details.csv`为正式off CSV，`.../profiler/timer_on/...`为配对on CSV。图来自单次rank0观察，不是两次正式均值；ISSUE不是硬件完成，不能与PMU活跃时间混算。
 
-本地证据：`C:\Project\Infra\ops-transformer-hs\outputs\ds-ladder-1020\checkpoint-4`，大小/SHA清单`manifest.json`已核验。保存各节点源码归档、实际kernel与host扩展、构建命令/日志、有效配置、逐rank输出差分和失败记录。统计摘要含每个节点实际kernel SHA及独立启动样本。
+本地证据：`C:\Project\Infra\ops-transformer-hs\outputs\ds-ladder-1020\checkpoint-5`，大小/SHA清单`manifest.json`已核验。保存各节点源码归档、实际kernel与host扩展、构建命令/日志、有效配置、逐rank输出差分和失败记录。统计摘要含每个节点实际kernel SHA及独立启动样本。
 
 ## 验证与限制
 
 - 有效节点均通过8卡有限值/逐位差分；DS与其冻结DS输出差分，未声称我们与DS逐位相等。按用户要求未跑独立Golden；这不是正式数学精度验收，不能据此直接合入master。
-- CPU测试执行生产调度、行映射、credit或编排代码；不能证明硬件可见性。共享epilogue后32项、strided owner后33项CPU测试，设备kernel和host扩展均需原生构建成功。
+- CPU测试执行生产调度、行映射、credit或编排代码；不能证明硬件可见性。共享epilogue后32项、strided owner后33项、L0C容量检查后34项CPU测试，设备kernel和host扩展均需原生构建成功。
 - 本轮未新增task-block PMU，不复用历史PMU冒充本版计数器。正式性能、调试流水、PMU三种用途分开。
 - 小M闭合任务流仅在实际各专家M≤128、无共享专家且N2 tile数≤核数等条件成立时启用；其他场景保留原Wave。Host的CV选择仍使用均衡期望M，不保证偏斜性能。
 - 同一SO跨shape/路由筛选另列；不同分支的最低成绩不能拼接为一个不存在的统一实现。
 
-## 未完成/失败构建记录
+## 历史失败构建与修复重试
+
+以下均有对应修复后的有效节点，不是仍在运行或等待用户处理的实验。
 
 - `l2`：build=1，campaign=None。原样保留，不计为有效优化。
 - `l4`：build=1，campaign=None。原样保留，不计为有效优化。
@@ -69,3 +73,47 @@
 - `l5`：build=1，campaign=None。原样保留，不计为有效优化。
 
 执行顺序见[PLAN](PLAN.md)；调度、同步、UB边界的详细说明见[差异账本](DIFFERENCES.md)。
+
+## 最佳候选与DS的同shape配对流水
+
+BS1024补采，仅用于定位；不计为新的优化实验，也不替换上面的正式累计表。
+
+|方法|timer-off μs|完整被动timer开销|
+|---|---:|---:|
+|l6|1097.74|1.64%|
+|ds|1053.21|0.02%|
+
+两份图分别在检查点的`trace-pair/l6/timer_trace.json`和`trace-pair/ds/timer_trace.json`；同目录保留各自原始事件及16份off/on CSV。仅rank0记录，但覆盖全部32组与AIC/AIV0/AIV1。
+
+rank0的32组AIC提交窗口均值：
+
+|位置|L6 μs|DS μs|差值 μs|
+|---|---:|---:|---:|
+|GMM1 ISSUE累计|652.52|622.33|+30.19|
+|GMM2 ISSUE累计|305.53|300.46|+5.07|
+|两类ISSUE之外|56.42|45.37|+11.05|
+|首GMM1至末GMM2 ISSUE窗口|1014.47|968.16|+46.31|
+
+ISSUE不是硬件纯计算；首SF预取等细节边界未完全一致。此表只用于导航，不能把它与timer-off的端到端差值再次相加；优先核对GMM1供数/提交与其余控制区间，而非断言MMAD慢了30μs。
+
+## 同一SO跨shape复查
+
+L6和累计L11各使用自己的同一个SO。下面每方法每shape仅一次启动，是筛选而非稳定收益证明；BS512的重复结果见前表。不将各shape最低值拼成一个虚拟版本。
+
+|BS/卡|初始L0 μs|L6 μs|累计L11 μs|布局DS μs|L6较L0降耗|
+|---|---:|---:|---:|---:|---:|
+|32|619.14|620.97|620.93|591.40|-0.29%|
+|96|648.13|648.07|649.06|603.24|+0.01%|
+|256|709.79|707.72|705.74|628.20|+0.29%|
+|1024|1145.98|1095.60|1109.46|1050.77|+4.40%|
+|2048|2136.52|2135.09|2137.61|2044.17|+0.07%|
+|4096|4127.22|4131.40|4128.36|4014.81|-0.10%|
+
+BS96路由回归：
+
+|路由|L0 μs|L6 μs|L11 μs|输出检查|
+|---|---:|---:|---:|---|
+|random|650.36|648.58|649.95|8卡有限值/逐位差分通过，非独立Golden|
+|skewed|911.01|900.16|905.59|8卡有限值/逐位差分通过，非独立Golden|
+
+跨shape本地证据：`C:\Project\Infra\ops-transformer-hs\outputs\ds-ladder-1020\screen`。L11 BS1024与新DS BS512完整96轨流水、各自off/on配套CSV和DS JIT实物一并保存。

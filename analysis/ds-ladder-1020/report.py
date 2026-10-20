@@ -55,7 +55,7 @@ text += ['',
     '说明任务顺序与完成协议必须作为闭合系统审查，不能把某个flag或排列视为独立“神优化”。'
     'L5相对较慢L4的约4%不等于相对初始版的约4%。',
     '- L6在新协议上整stage写出有小幅额外收益；旧协议上同名策略曾无收益，体现交互作用。',
-    '- 融合VF、Scalar metadata/索引以及通信owner/源行打散的收益必须看表中真实结果。'
+    '- 融合VF、Scalar metadata/索引、通信owner/源行打散以及L0C半槽间距的收益必须看表中真实结果。'
     '机制更接近DS，并不保证本工程剩余数据布局、完成边界和生成指令也已经相同。',
     '- 大差距仍未闭合。下一批优先迁移完整AIC compute leaf及GMM2 SF布局/供数协议；'
     '不是再盲目增加buffer。具体差异、代码入口与风险见[差异账本](DIFFERENCES.md)。', '',
@@ -78,15 +78,35 @@ text += ['',
     '- 有效节点均通过8卡有限值/逐位差分；DS与其冻结DS输出差分，未声称我们与DS逐位相等。'
     '按用户要求未跑独立Golden；这不是正式数学精度验收，不能据此直接合入master。',
     '- CPU测试执行生产调度、行映射、credit或编排代码；不能证明硬件可见性。'
-    '共享epilogue后32项、strided owner后33项CPU测试，设备kernel和host扩展均需原生构建成功。',
+    '共享epilogue后32项、strided owner后33项、L0C容量检查后34项CPU测试，设备kernel和host扩展均需原生构建成功。',
     '- 本轮未新增task-block PMU，不复用历史PMU冒充本版计数器。正式性能、调试流水、PMU三种用途分开。',
     '- 小M闭合任务流仅在实际各专家M≤128、无共享专家且N2 tile数≤核数等条件成立时启用；'
     '其他场景保留原Wave。Host的CV选择仍使用均衡期望M，不保证偏斜性能。',
     '- 同一SO跨shape/路由筛选另列；不同分支的最低成绩不能拼接为一个不存在的统一实现。', '',
-    '## 未完成/失败构建记录', '']
+    '## 历史失败构建与修复重试', '',
+    '以下均有对应修复后的有效节点，不是仍在运行或等待用户处理的实验。', '']
 for n in data['incomplete']:
     text.append(f'- `{n["name"]}`：build={n["build_rc"]}，campaign={n["campaign_rc"]}。原样保留，不计为有效优化。')
 text += ['', '执行顺序见[PLAN](PLAN.md)；调度、同步、UB边界的详细说明见[差异账本](DIFFERENCES.md)。', '']
+for case in data.get('auxiliary',[]):
+    text+=['## 最佳候选与DS的同shape配对流水', '',
+        f'BS{case["bs"]}补采，仅用于定位；不计为新的优化实验，也不替换上面的正式累计表。', '',
+        '|方法|timer-off μs|完整被动timer开销|', '|---|---:|---:|']
+    for name,r in case['methods'].items():
+        text.append(f'|{name}|{r["mean_us"]:.2f}|{r["trace"]["overhead"]:.2f}%|')
+    text+=['', f'两份图分别在检查点的`trace-pair/l6/timer_trace.json`和`trace-pair/ds/timer_trace.json`；'
+           '同目录保留各自原始事件及16份off/on CSV。仅rank0记录，但覆盖全部32组与AIC/AIV0/AIV1。', '']
+    from trace_summary import summarize
+    windows={name:summarize(a.checkpoint/r['label']/'timer_all_events.json')['group_means']
+             for name,r in case['methods'].items()}
+    text+=['rank0的32组AIC提交窗口均值：', '',
+           '|位置|L6 μs|DS μs|差值 μs|','|---|---:|---:|---:|']
+    for key,label in [('gmm1_issue_us','GMM1 ISSUE累计'),('gmm2_issue_us','GMM2 ISSUE累计'),
+                      ('outside_issue_us','两类ISSUE之外'),('submit_window_us','首GMM1至末GMM2 ISSUE窗口')]:
+        v,d=windows['l6'][key],windows['ds'][key]
+        text.append(f'|{label}|{v:.2f}|{d:.2f}|{v-d:+.2f}|')
+    text+=['','ISSUE不是硬件纯计算；首SF预取等细节边界未完全一致。此表只用于导航，'
+           '不能把它与timer-off的端到端差值再次相加；优先核对GMM1供数/提交与其余控制区间，而非断言MMAD慢了30μs。','']
 if a.screen is not None:
     label=str(a.screen.resolve())
     screen=Path('\\\\?\\'+label) if os.name=='nt' else a.screen

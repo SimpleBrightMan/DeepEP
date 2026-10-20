@@ -15,18 +15,18 @@ root=Path(__file__).resolve().parent
 sources=set()
 summary=dict(scope='EP8 BS512 balanced full communication; timer-off; warm10/sample20/tail10; per-round rank-min',
     accuracy='8-rank finite/bitwise differential within each mathematical implementation; independent Golden not run',
-    nodes=[],incomplete=[])
+    nodes=[],incomplete=[],auxiliary=[])
 expected_model=dict(hidden=7168,intermediate_hidden=3072,num_experts=384,num_topk=6,num_shared_experts=0)
 
 def add(path,name=None):
     if path.is_file(): sources.add((path,name or str(path.relative_to(root))))
 
-def validate(node,label,method,identity):
+def validate(node,label,method,identity,bs=512):
     folder=node/label
     report=json.loads((folder/'performance.json').read_text())
     diff=json.loads((folder/'regression.json').read_text())
     if not diff['passed'] or diff['ranks']!=[True]*8: raise ValueError(f'{folder}: output regression')
-    if (report['ep'],report['bs'],report['timer'],report['recorded_rounds'],report['rounds'])!=(8,512,False,20,10):
+    if (report['ep'],report['bs'],report['timer'],report['recorded_rounds'],report['rounds'])!=(8,bs,False,20,10):
         raise ValueError('Measurement contract mismatch')
     if method=='ds':
         r=report['identity']
@@ -43,13 +43,36 @@ def validate(node,label,method,identity):
             m=json.loads((folder/f'setup/rank_{rank}/manifest.json').read_text())
             if (m['ep_size'],m['rank'],m['routing'],m['measurement'],m['input'])!=(8,rank,'balanced','full_moe','fp8'):
                 raise ValueError('Effective rank config mismatch')
-            if m['config']['model']!=expected_model or m['config']['bs_values']!=[512]: raise ValueError('Model mismatch')
+            if m['config']['model']!=expected_model or m['config']['bs_values']!=[bs]: raise ValueError('Model mismatch')
     csvs=[f for f in folder.rglob('kernel_details.csv') if 'timer_on' not in f.parts]
     if len(csvs)!=8: raise ValueError('Missing rank CSVs')
     return dict(label=str(folder.relative_to(root)),mean_us=report['mean_us'],rank_max_mean_us=report['rank_max_mean_us'])
 
+def export_trace(trace):
+    raw=json.loads((trace/'timer_all_events.json').read_text())
+    events=[dict(e,name=e['family'],group_id=e['core']//3,
+                 core_type='AIC' if e['core']%3==0 else 'AIV',sub_id=max(0,e['core']%3-1))
+            if 'family' in e else e for e in raw]
+    origin=min(e['start_cycle'] for e in events if e['name']=='KERNEL_TIMING' and e['core_type']=='AIC')
+    chrome=[]
+    for group in range(32):
+        for role,sub,off in [('AIC',0,0),('AIV',0,1),('AIV',1,2)]:
+            chrome.append(dict(ph='M',name='thread_sort_index',pid=0,tid=f'group_{group}_{role.lower()}_{sub}',args={'sort_index':group*3+off}))
+    totals=collections.defaultdict(float)
+    for e in events:
+        if e['name']=='KERNEL_TIMING':continue
+        totals[e['name']]+=(e['end_cycle']-e['start_cycle'])/1000/32
+        if any(s in e['name'] for s in ('WAIT','SYNC','DRAIN')):continue
+        chrome.append(dict(ph='X',name=e['name'],pid=0,tid=f"group_{e['group_id']}_{e['core_type'].lower()}_{e['sub_id']}",
+            ts=(e['start_cycle']-origin)/1000,dur=(e['end_cycle']-e['start_cycle'])/1000,
+            args={k:e[k] for k in ('group_id','core_type','sub_id')}))
+    if len({e['tid'] for e in chrome if e['ph']=='X'})!=96:raise ValueError('Incomplete passive trace')
+    (trace/'timer_trace.json').write_text(json.dumps(chrome,separators=(',',':')))
+    return dict(path=str((trace/'timer_trace.json').relative_to(root)),stage_mean_us=dict(totals),
+        overhead=json.loads((trace/'timer_overhead.json').read_text())['overhead_pct'])
+
 for node in sorted(root.iterdir()):
-    if not node.is_dir() or node.name in ('native','screen'): continue
+    if not node.is_dir() or node.name in ('native','screen','trace-pair'): continue
     rc=node/'campaign.rc'
     if not rc.exists() or rc.read_text().strip()!='0':
         summary['incomplete'].append(dict(name=node.name,build_rc=(node/'build.rc').read_text().strip() if (node/'build.rc').exists() else None,
@@ -73,25 +96,7 @@ for node in sorted(root.iterdir()):
             parent_reduction_pct=100*(1-methods['candidate']['mean_us']/parent['mean_us']),
             l0_reduction_pct=100*(1-methods['candidate']['mean_us']/methods['l0']['mean_us']),
             ds_increase_pct=100*(methods['candidate']['mean_us']/methods['ds']['mean_us']-1))
-        trace=node/'candidate-a'
-        events=json.loads((trace/'timer_all_events.json').read_text())
-        origin=min(e['start_cycle'] for e in events if e['name']=='KERNEL_TIMING' and e['core_type']=='AIC')
-        chrome=[]
-        for group in range(32):
-            for role,sub,off in [('AIC',0,0),('AIV',0,1),('AIV',1,2)]:
-                chrome.append(dict(ph='M',name='thread_sort_index',pid=0,tid=f'group_{group}_{role.lower()}_{sub}',args={'sort_index':group*3+off}))
-        totals=collections.defaultdict(float)
-        for e in events:
-            if e['name']=='KERNEL_TIMING': continue
-            totals[e['name']]+=(e['end_cycle']-e['start_cycle'])/1000/32
-            if any(s in e['name'] for s in ('WAIT','SYNC','DRAIN')): continue
-            chrome.append(dict(ph='X',name=e['name'],pid=0,tid=f"group_{e['group_id']}_{e['core_type'].lower()}_{e['sub_id']}",
-                ts=(e['start_cycle']-origin)/1000,dur=(e['end_cycle']-e['start_cycle'])/1000,
-                args={k:e[k] for k in ('group_id','core_type','sub_id')}))
-        if len({e['tid'] for e in chrome if e['ph']=='X'})!=96: raise ValueError('Incomplete passive trace')
-        (trace/'timer_trace.json').write_text(json.dumps(chrome,separators=(',',':')))
-        item['trace']=dict(path=f'{node.name}/candidate-a/timer_trace.json',stage_mean_us=dict(totals),
-            overhead=json.loads((trace/'timer_overhead.json').read_text())['overhead_pct'])
+        item['trace']=export_trace(node/'candidate-a')
         summary['nodes'].append(item)
         package=node/'package/deep_ep_experimental/megamoe'
         for f in [package/'libmegamoe_kernel.so',*package.glob('_C*.so')]: add(f,f'{node.name}/native/{f.name}')
@@ -105,6 +110,21 @@ for node in sorted(root.iterdir()):
         for f in folder.rglob('*'):
             if f.is_file() and (f.suffix=='.json' or f.name in ('kernel_details.csv','metric_summary.db')): add(f)
     add(node/'native-build/compile_commands.json')
+
+aux=root/'trace-pair'
+if (aux/'campaign.rc').exists() and (aux/'campaign.rc').read_text().strip()=='0':
+    identity=json.loads((root/'l6/identity.json').read_text())
+    methods={}
+    for name,method in [('l6','candidate'),('ds','ds')]:
+        record=validate(aux,name,method,identity,bs=1024)
+        record['trace']=export_trace(aux/name)
+        if len(list((aux/name).rglob('kernel_details.csv')))!=16:raise ValueError('Auxiliary on/off CSV missing')
+        methods[name]=record
+    summary['auxiliary'].append(dict(ep=8,bs=1024,methods=methods,
+        scope='L6/DS timer-off plus separate full passive timer; one launch each, not a new optimization'))
+    for f in aux.rglob('*'):
+        if f.is_file() and (f.suffix in ('.json','.log','.rc') or f.name=='kernel_details.csv'):add(f)
+    add(root/'trace-pair-controller.log')
 
 stable={n['name'] for n in summary['nodes']} | {n['name'] for n in summary['incomplete']
     if n['campaign_rc'] is not None or n['build_rc'] not in (None,'0')}
