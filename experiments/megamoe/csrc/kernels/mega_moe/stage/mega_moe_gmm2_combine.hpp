@@ -54,6 +54,16 @@ __aicore__ inline CombineTokenRoute LoadCombineTokenRoute(const LocalTensor<int3
             static_cast<uint32_t>(metaInfoTensor.GetValue(recordBase + TOPK_INDEX))};
 }
 
+// wave发送通常每核只有少量行；直接读取三个路由字段，避免为小metadata额外排入MTE2->Scalar完成边界。
+// 调用者先观察同一slice的GMM2 ready；Dispatch生成的metadata此时已发布，不改变可见性协议。
+__aicore__ inline CombineTokenRoute LoadGmCombineTokenRoute(const Params& params, uint64_t row)
+{
+    auto record = reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr) + row * META_INFO_SIZE;
+    return {static_cast<uint32_t>(ReadGmByPassDCache(record + RANK_ID)),
+            static_cast<uint32_t>(ReadGmByPassDCache(record + TOKEN_ID)),
+            static_cast<uint32_t>(ReadGmByPassDCache(record + TOPK_INDEX))};
+}
+
 // 目标卡 combine 接收区按 (token, topk) 展开的紧凑行号。
 __aicore__ inline uint64_t GetCombineDstRowIndex(const CombineTokenRoute& route, const Params& params)
 {
@@ -86,11 +96,9 @@ __aicore__ inline void CombineTokens(uint32_t nLoc, uint32_t n, LocalTensor<int3
 // 发送一行完整的 Combine 数据，BF16 与 FP8 记录复用相同的定长搬运流程。
 template <typename Element>
 __aicore__ inline void SendCombineTokenRow(uint32_t rowElements, uint64_t gmRemoteBaseOffset,
-                                           LocalTensor<int32_t>& metaInfoTensor, LocalTensor<Element>& rowTensor,
+                                           const CombineTokenRoute& route, LocalTensor<Element>& rowTensor,
                                            const Params& params)
 {
-    CombineTokenRoute route = LoadCombineTokenRoute(metaInfoTensor, 0U);
-
     GlobalTensor<Element> gmRemoteD;
     gmRemoteD.SetGlobalBuffer(
         reinterpret_cast<__gm__ Element*>(GetRankWinAddrWithOffset(route.dstRankId, gmRemoteBaseOffset)));
@@ -218,28 +226,13 @@ __aicore__ inline void DrainCombineRowBuffers(uint32_t& issuedRowCount, uint32_t
     issuedRowCount = 0U;
 }
 
-// 加载一段连续 wave Combine token 的 metadata。
-__aicore__ inline void PreloadWaveCombineMetaInfo(const Params& params, WaveCombineScratch& scratch,
-                                                  uint64_t gmTokenOffset, uint32_t tokenCount, uint32_t ubTokenOffset)
-{
-    if (tokenCount == 0U) {
-        return;
-    }
-    LocalTensor<int32_t> metaInfoUb = scratch.metaInfoTensor[ubTokenOffset * META_INFO_SIZE];
-    GlobalTensor<int32_t> metaInfoGm;
-    metaInfoGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr));
-    DataCopy(metaInfoUb, metaInfoGm[gmTokenOffset * META_INFO_SIZE], tokenCount * META_INFO_SIZE);
-    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-}
-
 // 搬运并按需量化一个 wave Combine token 后发送；函数内部不包含 GMM2-ready 依赖。
 template <bool IsBufferReuse>
 __aicore__ inline void SendWaveCombineToken(const MoeStageCommonConfig& common,
                                             const WaveCombineBufferConfig& bufferConfig, WaveCombineScratch& scratch,
                                             const Params& params, GlobalTensor<bfloat16_t>& gmm2OutGm,
                                             uint64_t gmRemoteBaseOffset, uint32_t tokenLocal,
-                                            LocalTensor<int32_t>& tokenMetaInfo, uint32_t slot)
+                                            const CombineImpl::CombineTokenRoute& route, uint32_t slot)
 {
     TEventID eventId = static_cast<TEventID>(bufferConfig.eventBase + slot);
     if constexpr (IsBufferReuse) {
@@ -253,7 +246,7 @@ __aicore__ inline void SendWaveCombineToken(const MoeStageCommonConfig& common,
     {
         SetFlag<HardEvent::MTE2_MTE3>(eventId);
         WaitFlag<HardEvent::MTE2_MTE3>(eventId);
-        CombineImpl::SendCombineTokenRow<bfloat16_t>(common.tokenHiddenDim, gmRemoteBaseOffset, tokenMetaInfo, rowUb,
+        CombineImpl::SendCombineTokenRow<bfloat16_t>(common.tokenHiddenDim, gmRemoteBaseOffset, route, rowUb,
                                                      params);
     }
     SetFlag<HardEvent::MTE3_MTE2>(eventId);
@@ -264,7 +257,7 @@ __aicore__ inline void SendWaveCombineToken(const MoeStageCommonConfig& common,
 __aicore__ inline void CombineWaveTokenRange(const MoeStageCommonConfig& common,
                                              const WaveCombineBufferConfig& bufferConfig, WaveCombineScratch& scratch,
                                              const Params& params, GM_ADDR gmm2OutGlobal, uint32_t tokenStart,
-                                             uint32_t tokenCount, uint32_t metaInfoUbTokenOffset, uint32_t& rowSequence)
+                                             uint32_t tokenCount, uint64_t metaInfoGmRowStart, uint32_t& rowSequence)
 {
     if constexpr (g_coreType == AIC) {
         return;
@@ -282,17 +275,15 @@ __aicore__ inline void CombineWaveTokenRange(const MoeStageCommonConfig& common,
     firstUseCount = firstUseCount < tokenCount ? firstUseCount : tokenCount;
     for (; tokenIdxInSlice < firstUseCount; ++tokenIdxInSlice, ++rowSequence) {
         uint32_t slot = rowSequence % rowBufferCount;
-        LocalTensor<int32_t> tokenMetaInfo =
-            scratch.metaInfoTensor[(metaInfoUbTokenOffset + tokenIdxInSlice) * META_INFO_SIZE];
+        auto route = CombineImpl::LoadGmCombineTokenRoute(params, metaInfoGmRowStart + tokenIdxInSlice);
         SendWaveCombineToken<false>(common, bufferConfig, scratch, params, gmm2OutGm, gmRemoteBaseOffset,
-                                    tokenStart + tokenIdxInSlice, tokenMetaInfo, slot);
+                                    tokenStart + tokenIdxInSlice, route, slot);
     }
     for (; tokenIdxInSlice < tokenCount; ++tokenIdxInSlice, ++rowSequence) {
         uint32_t slot = rowSequence % rowBufferCount;
-        LocalTensor<int32_t> tokenMetaInfo =
-            scratch.metaInfoTensor[(metaInfoUbTokenOffset + tokenIdxInSlice) * META_INFO_SIZE];
+        auto route = CombineImpl::LoadGmCombineTokenRoute(params, metaInfoGmRowStart + tokenIdxInSlice);
         SendWaveCombineToken<true>(common, bufferConfig, scratch, params, gmm2OutGm, gmRemoteBaseOffset,
-                                   tokenStart + tokenIdxInSlice, tokenMetaInfo, slot);
+                                   tokenStart + tokenIdxInSlice, route, slot);
     }
 }
 
@@ -743,8 +734,8 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
                                        static_cast<int32_t>(GetTokenCombineProducerCount(common, job, rowCount)));
             }
         }
-        PreloadWaveCombineMetaInfo(params, scratch, globalRowStart + owned.start + done, count, 0U);
-        CombineWaveTokenRange(common, buffers, scratch, params, sliceOutput, owned.start + done, count, 0U,
+        CombineWaveTokenRange(common, buffers, scratch, params, sliceOutput, owned.start + done, count,
+                              globalRowStart + owned.start + done,
                               rowSequence);
         // 发送完成才结束计时和复用 metadata/UB；不增加全核或全卡同步。
         // metadata已由Scalar读成路由值，后续可覆盖；行槽必须等自己的MTE3_MTE2归还。
