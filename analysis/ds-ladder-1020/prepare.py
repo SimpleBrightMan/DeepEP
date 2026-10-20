@@ -36,9 +36,11 @@ shutil.copytree(source/'experiments/megamoe/python/deep_ep_experimental/megamoe'
                 package/'deep_ep_experimental/megamoe', dirs_exist_ok=True)
 tests = source/'experiments/megamoe/tests'
 with (out/'cpu-tests.log').open('x') as log:
-    subprocess.run([sys.executable, '-I', '-m', 'pytest', '-q', *[
+    selected = [
         str(tests/name) for name in ('test_aiv1_resident_ub.py', 'test_aiv1_fair_scheduler.py',
-        'test_dispatch.py', 'test_aiv1_async_events.py', 'test_gmm1_cv_plan.py', 'test_timer.py', 'test_breakdown.py')]],
+        'test_dispatch.py', 'test_aiv1_async_events.py', 'test_gmm1_cv_plan.py', 'test_timer.py', 'test_breakdown.py')]
+    if (tests/'test_small_linear_task_schedule.py').exists(): selected.append(str(tests/'test_small_linear_task_schedule.py'))
+    subprocess.run([sys.executable, '-I', '-m', 'pytest', '-q', *selected],
         stdout=log, stderr=subprocess.STDOUT, check=True, timeout=180)
 cann = Path(os.environ['ASCEND_HOME_PATH'])
 commands = [

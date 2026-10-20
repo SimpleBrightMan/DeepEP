@@ -10,6 +10,7 @@
 #define MEGA_MOE_WAVE_A8W4_H
 
 #include "common/mega_moe_utils.hpp"
+#include "common/small_linear_task_schedule.hpp"
 #include "mega_moe_arch35.hpp"
 
 namespace MegaMoeImpl {
@@ -123,6 +124,10 @@ private:
                                                       GMMAddrInfo& gmm2AddrInfo, uint32_t& startBlockIdx);
     __aicore__ inline void ProcessMoeExpertStages(int32_t& gmm1TileReadySequence);
     __aicore__ inline void ProcessGmmWaves(int32_t& gmm1TileReadySequence);
+    __aicore__ inline uint32_t SmallLinearBlockCount();
+    __aicore__ inline void AdvanceSmallLinearExpert(ExpertContext& expert, uint32_t block,
+                                                     uint32_t& blockEnd, uint32_t& nextExpert);
+    __aicore__ inline void ProcessSmallLinearTasks(uint32_t blocks, int32_t& readySequence);
 
     __aicore__ inline void RunNextGmm1Slice(ExpertWaveRange& wave, uint32_t& usedMGroups,
                                             ExpertContext& gmm1ExpertContext, GMMAddrInfo& gmm1AddrInfo,
@@ -657,6 +662,13 @@ __aicore__ inline ExpertWaveRange MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFun
 template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessGmmWaves(int32_t& gmm1TileReadySequence)
 {
+    if constexpr (UseCv) {
+        const uint32_t blocks = SmallLinearBlockCount();
+        if (blocks != static_cast<uint32_t>(-1)) {
+            ProcessSmallLinearTasks(blocks, gmm1TileReadySequence);
+            return;
+        }
+    }
     uint64_t gmm1Count = 0U;
     uint64_t gmm2Count = 0U;
 
@@ -703,6 +715,121 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         gmm1CatlassContext_.End();
         if constexpr (g_coreType == AIC) Gmm1AsyncCompletion::DrainProducer();
     }
+    timer_.SetWave(AscendTimer::NO_WAVE);
+}
+
+// 只迁移当前闭合的单M块协议：偏斜产生大专家时保留原Wave，不能用期望M冒充实际容量。
+template <TemplateMegaMoeA8W4WaveTypeClass>
+__aicore__ inline uint32_t MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::SmallLinearBlockCount()
+{
+    if (computeReplay_ || sharedExpertNum_ != 0U ||
+        Ops::Base::CeilDiv(commonConfig_.tokenHiddenDim,uint32_t(L1_TILE_N)) > gmmExecutionConfig_.blockJob.totalJobs)
+        return static_cast<uint32_t>(-1);
+    uint32_t blocks = 0U;
+    for (uint32_t expert=0; expert<commonConfig_.moeExpertPerRank; ++expert) {
+        const uint32_t rows = GetExpertTokenCountFromWorkspace(params_.workspaceInfo.expertRevTokenNumsPtr,
+            countWorkspace_, commonConfig_.moeExpertPerRank, expert);
+        if (rows > Gmm1CvPlan::Rows) return static_cast<uint32_t>(-1);
+        blocks += rows != 0U;
+    }
+    return blocks;
+}
+
+template <TemplateMegaMoeA8W4WaveTypeClass>
+__aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::AdvanceSmallLinearExpert(
+    ExpertContext& expert, uint32_t block, uint32_t& blockEnd, uint32_t& nextExpert)
+{
+    while (block >= blockEnd) {
+        this->PrepareGmmExpertContext(expert, nextExpert++);
+        if (Get<M_VALUE>(expert.problemShape) != 0U) ++blockEnd;
+    }
+}
+
+// L4只迁移DS计算task顺序，保留我们的GMM2完成发布协议。
+// 连续GMM2 phase最后统一等FIX，再重放本核已提交task发布ready；不逐tile排空。
+template <TemplateMegaMoeA8W4WaveTypeClass>
+__aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessSmallLinearTasks(
+    uint32_t blocks, int32_t& readySequence)
+{
+    const auto& job = gmmExecutionConfig_.blockJob;
+    const uint32_t n1 = Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF,uint32_t(GMM1_TASK_N));
+    const uint32_t n2 = Ops::Base::CeilDiv(commonConfig_.tokenHiddenDim,uint32_t(L1_TILE_N));
+    SmallLinearTaskSchedule schedule{blocks,n1,n2,job.totalJobs};
+    auto first = CreateExpertContext(commonConfig_), second = CreateExpertContext(commonConfig_);
+    auto published = CreateExpertContext(commonConfig_);
+    uint32_t firstEnd=0U, firstNext=0U, secondEnd=0U, secondNext=0U, pubEnd=0U, pubNext=0U;
+    uint32_t pendingBegin=0U, pendingEnd=0U;
+    bool pending=false;
+    auto finishSecond = [&]() __aicore__ {
+        if (!pending) return;
+        gmm2WaveContext_.DrainOutput();
+        if constexpr (g_coreType == AIC) {
+            for (uint32_t index=pendingBegin; index<pendingEnd; index+=job.totalJobs) {
+                AdvanceSmallLinearExpert(published,index/n2,pubEnd,pubNext);
+                NotifyTokenCombineSliceReady(params_,published.expertIdx,0U);
+            }
+        }
+        pending=false;
+    };
+    SmallLinearTask task{};
+    while (schedule.Next(job.jobIndex,task)) {
+        timer_.SetWave(task.index / job.totalJobs);
+        GMMAddrInfo addr{};
+        if (task.gmm1) {
+            finishSecond();
+            gmm2WaveContext_.HandoffTo(gmm1CatlassContext_);
+            AdvanceSmallLinearExpert(first,task.index/n1,firstEnd,firstNext);
+            const auto config = Gmm1Config::BuildGmm1ProblemConfig(first.problemShape,job,GMM1_TILE_M);
+            const uint32_t rows = static_cast<uint32_t>(Get<M_VALUE>(first.problemShape));
+            const uint32_t column = task.index%n1 * GMM1_TASK_N;
+            const uint32_t columns = Min(uint32_t(GMM1_TASK_N),uint32_t(config.outputN)-column);
+            UpdateMoeExpertGmm1GlobalBuffer<ActivationType,Weight1Type,ActivationQuantOutType,QuantScaleOutType,
+                A_ELEMS_PER_BYTE,true>(gmmExecutionConfig_,syncWorkspaceLayout_,params_.workspaceInfo,
+                moeWeightTensorListAddrs_,epilogueOp_,addr,first,0U,n1);
+            addr.timer = timer_.Enabled() ? &timer_ : nullptr;
+            gmm1CatlassContext_.UpdateProblem(config,addr);
+            gmm1CatlassContext_.Begin();
+            timer_.SetSlice(first.expertIdx,0U,rows);
+            if constexpr (g_coreType == AIC) {
+                AscendTimerTileScope event(addr.timer,AscendTimer::AIC_GMM1_ISSUE,0U,column,rows,columns);
+                WaitForGmm1InputReady<false>(addr,config,0U);
+                gmm1CatlassContext_.ComputeCv(0U,column,rows,columns,uint32_t(readySequence),addr.gmmToEpilogueFlag);
+                readySequence += Gmm1CvPlan::ChunkCount(rows);
+            } else {
+                AscendTimerSpanScope event(addr.timer,AscendTimer::AIV_GMM1_PROLOGUE);
+                gmm1CatlassContext_.Dequantize(column,rows,columns);
+            }
+        } else {
+            gmm1CatlassContext_.HandoffTo(gmm2WaveContext_);
+            AdvanceSmallLinearExpert(second,task.index/n2,secondEnd,secondNext);
+            const auto config = Gmm2Config::BuildGmm2ProblemConfig(second.problemShape,job,GMM1_TILE_M);
+            const uint32_t rows = static_cast<uint32_t>(Get<M_VALUE>(second.problemShape));
+            const uint32_t column = task.index%n2 * L1_TILE_N;
+            const uint32_t columns = Min(uint32_t(L1_TILE_N),uint32_t(config.outputN)-column);
+            UpdateMoeExpertGmm2GlobalBuffer<Weight1Type,ActivationQuantOutType,QuantScaleOutType>(
+                gmmExecutionConfig_,syncWorkspaceLayout_,params_.workspaceInfo,moeWeightTensorListAddrs_,addr,second);
+            addr.timer = timer_.Enabled() ? &timer_ : nullptr;
+            gmm2WaveContext_.UpdateProblem(config,addr);
+            gmm2WaveContext_.Begin();
+            timer_.SetSlice(second.expertIdx,0U,rows);
+            if constexpr (g_coreType == AIC) {
+                AscendTimerTileScope event(addr.timer,AscendTimer::AIC_GMM2_ISSUE,0U,column,rows,columns);
+                WaitForGmm2InputReady<false>(addr,config,0U);
+                gmm2WaveContext_.Compute(0U,column,rows,columns);
+            } else {
+                AscendTimerSpanScope event(addr.timer,AscendTimer::AIV_GMM2_PROLOGUE);
+                gmm2WaveContext_.Dequantize(column,rows,columns);
+            }
+            if (!pending) pendingBegin=task.index;
+            pendingEnd=task.index+job.totalJobs;
+            pending=true;
+        }
+        timer_.ClearSlice();
+    }
+    finishSecond();
+    gmm2WaveContext_.HandoffTo(gmm1CatlassContext_);
+    gmm1CatlassContext_.End();
+    if constexpr (g_coreType == AIC) Gmm1AsyncCompletion::DrainProducer();
     timer_.SetWave(AscendTimer::NO_WAVE);
 }
 
