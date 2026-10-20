@@ -27,6 +27,7 @@ def local_binary(tmp_path_factory):
     source.write_text(
         r"""
 #include "compute_contract.hpp"
+#include "expert_plan.hpp"
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -45,6 +46,7 @@ struct Payload {
 };
 struct Rank {
     Config config{};
+    ExpertPlan plan;
     uint32_t bs{};
     std::array<uint64_t, 16> counts{}, send{}, recv{};
     std::vector<uint64_t> order, inverse;
@@ -145,6 +147,21 @@ int main(int argc, char** argv) {
         d.received.resize(rows);
         d.gmm2.assign(rows, poison);
     }
+    std::vector<int64_t> allCounts(16 * 384);
+    for (uint32_t source = 0; source < 16; ++source) {
+        assert(ranks[source].bs == ranks[0].bs);
+        for (auto expert : ranks[source].ids) ++allCounts[source * 384 + expert];
+    }
+    for (auto& r : ranks) {
+        r.config.localExperts = 24;
+        r.config.intermediate = 1280;
+        r.config.cvRows = 256;
+        r.config.maxPeerChunks = (r.bs * topk + r.config.cvRows - 1) / r.config.cvRows;
+        r.plan = BuildExpertPlan(allCounts.data(), r.config, 16ULL * r.bs * topk);
+        assert(r.plan.config.selfSendRow == r.config.selfSendRow);
+        assert(r.plan.config.selfRecvRow == r.config.selfRecvRow);
+        assert(r.plan.config.selfRows == r.config.selfRows);
+    }
     // Buffers persist between epochs. A direct self write must never touch a
     // remote interval still holding another call's data. Remote completions
     // are deliberately applied in reverse order after all self work.
@@ -202,24 +219,39 @@ int main(int argc, char** argv) {
             const auto before = d.returned;
             assert(std::all_of(receiveVisits[destination].begin(), receiveVisits[destination].end(),
                                [](auto n) { return n == 1; }));
-            for (uint32_t source = 0; source < 16; ++source) {
-                const auto& s = ranks[source];
-                for (uint64_t row = 0; row < s.counts[destination]; ++row) {
-                    const auto receivedRow = d.recv[source] + row;
-                    const auto sourceExpanded = s.send[destination] + row;
-                    const auto original = s.order[sourceExpanded];
-                    const auto expert = s.ids[original];
-                    assert(expert / 24 == destination);
-                    const auto expectedInput = Input(epoch, source, original / topk);
-                    assert(d.received[receivedRow] == expectedInput);
-                    const auto value = Expert(d.received[receivedRow], expert);
-                    if (source == destination) {
-                        const auto target = SelfReturnRow(receivedRow, d.config);
-                        assert(target == sourceExpanded && ++returnVisits[source][target] == 1);
-                        d.returned[target] = value;
-                        assert(d.gmm2[receivedRow] == poison);
-                    } else {
-                        d.gmm2[receivedRow] = value;
+            // Exercise the same expert-major gather/scatter descriptors as the
+            // kernel. The scalar expert transform is an independent oracle;
+            // communication/Reduce must preserve original token+top-k identity.
+            for (const auto& group : d.plan.fragments) {
+                std::vector<Payload> gathered(group.rows);
+                std::vector<uint32_t> gatheredVisits(group.rows);
+                for (uint32_t j = 0; j < group.segmentCount; ++j) {
+                    const auto& segment = d.plan.segments[group.segmentBegin + j];
+                    const auto& s = ranks[segment.sourceRank];
+                    for (uint32_t row = 0; row < segment.rows; ++row) {
+                        const auto original = s.order[segment.returnRow + row];
+                        assert(s.ids[original] == destination * 24 + group.expert);
+                        const auto input = d.received[segment.receiveRow + row];
+                        assert(input == Input(epoch, segment.sourceRank, original / topk));
+                        assert(++gatheredVisits[segment.tileRow + row] == 1);
+                        gathered[segment.tileRow + row] = input;
+                    }
+                }
+                assert(std::all_of(gatheredVisits.begin(), gatheredVisits.end(), [](auto n) { return n == 1; }));
+                for (uint32_t j = 0; j < group.segmentCount; ++j) {
+                    const auto& segment = d.plan.segments[group.segmentBegin + j];
+                    for (uint32_t row = 0; row < segment.rows; ++row) {
+                        const auto receiveRow = segment.receiveRow + row;
+                        const auto returnRow = segment.returnRow + row;
+                        const auto value = Expert(gathered[segment.tileRow + row], destination * 24 + group.expert);
+                        if (segment.sourceRank == destination) {
+                            assert(returnRow == SelfReturnRow(receiveRow, d.config));
+                            assert(++returnVisits[destination][returnRow] == 1);
+                            d.returned[returnRow] = value;
+                            assert(d.gmm2[receiveRow] == poison);
+                        } else {
+                            d.gmm2[receiveRow] = value;
+                        }
                     }
                 }
             }
@@ -279,6 +311,7 @@ int main(int argc, char** argv) {
         + [
             "-std=c++17",
             "-O1",
+            "-UNDEBUG",
             "-I" + str(root / "experiments/megamoe/csrc/kernels/mega_moe/urma"),
             str(source),
             "-o",
@@ -325,7 +358,7 @@ def test_sparse_duplicate_and_ragged_direct_self_roundtrip(local_binary, pattern
     rng = np.random.default_rng(1019)
     ids = []
     for rank in range(16):
-        bs = 1 + rank * 19
+        bs = 307
         if pattern == "random":
             value = rng.integers(0, 384, (bs, 8), dtype=np.int64)
         else:

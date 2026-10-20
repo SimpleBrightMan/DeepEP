@@ -100,9 +100,9 @@ class Fragment:
 def cv_fragments(routes, destination_rank, cv_rows):
     """Intersect each peer's fixed-row communication window with expert runs.
 
-    peer_row is the stable row in that source->destination stream. Both GMMs
-    preserve it; source_expanded_row is the target of the return PUT. Fragments
-    are never joined across an expert boundary.
+    peer_row is the stable row in that source->destination stream and
+    source_expanded_row is the target of the return PUT. These intersections
+    describe communication, not the expert-major GMM task boundaries.
     """
     if type(cv_rows) is not int or cv_rows <= 0 or not routes:
         raise ValueError("positive cv_rows and at least one rank are required")
@@ -141,6 +141,78 @@ def cv_fragments(routes, destination_rank, cv_rows):
     return fragments
 
 
+@dataclass(frozen=True)
+class RowSegment:
+    source_rank: int
+    cv_id: int
+    receive_row: int
+    return_row: int
+    tile_row: int
+    rows: int
+
+
+@dataclass(frozen=True)
+class ExpertMGroup:
+    expert: int
+    local_expert: int
+    row_begin: int
+    expert_row: int
+    rows: int
+    segments: tuple[RowSegment, ...]
+
+
+def expert_m_groups(routes, destination_rank, cv_rows):
+    """CPU oracle for expert-major M256 gather/scatter descriptors.
+
+    Build each expert's ordered row identities first, then partition those
+    identities into M256 groups. This intentionally differs from the native
+    interval/prefix construction, so coverage tests exercise an independent
+    algorithm. Communication CV size never changes the compute partition.
+    """
+    if type(cv_rows) is not int or cv_rows <= 0 or not routes:
+        raise ValueError("positive cv_rows and at least one rank are required")
+    first = routes[0]
+    if len(routes) != first.world or not 0 <= destination_rank < first.world:
+        raise ValueError("route table/rank does not match world")
+    if any((r.world, r.num_experts) != (first.world, first.num_experts) for r in routes):
+        raise ValueError("inconsistent expert topology")
+    local_experts = first.num_experts // first.world
+    receive_bases, receive_rows = [], 0
+    for route in routes:
+        receive_bases.append(receive_rows)
+        receive_rows += int(route.peer_counts[destination_rank])
+    groups, compute_row = [], 0
+    for local in range(local_experts):
+        expert = destination_rank * local_experts + local
+        identities = []
+        for source, route in enumerate(routes):
+            begin, end = map(int, route.expert_offsets[expert : expert + 2])
+            peer_base = int(route.peer_offsets[destination_rank])
+            for expanded_row in range(begin, end):
+                peer_row = expanded_row - peer_base
+                identities.append((source, peer_row // cv_rows, receive_bases[source] + peer_row, expanded_row))
+        for offset in range(0, len(identities), 256):
+            rows = identities[offset : offset + 256]
+            segments = []
+            start = 0
+            while start < len(rows):
+                source, cv, receive_row, return_row = rows[start]
+                end = start + 1
+                while end < len(rows) and rows[end] == (
+                    source,
+                    cv,
+                    receive_row + end - start,
+                    return_row + end - start,
+                ):
+                    end += 1
+                segments.append(RowSegment(source, cv, receive_row, return_row, start, end - start))
+                start = end
+            groups.append(ExpertMGroup(expert, local, compute_row, offset, len(rows), tuple(segments)))
+            compute_row += len(rows)
+    assert compute_row == receive_rows
+    return groups
+
+
 def remote_peer_for_worker(rank, worker, world=16):
     """One remote PE per communication worker; the self PE uses local copies."""
     if not 0 <= rank < world or not 0 <= worker < world - 1:
@@ -171,14 +243,22 @@ def simulate_roundtrip(inputs, topk_idx, topk_weights, num_experts, cv_rows, exp
         returned.append(np.empty((route.order.size, x.shape[1]), dtype=x.dtype))
         written.append(np.zeros(route.order.size, dtype=np.int32))
     for destination in range(world):
-        for fragment in cv_fragments(routes, destination, cv_rows):
-            source = fragment.source_rank
-            section = slice(fragment.source_expanded_row, fragment.source_expanded_row + fragment.rows)
-            value = np.asarray(expert_fn(fragment.expert, expanded[source][section]))
-            if value.shape != returned[source][section].shape:
+        for group in expert_m_groups(routes, destination, cv_rows):
+            gathered = np.concatenate(
+                [
+                    expanded[segment.source_rank][segment.return_row : segment.return_row + segment.rows]
+                    for segment in group.segments
+                ],
+                axis=0,
+            )
+            value = np.asarray(expert_fn(group.expert, gathered))
+            if value.shape != gathered.shape:
                 raise ValueError("expert transform must preserve the output hidden shape")
-            returned[source][section] = value
-            written[source][section] += 1
+            for segment in group.segments:
+                source = segment.source_rank
+                section = slice(segment.return_row, segment.return_row + segment.rows)
+                returned[source][section] = value[segment.tile_row : segment.tile_row + segment.rows]
+                written[source][section] += 1
     if any(not np.all(count == 1) for count in written):
         raise AssertionError("return PUT coverage must be exactly once per routing instance")
     return [

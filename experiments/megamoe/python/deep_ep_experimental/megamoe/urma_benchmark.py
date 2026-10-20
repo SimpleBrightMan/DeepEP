@@ -215,6 +215,7 @@ def run(args, config, group):
         numerical_validation="cpu_golden" if args.golden_dir else "skipped",
         input="prequantized FP8 E4M3 + E8M0; conversion/input generation outside measurement",
         native_urma_protocol=int(_extension().urma_api_protocol),
+        compute_schedule=getattr(_extension(), "urma_compute_schedule", "source-cv"),
         timer_clock_mhz=args.timer_clock_mhz,
         timer_clock_source="explicit assumption; default follows legacy timer/protocol.py CYCLE_TO_US=1000",
         detailed_trace=args.trace,
@@ -223,6 +224,11 @@ def run(args, config, group):
         trace_scope="additional diagnostic invocation after aggregate timer pass; formal measurements have both disabled",
     )
     (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    if rank == 0:
+        print(
+            f"[URMA SCHEDULE] compute={manifest['compute_schedule']} communication_cv_rows={args.cv_rows}",
+            flush=True,
+        )
     all_reports = []
     for bs in config["bs_values"]:
         case = rank_dir / f"bs_{bs}"

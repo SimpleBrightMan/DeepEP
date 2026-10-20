@@ -6,6 +6,7 @@ import pytest
 from deep_ep_experimental.megamoe.urma_routing import (
     CompletionLedger,
     cv_fragments,
+    expert_m_groups,
     plan_routes,
     prepare_routes,
     remote_peer_for_worker,
@@ -74,6 +75,66 @@ def test_stable_expansion_preserves_repeated_expert_instances():
     assert route.order.tolist() == [3, 1, 4, 0, 2, 5]
     assert route.reduce_index.tolist() == [[3, 1, 4], [0, 2, 5]]
     assert route.peer_counts.tolist() == [3, 3]
+
+
+@pytest.mark.parametrize("bs, expected_groups", [(2048, 72), (4096, 144), (8192, 264)])
+@pytest.mark.parametrize("destination", [0, 7, 15])
+@pytest.mark.parametrize("cv_rows", [128, 256, 1024])
+def test_expert_m256_partition_is_independent_of_communication_cv(bs, expected_groups, destination, cv_rows):
+    routes = [plan_routes(balanced(bs, rank), 384, 16) for rank in range(16)]
+    groups = expert_m_groups(routes, destination, cv_rows)
+    assert len(groups) == expected_groups
+    assert [g.expert for g in groups] == sorted(g.expert for g in groups)
+    written = np.zeros(bs * 8, dtype=np.uint8)
+    compute_rows = 0
+    for group in groups:
+        assert group.row_begin == compute_rows
+        assert 0 < group.rows <= 256
+        compute_rows += group.rows
+        local_coverage = np.zeros(group.rows, dtype=np.uint8)
+        for segment in group.segments:
+            route = routes[segment.source_rank]
+            begin, end = map(int, route.expert_offsets[group.expert : group.expert + 2])
+            assert begin <= segment.return_row < segment.return_row + segment.rows <= end
+            peer_row = segment.return_row - int(route.peer_offsets[destination])
+            assert peer_row // cv_rows == (peer_row + segment.rows - 1) // cv_rows == segment.cv_id
+            local_coverage[segment.tile_row : segment.tile_row + segment.rows] += 1
+            written[segment.receive_row : segment.receive_row + segment.rows] += 1
+        assert np.all(local_coverage == 1)
+    assert np.all(written == 1)
+    assert compute_rows == bs * 8
+    for expert in range(destination * 24, (destination + 1) * 24):
+        expert_groups = [g for g in groups if g.expert == expert]
+        assert all(g.rows == 256 for g in expert_groups[:-1])
+        assert sum(g.rows for g in expert_groups) == sum(int(r.expert_counts[expert]) for r in routes)
+
+
+def test_first_m256_needs_only_its_actual_sources_and_preserves_self_mapping():
+    routes = [plan_routes(balanced(2048, rank), 384, 16) for rank in range(16)]
+    first = expert_m_groups(routes, 0, 256)[0]
+    assert [(s.source_rank, s.rows) for s in first.segments] == [(0, 43), (1, 43), (2, 42), (3, 43), (4, 43), (5, 42)]
+    assert {s.cv_id for s in first.segments} == {0}
+    assert first.rows == 256
+    self_segment = first.segments[0]
+    assert self_segment.return_row == int(routes[0].expert_offsets[0])
+
+
+def test_expert_m256_roundtrip_really_combines_sources_before_expert_call():
+    world, bs, topk = 4, 300, 2
+    xs = [np.full((bs, 2), rank, dtype=np.float32) for rank in range(world)]
+    ids = [np.tile([0, 1], (bs, 1)) for _ in range(world)]
+    weights = [np.ones((bs, topk), dtype=np.float32) for _ in range(world)]
+    calls = []
+
+    def expert(expert_id, rows):
+        calls.append((expert_id, len(rows), len(np.unique(rows[:, 0]))))
+        return rows + expert_id
+
+    result = simulate_roundtrip(xs, ids, weights, 8, 128, expert)
+    assert [size for _, size, _ in calls] == [256, 256, 256, 256, 176] * 2
+    assert any(sources > 1 for _, _, sources in calls)
+    for rank, actual in enumerate(result):
+        np.testing.assert_array_equal(actual, np.full_like(xs[rank], 2 * rank + 1))
 
 
 @pytest.mark.parametrize("rank", range(16))

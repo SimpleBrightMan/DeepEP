@@ -53,7 +53,9 @@ enum class TraceEvent : uint32_t {
     RankBarrier,
     Reduce,
     LocalSync,
-    Gmm1Drain
+    Gmm1Drain,
+    InputScaleGather,
+    WaitInputScale
 };
 
 struct TraceMeta {
@@ -69,19 +71,41 @@ struct TraceMeta {
     uint64_t bytes = 0U;
 };
 
-// One intersection of a peer CV interval and an expert's stable route stream.
+// One expert-major M<=256 group, gathering rows across source/CV boundaries.
 struct Fragment {
     uint32_t expert;
-    uint32_t sourceRank;
+    uint32_t segmentBegin;
     uint64_t rowBegin;
     uint32_t rows;
-    uint32_t inputReadyIndex;
+    uint32_t segmentCount;
     uint64_t gmm1TileBegin;
     uint64_t gmm2TileBegin;
 };
 
+// One contiguous input/output run inside a compute group and a transport CV.
+// receiveRow addresses source-major input/GMM2 output. returnRow is the source's
+// expanded-row offset, including direct self output in the local return window.
+struct RowSegment {
+    uint32_t sourceRank;
+    uint32_t cv;
+    uint64_t receiveRow;
+    uint64_t returnRow;
+    uint32_t tileRow;
+    uint32_t rows;
+    uint32_t inputReadyIndex;
+    uint32_t reserved;
+};
+
+// One batch per local expert, including an empty range for an empty expert.
+struct ComputeBatch {
+    uint32_t fragmentBegin;
+    uint32_t fragmentCount;
+};
+
 // Send chunks use local expanded-row offsets. Receive chunks describe the
 // corresponding source-major input and full-width GMM2 output interval.
+// A receive chunk's fragmentBegin/Count index chunkGroupIndices, not fragments:
+// all referenced compute groups must finish before the contiguous return PUT.
 struct Chunk {
     uint32_t peer;
     uint32_t cv;
@@ -139,14 +163,19 @@ struct Arguments {
     uint64_t output;
     uint64_t expandedX;
     uint64_t expandedScale;
+    uint64_t gatheredInputScale;
     uint64_t gmm1Output;
     uint64_t activation;
     uint64_t activationScale;
     uint64_t gmm2Output;
     uint64_t fragments;
+    uint64_t segments;
+    uint64_t computeBatches;
+    uint64_t chunkGroupIndices;
     uint64_t sendChunks;
     uint64_t recvChunks;
     uint64_t gmm1Done;
+    uint64_t inputScaleDone;
     uint64_t activationDone;
     uint64_t gmm2Done;
     uint64_t localFlags;
@@ -157,6 +186,8 @@ struct Arguments {
     uint64_t ffts;
 };
 static_assert(sizeof(Fragment) == 40);
+static_assert(sizeof(RowSegment) == 40);
+static_assert(sizeof(ComputeBatch) == 8);
 static_assert(sizeof(Chunk) == 40);
 }  // namespace MegaMoeUrma
 

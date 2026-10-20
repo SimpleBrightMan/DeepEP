@@ -15,6 +15,7 @@
 
 #include "resource.hpp"
 #include "a8w4_k_plan.hpp"
+#include "segmented_row_io.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/coord.hpp"
 #include "catlass/numeric_size.hpp"
@@ -308,10 +309,11 @@ public:
 
     /// Perform a block-scoped matrix multiply-accumulate
     template <class TensorA, class TensorC, class TensorMxScaleA = EmptyClass, class TensorMxScaleB = EmptyClass,
-              class TensorBias = EmptyClass>
+              class TensorBias = EmptyClass, class RowIO = MegaMoeImpl::GmmKernel::ContiguousRowIO>
     CATLASS_DEVICE void operator()(TensorA& tensorA, TensorC& tensorC, GemmCoord const& actualShape,
                                    TensorMxScaleA const& tensorMxScaleA = {}, TensorMxScaleB const& tensorMxScaleB = {},
-                                   bool allowDynamicB = false, TensorBias const& tensorBias = {})
+                                   bool allowDynamicB = false, TensorBias const& tensorBias = {},
+                                   RowIO const& rowIO = {}, uint32_t rowBegin = 0, uint32_t columnBegin = 0)
     {
         // Check L1TileShape
         if constexpr (HAS_BIAS) {
@@ -395,7 +397,11 @@ public:
             if (kOffset == aStart) {
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1AListId]);
                 auto tensorTileA = GetTile(tensorA, tla::MakeCoord(0, aStart), tla::MakeShape(mBlockActual, aActual));
-                copyGmToL1A(tensorL1A, tensorTileA);
+                if constexpr (RowIO::kGatherInput) {
+                    rowIO.Gather(tensorL1A, rowBegin, mBlockActual, aStart, aActual);
+                } else {
+                    copyGmToL1A(tensorL1A, tensorTileA);
+                }
                 InitZeroInL1A(tensorL1A, tla::MakeShape(mL1Actual, aActual));
             }
 
@@ -484,7 +490,7 @@ public:
 
                 // If the unit flag is enabled, the unit flag is set according to the calculation progress
                 uint8_t unitFlag = 0b00;
-                if constexpr (ENABLE_UNIT_FLAG) {
+                if constexpr (ENABLE_UNIT_FLAG && !RowIO::kScatterOutput) {
                     if ((kL1Idx == kL1Loop - 1) && (kL0Idx == kL0Loop - 1)) {
                         unitFlag = 0b11;
                     } else {
@@ -526,7 +532,18 @@ public:
         }
         // copy block out
         copyL0CToDst.params.scale = 64;
-        if constexpr (!ENABLE_UNIT_FLAG) {
+        if constexpr (RowIO::kScatterOutput) {
+            static_assert(!ENABLE_UNIT_FLAG, "Segmented output requires ordinary L0C layout and explicit FIX events");
+            // A segmented result has several FIX readers of the same L0C
+            // tile. The single-store unit-flag protocol cannot release that
+            // tile on its first segment. Use explicit events for this opt-in
+            // path, and leave the ordinary main-kernel protocol unchanged.
+            AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);
+            AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);
+            rowIO.Scatter(copyL0CToDst, tensorC, tensorL0C, rowBegin, mBlockActual, columnBegin, nBlockActual);
+            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEventList[l0CListId]);
+            l0CListId = (l0CListId + 1 < L0C_STAGES) ? (l0CListId + 1) : 0;
+        } else if constexpr (!ENABLE_UNIT_FLAG) {
             AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);
             AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);
             copyL0CToDst(tensorC, tensorL0C);

@@ -55,7 +55,10 @@ __aicore__ inline void PublishSelfDispatchReady(const Arguments& args)
 __aicore__ inline void WaitChunkComputed(const Arguments& args, const Chunk& chunk, Timer& timer)
 {
     for (uint32_t j = 0U; j < chunk.fragmentCount; ++j) {
-        const uint32_t index = chunk.fragmentBegin + j;
+        // A communication CV intersects arbitrary expert-major compute groups.
+        // Host deduplicates this adjacency list; each group counter covers its
+        // complete GMM2 N direction after every segmented FIX store completes.
+        const uint32_t index = reinterpret_cast<__gm__ uint32_t*>(args.chunkGroupIndices)[chunk.fragmentBegin + j];
         const Fragment fragment = LoadFragment(args, index);
         TraceMeta meta = ChunkTraceMeta(chunk);
         meta.fragment = index;

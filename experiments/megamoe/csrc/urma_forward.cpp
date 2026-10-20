@@ -2,6 +2,7 @@
 // Modified by SimpleBright_Man 2026
 #include "urma_forward.hpp"
 #include "kernels/mega_moe/urma/compute_contract.hpp"
+#include "kernels/mega_moe/urma/expert_plan.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -15,9 +16,7 @@
 
 namespace deepep::megamoe {
 namespace {
-using MegaMoeUrma::Chunk;
 using MegaMoeUrma::Config;
-using MegaMoeUrma::Fragment;
 constexpr uint64_t kAlignment = 512;
 uint64_t Align(uint64_t value, uint64_t alignment = kAlignment)
 {
@@ -122,80 +121,9 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
                     ". Multi-host testing requires one mutually accessible UB memory domain.");
     }
 
-    const auto* counts = counts_cpu.data_ptr<int64_t>();
-    uint64_t peer_rows[16][16]{};
-    uint64_t send_base[16][16]{};
-    uint64_t receive_base[16][16]{};
-    for (uint32_t src = 0; src < 16; ++src) {
-        uint64_t row = 0;
-        for (uint32_t dst = 0; dst < 16; ++dst) {
-            send_base[src][dst] = row;
-            for (uint32_t expert = 0; expert < 24; ++expert) {
-                const auto count = counts[src * 384 + dst * 24 + expert];
-                TORCH_CHECK(count >= 0 && count <= static_cast<int64_t>(config.bs) * topk, "Invalid count for source ",
-                            src, ", expert ", dst * 24 + expert);
-                peer_rows[src][dst] += count;
-            }
-            row += peer_rows[src][dst];
-        }
-        TORCH_CHECK(row == static_cast<uint64_t>(config.bs) * topk, "Route count sum differs from BS*topk");
-    }
-    for (uint32_t dst = 0; dst < 16; ++dst) {
-        uint64_t row = 0;
-        for (uint32_t src = 0; src < 16; ++src) {
-            receive_base[dst][src] = row;
-            row += peer_rows[src][dst];
-        }
-        TORCH_CHECK(row <= static_cast<uint64_t>(max_recv_rows), "rank ", dst, " needs ", row,
-                    " receive rows; increase max_recv_rows (capacity ", max_recv_rows, ")");
-        if (dst == rank) config.receiveRows = row;
-    }
-    config.selfSendRow = send_base[rank][rank];
-    config.selfRecvRow = receive_base[rank][rank];
-    config.selfRows = peer_rows[rank][rank];
-
-    std::vector<Chunk> send_chunks, recv_chunks;
-    std::vector<Fragment> fragments;
-    for (uint32_t peer = 0; peer < 16; ++peer) {
-        const uint64_t rows = peer_rows[rank][peer];
-        for (uint64_t begin = 0, cv = 0; begin < rows; begin += cv_rows, ++cv) {
-            send_chunks.push_back({peer, static_cast<uint32_t>(cv), send_base[rank][peer] + begin,
-                                   receive_base[peer][rank] + begin,
-                                   static_cast<uint32_t>(std::min<uint64_t>(cv_rows, rows - begin)), 0, 0, 0});
-        }
-        const uint64_t incoming = peer_rows[peer][rank];
-        for (uint64_t begin = 0, cv = 0; begin < incoming; begin += cv_rows, ++cv) {
-            const uint64_t end = std::min<uint64_t>(begin + cv_rows, incoming);
-            Chunk chunk{peer,
-                        static_cast<uint32_t>(cv),
-                        receive_base[rank][peer] + begin,
-                        send_base[peer][rank] + begin,
-                        static_cast<uint32_t>(end - begin),
-                        static_cast<uint32_t>(fragments.size()),
-                        0,
-                        0};
-            uint64_t expert_begin = 0;
-            for (uint32_t expert = 0; expert < 24; ++expert) {
-                const uint64_t expert_end = expert_begin + counts[peer * 384 + rank * 24 + expert];
-                const uint64_t lo = std::max(begin, expert_begin);
-                const uint64_t hi = std::min(end, expert_end);
-                if (lo < hi) {
-                    const uint32_t n = hi - lo;
-                    fragments.push_back({expert, peer, receive_base[rank][peer] + lo, n,
-                                         peer * config.maxPeerChunks + static_cast<uint32_t>(cv), config.gmm1Tiles,
-                                         config.gmm2Tiles});
-                    config.gmm1Tiles += ((n + 255U) / 256U) * ((intermediate + 255U) / 256U);
-                    config.gmm2Tiles += ((n + 255U) / 256U) * ((config.hidden + 255U) / 256U);
-                }
-                expert_begin = expert_end;
-            }
-            chunk.fragmentCount = fragments.size() - chunk.fragmentBegin;
-            recv_chunks.push_back(chunk);
-        }
-    }
-    config.fragmentCount = fragments.size();
-    config.sendChunkCount = send_chunks.size();
-    config.recvChunkCount = recv_chunks.size();
+    const auto plan =
+        MegaMoeUrma::BuildExpertPlan(counts_cpu.data_ptr<int64_t>(), config, static_cast<uint64_t>(max_recv_rows));
+    config = plan.config;
     const auto options = example.options().dtype(torch::kUInt8);
     const uint64_t expanded_rows = static_cast<uint64_t>(config.bs) * topk;
     auto allocate = [&](uint64_t bytes) {
@@ -203,14 +131,19 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     };
     expanded_x_ = allocate(expanded_rows * config.hidden);
     expanded_scale_ = allocate(expanded_rows * (config.hidden / 32));
+    gathered_input_scale_ = allocate(config.receiveRows * (config.hidden / 32));
     gmm1_ = allocate(config.receiveRows * intermediate * 4);
     activation_ = allocate(config.receiveRows * intermediate);
     activation_scale_ = allocate(config.receiveRows * (intermediate / 32));
     gmm2_ = allocate(config.receiveRows * config.hidden * 2);
-    fragments_ = Upload(fragments, options);
-    send_chunks_ = Upload(send_chunks, options);
-    recv_chunks_ = Upload(recv_chunks, options);
+    fragments_ = Upload(plan.fragments, options);
+    segments_ = Upload(plan.segments, options);
+    compute_batches_ = Upload(plan.computeBatches, options);
+    chunk_group_indices_ = Upload(plan.chunkGroupIndices, options);
+    send_chunks_ = Upload(plan.sendChunks, options);
+    recv_chunks_ = Upload(plan.recvChunks, options);
     gmm1_done_ = allocate(config.gmm1Tiles * MegaMoeUrma::kFlagBytes);
+    input_scale_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
     activation_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
     gmm2_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
     local_flags_ = allocate(16 * MegaMoeUrma::kFlagBytes);
@@ -218,14 +151,19 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
 
     args_.expandedX = Address(expanded_x_);
     args_.expandedScale = Address(expanded_scale_);
+    args_.gatheredInputScale = Address(gathered_input_scale_);
     args_.gmm1Output = Address(gmm1_);
     args_.activation = Address(activation_);
     args_.activationScale = Address(activation_scale_);
     args_.gmm2Output = Address(gmm2_);
     args_.fragments = Address(fragments_);
+    args_.segments = Address(segments_);
+    args_.computeBatches = Address(compute_batches_);
+    args_.chunkGroupIndices = Address(chunk_group_indices_);
     args_.sendChunks = Address(send_chunks_);
     args_.recvChunks = Address(recv_chunks_);
     args_.gmm1Done = Address(gmm1_done_);
+    args_.inputScaleDone = Address(input_scale_done_);
     args_.activationDone = Address(activation_done_);
     args_.gmm2Done = Address(gmm2_done_);
     args_.localFlags = Address(local_flags_);
@@ -301,7 +239,7 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     CheckTensor(output, 2, "out", device);
     TORCH_CHECK(output.scalar_type() == torch::kBFloat16 && output.sizes() == x.sizes(), "out must be BF16 [BS,H]");
     auto stream = c10_npu::getCurrentNPUStream();
-    for (auto* tensor : {&gmm1_done_, &activation_done_, &gmm2_done_, &local_flags_}) {
+    for (auto* tensor : {&gmm1_done_, &input_scale_done_, &activation_done_, &gmm2_done_, &local_flags_}) {
         ASCEND_DEEPEP_CHECK_ACL(
             aclrtMemsetAsync(tensor->data_ptr(), tensor->numel(), 0, tensor->numel(), stream.stream()));
     }
@@ -341,14 +279,19 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
                                &output,
                                &expanded_x_,
                                &expanded_scale_,
+                               &gathered_input_scale_,
                                &gmm1_,
                                &activation_,
                                &activation_scale_,
                                &gmm2_,
                                &fragments_,
+                               &segments_,
+                               &compute_batches_,
+                               &chunk_group_indices_,
                                &send_chunks_,
                                &recv_chunks_,
                                &gmm1_done_,
+                               &input_scale_done_,
                                &activation_done_,
                                &gmm2_done_,
                                &local_flags_,
@@ -364,8 +307,9 @@ int64_t UrmaPlan::workspace_bytes() const
 {
     int64_t bytes = 0;
     for (const auto* tensor :
-         {&expanded_x_, &expanded_scale_, &gmm1_, &activation_, &activation_scale_, &gmm2_, &fragments_, &send_chunks_,
-          &recv_chunks_, &gmm1_done_, &activation_done_, &gmm2_done_, &local_flags_, &system_workspace_})
+         {&expanded_x_, &expanded_scale_, &gathered_input_scale_, &gmm1_, &activation_, &activation_scale_, &gmm2_,
+          &fragments_, &segments_, &compute_batches_, &chunk_group_indices_, &send_chunks_, &recv_chunks_, &gmm1_done_,
+          &input_scale_done_, &activation_done_, &gmm2_done_, &local_flags_, &system_workspace_})
         bytes += tensor->nbytes();
     return bytes;
 }

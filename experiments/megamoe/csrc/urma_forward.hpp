@@ -26,7 +26,9 @@ private:
     PlatformInfo platform_{};
     MegaMoeUrma::Arguments args_{};
     torch::Tensor expanded_x_, expanded_scale_, gmm1_, activation_, activation_scale_, gmm2_;
+    torch::Tensor gathered_input_scale_, input_scale_done_;
     torch::Tensor fragments_, send_chunks_, recv_chunks_, gmm1_done_, activation_done_, gmm2_done_, local_flags_;
+    torch::Tensor segments_, compute_batches_, chunk_group_indices_;
     torch::Tensor system_workspace_;
     int64_t last_epoch_ = 0;
 };

@@ -4,7 +4,7 @@
 
 首版范围：默认单机 EP16，固定使用28个AIC / 56个AIV、每个AIV至少192 KiB UB、H=3584、I=1280、384个专家、TopK=8、无共享专家、FP8输入/FP4权重、BS=2048/4096/8192。物理核心数更多的兼容机型仍只启动这28组计算核。任意合法路由均走同一流程；超过配置接收容量的偏斜路由会在启动计算前明确报错。
 
-GMM保留256行tile；SwiGLU在每个已就绪GMM1 tile内按最多128行处理，全部子块写出后只发布一次该tile的完成贡献。其两个BF16输入缓冲合计128 KiB，AIV0的W4解量化流水使用192 KiB，后者决定当前UB最低要求。通信CV大小、专家行顺序及GMM调度不因子块划分改变。资源不足时分别报告核心数或UB容量，并打印实际查询值。
+GMM按专家聚合不同来源的行，使用M256计算块，仅专家尾块不足256行；通信CV不再决定计算分块。SwiGLU在每个已就绪GMM1 tile内按最多128行处理，全部子块写出后只发布一次该tile的完成贡献。其两个BF16输入缓冲合计128 KiB，AIV0的W4解量化流水使用192 KiB，后者决定当前UB最低要求。资源不足时分别报告核心数或UB容量，并打印实际查询值。
 
 通信接口与固定 CV 调度参考 [ops-transformer PR11602](https://gitcode.com/cann/ops-transformer/pull/11602)（分析版本 `3ab6b8bba2cbdaf3751596c3e4b0488e1991df5f`）。计算复用本仓主线的 FP8/W4 CATLASS 和 SwiGLU 算术；返回方向改为 PUT。
 
@@ -13,37 +13,53 @@ GMM保留256行tile；SwiGLU在每个已就绪GMM1 tile内按最多128行处理�
 1. 每个输入 `[token, topk_slot]` 都是独立路由实例。按 `[目标rank][目标本地expert][原始token/topk位置]` 稳定排序，建立 `order` 和逆映射 `reduce_index[token,slot]=expanded_row`。
 2. 56个AIV共同展开FP8 token和E8M0 scale：远端路由写连续发送区，self路由直接写本rank接收区；不再从发送区执行一次SelfDispatch拷贝。一个token命中多个expert时复制对应多行，本版不做去重。
 3. 每个目标rank的连续行流按 `cv_rows` 截断，通过 URMA PUT 发送。token与scale使用各自连续平面。
-4. 每个CV与expert区间取交集，产生 `source_rank、cv_id、expert、cv_row、expert_row、rows、source_expanded_row` 描述符。GMM1、SwiGLU、GMM2共用行身份；跨expert边界必须分别计算。
-5. 计算按通信CV前瞻一批：先执行首个CV的GMM1，随后交替执行下一个CV的GMM1和上一个CV的GMM2，最后执行末个CV的GMM2。SwiGLU按已完成的gate/up tile独立推进；GMM2仍等待对应CV/expert交集的全部SwiGLU tile完成。远端结果写按来源rank排列的连续GMM2输出区，返回PUT等待整个CV的完整H列；self结果直接写Reduce最终读取的返回区，不再执行SelfCombine拷贝。
+4. 对每个本地expert，把16个来源的行按source编号连接，按M256划分计算组；专家尾组可以不足256，不与下一个专家混算。每组的Segment记录来源、CV、接收行、组内行和返回展开行。Segment在source/CV边界切分，但这些边界不再切分矩阵计算。
+5. GMM1按Segment把X分段加载到同一L1计算块，只等待该组实际涉及的Dispatch CV及scale准备。scale由13个AIV1独立准备，每个M组只聚合一次到expert-major GM；AIC沿用连续MX scale加载。GMM1输出、SwiGLU及GMM2输入使用连续的expert-major计算行序。GMM2按同一映射将远端结果分段写回原source-major连续输出区，self结果直接写Reduce最终读取的位置。各peer的Combine CV等待所有覆盖它的M组完成全部H列，再按原连续区间PUT。
 6. 本rank的15个远端Dispatch全部完成且self接收区已就绪后才提交Combine PUT，此处不插入全卡同步。Combine延后quiet，所有PUT完成后参加最终全卡同步，再由56个AIV按`reduce_index`读取各top-k结果、乘路由权重并求和。
 
 15个通信AIV1各独占一个远端rank。通信worker `w` 的peer为 `w < rank ? w : w+1`；剩余13个AIV1执行SwiGLU。self就绪标志在Pack本地同步后发布，原来承担self拷贝的block15随后直接进入SwiGLU。远端两个阶段都只使用PUT，队列同一peer始终只有一个提交者。
 
 Pack和Reduce是计算前后的独立本地阶段，使用28组中的全部AIV0/AIV1，共56个AIV；任务编号为`block*2+subblock`，按56核划分行。阶段结束仍保留原有DMA完成及本地同步，再复用UB进行计算或结束调用。当前内核固定启动28组；即使物理设备有64个AIV，也只使用已启动的56个，不扩大计算/通信核数量。
 
-self直接写地址按现有`send_base/receive_base`映射，远端PUT的地址、顺序、CV和数量不变，计算仍按来源rank外循环、CV内循环。没有在本次改动中加入跨peer交错。当前Pack完成前不会对peer发布新epoch的Start；上一轮本地计算/返回/Reduce由同一runtime stream串行完成，因此self直接写不会覆盖尚在使用的上一轮数据。
+self直接写地址按现有`send_base/receive_base`映射；同一计算组可同时含self和远端行，逐Segment决定输出地址。远端PUT的地址、顺序、CV和数量不变，计算按expert顺序推进多个peer的返回结果。当前Pack完成前不会对peer发布新epoch的Start；上一轮本地计算/返回/Reduce由同一runtime stream串行完成，因此self直接写不会覆盖尚在使用的上一轮数据。
 
 接收数据/中间结果/返回结果不按CV覆盖复用。所有BS共享固定对称heap布局，epoch由`UrmaBuffer`统一递增，不因创建新Plan或切换BS重新归零。
 
 通信域启用MTE和UDMA，每个对端独立QP0，不使用共享jetty。MTE只用于完成标志与本地搬运；远端token、scale和FFN结果均走UDMA PUT。每次调用在同一runtime stream串行执行，并在下一次写入前与各peer握手，保护上一轮Reduce尚未读完的结果。
 
-### 计算按通信 CV 前瞻一批
+### 专家 M256 与通信 CV 解耦
 
-这里的一个CV是**单个来源rank发送的一段连续行**，用`(source_rank, cv_id)`唯一标识。不同来源rank的同号CV彼此独立，不会合成一批。计算沿现有描述符顺序遍历；一个CV跨越多个expert时，先完成该CV内所有expert交集的GMM1，再按下面的顺序安排GMM2：
+通信CV仍是**单个来源rank发送的一段连续行**，用`(source_rank, cv_id)`唯一标识。计算批次改为一个本地专家的全部M256组，同专家内不混入其它专家。每个M组有独立的输入依赖列表，不需要等齐全16个来源。例如BS2048均衡时，专家0第一个M256由来源0～5分别贡献43、43、42、43、43、42行。
+
+计算前瞻按专家批次进行：
 
 ```text
-GMM1(CV0)
-for i = 0 .. 最后一个CV之前:
-    GMM1(CV[i+1])
-    GMM2(CV[i])
-GMM2(最后一个CV)
+GMM1(expert0)
+for e = 0 .. localExperts-2:
+    GMM1(expert[e+1])
+    GMM2(expert[e])
+GMM2(expert[last])
 ```
 
-只有一个非空CV时直接执行`GMM1→GMM2`；没有接收行时没有计算任务。前瞻把下一个CV的GMM1放到当前CV的GMM2之前，让13个SwiGLU核在这段时间处理已就绪的当前CV。28组AIC/AIV0仍按原有全局tile编号分工，不改变每个CV的行、专家边界、tile数量或输出位置。
+MX scale在L1中的zZ布局按16行组织，任意来源边界可能落在2字节偏移，不能直接调用要求32字节LocalTensor起址的DMA。为此只增加`receiveRows*(H/32)`字节的scale GM工作区：准备时UB每行补齐到32字节，写回GM时压紧；不新增完整X重排。该缓冲在每次调用重新填充，组完成标志逐次清零。13个AIV1分别推进scale准备和activation两个游标，只有依赖就绪才执行任务，避免等待GMM1时阻止后续scale准备。trace中的`InputScaleGather`记录该额外搬运，`WaitInputScale`记录AIC等待。
 
-各AIC及其配对AIV0按本核任务独立推进，CV批次之间没有barrier。这里`GMM1(CV)`完成指本核负责的任务结束，并不代表全部核心同时完成该CV；GMM2仍检查对应fragment的真实SwiGLU完成计数。每段GMM结束后，配对AIV0向本组AIC发送End确认，确保旧段已消费完6–9号流水槽信号后才复用；此确认只涉及该对AIC/AIV0，不让15个通信AIV1或13个SwiGLU AIV1参与同步。
+Scale准备只在详细trace中独立计时，未归入原有8个aggregate phase；因此不能用这些phase的累计时间代表完整算子耗时。正式`CACHED_FORWARD`和`FULL_E2E`均包含该步骤。
 
-该调度默认生效，无需新开关。它保留Dispatch就绪检查、`WaitActivation`、原有计算流水完成等待及计数发布，不增加全核或全卡同步；PUT顺序、payload、量化算术、路由权重和Reduce公式均保持原有定义。它能否减少等待需要由正式耗时与trace验证，不能仅凭前瞻顺序推定收益。
+空专家没有计算任务。各AIC及其配对AIV0按本核任务独立推进，专家批次之间没有全核barrier；GMM1下一批可以与上一批的SwiGLU/GMM2重叠。13个SwiGLU核使用新的M组任务编号，GMM2等待同组全部1280列activation完成，不能只等待其中一个N tile。
+
+返回CV保存它所依赖的M组编号列表，同一组去重后只出现一次。每组全部GMM2 N tile完成分段输出后才满足依赖；仅提交Cube/FIX指令不能提前放行PUT。BS2048时一个peer的CV0大致跨6个专家，新顺序让多个peer按CV波次逐渐就绪，不保证15个peer同时开始。
+
+每段GMM结束后仍由配对AIV0向本组AIC发送End确认，确保旧段消费完流水槽信号后才复用；该确认不涉及通信或SwiGLU AIV1。接收数据读取保留URMA所需的cache bypass。
+
+默认均衡模型的每rank任务数如下，CV128/256/1024等取值不改变这些计算组数：
+
+| BS | M256组（含专家尾组） | GMM1逻辑tile | GMM2 tile |
+|---|---:|---:|---:|
+| 2048 | 72 | 360 | 1008 |
+| 4096 | 144 | 720 | 2016 |
+| 8192 | 264 | 1320 | 3696 |
+
+该调度默认生效，无需新开关。benchmark打印`[URMA SCHEDULE] compute=expert-m256`并写入manifest；若显示`source-cv`，当前Python加载的还是旧native扩展，需要重新编译安装。流水图和正式耗时仍需实测验证；不能将tile数量减少倍数视为耗时加速倍数。
 
 ## Python 接口与路由成本
 
@@ -61,7 +77,7 @@ y = buffer.forward_prepared(x, topk_weights, weights1, weights2, prepared)
 buffer.destroy()
 ```
 
-`prepare_routes`每次在输入NPU上执行排序、计数、前缀和及逆映射。首版随后把384个counts复制到CPU，经Store交换完整计数表，native据此生成CV描述符并送回NPU。它包含设备同步和host控制开销，是后续需要优化的一部分。
+`prepare_routes`每次在输入NPU上执行排序、计数、前缀和及逆映射。随后把384个counts复制到CPU，经Store交换完整计数表，native据此生成通信CV、专家M组、Segment及CV输出依赖表并送回NPU。它包含设备同步和host控制开销，是后续需要优化的一部分。
 
 `forward`始终包含这一步。`forward_prepared`只允许复用同一buffer的不变路由。修改prepared中的任何路由tensor后拒绝继续使用。默认`max_recv_rows=2*max_BS*topk`；非均衡路由可能需要在所有rank一致增大该参数，并承担额外HBM占用。
 
@@ -179,7 +195,7 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 
 每条轨道对应`block 00..27`的`AIC/AIV0/AIV1`，引擎编号为`block*3+0/1/2`。Pack和Reduce现在同时出现在AIV0/AIV1轨道；SelfDispatch/SelfCombine不再产生拷贝事件，旧事件编号保留供历史trace解析。事件参数包含可用的peer、CV、fragment、expert、行起点/行数、M/N tile位置、列数和字节数；不适用字段显示null。`LocalSync`的CV字段另解释为`sync_stage`：0=pack、1=compute/return、2=rank barrier、3=reduce。
 
-编译和trace运行仍使用上面的命令，不增加调度或采样参数。核对前瞻顺序时，在AIC/AIV0轨道按`(peer, cv)`合并同一CV的fragment，观察GMM1与GMM2条的先后；fragment/expert元数据沿用原编号，因此重排后编号可以往回跳。单个核心只记录分给自己的tile，缺少某CV的条不等于该CV未计算。`WaitActivation`仍会出现，表示该核心实际执行GMM2前尚未满足的依赖；aggregate timer阶段与逐事件schema均不变。
+编译和trace运行仍使用上面的命令，不增加调度或采样参数。新计算事件中的`fragment`字段表示专家M组编号，`row`表示expert-major计算行；一个组可以跨多个peer/CV，因此这两个字段为null。`WaitDispatch`保留实际等待的peer/CV及接收行，通信事件仍表示原peer/CV。核对前瞻时按`expert,fragment`观察GMM1与GMM2先后，不能再按peer解释计算轨道。单个核心只记录分给自己的tile，缺少某组的条不等于该组未计算。`WaitActivation`仍表示执行GMM2前尚未满足的依赖；aggregate timer阶段与逐事件schema不变。
 
 | 图中标签 | 应如何理解 |
 |---|---|
@@ -227,8 +243,8 @@ python3 experiments/megamoe/scripts/urma_trace_to_text.py \
 ## 下一步优化方向
 
 - 将计数交换、前缀和、CV描述符生成移到设备，减少同步和host工作；完整E2E应始终计入实际准备成本。
-- 扫描CV行数和Mtile：当前均衡场景每来源每expert平均仅42.7/85.3/170.7行，大CV不会消除不同expert或来源的M尾块。
-- 将GMM2就绪条件从整个CV/expert交集细化到完整I列的Mtile，缩短等待；本地展开可按原始token一次读入后复制多个目标行。
+- 扫描通信CV行数和专家计算前瞻深度，两者现已独立；进一步改善不均衡路由下固定专家顺序的等待。
+- 优化分段L1加载及FIX输出的指令数量，在完整M256收益和非对齐片段搬运成本之间实测取舍；本地展开可按原始token一次读入后复制多个目标行。
 - 增加每peer队列的完成进度控制，同时保持独占提交；不能把15个peer owner直接改成多个核竞争同一队列。
 - 在正确性与真实全算子收益确认后，才考虑受credit保护的接收/返回缓冲复用，以降低全量中间结果的HBM占用。
 
@@ -239,3 +255,5 @@ python3 experiments/megamoe/scripts/urma_trace_to_text.py \
 2026-10-20 将SwiGLU改为128行子块后，483项CPU回归及CANN 9.2.0完整wheel编译通过。在两台各8张Ascend950DT、同SuperPod的机器上完成EP16功能验证：`--bs-values 2048,4096,8192 --routing balanced --cv-rows 256 --warmup 1 --iters 2 --timer --allow-multi-host`。三个BS均完成路由准备、完整forward、timer诊断及通信域销毁，两台worker正常退出；没有触发原256 KiB UB检查。测试使用Python 3.12.14、Torch 2.12.0及torch_npu 2.12.0.post2，未启用Golden数值校验，短轮次耗时也不作为UBX性能结论。
 
 2026-10-20 逐事件trace版本通过569项CPU回归、全仓pre-commit及CANN 9.2.0完整wheel编译。在另外两台空闲的8卡Ascend950DT、同SuperPod机器上，使用上述命令增加`--trace --trace-capacity 4096`完成EP16验证。三个BS共48份rank/BS流水图均通过完整性校验，84个引擎均有记录，dropped均为0；BS2048/4096/8192每rank分别记录48174/55586/71690条事件，单引擎最大分别为954/1094/1378。正式性能、aggregate timer和详细trace分别运行，两台worker正常退出。本次同样没有Golden数值校验，不据此宣称UBX性能或数值精度通过。
+
+2026-10-20 专家M256版本通过737项MegaMoE/runtime CPU回归、修改文件的pre-commit检查及CANN 9.2.0完整wheel编译。测试覆盖实际C++路由规划器、任意source/CV边界的行映射、L1/L0C分段布局、scale压紧、独立游标调度、self直接返回及旧路径回归；隔离wheel导入确认`urma_compute_schedule=expert-m256`与timer启用。本次只编译和执行CPU测试，没有启动NPU，也没有进行设备数值或性能验证。编译产物与日志保存在`177.2.21.1:/home/codex-deepep/megamoe-urma-expert-m256-20261020/`。

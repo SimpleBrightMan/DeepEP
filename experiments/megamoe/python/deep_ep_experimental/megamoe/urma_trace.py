@@ -43,6 +43,8 @@ EVENTS = (
     "Reduce",
     "LocalSync",
     "Gmm1Drain",
+    "InputScaleGather",
+    "WaitInputScale",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
 SYNC_STAGES = {0: "pack", 1: "compute/return", 2: "rank barrier", 3: "reduce"}

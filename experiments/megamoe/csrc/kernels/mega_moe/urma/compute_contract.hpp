@@ -6,14 +6,19 @@
 
 namespace MegaMoeUrma {
 
-// Pure host/device scheduling arithmetic. Fragments retain the peer/CV row
-// order; an expert boundary always starts a new fragment, not a new Wave.
+// Pure host/device scheduling arithmetic. Compute groups contain at most M256
+// rows of one expert, independently of the peer/CV communication boundaries.
 constexpr uint32_t kComputeCores = kAic;
 constexpr uint32_t kComputeTileM = 256U;
 constexpr uint32_t kComputeTileN = 256U;
 // Keep matrix scheduling at M256; only the AIV1 epilogue works in M128
 // slices. The W4 AIV0 prologue remains the largest UB user at exactly 192KiB.
 constexpr uint32_t kActivationTileM = 128U;
+// The URMA v1 input is H3584: each row has 112 E8M0 bytes. GM stays
+// compact while DMA uses 32-byte-aligned rows in phase-private activation UB.
+constexpr uint32_t kInputScaleBytes = 3584U / 32U;
+constexpr uint32_t kInputScaleUbStride = ((kInputScaleBytes + 31U) / 32U) * 32U;
+constexpr uint32_t kInputScaleUbBytes = kComputeTileM * kInputScaleUbStride;
 constexpr uint32_t kRequiredUbBytes = 192U * 1024U;
 struct ActivationUbContract {
     static constexpr uint32_t elements = kActivationTileM * kComputeTileN;
@@ -33,6 +38,7 @@ static_assert(ActivationUbContract::inputEnd == 128U * 1024U);
 static_assert(ActivationUbContract::scratchEnd == 101U * 1024U);
 static_assert(ActivationUbContract::inputEnd <= kRequiredUbBytes &&
               ActivationUbContract::scratchEnd <= kRequiredUbBytes);
+static_assert(kInputScaleUbBytes == 32768U && kInputScaleUbBytes <= ActivationUbContract::inputEnd);
 
 struct ActivationRowSlice {
     uint32_t rowBegin;
@@ -43,7 +49,7 @@ enum class ComputeBatchStage : uint32_t { None = 0U, Gmm1 = 1U, Gmm2 = 2U };
 
 struct ComputeBatchTask {
     ComputeBatchStage stage;
-    uint32_t chunkIndex;
+    uint32_t batchIndex;
 };
 
 struct ComputeBatchRange {
@@ -84,27 +90,27 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t SelfReturnRow(uint64_t receivedRo
     return config.selfSendRow + (receivedRow - config.selfRecvRow);
 }
 
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ComputeBatchTaskCount(uint32_t chunkCount)
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ComputeBatchTaskCount(uint32_t batchCount)
 {
-    return static_cast<uint64_t>(chunkCount) * 2U;
+    return static_cast<uint64_t>(batchCount) * 2U;
 }
 
-// A batch is one existing receive chunk, uniquely identified by (peer, cv).
-// Warmup G1(0), then G1(i) -> G2(i-1), then drain G2(last). No new communication
-// boundary, expert split, or task ownership is introduced by this ordering.
-MEGAMOE_URMA_COMPUTE_INLINE constexpr ComputeBatchTask ComputeBatchTaskAt(uint64_t step, uint32_t chunkCount)
+// A batch contains all M256 groups of one expert, including an empty batch for
+// an empty expert. Warmup G1(0), then G1(i) -> G2(i-1), then drain G2(last).
+// Every AIC/AIV0 follows this order independently; there is no expert barrier.
+MEGAMOE_URMA_COMPUTE_INLINE constexpr ComputeBatchTask ComputeBatchTaskAt(uint64_t step, uint32_t batchCount)
 {
-    const uint64_t taskCount = ComputeBatchTaskCount(chunkCount);
+    const uint64_t taskCount = ComputeBatchTaskCount(batchCount);
     if (step >= taskCount) return {ComputeBatchStage::None, 0U};
     if (step == 0U) return {ComputeBatchStage::Gmm1, 0U};
-    if (step == taskCount - 1U) return {ComputeBatchStage::Gmm2, chunkCount - 1U};
+    if (step == taskCount - 1U) return {ComputeBatchStage::Gmm2, batchCount - 1U};
     if ((step & 1U) != 0U) return {ComputeBatchStage::Gmm1, static_cast<uint32_t>((step + 1U) / 2U)};
     return {ComputeBatchStage::Gmm2, static_cast<uint32_t>(step / 2U - 1U)};
 }
 
-MEGAMOE_URMA_COMPUTE_INLINE constexpr ComputeBatchRange ComputeBatchFragments(const Chunk& chunk)
+MEGAMOE_URMA_COMPUTE_INLINE constexpr ComputeBatchRange ComputeBatchFragments(const ComputeBatch& batch)
 {
-    return {chunk.fragmentBegin, chunk.fragmentBegin + chunk.fragmentCount};
+    return {batch.fragmentBegin, batch.fragmentBegin + batch.fragmentCount};
 }
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr ActivationRowSlice ActivationSlice(uint32_t tileRowBegin, uint32_t tileRows,

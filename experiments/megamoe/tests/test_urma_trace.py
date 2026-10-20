@@ -69,9 +69,19 @@ def test_every_event_id_has_a_name_and_no_fabricated_async_events():
     for event_id, name in enumerate(EVENTS):
         add_record(raw, engine=event_id, event=name)
     result = decode_trace(raw, rank=0, clock_mhz=1000)
-    assert len(events(result)) == 28
+    assert len(events(result)) == 30
     assert {row["ph"] for row in result["traceEvents"]} == {"M", "X"}
-    assert {row["args"]["event_id"] for row in events(result)} == set(range(28))
+    assert {row["args"]["event_id"] for row in events(result)} == set(range(30))
+
+
+def test_expert_group_trace_keeps_multisource_identity_and_scale_preparation():
+    raw = trace_buffer()
+    add_record(raw, engine=47, event="InputScaleGather", start=1000, end=1020, fragment=0, expert=0, rows=256)
+    add_record(raw, engine=0, event="WaitInputScale", start=1005, end=1021, fragment=0, expert=0)
+    add_record(raw, engine=0, event="Gmm1Tile", start=1021, end=1050, fragment=0, expert=0, rows=256, columns=256)
+    decoded = events(decode_trace(raw, rank=0, clock_mhz=1000))
+    assert [row["cat"] for row in decoded] == ["compute.copy", "wait.sync", "cube.submit"]
+    assert all(row["args"]["peer"] is None and row["args"]["cv"] is None for row in decoded)
 
 
 def test_local_sync_cv_field_is_a_named_sync_stage():
@@ -197,7 +207,7 @@ def test_overflow_lists_all_affected_engines_and_writes_no_partial_trace(tmp_pat
         (1, 999, "ticks"),
         (0, UNKNOWN, "ticks"),
         (1, UNKNOWN, "ticks"),
-        (2, 28, "event id"),
+        (2, 30, "event id"),
         (3, 16, "peer"),
         (13, 1, "reserved record"),
     ],
