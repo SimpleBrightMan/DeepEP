@@ -393,6 +393,40 @@ public:
         const uint32_t ka = kPlan.ka;
         const uint32_t kb = kPlan.kb;
         const uint32_t kL1Loop = CeilDiv(kBlockActual, kb);
+        // DS式最后K衔接：一个N半块完成累加就发FIX，不等另一半的MMAD提交。
+        // 回调只负责输出；保持scale=64、父L0C stride和每半块的unit flag。
+        auto emitHalf = [&](const auto& accumulator, uint32_t column, uint32_t columns) {
+            if constexpr (TensorC::position == AscendC::TPosition::VECCALC) {
+                using Plan = MegaMoeImpl::Gmm1CvPlan;
+                if (column == 0U) {
+                    // 允许消费者排入V等待；数据仍必须等两半FIX后的真实FULL。
+                    AscendC::WriteGmByPassDCache(outputIssued,
+                        static_cast<int32_t>(outputSequence + Plan::ChunkCount(mBlockActual)));
+                }
+                for (uint32_t row = 0U; row < mBlockActual; row += Plan::Rows) {
+                    const uint32_t rows = Min(Plan::Rows, mBlockActual - row);
+                    const uint32_t sequence = outputSequence + row / Plan::Rows;
+                    if (column == 0U) MegaMoeImpl::Gmm1AsyncCompletion::AcquireProducer(sequence);
+                    AscendC::LocalTensor<ElementC> ub(AscendC::TPosition::VECCALC,
+                        Plan::SlotOffset(sequence), Plan::SlotBytes / sizeof(ElementC));
+                    auto full = tla::MakeTensor(ub,
+                        tla::MakeLayout<ElementC, Catlass::layout::RowMajor>(rows, nBlockActual), Arch::PositionUB{});
+                    auto destination = GetTile(full, tla::MakeCoord(0U, column), tla::MakeShape(rows, columns));
+                    auto source = GetTile(accumulator, tla::MakeCoord(row, 0U), tla::MakeShape(rows, columns));
+                    typename TileCopy::template CopyL0CToDst<decltype(destination)> copy;
+                    copy.params.scale = 64;
+                    copy(destination, source, 0b11);
+                    if (column + columns == nBlockActual)
+                        MegaMoeImpl::Gmm1AsyncCompletion::PublishCompleted(sequence);
+                }
+            } else {
+                auto destination = GetTile(tensorC, tla::MakeCoord(0U, column),
+                                           tla::MakeShape(mBlockActual, columns));
+                typename TileCopy::template CopyL0CToDst<decltype(destination)> copy;
+                copy.params.scale = 64;
+                copy(destination, accumulator, 0b11);
+            }
+        };
         for (uint32_t kL1Idx = 0; kL1Idx < kL1Loop; ++kL1Idx) {
             const uint32_t kOffset = kL1Idx * kb;
             const uint32_t kL1Actual = Min(kb, kBlockActual - kOffset);
@@ -481,7 +515,7 @@ public:
             if (mL1Actual <= 128U) {
                 MmadPairedB(tensorL1A, tensorL1MxScaleA, tensorL1MxScaleB, tensorL0C,
                             mL1Actual, nL1Actual, kb, kL1Actual, kOffset - aStart, l0kOffset,
-                            kL1Idx == 0U, kL1Idx + 1U == kL1Loop);
+                            kL1Idx == 0U, kL1Idx + 1U == kL1Loop, emitHalf);
             } else {
                 auto tensorL1B = tla::MakeTensor(
                     l1BTensorList[l1BListId], tla::MakeLayout<ElementB, LayoutTagL1B>(kb, nL1Actual), Arch::PositionL1{});
@@ -591,6 +625,9 @@ public:
                 l1MxScaleBListId = (l1MxScaleBListId + 1) % Buffers::ScaleStages;
             }
         }
+        if constexpr (ENABLE_UNIT_FLAG) {
+            if (mL1Actual <= 128U) return;  // 两个N半块已在最后K中各提交一次FIX。
+        }
         // copy block out
         copyL0CToDst.params.scale = 64;
         if constexpr (TensorC::position == AscendC::TPosition::VECCALC) {
@@ -628,10 +665,10 @@ protected:
     // 同一 A 供两个 N 半块使用；只有最后一半消费后才归还 A credit。
     // UnitFlag 是按 L0C 存储单元生效：每个 N 半块各自在最后 K 发布完成，
     // 整块 FIX 才能等待并消费两半；只给第二半 UPDATE 会让第一半永远不就绪。
-    template <class A, class SA, class SB, class C>
+    template <class A, class SA, class SB, class C, class Emit>
     CATLASS_DEVICE void MmadPairedB(A& a, SA& sa, SB& sb, C& c, uint32_t m, uint32_t n,
                                    uint32_t bStrideK, uint32_t kActual, uint32_t aOffset, uint32_t scaleOffset,
-                                   bool firstKWindow, bool lastKWindow)
+                                   bool firstKWindow, bool lastKWindow, Emit& emit)
     {
         static_assert(!HAS_BIAS && L0A_TILE_SIZE >= 128U * 256U && L0B_TILE_SIZE >= 256U * 128U,
                       "split-N requires 32KiB operand slots and no bias");
@@ -665,6 +702,9 @@ protected:
                 const bool last = lastKWindow && k + kk >= kActual;
                 const uint8_t unitFlag = ENABLE_UNIT_FLAG ? (last ? 0b11 : 0b10) : 0b00;
                 tileMmad(tc, l0a, l0b, m, nn, kk, firstKWindow && k == 0U, unitFlag);
+                if constexpr (ENABLE_UNIT_FLAG) {
+                    if (last) emit(tc, no, nn);
+                }
                 AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
                 l0BListId = (l0BListId + 1U) % L0B_STAGES;
             }
