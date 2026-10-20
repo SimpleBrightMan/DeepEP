@@ -342,11 +342,12 @@ public:
 
     /// Perform a block-scoped matrix multiply-accumulate
     template <class TensorA, class TensorC, class TensorMxScaleA = EmptyClass, class TensorMxScaleB = EmptyClass,
-              class TensorBias = EmptyClass>
+              class TensorBias = EmptyClass, class InputReady = EmptyClass>
     CATLASS_DEVICE void operator()(TensorA& tensorA, TensorC& tensorC, GemmCoord const& actualShape,
                                    TensorMxScaleA const& tensorMxScaleA = {}, TensorMxScaleB const& tensorMxScaleB = {},
                                    bool allowDynamicB = false, TensorBias const& tensorBias = {},
-                                   uint32_t outputSequence = 0U, __gm__ int32_t* outputIssued = nullptr)
+                                   uint32_t outputSequence = 0U, __gm__ int32_t* outputIssued = nullptr,
+                                   InputReady inputReady = {})
     {
         // Check L1TileShape
         if constexpr (HAS_BIAS) {
@@ -452,8 +453,15 @@ public:
                                           tla::MakeShape(mBlockActual, scaleCount));
                 auto tileScaleB = GetTile(tensorMxScaleB, tla::MakeCoord(scaleStart / MX_SCALE_GROUP_NUM, 0),
                                           tla::MakeShape(scaleCount, nBlockActual));
-                copyGmToL1MxScaleA(tensorL1MxScaleA, tileScaleA);
-                copyGmToL1MxScaleB(tensorL1MxScaleB, tileScaleB);
+                if constexpr (std::is_same_v<InputReady,EmptyClass>) {
+                    copyGmToL1MxScaleA(tensorL1MxScaleA, tileScaleA);
+                    copyGmToL1MxScaleB(tensorL1MxScaleB, tileScaleB);
+                } else {
+                    // B scale 与输入ready无关，先提交MTE2；A及A scale仍必须在原ready边界之后。
+                    copyGmToL1MxScaleB(tensorL1MxScaleB, tileScaleB);
+                    if (kL1Idx==0U) inputReady();
+                    copyGmToL1MxScaleA(tensorL1MxScaleA, tileScaleA);
+                }
             }
 
             // A窗口随M切换K512/K256，均不超过独立64KiB槽。

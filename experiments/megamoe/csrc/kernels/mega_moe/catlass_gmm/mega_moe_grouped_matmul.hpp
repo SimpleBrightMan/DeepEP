@@ -269,9 +269,10 @@ public:
 
 protected:
 
+    template<class InputReady=Catlass::EmptyClass>
     __aicore__ inline void ComputeProjection(uint32_t m, uint32_t weightN, uint32_t rows, uint32_t cols,
                                              uint32_t outputN, __gm__ int32_t* outputIssued = nullptr,
-                                             uint32_t outputSequence = 0U)
+                                             uint32_t outputSequence = 0U,InputReady inputReady = {})
     {
         auto aAddress = reinterpret_cast<GM_ADDR>(ReusedActivationReadAddress(reinterpret_cast<uint64_t>(addr_.aGlobal)));
         auto saAddress = reinterpret_cast<GM_ADDR>(ReusedActivationReadAddress(reinterpret_cast<uint64_t>(addr_.aScaleGlobal)));
@@ -289,10 +290,11 @@ protected:
                 Gmm1CvPlan::SlotBytes / sizeof(Out));
             auto cv = tla::MakeTensor(ub, tla::MakeLayout<Out, LayoutC>(rows, cols), Catlass::Arch::PositionUB{});
             block_(tileA, cv, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U,
-                   Catlass::EmptyClass{}, outputSequence, outputIssued);
+                   Catlass::EmptyClass{}, outputSequence, outputIssued,inputReady);
           } else {
             auto tileC = tla::GetTile(c, tla::MakeCoord(m, outputN), tla::MakeShape(rows, cols));
-            block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U);
+            block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U,
+                   Catlass::EmptyClass{},0U,nullptr,inputReady);
           }
         };
         if (blockedWeightScales_) {
@@ -362,11 +364,12 @@ public:
             }
         }
     }
+    template<class InputReady=Catlass::EmptyClass>
     __aicore__ inline void ComputeCv(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols,
-                                      uint32_t sequence, __gm__ int32_t* issued)
+                                      uint32_t sequence, __gm__ int32_t* issued,InputReady inputReady = {})
     {
         // 只由配对routed入口调用：logical N128 -> physical gate/up N256。
-        Pipeline::ComputeProjection(m, n * 2U, rows, cols * 2U, n * 2U, issued, sequence);
+        Pipeline::ComputeProjection(m, n * 2U, rows, cols * 2U, n * 2U, issued, sequence,inputReady);
     }
     __aicore__ inline void Dequantize(uint32_t n, uint32_t rows, uint32_t cols)
     {
@@ -403,9 +406,10 @@ public:
     {
     }
 
-    __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols)
+    template<class InputReady=Catlass::EmptyClass>
+    __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols,InputReady inputReady = {})
     {
-        Pipeline::ComputeProjection(m, n, rows, cols, n);
+        Pipeline::ComputeProjection(m, n, rows, cols, n,nullptr,0U,inputReady);
     }
     __aicore__ inline void Dequantize(uint32_t n, uint32_t rows, uint32_t cols)
     {

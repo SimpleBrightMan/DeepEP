@@ -785,8 +785,8 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
             timer_.SetSlice(first.expertIdx,0U,rows);
             if constexpr (g_coreType == AIC) {
                 AscendTimerTileScope event(addr.timer,AscendTimer::AIC_GMM1_ISSUE,0U,column,rows,columns);
-                WaitForGmm1InputReady<false>(addr,config,0U);
-                gmm1CatlassContext_.ComputeCv(0U,column,rows,columns,uint32_t(readySequence),addr.gmmToEpilogueFlag);
+                auto inputReady=[&]() __aicore__ {WaitForGmm1InputReady<false>(addr,config,0U);};
+                gmm1CatlassContext_.ComputeCv(0U,column,rows,columns,uint32_t(readySequence),addr.gmmToEpilogueFlag,inputReady);
                 readySequence += Gmm1CvPlan::ChunkCount(rows);
             } else {
                 AscendTimerSpanScope event(addr.timer,AscendTimer::AIV_GMM1_PROLOGUE);
@@ -807,9 +807,11 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
             timer_.SetSlice(second.expertIdx,0U,rows);
             if constexpr (g_coreType == AIC) {
                 AscendTimerTileScope event(addr.timer,AscendTimer::AIC_GMM2_ISSUE,0U,column,rows,columns);
-                WaitForGmm2InputReady<false>(addr,config,0U);
-                Gmm1AsyncCompletion::AcquireProducer(uint32_t(readySequence));
-                gmm2WaveContext_.Compute(0U,column,rows,columns);
+                auto inputReady=[&]() __aicore__ {
+                    WaitForGmm2InputReady<false>(addr,config,0U);
+                    Gmm1AsyncCompletion::AcquireProducer(uint32_t(readySequence));
+                };
+                gmm2WaveContext_.Compute(0U,column,rows,columns,inputReady);
                 Gmm1AsyncCompletion::PublishCompleted(uint32_t(readySequence));
                 auto issued = reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagGmmToEpiloguePtr) +
                     static_cast<uint64_t>(job.jobIndex)*INT_CACHELINE;
