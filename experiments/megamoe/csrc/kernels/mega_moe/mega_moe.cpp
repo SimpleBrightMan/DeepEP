@@ -9,6 +9,9 @@
 #include "kernel_launch.hpp"
 #include "mega_moe_tiling.hpp"
 #include "common/mega_moe_constants.hpp"
+#include "common/mega_moe_aiv1_ub_layout.hpp"
+#include <stdexcept>
+#include <string>
 #if defined(__NPU_DEVICE__)
 #include "mega_moe_wave_a8w8.hpp"
 #include "mega_moe_wave_a8w4.hpp"
@@ -60,6 +63,24 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
 {
     const auto& tiling = *reinterpret_cast<const MegaMoeTilingData*>(tiling_host);
     static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
+    if (is_a8w4) {
+        using MegaMoeImpl::Aiv1ResidentUbLayout;
+        static_assert(Aiv1ResidentUbLayout::MetaWords == MegaMoeImpl::META_INFO_SIZE &&
+                      Aiv1ResidentUbLayout::MetaWords == MegaMoeImpl::INT32_PER_256B);
+        const uint32_t slots = tiling.bs <= MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS ? 6U : 2U;
+        const auto& config = tiling.dispatchBufferConfig;
+        const auto resident = MegaMoeImpl::MakeAiv1ResidentUbLayout(
+            tiling.h, tiling.epWorldSize, tiling.moeExpertPerRank, config.routeItemsPerBatch,
+            config.bufferCount, config.copyBufferBytes, slots);
+        // 实验分支不让未适配的共享激活覆盖常驻数据；容量错误在发射NPU前报告。
+        if (tiling.sharedExpertNum != 0U || !resident.valid || resident.end > ub_bytes || resident.end > 256U * 1024U) {
+            throw std::invalid_argument("AIV1 resident UB unsupported: BS=" + std::to_string(tiling.bs) +
+                " H=" + std::to_string(tiling.h) + " EP=" + std::to_string(tiling.epWorldSize) +
+                " local_experts=" + std::to_string(tiling.moeExpertPerRank) +
+                " shared=" + std::to_string(tiling.sharedExpertNum) + " required=" + std::to_string(resident.end) +
+                " available=" + std::to_string(ub_bytes));
+        }
+    }
     // 按本次实际 BS 编译期特化；不改变 wave 预算、Dispatch/Combine 或共享专家策略。
     if (is_a8w4 && tiling.bs <= MegaMoeImpl::W4A8_PAIRED_GATE_UP_MAX_TOKENS) {
         mega_moe_kernel<true, true><<<block_dim, ub_bytes, stream>>>(

@@ -121,34 +121,35 @@ __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQua
     AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);
     const uint32_t gateLoc = Config::FUSED_GATE_UP ? nLoc * ACTIVATION_N_HALF : nLoc;
     const uint32_t upLoc = gateLoc + (Config::FUSED_GATE_UP ? Get<N_VALUE>(actualShape) : config.outputN);
-    auto tensorBlockGmFirst = l0cOutGm.Slice(Te::MakeCoord(mLoc, gateLoc),
-                                             Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
-    auto tensorBlockGmSecond =
-        l0cOutGm.Slice(Te::MakeCoord(mLoc, upLoc), Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
-    auto layoutL0cUb = MakeLayoutC{}(config.tileM, L1_TILE_N);
+    // 激活工作区可以小于GMM tile；按行分段，不改变一个原始tile只贡献一次ready。
+    constexpr uint32_t ubRows = ActivationQuantOp::UB_TILE_M;
+    constexpr uint32_t ubColumns = ActivationQuantOp::UB_TILE_N;
+    auto layoutL0cUb = MakeLayoutC{}(ubRows, ubColumns);
     int64_t ubOffsetFirst = 0;
-    uint32_t ubBufferSize =
-        config.tileM == L1_TILE_M_128 ? MAX_SINGLE_MN_ALIGN32_NUM_128 : MAX_SINGLE_MN_ALIGN32_NUM_256;
+    constexpr uint32_t ubBufferSize = ubRows * ubColumns;
     int64_t ubOffsetSecond = static_cast<int64_t>(ubBufferSize) * sizeof(ElementC);
     auto tensorBlockUbFirst = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetFirst), layoutL0cUb);
     auto tensorBlockUbSecond = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetSecond), layoutL0cUb);
     auto copyGm2Ub = AscendC::Te::MakeCopy(AscendC::Te::CopyGM2UB{});
-    AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, tensorBlockGmFirst);
-    AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
-    Std::tuple<int64_t, int64_t, int64_t, int64_t> epilogueShape{Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape),
-                                                                 0, 0};
-    Std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t> epilogueOffset{
-        mLoc * config.outputN + nLoc,
-        mLoc * CeilDiv(config.outputN, MXFP_DIVISOR_SIZE) * MXFP_MULTI_BASE_SIZE +
-            CeilDiv(nLoc, MXFP_DIVISOR_SIZE) * MXFP_MULTI_BASE_SIZE,
-        0,
-        0,
-        0,
-        0};
-    AscendC::SetCtrlSpr<60, 60>(0);
-    activationQuantOp(epilogueShape, epilogueOffset);
+    for (uint32_t row = 0U; row < Get<M_VALUE>(actualShape); row += ubRows) {
+        const uint32_t count = Min(ubRows, static_cast<uint32_t>(Get<M_VALUE>(actualShape)) - row);
+        auto tensorBlockGmFirst = l0cOutGm.Slice(Te::MakeCoord(mLoc + row, gateLoc),
+                                               Te::MakeShape(count, Get<N_VALUE>(actualShape)));
+        auto tensorBlockGmSecond = l0cOutGm.Slice(Te::MakeCoord(mLoc + row, upLoc),
+                                                Te::MakeShape(count, Get<N_VALUE>(actualShape)));
+        AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, tensorBlockGmFirst);
+        AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
+        Std::tuple<int64_t, int64_t, int64_t, int64_t> epilogueShape{count, Get<N_VALUE>(actualShape), 0, 0};
+        Std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t> epilogueOffset{
+            (mLoc + row) * config.outputN + nLoc,
+            (mLoc + row) * CeilDiv(config.outputN, MXFP_DIVISOR_SIZE) * MXFP_MULTI_BASE_SIZE +
+                CeilDiv(nLoc, MXFP_DIVISOR_SIZE) * MXFP_MULTI_BASE_SIZE,
+            0, 0, 0, 0};
+        AscendC::SetCtrlSpr<60, 60>(0);
+        activationQuantOp(epilogueShape, epilogueOffset);
+    }
     NotifyGmm2InputReady<IsWaveFlagGrained>(gmmAddrInfo.activationToGmm2Flag, mLoc / L1_TILE_M_256);
     AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(0);
     AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(0);

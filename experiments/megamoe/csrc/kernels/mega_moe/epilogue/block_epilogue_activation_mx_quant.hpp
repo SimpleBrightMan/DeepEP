@@ -55,6 +55,8 @@ public:
     __aicore__ inline BlockEpilogueActivationMxQuant() {}
 
     static constexpr uint32_t MAX_SINGLE_MN = TileM * TileN;
+    static constexpr uint32_t UB_TILE_M = TileM;
+    static constexpr uint32_t UB_TILE_N = TileN;
 
     struct Arguments {
         GM_ADDR yGmAddr{nullptr};

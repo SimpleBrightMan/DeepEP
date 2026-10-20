@@ -67,6 +67,7 @@ private:
     using MegaMoeBase::tokenDispatchScratch_;
     using MegaMoeBase::waveCombineJob_;
     using MegaMoeBase::waveCombineScratch_;
+    using MegaMoeBase::waveCombineBuffers_;
 
     using SharedActivationCursor = typename MegaMoeBase::SharedActivationCursor;
     using MegaMoeBase::sharedExpertNum_;
@@ -168,8 +169,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
         const ExpertSlice slice{range.begin.expertIdx, range.begin.tokenIndexInExpert,
                                 static_cast<uint32_t>(range.end.globalTokenIndex - range.begin.globalTokenIndex),
                                 range.begin.globalTokenIndex};
-        // SwiGLU/Combine 会复用 UB；从 GM 备份恢复本专家 prefix，不依赖上一阶段的 UB 内容。
-        ReloadDispatchCumsumRange(commonConfig_, tokenDispatchScratch_, range.begin.expertIdx, range.begin.expertIdx);
+        // Prefix与两种消费者的工作区互不重叠，保持本launch的UB快照，不再从GM恢复。
         timer_.SetWave(static_cast<int64_t>(waveId));
         timer_.StartSpan(AscendTimer::AIV_DISPATCH);
         // AIC-balance使用独立GMM1/GMM2游标；只映射通信job，不能修改计算游标或物理核号。
@@ -328,7 +328,7 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     // 到本次算子结束前不会重置，因此检查与发送之间无需再次轮询。
     // timer 仍记录物理核；完整行发送及 UB 排空规则保持原样。
     RunTokenCombineSlice<true>(commonConfig_, combineJob, params_, expertContext, begin.tokenIndexInExpert, rows,
-                               timer_, waveCombineScratch_);
+                               timer_, waveCombineScratch_, &waveCombineBuffers_);
     return true;
 }
 
@@ -456,7 +456,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     exceptionDump_.UpdateStage(MegaMoeImpl::Stage::MOE_GMM1_ACTIVATION);
     DispatchBuffInit();
     if (!computeReplay_) {
-        PrepareMoeExpertTokenCountTable<true>(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
+        PrepareMoeExpertTokenCountTable<false>(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
         if (GetSubBlockIdx() == 0U) {
             WaitForMoeExpertTokenCountReady(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr, countWorkspace_, 0U);
         }

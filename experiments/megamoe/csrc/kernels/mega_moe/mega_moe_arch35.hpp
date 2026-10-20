@@ -22,6 +22,7 @@
 #include "mc2_common/mc2_kernel_utils.hpp"
 #include "kernel_operator_list_tensor_intf.h"
 #include "common/mega_moe_types.hpp"
+#include "common/mega_moe_aiv1_ub_layout.hpp"
 #include "common/mega_moe_workspace.hpp"
 #include "common/mega_moe_utils.hpp"
 #include "common/ascend_timer_v2_device.hpp"
@@ -159,7 +160,8 @@ protected:
         Std::IsSame<Weight1Type, fp4x2_e2m1_t>::value && Std::IsSame<QuantOutType, fp8_e4m3fn_t>::value;
     static_assert(ENABLE_A8W4, "This orchestration base is W4A8 only; A8W8 has its own implementation");
     static constexpr uint32_t GMM1_TILE_M = L1_TILE_M_256;
-    static constexpr uint32_t EPILOGUE_TILE_M = L1_TILE_M_256;
+    // 只缩小激活私有工作区，不改变GMM tile或ready计数粒度。
+    static constexpr uint32_t EPILOGUE_TILE_M = Aiv1ResidentUbLayout::ActivationRows;
     QuantProcessScratch<ActivationType> quantScratch_;
     SharedExpertPrepareScratch<ActivationType> sharedExpertPrepareScratch_;
     SendMaskScratch sendMaskScratch_;
@@ -182,6 +184,7 @@ protected:
     SharedBlockEpilogue sharedEpilogueOp_;
     TokenDispatchScratch<ActivationType> tokenDispatchScratch_;
     WaveCombineScratch waveCombineScratch_;
+    WaveCombineBufferConfig waveCombineBuffers_{};
     TokenUnpermuteScratch tokenUnpermuteScratch_;
     MegaMoeImpl::ExceptionDumpEngine exceptionDump_;
     AscendTimerDevice timer_;
@@ -332,7 +335,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::DispatchBuffInit()
                                               static_cast<uint64_t>(cumsumInfoTensorSize) * countWorkspace_.blockIdx));
     }
 
-    uint32_t cumsumInfoTensorAddr = 0U;
+    uint32_t cumsumInfoTensorAddr = Aiv1ResidentUbLayout::ActivationBytes;
     scratch.cumsumInfoTensor =
         LocalTensor<int32_t>(TPosition::VECCALC, cumsumInfoTensorAddr, cumsumInfoTensorSize / sizeof(int32_t));
     // compact route 已消除 mask 扫描，只保留一份接收 index batch。
@@ -352,6 +355,16 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::DispatchBuffInit()
     uint32_t metaInfoTensorSize = static_cast<uint32_t>(bufferConfig.bufferCount) * INT32_PER_256B * sizeof(int32_t);
     scratch.metaInfoTensor =
         LocalTensor<int32_t>(TPosition::VECCALC, metaInfoTensorAddr, metaInfoTensorSize / sizeof(int32_t));
+    const uint32_t combineSlots = commonConfig_.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS ? 6U : 2U;
+    const auto resident = MakeAiv1ResidentUbLayout(
+        commonConfig_.tokenHiddenDim, commonConfig_.worldSize, commonConfig_.moeExpertPerRank,
+        bufferConfig.routeItemsPerBatch, bufferConfig.bufferCount, context.quantTokenScaleAlignBytes, combineSlots);
+    // launcher先检查容量；此处只绑定一次。三阶段仍保留原生完成等待，不靠别的阶段覆盖UB。
+    waveCombineBuffers_ = combineSlots == 6U
+        ? InitWaveCombineBuffers<false, 6U>(commonConfig_, waveCombineScratch_, resident.combineRowsBase,
+                                          resident.combineMetaBase)
+        : InitWaveCombineBuffers<false, 2U>(commonConfig_, waveCombineScratch_, resident.combineRowsBase,
+                                          resident.combineMetaBase);
 }
 
 template <TemplateMegaMoeTypeClass>

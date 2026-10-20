@@ -133,7 +133,9 @@ constexpr uint32_t WAVE_COMBINE_META_INFO_TOKEN_CAPACITY = 1536U;
 // 最后一轮不再与 GMM1/SwiGLU 并行时，调用方才为 AIV0 补充初始化。
 template <bool IncludeAiv0 = false, uint32_t MaxRowBufferCount = WAVE_COMBINE_MAX_ROW_BUFFER_COUNT>
 __aicore__ inline WaveCombineBufferConfig InitWaveCombineBuffers(const MoeStageCommonConfig& common,
-                                                                 WaveCombineScratch& scratch)
+                                                                 WaveCombineScratch& scratch,
+                                                                 uint32_t rowBase = WAVE_COMBINE_UB_BASE,
+                                                                 uint32_t metaBase = META_INFO_TENSOR_ADDR)
 {
     static_assert(MaxRowBufferCount > 0U && MaxRowBufferCount <= WAVE_COMBINE_MAX_ROW_BUFFER_COUNT,
                   "invalid Combine row buffer count");
@@ -153,8 +155,8 @@ __aicore__ inline WaveCombineBufferConfig InitWaveCombineBuffers(const MoeStageC
 
     uint32_t rowRingBytes = bufferConfig.rowBufferCount * bufferConfig.slotStrideBytes;
     scratch.rowBufferTensor =
-        LocalTensor<bfloat16_t>(TPosition::VECIN, WAVE_COMBINE_UB_BASE, rowRingBytes / sizeof(bfloat16_t));
-    scratch.metaInfoTensor = LocalTensor<int32_t>(TPosition::VECCALC, META_INFO_TENSOR_ADDR,
+        LocalTensor<bfloat16_t>(TPosition::VECIN, rowBase, rowRingBytes / sizeof(bfloat16_t));
+    scratch.metaInfoTensor = LocalTensor<int32_t>(TPosition::VECCALC, metaBase,
                                                   WAVE_COMBINE_META_INFO_TOKEN_CAPACITY * META_INFO_SIZE);
 
     return bufferConfig;
@@ -699,7 +701,8 @@ __aicore__ inline void NotifyTokenCombineSliceReady(const Params& params, uint32
 template <bool InputReadyChecked = false>
 __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, const AivJobContext& job,
                                             const Params& params, const ExpertContext& expertContext, uint32_t rowStart,
-                                            uint32_t rowCount, AscendTimerDevice& timer, WaveCombineScratch& scratch)
+                                            uint32_t rowCount, AscendTimerDevice& timer, WaveCombineScratch& scratch,
+                                            const WaveCombineBufferConfig* residentBuffers = nullptr)
 {
     if constexpr (g_coreType == AIC) {
         return;
@@ -714,8 +717,9 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
     }
     // 按实际单卡 BS 选择，不能用专家 slice 行数：Prefill 恢复两槽以限制并发搬运，Decode 保留六槽。
     // AIV1 任务不抢占；Dispatch/Combine 均排空后才交还 UB 和事件 0..5。
-    auto buffers = common.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS ? InitWaveCombineBuffers(common, scratch)
-                                                                  : InitWaveCombineBuffers<false, 2U>(common, scratch);
+    auto buffers = residentBuffers != nullptr ? *residentBuffers :
+        (common.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS ? InitWaveCombineBuffers(common, scratch)
+                                                      : InitWaveCombineBuffers<false, 2U>(common, scratch));
     GM_ADDR sliceOutput =
         params.workspaceInfo.gmm2MmadResPtr + globalRowStart * common.tokenHiddenDim * sizeof(bfloat16_t);
     uint32_t rowSequence = 0U;
