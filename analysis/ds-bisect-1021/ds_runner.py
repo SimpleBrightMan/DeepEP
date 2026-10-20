@@ -57,6 +57,11 @@ for attr in ('transformed_l1_weights','transformed_l2_weights'):
     original=weight.reshape(e,n,256//tile_n,tile_n,half_k//(tile_k//2),tile_k//32,16)
     packed=original.permute(0,1,4,2,5,3,6).contiguous()
     assert torch.equal(packed.permute(0,1,3,5,2,4,6).contiguous(),original)
+    sf_layout=identity.get('variant',{}).get('weight_sf_layout','pair_major')
+    if sf_layout=='n_major':
+        # 纯排列消融：每N行连续SF，保持外部shape/位模式；不计入kernel Duration。
+        scale=scale.transpose(-1,-2).contiguous().reshape(scale.shape)
+    elif sf_layout!='pair_major':raise ValueError(f'Unknown scale layout={sf_layout}')
     setattr(case,attr,(packed.reshape(weight.shape),scale))
 out.mkdir(exist_ok=True)
 for _ in range(10):case.run_fused(timer=None)

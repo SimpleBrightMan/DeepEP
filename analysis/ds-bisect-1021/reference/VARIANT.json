@@ -1,0 +1,6 @@
+{
+  "weight_sf_layout": "n_major",
+  "activation_sf_layout": "pair_major",
+  "numeric_contract": "DS",
+  "change": "Reverse ablation: restore our N-major weight SF storage inside full DS; no numerical change"
+}

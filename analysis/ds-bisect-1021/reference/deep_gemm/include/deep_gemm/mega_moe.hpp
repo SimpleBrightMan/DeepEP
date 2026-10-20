@@ -554,7 +554,7 @@ __aicore__ inline void aic_gemm_pipeline(__gm__ uint8_t* buffer, uint32_t num_to
                 if (sf_pair_idx % kNumSFPairsPerChunk == 0) {
                     wait<PIPE_MTE1, PIPE_MTE2>(kSFEmpty, sf_stage_idx);
                     copy_gm_to_l1_mx(l1_sfb[sf_stage_idx],
-                                     gm_ptr<int16_t, Major::MN>(BLOCK_N, reinterpret_cast<uintptr_t>(task_weights.sf + sf_offset + sf_pair_idx * BLOCK_N)),
+                                     gm_ptr<int16_t, Major::K>(num_sf_pairs, reinterpret_cast<uintptr_t>(task_weights.sf + sf_offset + sf_pair_idx)),
                                      BLOCK_N, num_chunk_pairs, weight_sf_l2_hint);
                 }
 

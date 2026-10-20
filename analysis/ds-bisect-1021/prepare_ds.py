@@ -28,5 +28,7 @@ identity=dict(node=a.name,revision=revision,host_source='frozen DS host extensio
               archive_sha256=hashlib.sha256((a.campaign/f'{a.name}.tar').read_bytes()).hexdigest(),
               files={str(f.relative_to(package)):hashlib.sha256(f.read_bytes()).hexdigest()
                      for f in sorted(package.rglob('*')) if f.is_file()})
+variant=source/'analysis/ds-bisect-1021/reference/VARIANT.json'
+identity['variant']=json.loads(variant.read_text()) if variant.exists() else dict(weight_sf_layout='pair_major',activation_sf_layout='pair_major',numeric_contract='DS')
 (out/'identity.json').write_text(json.dumps(identity,indent=2));(out/'build.rc').write_text('0\n')
 print('DS_SOURCE_PREPARED',a.name,revision,flush=True)
