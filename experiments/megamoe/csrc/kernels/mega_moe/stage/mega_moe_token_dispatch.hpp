@@ -23,6 +23,7 @@
 #include "mega_moe_token_quant.hpp"
 #include "mega_moe_count_arrival.hpp"
 #include "../common/aiv1_async_events.hpp"
+#include "../common/strided_row_owner.hpp"
 
 namespace MegaMoeImpl {
 
@@ -513,6 +514,38 @@ __aicore__ inline void DispatchExpertSlice(const TokenDispatchConfig& context, c
         clipped.rowStartInExpert + rows.start, clipped.rowStartInExpert + rows.start + rows.count};
     DispatchOwnedExpertSlice<ActivationType, QuantScaleType, PipelineTileM, TopkWeightsPrefetch, PeerBalanced>(
         context, common, syncLayout, params, winRankAddr, scratch, clipped, owned, async);
+}
+
+// 只供已验证每专家M<=128的small-linear闭合协议：一个专家只占M256的第0个ready槽。
+// 所有core贡献其真实行数，零行不贡献；sum(ownerRows)==专家实际行数后GMM1才可启动。
+// 此节点只迁移strided owner，不迁移DS的源行互素置换；metadata与数学输出均保持原映射。
+template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTileM>
+__aicore__ inline void DispatchStridedSmallExpertSlice(
+    const TokenDispatchConfig& context, const MoeStageCommonConfig& common, const BlockJobContext& job,
+    const MoeSyncWorkspaceLayout& syncLayout, const Params& params, GM_ADDR* winRankAddr,
+    TokenDispatchScratch<ActivationType>& scratch, const ExpertSlice& slice, DispatchAsyncState& async)
+{
+    if (job.totalJobs==0U || slice.globalRowStart>=context.maxOutputSize) return;
+    const uint64_t available=context.maxOutputSize-slice.globalRowStart;
+    const uint32_t rows=static_cast<uint32_t>(min(uint64_t(slice.rowCount),available));
+    StridedRowOwner owner{job.jobIndex,rows,job.totalJobs};
+    DispatchRouteBatch batch{};
+    uint32_t row=0U,contribution=0U;
+    while (owner.Next(row)) {
+        const uint32_t global=static_cast<uint32_t>(slice.globalRowStart)+row;
+        const uint32_t peer=FindDispatchSourceRank(common,scratch,slice.expertIdx,global);
+        const uint32_t prefix=slice.expertIdx*common.worldSize+peer;
+        const uint32_t begin=prefix==0U ? 0U : static_cast<uint32_t>(scratch.cumsumInfoTensor.GetValue(prefix-1U));
+        const PeerTransfer transfer{peer,global-begin,1U,global};
+        AppendPeerRouteSegment<ActivationType,QuantScaleType,false>(
+            context,common,params,winRankAddr,scratch,slice.expertIdx,transfer,batch,async.progress);
+        ++contribution;
+    }
+    if (contribution==0U) return;
+    // row区间在这里仅表示对第0个ready槽的计数贡献；并不声称strided行是连续区间。
+    FinishDispatchOwnedRows<ActivationType,QuantScaleType,PipelineTileM,false>(
+        context,syncLayout,params,winRankAddr,scratch,slice.expertIdx,
+        {static_cast<uint32_t>(slice.globalRowStart),0U,contribution},batch,async.progress,&async);
 }
 
 /*

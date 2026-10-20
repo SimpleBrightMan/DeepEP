@@ -119,7 +119,7 @@ private:
                                                       GMMAddrInfo& gmmAddrInfo, uint32_t& startBlockIdx,
                                                       int32_t& gmm1TileReadySequence, uint32_t gmm1TilesPerMGroup);
     __aicore__ inline void DispatchNextExpertSlice(ExpertTokenPosition& position, uint32_t& waveMGroupCount,
-                                                   uint64_t waveId);
+                                                   uint64_t waveId, bool stridedSmall = false);
     __aicore__ inline void RunGmm2CombineForWaveRange(const ExpertWaveRange& wave, ExpertContext& gmm2ExpertContext,
                                                       GMMAddrInfo& gmm2AddrInfo, uint32_t& startBlockIdx);
     __aicore__ inline void ProcessMoeExpertStages(int32_t& gmm1TileReadySequence);
@@ -185,7 +185,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm1
 // 只由 AIV1 调用。复用原有分片、分核和完成边界。
 template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::DispatchNextExpertSlice(
-    ExpertTokenPosition& position, uint32_t& waveMGroupCount, uint64_t waveId)
+    ExpertTokenPosition& position, uint32_t& waveMGroupCount, uint64_t waveId, bool stridedSmall)
 {
     if (dispatchAsync_.pending) {
         timer_.SetWave(static_cast<int64_t>(waveId));
@@ -221,7 +221,11 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
         }
         // 小 batch 每核仅几行，直接二分源 rank，避免空 peer 的配额统计/扫描；索引预取仍保留。
         // 只改变行排列，token metadata 随行写出；GMM 和 Combine 的 slice/ready 边界不变。
-        if (commonConfig_.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS) {
+        if (stridedSmall) {
+            DispatchStridedSmallExpertSlice<ActivationType,QuantScaleOutType,GMM1_TILE_M>(
+                tokenDispatchConfig_,commonConfig_,gmmExecutionConfig_.blockJob,syncWorkspaceLayout_,
+                params_,g_winRankAddr_,tokenDispatchScratch_,slice,dispatchAsync_);
+        } else if (commonConfig_.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS) {
             DispatchExpertSlice<ActivationType, QuantScaleOutType, GMM1_TILE_M, false>(
                 tokenDispatchConfig_, commonConfig_, dispatchJob, syncWorkspaceLayout_, params_, g_winRankAddr_,
                 tokenDispatchScratch_, slice, &dispatchAsync_);
@@ -897,7 +901,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
                 dispatchGroups=0U;
                 ++dispatchWave;
             }
-            DispatchNextExpertSlice(dispatch,dispatchGroups,dispatchWave);
+            DispatchNextExpertSlice(dispatch,dispatchGroups,dispatchWave,true);
             preferCombine=true;
             progressed=true;
         }
