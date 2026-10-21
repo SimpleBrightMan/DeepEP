@@ -37,16 +37,17 @@ def scheduler_binary(tmp_path_factory):
 using namespace MegaMoeUrma;
 struct Task { uint32_t kind, fragment; uint64_t tile; };
 int main() {
-    static_assert(kComputeTileM == 256 && kActivationTileM == 128);
+    static_assert(kComputeTileM == 384 && kComputeTileN == 128 && kActivationTileM == 128);
+    static_assert(kComputeTileK0 == 64);
     static_assert(kRequiredUbBytes == 196608);
-    static_assert(ActivationUbContract::inputEnd == 131072);
-    static_assert(ActivationUbContract::scratchEnd == 103424);
-    static_assert(ActivationUbContract::upOffset == 65536);
-    static_assert(ActivationUbContract::quantOffset == 65536);
-    static_assert(ActivationUbContract::scaleOffset == 98304);
-    static_assert(ActivationUbContract::maxExpOffset == 99328);
-    static_assert(ActivationUbContract::reciprocalOffset == 101376);
-    static_assert(kInputScaleBytes == 112 && kInputScaleUbStride == 128 && kInputScaleUbBytes == 32768);
+    static_assert(ActivationUbContract::inputEnd == 65536);
+    static_assert(ActivationUbContract::scratchEnd == 51712);
+    static_assert(ActivationUbContract::upOffset == 32768);
+    static_assert(ActivationUbContract::quantOffset == 32768);
+    static_assert(ActivationUbContract::scaleOffset == 49152);
+    static_assert(ActivationUbContract::maxExpOffset == 49664);
+    static_assert(ActivationUbContract::reciprocalOffset == 50688);
+    static_assert(kInputScaleBytes == 112 && kInputScaleUbStride == 128 && kInputScaleUbBytes == 49152);
     assert(ActivationSlice(512, 0, 0).rows == 0);
     assert(ActivationSlice(512, 128, 128).rows == 0);
     Config config{};
@@ -118,25 +119,25 @@ int main() {
     for (uint32_t f = 0; f < fragments.size(); ++f) {
         auto &d = fragments[f];
         auto n1 = ComputeTileCount(d.rows, 1280), n2 = ComputeTileCount(d.rows, 3584);
-        assert(n1 == ((d.rows + 255) / 256) * 5);
-        assert(n2 == ((d.rows + 255) / 256) * 14);
-        std::vector<uint32_t> outputVisits(d.rows * 5), scaleVisits(d.rows * 40);
+        assert(n1 == ((d.rows + 383) / 384) * 10);
+        assert(n2 == ((d.rows + 383) / 384) * 28);
+        std::vector<uint32_t> outputVisits(d.rows * 10), scaleVisits(d.rows * 40);
         uint32_t originalTileContributions = 0;
         for (uint32_t m = 0; m < d.rows; m += kComputeTileM) {
             const auto tileRows = std::min(kComputeTileM, d.rows - m);
-            for (uint32_t n = 0; n < 1280; n += 256) {
+            for (uint32_t n = 0; n < 1280; n += 128) {
                 uint32_t slices = 0, visitedRows = 0;
                 for (uint32_t offset = 0; offset < tileRows; offset += kActivationTileM) {
                     auto slice = ActivationSlice(m, tileRows, offset);
                     assert(slice.rows > 0 && slice.rows <= 128);
                     assert(slice.rowBegin == m + offset && slice.rowBegin + slice.rows <= d.rows);
-                    assert(ActivationUbContract::upOffset + slice.rows * 256 * 2 <=
+                    assert(ActivationUbContract::upOffset + slice.rows * 128 * 2 <=
                            ActivationUbContract::inputEnd);
-                    assert(ActivationUbContract::reciprocalOffset + slice.rows * 8 * 2 <=
+                    assert(ActivationUbContract::reciprocalOffset + slice.rows * 4 * 2 <=
                            ActivationUbContract::scratchEnd);
                     for (uint32_t row = slice.rowBegin; row < slice.rowBegin + slice.rows; ++row) {
-                        ++outputVisits[row * 5 + n / 256];
-                        for (uint32_t scale = n / 32; scale < (n + 256) / 32; ++scale)
+                        ++outputVisits[row * 10 + n / 128];
+                        for (uint32_t scale = n / 32; scale < (n + 128) / 32; ++scale)
                             ++scaleVisits[row * 40 + scale];
                     }
                     visitedRows += slice.rows;
@@ -144,7 +145,7 @@ int main() {
                 }
                 assert(visitedRows == tileRows && slices == (tileRows + 127) / 128);
                 // Completion belongs to the original ready tile, never each
-                // sub-slice: GMM2 must not observe a half-written M256 tile.
+                // sub-slice: GMM2 must not observe a partially written M384 tile.
                 ++originalTileContributions;
             }
         }
@@ -229,6 +230,18 @@ int main() {
                 auto start = FirstOwnedComputeTile(prefix, worker, workers);
                 assert(start < workers && (prefix + start) % workers == worker);
             }
+    // Context reuse ends on the last owned group, including sparse GMM1
+    // ownership and the M384/N128 GMM2 case with one tile per AIC per group.
+    for (uint64_t prefix : {0ULL, 17ULL, (1ULL << 32) + 31ULL})
+        for (uint32_t groupCount : {0U, 1U, 2U, 3U, 8U})
+            for (uint32_t tiles : {10U, 28U})
+                for (uint32_t core = 0; core < 28U; ++core) {
+                    uint32_t last = groupCount;
+                    for (uint32_t group = 0; group < groupCount; ++group)
+                        if (FirstOwnedComputeTile(prefix + uint64_t(group) * tiles, core, 28U) < tiles)
+                            last = group;
+                    assert(LastOwnedComputeGroup(prefix, groupCount, tiles, core, 28U) == last);
+                }
     for (uint32_t seed = 0; seed < 10; ++seed) {
         std::mt19937 random(seed);
         std::vector<size_t> cursor(tasks.size());
@@ -239,14 +252,14 @@ int main() {
         std::vector<uint32_t> actors(tasks.size());
         std::iota(actors.begin(), actors.end(), 0);
         // Dispatch producers are independent of GMM2/Combine. Different CVs
-        // feeding the same M256 may arrive far apart; every segment must wait.
+        // feeding the same M384 may arrive far apart; every segment must wait.
         std::vector<uint32_t> readyAt(chunkCount);
         for (uint32_t index = 0; index < chunkCount; ++index)
             readyAt[index] = chunks[index].peer == config.rank ? 0 : 1 + random() % 80;
         uint32_t activationStart[13]{};
         activationStart[0] = 95;  // Stress an independently delayed activation worker.
         const uint32_t dispatchCompleteAt = 140;
-        std::vector<uint32_t> outputWrites(plan.config.receiveRows * 14), nextPeerChunk(16), sent(chunkCount);
+        std::vector<uint32_t> outputWrites(plan.config.receiveRows * 28), nextPeerChunk(16), sent(chunkCount);
         uint32_t remainingChunks = 0;
         for (uint32_t index = 0; index < chunkCount; ++index) {
             if (chunks[index].peer == config.rank) sent[index] = 1;
@@ -288,13 +301,13 @@ int main() {
                 else {
                     const auto& group = fragments[t.fragment];
                     const uint32_t n = t.tile - group.gmm2TileBegin;
-                    assert(n < 14);
+                    assert(n < 28);
                     // This models the actual completion boundary: scatter
                     // every span of this N tile before incrementing gmm2Done.
                     for (uint32_t j = 0; j < group.segmentCount; ++j) {
                         const auto& segment = plan.segments[group.segmentBegin + j];
                         for (uint32_t row = 0; row < segment.rows; ++row)
-                            assert(++outputWrites[(segment.receiveRow + row) * 14 + n] == 1);
+                            assert(++outputWrites[(segment.receiveRow + row) * 28 + n] == 1);
                     }
                     ++g2Done[t.fragment];
                 }
@@ -313,8 +326,8 @@ int main() {
                 }
                 if (!ready || tick < dispatchCompleteAt) continue;
                 for (uint32_t row = 0; row < chunk.rows; ++row)
-                    for (uint32_t n = 0; n < 14; ++n)
-                        assert(outputWrites[(chunk.localRow + row) * 14 + n] == 1);
+                    for (uint32_t n = 0; n < 28; ++n)
+                        assert(outputWrites[(chunk.localRow + row) * 28 + n] == 1);
                 assert(++sent[index] == 1);
                 ++nextPeerChunk[peer]; --remainingChunks; ++progress;
             }
@@ -378,7 +391,7 @@ def empty_destination_counts(bs):
 
 
 @pytest.mark.parametrize("bs", [2048, 4096, 8192])
-@pytest.mark.parametrize("cv_rows", [128, 256, 1024, 4096])
+@pytest.mark.parametrize("cv_rows", [128, 256, 512, 1024, 4096])
 def test_expert_group_assignment_and_independent_activation_combine_progress(scheduler_binary, bs, cv_rows):
     counts = []
     for rank in range(16):
@@ -396,7 +409,7 @@ def test_cross_source_cv_groups_and_late_input_do_not_release_combine_early(sche
     run_scheduler(scheduler_binary, counts, 1024, cv_rows=128)
 
 
-@pytest.mark.parametrize("rows", [1, 43, 85, 127, 128, 129, 171, 255, 256, 257, 511, 512, 513, 4096])
+@pytest.mark.parametrize("rows", [1, 43, 85, 127, 128, 129, 171, 255, 256, 257, 383, 384, 385, 511, 512, 513, 767, 768, 769, 4096])
 def test_activation_subtile_bounds_and_one_completion_per_original_tile(scheduler_binary, rows):
     counts = empty_destination_counts(512)
     counts[0, 7 * 24] = rows

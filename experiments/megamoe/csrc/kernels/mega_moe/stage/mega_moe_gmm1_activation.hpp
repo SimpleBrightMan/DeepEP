@@ -505,8 +505,8 @@ __aicore__ inline void Gmm1Aiv1PrefetchEpilogueTileA8W4(ActivationQuantOp& activ
 }
 
 // 非 Prefetch 路径的 AIV1 从 GM 取回完整 A8W4 GMM1 tile 并执行 SwiGLU/量化。
-template <typename ElementC, typename MakeLayoutC, bool IsWaveFlagGrained, typename TensorC, typename ActivationQuantOp,
-          typename Config, typename ActualShape>
+template <typename ElementC, typename MakeLayoutC, bool IsWaveFlagGrained, uint32_t ActivationTileN = L1_TILE_N,
+          typename TensorC, typename ActivationQuantOp, typename Config, typename ActualShape>
 __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQuantOp, TensorC& l0cOutGm,
                                                 const GMMAddrInfo& gmmAddrInfo, const Config& config,
                                                 const ActualShape& actualShape, uint32_t mLoc, uint32_t nLoc)
@@ -522,10 +522,11 @@ __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQua
                                              Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
     auto tensorBlockGmSecond =
         l0cOutGm.Slice(Te::MakeCoord(mLoc, upLoc), Te::MakeShape(Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape)));
-    auto layoutL0cUb = MakeLayoutC{}(config.tileM, L1_TILE_N);
+    auto layoutL0cUb = MakeLayoutC{}(config.tileM, ActivationTileN);
     int64_t ubOffsetFirst = 0;
     uint32_t ubBufferSize =
         config.tileM == L1_TILE_M_128 ? MAX_SINGLE_MN_ALIGN32_NUM_128 : MAX_SINGLE_MN_ALIGN32_NUM_256;
+    ubBufferSize = ubBufferSize / L1_TILE_N * ActivationTileN;
     int64_t ubOffsetSecond = static_cast<int64_t>(ubBufferSize) * sizeof(ElementC);
     auto tensorBlockUbFirst = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetFirst), layoutL0cUb);
     auto tensorBlockUbSecond = Te::MakeTensor(Te::MakeMemPtr<Te::Location::UB, ElementC>(ubOffsetSecond), layoutL0cUb);

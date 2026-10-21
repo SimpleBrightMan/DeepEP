@@ -6,13 +6,15 @@
 
 namespace MegaMoeUrma {
 
-// Pure host/device scheduling arithmetic. Compute groups contain at most M256
+// Pure host/device scheduling arithmetic. Compute groups contain at most M384
 // rows of one expert, independently of the peer/CV communication boundaries.
 constexpr uint32_t kComputeCores = kAic;
 constexpr uint32_t kReduceWorkers = kLocalWorkers - kCommunicationWorkers;
-constexpr uint32_t kComputeTileM = 256U;
-constexpr uint32_t kComputeTileN = 256U;
-// Keep matrix scheduling at M256; only the AIV1 epilogue works in M128
+constexpr uint32_t kComputeTileM = 384U;
+constexpr uint32_t kComputeTileN = 128U;
+// M384/K128 would need 96KiB for double-buffered L0A; K64 fits in 48KiB.
+constexpr uint32_t kComputeTileK0 = 64U;
+// Keep matrix scheduling at M384; only the AIV1 epilogue works in M128
 // slices. The W4 AIV0 prologue remains the largest UB user at exactly 192KiB.
 constexpr uint32_t kActivationTileM = 128U;
 // The URMA v1 input is H3584: each row has 112 E8M0 bytes. GM stays
@@ -35,11 +37,11 @@ struct ActivationUbContract {
     static constexpr uint32_t reciprocalOffset = maxExpOffset + scaleElements * sizeof(uint16_t);
     static constexpr uint32_t scratchEnd = reciprocalOffset + scaleElements * sizeof(uint16_t);
 };
-static_assert(ActivationUbContract::inputEnd == 128U * 1024U);
-static_assert(ActivationUbContract::scratchEnd == 101U * 1024U);
+static_assert(ActivationUbContract::inputEnd == 64U * 1024U);
+static_assert(ActivationUbContract::scratchEnd == 101U * 512U);
 static_assert(ActivationUbContract::inputEnd <= kRequiredUbBytes &&
               ActivationUbContract::scratchEnd <= kRequiredUbBytes);
-static_assert(kInputScaleUbBytes == 32768U && kInputScaleUbBytes <= ActivationUbContract::inputEnd);
+static_assert(kInputScaleUbBytes == 49152U && kInputScaleUbBytes <= ActivationUbContract::inputEnd);
 
 struct ActivationRowSlice {
     uint32_t rowBegin;
@@ -125,7 +127,7 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ComputeBatchTaskCount(uint32_t ba
     return static_cast<uint64_t>(batchCount) * 2U;
 }
 
-// A batch contains all M256 groups of one expert, including an empty batch for
+// A batch contains all M384 groups of one expert, including an empty batch for
 // an empty expert. Warmup G1(0), then G1(i) -> G2(i-1), then drain G2(last).
 // Every AIC/AIV0 follows this order independently; there is no expert barrier.
 MEGAMOE_URMA_COMPUTE_INLINE constexpr ComputeBatchTask ComputeBatchTaskAt(uint64_t step, uint32_t batchCount)
@@ -165,7 +167,7 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t FirstOwnedComputeTile(uint64_t ti
     return worker >= startOwner ? worker - startOwner : worker + workerCount - startOwner;
 }
 
-// Each nonempty fragment is at most M256, so all groups of an expert have the
+// Each nonempty fragment is at most M384, so all groups of an expert have the
 // same N tile count, including its short final M group. Return groupCount when
 // this worker has no tile; no hardware context may be opened in that case.
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t LastOwnedComputeGroup(uint64_t tileBegin, uint32_t groupCount,

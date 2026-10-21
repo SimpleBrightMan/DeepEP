@@ -235,7 +235,7 @@ DRIVER = r"""
 #include <string>
 using namespace MegaMoeUrma;
 using namespace AscendC;
-static_assert(ReduceUbContract::end == 191328U);
+static_assert(ReduceUbContract::end == 191136U);
 struct TraceSink {
     uint64_t begins{}, ends{}, expectedRow{}, expectedRows{};
     bool active{};
@@ -299,8 +299,8 @@ int main(int argc, char** argv) {
     for (uint32_t route = 0; route < rows; ++route) routeForRow[inverse[route]] = route;
     for (uint32_t local = 0; local < count; ++local) {
         const std::array<uint64_t, 8> tokenDependencies = {
-            512U + local, 8191U, kReduceSelfDependency | local, kReduceSelfDependency | 4118U,
-            512U + local, 8191U, kReduceSelfDependency | local, kReduceSelfDependency | 4118U};
+            512U + local, 8191U, kReduceSelfDependency | local, kReduceSelfDependency | 2753U,
+            512U + local, 8191U, kReduceSelfDependency | local, kReduceSelfDependency | 2753U};
         for (uint32_t slot = 0; slot < 8; ++slot)
             dependencies[(begin + local) * 8U + slot] = tokenDependencies[slot];
     }
@@ -318,7 +318,7 @@ int main(int argc, char** argv) {
         for (auto& value : output) value.bits = 0x7fc1;
         Arguments args{};
         args.config.hidden = 3584; args.config.topk = 8; args.config.bs = bs;
-        args.config.maxPeerChunks = 512; args.config.fragmentCount = 4119;
+        args.config.maxPeerChunks = 512; args.config.fragmentCount = 2754;
         args.config.epoch = 7U + invocation;
         args.symmetric = returnedBase;
         args.config.combineReadyOffset = uintptr_t(1) << 35U;
@@ -351,7 +351,7 @@ int main(int argc, char** argv) {
             return true;
         };
         auto ready = [&](uint64_t dependency) {
-            if (dependency == 8191U || dependency == (kReduceSelfDependency | 4118U)) return true;
+            if (dependency == 8191U || dependency == (kReduceSelfDependency | 2753U)) return true;
             const auto index = dependency & ~kReduceSelfDependency;
             const uint32_t local = dependency & kReduceSelfDependency ? index : index - 512U;
             assert(local < count);
@@ -372,7 +372,7 @@ int main(int argc, char** argv) {
                 return uint64_t(complete ? 16U : mode == "overcount" ? 17U : 15U);
             }
             uint64_t dependency;
-            if (address >= args.gmm2Done && address < args.gmm2Done + uint64_t(4119U) * 128U) {
+            if (address >= args.gmm2Done && address < args.gmm2Done + uint64_t(2754U) * 128U) {
                 assert((address - args.gmm2Done) % 128U == 0U);
                 dependency = kReduceSelfDependency | ((address - args.gmm2Done) / 128U);
             } else {
@@ -399,7 +399,7 @@ int main(int argc, char** argv) {
                     readyCandidate = local;
                 }
             }
-            if (dependency & kReduceSelfDependency) return uint64_t(complete ? 14U : 13U);
+            if (dependency & kReduceSelfDependency) return uint64_t(complete ? 28U : 27U);
             return complete ? args.config.epoch : mode == "future" ? args.config.epoch + 1U : args.config.epoch - 1U;
         };
         beforePayload = [&](uintptr_t address) {
@@ -478,7 +478,7 @@ int main(int argc, char** argv) {
                 assert(cycleCalls == 0U);
             }
             if (mode != "fast" && mode != "wait-switch") {
-                assert(positiveReads[8191U] == 1U && positiveReads[kReduceSelfDependency | 4118U] == 1U);
+                assert(positiveReads[8191U] == 1U && positiveReads[kReduceSelfDependency | 2753U] == 1U);
                 if (!allInputsObserved) {
                     for (uint32_t local = 0; local < count; ++local)
                         assert(positiveReads[512U + local] == 1U && positiveReads[kReduceSelfDependency | local] == 1U);

@@ -9,6 +9,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+COMPUTE_TILE_M = 384
+COMPUTE_TILE_N = 128
+COMPUTE_TILE_K0 = 64
+COMPUTE_SCHEDULE = "expert-m384-n128"
+
 
 @dataclass(frozen=True)
 class DeviceRoutes:
@@ -162,10 +167,10 @@ class ExpertMGroup:
 
 
 def expert_m_groups(routes, destination_rank, cv_rows):
-    """CPU oracle for expert-major M256 gather/scatter descriptors.
+    """CPU oracle for expert-major M384 gather/scatter descriptors.
 
     Build each expert's ordered row identities first, then partition those
-    identities into M256 groups. This intentionally differs from the native
+    identities into M384 groups. This intentionally differs from the native
     interval/prefix construction, so coverage tests exercise an independent
     algorithm. Communication CV size never changes the compute partition.
     """
@@ -191,8 +196,8 @@ def expert_m_groups(routes, destination_rank, cv_rows):
             for expanded_row in range(begin, end):
                 peer_row = expanded_row - peer_base
                 identities.append((source, peer_row // cv_rows, receive_bases[source] + peer_row, expanded_row))
-        for offset in range(0, len(identities), 256):
-            rows = identities[offset : offset + 256]
+        for offset in range(0, len(identities), COMPUTE_TILE_M):
+            rows = identities[offset : offset + COMPUTE_TILE_M]
             segments = []
             start = 0
             while start < len(rows):

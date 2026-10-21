@@ -9,7 +9,7 @@ GMM 使用 CATLASS 的 `PackedMxA8W4TileCopyTla`、MX MMAD 和 NZ 权重反量�
 `mega_moe_grouped_matmul.hpp` 接受一个专家 slice 的地址和形状，由 stage 层提供 tile 顺序及输入/输出完成同步。
 
 - `../common/mega_moe_block_scheduler.hpp` 使用 swizzle=3、跨专家轮转和共享专家调度。
-- `block_mmad_a8w4.hpp`：AIC 使用独立的 A/B K 窗口、L0 K128、4096-K scale 窗口，只等待 AIV0。
+- `block_mmad_a8w4.hpp`：AIC 使用独立的 A/B K 窗口、默认L0 K128、4096-K scale 窗口，只等待 AIV0。URMA实验M384N128使用L0 K64。
 - `a8w4_k_plan.hpp`：AIC/AIV0 共用的分块规则。小 M 时按 N/(2×M对齐值) 扩大 A 窗口；slice M<256 且实际 N≤128 时 B 使用 K512，其余使用 K256。
 - `block_prologue_a8w4.hpp`：AIV0 将每个 B 窗口拆成两个半块，使用四个 UB stage；每个 stage 使用 16 KiB FP4 输入和 32 KiB FP8 输出，共 192 KiB。两个半块写完后才发布一次权重就绪。
 - `resource.hpp`：本地存储的非拥有视图；不创建 TPipe，不重置 Wave 中其他阶段的事件。
@@ -23,11 +23,12 @@ AIC 不发送或等待 AIV1 的 `+16` 标志。AIV0 在 slice 结束时排空两
 因此 GMM2 可以继续使用同一组 L1/L0/UB 和 event ID；对象存活不等于持续占用硬件事件。
 AIV1 的 context 保持休眠，不建立 prologue 缓冲区视图、不操作 CATLASS 同步标志，继续执行 Dispatch、SwiGLU 和 Combine。
 主线 GMM2 使用独立的 `CatlassGmm2` 局部对象。URMA 同时持有 GMM1/GMM2 对象，通过
-`UpdateProblem()`、`Begin()`、`End()` 在同专家的多个 M256 组间复用活动上下文，阶段切换时交还资源。
+`UpdateProblem()`、`Begin()`、`End()` 在同专家的多个计算组间复用活动上下文，阶段切换时交还资源。
 GMM1/GMM2 只共用内部的 AIC/AIV0 pipeline；
 gate/up 合并投影及输出偏移由 `CatlassGmm1` 管理，单投影和行主序输出由 `CatlassGmm2` 管理。
 L1 分配为两组 B64KiB、两组 A128KiB、两组 scaleA32KiB 和两组 scaleB32KiB，共 512 KiB。
 L1 地址分配：B 在 0/384 KiB，A 在 128/256 KiB，scaleA 在 64/448 KiB，scaleB 在 96/480 KiB。
+URMA实验M384N128将每槽scaleA扩为48 KiB、scaleB缩为16 KiB，scaleB移到112/496 KiB，总计仍512 KiB。B槽保持64 KiB以兼容尾组动态K512。L0 K64下，A/B双槽占48/16 KiB，单槽FP32 L0C占192 KiB。
 UB 的 FP4 输入在 0/16/32/48 KiB；FP8 输出从 64 KiB 开始，每个 256 字节向量按四个 stage 交错，步长 1024 字节。
 VF 和 UB→L1 DMA 使用相同的交错步长，DMA 将当前 stage 的向量收集为连续 NZ 数据。
 AIV0 在第一半块反量化前等待对应 L1 B 槽位空闲。

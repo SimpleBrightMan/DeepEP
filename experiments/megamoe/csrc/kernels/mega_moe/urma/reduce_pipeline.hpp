@@ -19,7 +19,7 @@ struct ReduceUbContract {
     static constexpr uint32_t maxRoutes = maxTokens * topk;
     static constexpr uint32_t maxRemoteDependencies = kWorld * 512U;
     // Arbitrary routing: at most 16*8192*8 received rows, partitioned into
-    // M256 groups for 24 experts. Sum(ceil(expertRows/256)) <= 4096+23.
+    // M384 groups for 24 experts. Sum(ceil(expertRows/384)) <= 2731+23.
     static constexpr uint32_t maxSelfDependencies = kWorld * 8192U * topk / kComputeTileM + 24U;
     static constexpr uint32_t bf16RowBytes = hidden * sizeof(uint16_t);
     static constexpr uint32_t fp32RowBytes = hidden * sizeof(float);
@@ -40,7 +40,7 @@ struct ReduceUbContract {
     static constexpr uint32_t routeRingBytes = (inputs * sizeof(uint32_t) + 31U) / 32U * 32U;
     static constexpr uint32_t end = routeRingOffset + routeRingBytes;
 };
-static_assert(ReduceUbContract::maxTokens == 200U && ReduceUbContract::end == 191328U);
+static_assert(ReduceUbContract::maxTokens == 200U && ReduceUbContract::end == 191136U);
 static_assert(ReduceUbContract::end <= kRequiredUbBytes);
 static_assert(ReduceUbContract::inputFp32Offset % 32U == 0U && ReduceUbContract::accumulatorOffset % 32U == 0U &&
               ReduceUbContract::outputOffset % 32U == 0U && ReduceUbContract::inverseOffset % 32U == 0U &&

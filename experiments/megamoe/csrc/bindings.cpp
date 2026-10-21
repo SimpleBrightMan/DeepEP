@@ -6,6 +6,7 @@
 #include "shmem.h"
 #include "kernels/mega_moe/common/ascend_timer_v2.hpp"
 #include "kernels/mega_moe/common/mega_moe_constants.hpp"
+#include "kernels/mega_moe/urma/compute_contract.hpp"
 
 namespace py = pybind11;
 
@@ -16,7 +17,10 @@ PYBIND11_MODULE(_C, module)
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.def("buffer_size", &deepep::megamoe::buffer_size);
     module.attr("urma_api_protocol") = MegaMoeUrma::kProtocol;
-    module.attr("urma_compute_schedule") = "expert-m256";
+    module.attr("urma_compute_schedule") = "expert-m384-n128";
+    module.attr("urma_compute_tile_m") = MegaMoeUrma::kComputeTileM;
+    module.attr("urma_compute_tile_n") = MegaMoeUrma::kComputeTileN;
+    module.attr("urma_compute_tile_k0") = MegaMoeUrma::kComputeTileK0;
     module.attr("urma_local_pipeline") = "pack6-reduce6-output2";
     module.attr("urma_tail_schedule") = "combine-ready-scan-reduce41";
     module.attr("urma_timer_numel") = MegaMoeUrma::kTimerElements;

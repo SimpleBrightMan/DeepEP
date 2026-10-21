@@ -168,7 +168,7 @@ def check_plans(ids, cv_rows, routes, plans):
         assert self_send == routes[rank].peer_offsets[rank]
         assert self_recv == receive_base[rank, rank] and self_rows == counts[rank, rank]
         assert groups == len(plan["F"]) and sends == len(plan["T"]) and receives == len(plan["R"])
-        assert g1 == groups * 5 and g2 == groups * 14
+        assert g1 == groups * 10 and g2 == groups * 28
         assert len(plan["B"]) == 24
         covered = np.zeros(rows, dtype=np.int8)
         compact = np.zeros(rows, dtype=np.int8)
@@ -185,15 +185,15 @@ def check_plans(ids, cv_rows, routes, plans):
                     peer_row = return_row - int(route.peer_offsets[rank])
                     expert_rows.append((source, int(receive_base[source, rank]) + peer_row, return_row))
             first, count = plan["B"][expert]
-            assert count == (len(expert_rows) + 255) // 256
+            assert count == (len(expert_rows) + 383) // 384
             assert first == sum(b[1] for b in plan["B"][:expert])
             cursor = 0
             for group_index in range(first, first + count):
                 e, begin, row_begin, group_rows, segment_count, g1_begin, g2_begin = plan["F"][group_index]
-                assert e == expert and 0 < group_rows <= 256
-                assert group_rows == min(256, len(expert_rows) - cursor)
+                assert e == expert and 0 < group_rows <= 384
+                assert group_rows == min(384, len(expert_rows) - cursor)
                 assert row_begin == len(expected_compact_rows) + cursor
-                assert g1_begin == group_index * 5 and g2_begin == group_index * 14
+                assert g1_begin == group_index * 10 and g2_begin == group_index * 28
                 compact[row_begin : row_begin + group_rows] += 1
                 mapping = []
                 for segment_index in range(begin, begin + segment_count):
@@ -284,8 +284,8 @@ def check_plans(ids, cv_rows, routes, plans):
         assert sum(c[4] for c in plan["R"] if c[0] != rank) == counts[:, rank].sum() - self_rows
 
 
-@pytest.mark.parametrize("bs,expected_groups", [(2048, 72), (4096, 144), (8192, 264)])
-@pytest.mark.parametrize("cv_rows", [128, 256, 1024, 4096])
+@pytest.mark.parametrize("bs,expected_groups", [(2048, 48), (4096, 96), (8192, 192)])
+@pytest.mark.parametrize("cv_rows", [128, 256, 512, 1024, 4096])
 def test_balanced_expert_groups_preserve_original_transport(expert_plan_binary, bs, expected_groups, cv_rows):
     ids = []
     for rank in range(16):
@@ -309,7 +309,7 @@ def test_sparse_skewed_ragged_and_empty_experts(expert_plan_binary, pattern, cv_
             destination = {"all_self": rank, "empty_self": (rank + 1) % 16, "one_expert": 7, "boundary": 0}[pattern]
             value = np.full((bs, 8), destination * 24, dtype=np.int64)
             if pattern != "one_expert":
-                # Unequal source/expert lengths intersect both M256 and CV
+                # Unequal source/expert lengths intersect both M384 and CV
                 # boundaries; the remainder of the 24 experts remains empty.
                 value.reshape(-1)[1 + rank * 7 : 258 + rank * 11] += 3
                 value[-1, -1] += 23

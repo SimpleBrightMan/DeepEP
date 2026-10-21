@@ -82,7 +82,7 @@ struct TraceMeta {
     uint64_t bytes = 0U;
 };
 
-// One expert-major M<=256 group, gathering rows across source/CV boundaries.
+// One expert-major M<=384 group, gathering rows across source/CV boundaries.
 struct Fragment {
     uint32_t expert;
     uint32_t segmentBegin;

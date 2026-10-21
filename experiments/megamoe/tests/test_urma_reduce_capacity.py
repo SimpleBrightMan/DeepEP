@@ -80,9 +80,9 @@ int main(int argc, char** argv) {
     for (uint32_t source = 0; source < kWorld; ++source)
         counts[source * 384U + 15U * 24U + 23U] = int64_t(routes);
     if (fragmented) {
-        // Twenty-three single-row experts maximize partial M256 groups.
-        // The last expert holds all other rows. With globalRoutes divisible
-        // by 256, this achieves globalRoutes / 256 + 23 groups exactly.
+        // Twenty-three single-row experts exercise partial M384 groups.
+        // The last expert holds all other rows; globalRoutes need not be
+        // divisible by the compute-group size.
         for (uint32_t expert = 0; expert < 23U; ++expert)
             counts[15U * 24U + expert] = 1;
         counts[15U * 24U + 23U] -= 23;
@@ -91,13 +91,15 @@ int main(int argc, char** argv) {
     config.rank = 15;
     const auto receiver = BuildExpertPlan(counts.data(), config, globalRoutes);
     CheckPlan(receiver);
-    const uint32_t expectedGroups = uint32_t(globalRoutes / 256U) + (fragmented ? 23U : 0U);
+    const uint32_t singletonGroups = fragmented ? 23U : 0U;
+    const uint32_t expectedGroups = singletonGroups +
+        uint32_t((globalRoutes - singletonGroups + kComputeTileM - 1U) / kComputeTileM);
     assert(receiver.config.receiveRows == globalRoutes);
     assert(receiver.config.fragmentCount == expectedGroups);
     const uint64_t lastSelf = receiver.reduceDependencies.back();
     assert((lastSelf & kReduceSelfDependency) != 0U);
     assert((lastSelf & ~kReduceSelfDependency) == expectedGroups - 1U);
-    if (bs == 8192U && fragmented) assert(expectedGroups == 4119U);
+    if (bs == 8192U && fragmented) assert(expectedGroups == 2754U);
 
     // Rank 0 has no incoming compute rows, but its final returned row depends
     // on peer 15's final CV. This reaches remote key 8191 at BS8192/CV128.

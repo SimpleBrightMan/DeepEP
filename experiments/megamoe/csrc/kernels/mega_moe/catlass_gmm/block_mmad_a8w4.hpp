@@ -96,7 +96,8 @@ public:
     // L1 tile size
     // Two 128-KiB A slots provide an independent kaL1 window.
     static constexpr uint32_t L1A_TILE_SIZE = 128U * 1024U;
-    static constexpr uint32_t L1B_TILE_SIZE = L1_TILE_N * L1_TILE_K * SizeOfBits<ElementB>::value / 8;
+    // N128 tails can use K512; reserve 64KiB even when the nominal tile is K256.
+    static constexpr uint32_t L1B_TILE_SIZE = 64U * 1024U;
     static constexpr uint32_t L1SCALEA_TILE_SIZE =
         L1_TILE_M * L1_TILE_K / MX_SCALE_GROUP_NUM * sizeof(ElementMxScaleA) * L1_SCALE_FACTOR_K;
     static constexpr uint32_t L1SCALEB_TILE_SIZE =
@@ -108,10 +109,16 @@ public:
     static constexpr uint32_t L0B_TILE_SIZE = L0_TILE_K * L0_TILE_N * SizeOfBits<ElementL0B>::value / 8;
     static constexpr uint32_t L0C_TILE_SIZE = L1_TILE_M * L1_TILE_N * sizeof(ElementAccumulator);
 
-    static_assert(L1_TILE_M == 256 && L1_TILE_N == 256 && L1_TILE_K == 256 && L1A_STAGES == 2 && L1B_STAGES == 2 &&
+    static_assert(((L1_TILE_M == 256 && L1_TILE_N == 256) || (L1_TILE_M == 384 && L1_TILE_N == 128)) &&
+                      L1_TILE_K == 256 && L1A_STAGES == 2 && L1B_STAGES == 2 &&
                       L1_SCALE_FACTOR_K == 16 && SizeOfBits<ElementA>::value == 8 && SizeOfBits<ElementB>::value == 8 &&
                       !HAS_BIAS,
-                  "Adaptive A8W4 requires two A128KiB/B64KiB/scale32KiB slots and no bias");
+                  "Adaptive A8W4 supports M256N256 or M384N128 with two A128KiB/B64KiB slots and no bias");
+    static_assert(L1B_TILE_SIZE + L1SCALEA_TILE_SIZE + L1SCALEB_TILE_SIZE == 128U * 1024U,
+                  "Each B/scale bank must fit beside the two A128KiB slots");
+    static_assert(L1_TILE_M != 384 ||
+                      (SizeOfBits<ElementL0A>::value == 8 && SizeOfBits<ElementL0B>::value == 8),
+                  "M384N128 resource sizing requires 8-bit L0 operands");
 
     // Check L0C_STAGES
     static_assert(!(ENABLE_UNIT_FLAG && L0C_STAGES != 1), "L0C_STAGES must be 1 when UnitFlag is true!");
@@ -178,7 +185,8 @@ public:
     CATLASS_DEVICE
     MegaMoeBlockMmadA8W4(MegaMoeResource& resource, uint32_t l1BufAddrStart = 0, bool activate = true)
     {
-        // L1 map: B=0/384KiB, A=128/256KiB, SA=64/448KiB, SB=96/480KiB.
+        // B=0/384KiB, A=128/256KiB, SA=64/448KiB.
+        // SB follows SA: 96/480KiB for M256N256, 112/496KiB for M384N128.
         uint32_t l1Offset = l1BufAddrStart;
         for (uint32_t i = 0; i < L1B_STAGES; i++) {
             // Assign L1/L0A/L0B space for each stages
@@ -228,7 +236,7 @@ public:
         }
         for (uint32_t i = 0; i < L1B_STAGES; i++) {
             l1MxScaleBTensorList[i] = resource.l1Buf.template GetBufferByByte<ElementMxScaleB>(
-                l1BufAddrStart + 96U * 1024U + i * 384U * 1024U);
+                l1BufAddrStart + L1B_TILE_SIZE + L1SCALEA_TILE_SIZE + i * 384U * 1024U);
             l1Offset += L1SCALEB_TILE_SIZE;
         }
 

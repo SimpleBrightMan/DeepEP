@@ -4,7 +4,7 @@
 
 // Host-only routing planner. Keep it independent of torch/CANN so the exact
 // descriptors consumed by the kernel can be exercised in CPU regression tests.
-#include "abi.hpp"
+#include "compute_contract.hpp"
 
 #include <algorithm>
 #include <array>
@@ -40,7 +40,7 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
     auto& config = plan.config;
     config.gmm1Tiles = config.gmm2Tiles = 0;
     constexpr uint32_t kExperts = kWorld * 24U;
-    constexpr uint32_t kRowsPerGroup = 256;
+    constexpr uint32_t kRowsPerGroup = kComputeTileM;
     const uint64_t expandedRows = static_cast<uint64_t>(config.bs) * config.topk;
     constexpr uint64_t kUnassignedDependency = std::numeric_limits<uint64_t>::max();
     plan.reduceDependencies.assign(expandedRows, kUnassignedDependency);
@@ -164,8 +164,8 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
             }
             group.segmentCount = static_cast<uint32_t>(plan.segments.size()) - group.segmentBegin;
             plan.fragments.push_back(group);
-            config.gmm1Tiles += (config.intermediate + 255U) / 256U;
-            config.gmm2Tiles += (config.hidden + 255U) / 256U;
+            config.gmm1Tiles += ComputeTileCount(group.rows, config.intermediate);
+            config.gmm2Tiles += ComputeTileCount(group.rows, config.hidden);
         }
         plan.computeBatches.push_back({firstGroup, static_cast<uint32_t>(plan.fragments.size()) - firstGroup});
         compactRow += expertRows;

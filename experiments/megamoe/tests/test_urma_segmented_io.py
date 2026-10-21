@@ -91,7 +91,7 @@ int main(int argc, char** argv) {
         }
         // GMM2: original row identity, self return remap, and each N-tile
         // offset are preserved; different segments never release/reuse L0C.
-        for (uint32_t nBegin = 0; nBegin < 3584; nBegin += 256) {
+        for (uint32_t nBegin = 0; nBegin < 3584; nBegin += 128) {
             std::vector<uint32_t> visited(tileRows, 0);
             for (const auto& segment : segments) {
                 auto part = Intersect(segment.tileRow, segment.rows, tileBegin, tileRows);
@@ -101,11 +101,11 @@ int main(int argc, char** argv) {
                                      part.segmentRow;
                 for (uint32_t row = 0; row < part.rows; ++row) {
                     ++visited[part.tileRow + row];
-                    for (uint32_t col = 0; col < 256; ++col) {
+                    for (uint32_t col = 0; col < 128; ++col) {
                         uint64_t dst = OutputOffset(outputRow + row, nBegin + col, 3584);
                         assert(dst / 3584 == outputRow + row && dst % 3584 == nBegin + col);
                         uint64_t src = L0COffset(part.tileRow + row, col, tileRows);
-                        assert(src < static_cast<uint64_t>(physicalM) * 256);
+                        assert(src < static_cast<uint64_t>(physicalM) * 128);
                     }
                 }
             }
@@ -146,8 +146,8 @@ int main(int argc, char** argv) {
     return binary
 
 
-@pytest.mark.parametrize("segment_rows", [1, 15, 16, 17, 31, 32, 43, 85, 171, 256])
-@pytest.mark.parametrize("rows,k", [(256, 3584), (171, 6144), (43, 4096), (85, 8192), (85, 4129)])
+@pytest.mark.parametrize("segment_rows", [1, 15, 16, 17, 31, 32, 43, 85, 171, 256, 383, 384])
+@pytest.mark.parametrize("rows,k", [(384, 3584), (383, 3584), (256, 3584), (171, 6144), (43, 4096), (85, 8192), (85, 4129)])
 def test_segmented_a_scale_and_scatter_layout(segmented_io_binary, segment_rows, rows, k):
     completed = subprocess.run(
         [str(segmented_io_binary), str(segment_rows), str(rows), str(k)],

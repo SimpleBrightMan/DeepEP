@@ -16,7 +16,7 @@ import threading
 from deep_ep._native import npu_api, require_native
 from deep_ep._runtime import Runtime, integer, warn_unclosed
 from deep_ep._store import StoreGroup
-from .urma_routing import DeviceRoutes, prepare_routes
+from .urma_routing import COMPUTE_SCHEDULE, COMPUTE_TILE_K0, COMPUTE_TILE_M, COMPUTE_TILE_N, DeviceRoutes, prepare_routes
 from .validation import collective_check
 
 
@@ -30,6 +30,17 @@ def _extension():
         raise RuntimeError("URMA Python/native versions differ; rebuild and reinstall the complete wheel")
     if getattr(extension, "urma_tail_schedule", None) != "combine-ready-scan-reduce41":
         raise RuntimeError("URMA tailCover needs its matching native wheel; rebuild and reinstall the complete wheel")
+    expected_compute = {
+        "urma_compute_schedule": COMPUTE_SCHEDULE,
+        "urma_compute_tile_m": COMPUTE_TILE_M,
+        "urma_compute_tile_n": COMPUTE_TILE_N,
+        "urma_compute_tile_k0": COMPUTE_TILE_K0,
+    }
+    for name, value in expected_compute.items():
+        if getattr(extension, name, None) != value:
+            raise RuntimeError(
+                f"URMA M384/N128 Python/native versions differ ({name}); rebuild and reinstall the complete wheel"
+            )
     return extension
 
 
@@ -131,6 +142,7 @@ class UrmaBuffer:
                 timeout,
                 allow_multi_host,
                 "combine-ready-scan-reduce41",
+                COMPUTE_SCHEDULE,
             ),
         )
         self.group = group

@@ -13,7 +13,7 @@ namespace MegaMoeUrma {
 using namespace AscendC;
 using MegaMoeImpl::Get;
 
-// A fragment is a compute M256 group of one expert. Row segments preserve its
+// A fragment is a compute M384 group of one expert. Row segments preserve its
 // input/output correspondence with the original source-major communication CVs.
 __aicore__ inline Fragment LoadFragment(const Arguments& args, uint32_t index)
 {
@@ -88,6 +88,17 @@ __aicore__ inline MegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& args, 
 using UrmaGmmConfig = MegaMoeImpl::GmmKernel::Config<true, 0, fp8_e4m3fn_t, fp4x2_e2m1_t, bfloat16_t, fp8_e8m0_t,
                                                      fp8_e8m0_t, false, false, false, false, false, false, false>;
 using UrmaProblemConfig = UrmaGmmConfig::ProblemConfig;
+// Override only this experimental caller: the shared main-kernel factories
+// retain M256/N256. Scheduling and the CATLASS physical tiles must agree.
+__aicore__ inline UrmaProblemConfig UrmaComputeTiling(UrmaProblemConfig config)
+{
+    config.tileM = kComputeTileM;
+    config.tileN = kComputeTileN;
+    config.activationTileM = kActivationTileM;
+    config.blockMmadTiling.tileM = kComputeTileM;
+    config.blockMmadTiling.tileN = kComputeTileN;
+    return config;
+}
 using UrmaInputRows = MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false>;
 using UrmaOutputRows = MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, false, true>;
 using UrmaActivation =
@@ -166,8 +177,10 @@ __aicore__ inline void CompleteComputeContext()
     }
 }
 
-using UrmaGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig, false, UrmaInputRows>;
-using UrmaGmm2 = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows>;
+using UrmaGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig, false, UrmaInputRows,
+                                                  kComputeTileM, kComputeTileN, kComputeTileK0>;
+using UrmaGmm2 = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows,
+                                                  kComputeTileM, kComputeTileN, kComputeTileK0>;
 
 __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex, UrmaGmm1& gmm1,
                                        bool endContext, Timer& timer)
@@ -176,7 +189,7 @@ __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, ui
     const Fragment fragment = LoadFragment(args, fragmentIndex);
     const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
     const auto shape = FragmentShape(args, fragment);
-    auto config1 = UrmaGmmConfig::BuildGmm1ProblemConfig(shape, job, kComputeTileM);
+    auto config1 = UrmaComputeTiling(UrmaGmmConfig::BuildGmm1ProblemConfig(shape, job, kComputeTileM));
     MegaMoeImpl::GmmKernel::BlockScheduler schedule1(
         {config1.m, config1.schedulerN, config1.k},
         MegaMoeImpl::GmmKernel::BlockScheduler::Params{
@@ -248,7 +261,7 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
     const Fragment fragment = LoadFragment(args, fragmentIndex);
     const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
     const auto shape = FragmentShape(args, fragment);
-    auto config2 = UrmaGmmConfig::BuildGmm2ProblemConfig(shape, job, kComputeTileM);
+    auto config2 = UrmaComputeTiling(UrmaGmmConfig::BuildGmm2ProblemConfig(shape, job, kComputeTileM));
     MegaMoeImpl::GmmKernel::BlockScheduler schedule2(
         {config2.m, config2.schedulerN, config2.k},
         MegaMoeImpl::GmmKernel::BlockScheduler::Params{
@@ -288,7 +301,7 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
     }
     if (endContext) {
         const uint64_t drainStart = timer.TraceBegin();
-        // One FIX drain per expert batch. Intermediate M256 groups keep
+        // One FIX drain per expert batch. Intermediate M384 groups keep
         // submitting; the block's FIX_M events still protect each L0C slot.
         gmm2.End();
         CompleteComputeContext();
@@ -402,7 +415,8 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
     addr.activationToGmm2Flag = nullptr;
     epilogue.UpdateGlobalAddr({static_cast<int64_t>(fragment.rowBegin * args.config.intermediate),
                                static_cast<int64_t>(fragment.rowBegin * (args.config.intermediate / 32U)), 0, 0, 0, 0});
-    auto config = UrmaGmmConfig::BuildGmm1ProblemConfig(FragmentShape(args, fragment), job, kComputeTileM);
+    auto config =
+        UrmaComputeTiling(UrmaGmmConfig::BuildGmm1ProblemConfig(FragmentShape(args, fragment), job, kComputeTileM));
     const auto layouts = UrmaGmmConfig::BuildLayouts(config);
     auto gmC = Te::MakeTensor(
         Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ bfloat16_t*>(addr.gmm1OutGlobal)), layouts.c);
@@ -417,7 +431,7 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
     const uint32_t n = Get<MegaMoeImpl::N_VALUE>(coord);
     const uint32_t rows = Get<MegaMoeImpl::M_VALUE>(tileShape);
     const uint32_t columns = Get<MegaMoeImpl::N_VALUE>(tileShape);
-    // Only the staging copy changes to M128; ready counters stay M256.
+    // Only the staging copy changes to M128; ready counters stay M384/N128.
     config.tileM = kActivationTileM;
     timer.Begin(Phase::Activation);
     for (uint32_t offset = 0U; offset < rows; offset += kActivationTileM) {
@@ -425,7 +439,7 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
         const MegaMoeImpl::GmmKernel::BlockScheduler::BlockShape sliceShape{slice.rows, columns, config.k};
         const auto sliceMeta = ComputeTileTraceMeta(fragmentMeta, slice.rowBegin, n, slice.rows, columns);
         const uint64_t sliceStart = timer.TraceBegin();
-        MegaMoeImpl::GmmKernel::Gmm1Aiv1EpilogueTileA8W4<bfloat16_t, UrmaGmmConfig::MakeLayoutC, true>(
+        MegaMoeImpl::GmmKernel::Gmm1Aiv1EpilogueTileA8W4<bfloat16_t, UrmaGmmConfig::MakeLayoutC, true, kComputeTileN>(
             epilogue, gmC, addr, config, sliceShape, slice.rowBegin, n);
         timer.TraceEnd(TraceEvent::ActivationSlice, sliceStart, sliceMeta);
     }

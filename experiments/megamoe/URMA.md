@@ -2,11 +2,13 @@
 
 本实验是完整的 Prefill 算子：真实路由准备、本地展开、Dispatch、GMM1、SwiGLU/MXFP8 量化、GMM2、Combine PUT 和加权 Reduce。没有屏蔽计算，也没有使用预置 balanced 专用路由。
 
-本分支为 `megamoe-urma-tailCover`，基于 `megamoe-urma` 的多槽版本 `a35b4d3`。原分支保留尾部全卡同步和56核Reduce；本分支采用每CV完成信号和41核Reduce，详见下文。两版均须各自重新编译安装完整wheel，不能混用rank或Python/native版本。
+本分支为 `megamoe-urma-test`，基于 `megamoe-urma-tailCover` 的 `29211fa`；`megamoe-urma` 同步为同一基线。保留每CV完成信号、41核Reduce、默认L2输入策略和同专家上下文复用，在实验分支中将计算组改为M384、GMM1/GMM2的N改为128。各分支须重新编译安装完整wheel，不能混用rank或Python/native版本。本次按要求仅修改和静态审查，未编译或运行测试；下文历史验收不覆盖本次实验。
 
 首版范围：默认单机 EP16，固定使用28个AIC / 56个AIV、每个AIV至少192 KiB UB、H=3584、I=1280、384个专家、TopK=8、无共享专家、FP8输入/FP4权重、BS=2048/4096/8192。物理核心数更多的兼容机型仍只启动这28组计算核。任意合法路由均走同一流程；超过配置接收容量的偏斜路由会在启动计算前明确报错。
 
-GMM按专家聚合不同来源的行，使用M256计算块，仅专家尾块不足256行；通信CV不再决定计算分块。SwiGLU在每个已就绪GMM1 tile内按最多128行处理，全部子块写出后只发布一次该tile的完成贡献。其两个BF16输入缓冲合计128 KiB，AIV0的W4解量化流水使用192 KiB，后者决定当前UB最低要求。资源不足时分别报告核心数或UB容量，并打印实际查询值。
+GMM按专家聚合不同来源的行，使用M384计算块，仅专家尾块不足384行；通信CV不决定计算分块，默认仍为256行。GMM1交付粒度为384×128的gate/up成对tile，SwiGLU拆成最多三次128×128，全部子块写出后只发布一次该tile的完成贡献。其两个BF16输入缓冲合计64 KiB，输入scale整理使用48 KiB；AIV0的W4解量化流水最坏使用192 KiB，后者决定当前UB最低要求。
+
+资源核算采用已安装CATLASS的Ascend950定义：L1 512 KiB、L0A/B各64 KiB、L0C 256 KiB。GMM2若用384×256，单个FP32累加块为384 KiB，超过L0C，因此也改成384×128（192 KiB）。L0 K128时A双槽为96 KiB，故两层L0 K均改64，A/B双槽分别48/16 KiB。L1保留A128 KiB×2、B64 KiB×2（兼容尾组K512）、scaleA48 KiB×2、scaleB16 KiB×2，合计512 KiB。L1 K仍为256；主线MTE调用使用原来的默认256×256/L0 K128。
 
 通信接口与固定 CV 调度参考 [ops-transformer PR11602](https://gitcode.com/cann/ops-transformer/pull/11602)（分析版本 `3ab6b8bba2cbdaf3751596c3e4b0488e1991df5f`）。计算复用本仓主线的 FP8/W4 CATLASS 和 SwiGLU 算术；返回方向改为 PUT。
 
@@ -15,7 +17,7 @@ GMM按专家聚合不同来源的行，使用M256计算块，仅专家尾块不�
 1. 每个输入 `[token, topk_slot]` 都是独立路由实例。按 `[目标rank][目标本地expert][原始token/topk位置]` 稳定排序，建立 `order` 和逆映射 `reduce_index[token,slot]=expanded_row`。
 2. 56个AIV共同展开FP8 token和E8M0 scale：远端路由写连续发送区，self路由直接写本rank接收区；不再从发送区执行一次SelfDispatch拷贝。一个token命中多个expert时复制对应多行，本版不做去重。
 3. 每个目标rank的连续行流按 `cv_rows` 截断，通过 URMA PUT 发送。token与scale使用各自连续平面。
-4. 对每个本地expert，把16个来源的行按source编号连接，按M256划分计算组；专家尾组可以不足256，不与下一个专家混算。每组的Segment记录来源、CV、接收行、组内行和返回展开行。Segment在source/CV边界切分，但这些边界不再切分矩阵计算。
+4. 对每个本地expert，把16个来源的行按source编号连接，按M384划分计算组；专家尾组可以不足384，不与下一个专家混算。每组的Segment记录来源、CV、接收行、组内行和返回展开行。Segment在source/CV边界切分，但这些边界不再切分矩阵计算。
 5. GMM1按Segment把X分段加载到同一L1计算块，只等待该组实际涉及的Dispatch CV及scale准备。scale由13个AIV1独立准备，每个M组只聚合一次到expert-major GM；AIC沿用连续MX scale加载。GMM1输出、SwiGLU及GMM2输入使用连续的expert-major计算行序。GMM2按同一映射将远端结果分段写回原source-major连续输出区，self结果直接写Reduce最终读取的位置。各peer的Combine CV等待所有覆盖它的M组完成全部H列，再按原连续区间PUT。
 6. 本rank的15个远端Dispatch全部完成且self接收区已就绪后才提交Combine PUT。每个Combine CV执行 `PUT → quiet(peer) → MTE DataCopy发布epoch flag`。计算侧AIV完成自己的任务后即可按token依赖Reduce，不再等待最终全卡同步。
 
@@ -26,7 +28,7 @@ Pack使用全部56个AIV，任务编号为`block*2+subblock`。Reduce只使用28
 本地阶段使用多槽流水，benchmark打印`local_pipeline=pack6-reduce6-output2 tail=combine-ready-scan-reduce41`。Pack按56核、Reduce按41核分配连续行区间：
 
 - Pack使用6个token/scale槽，按槽等待上一次MTE3完成，再下发新的MTE2；不同槽的读取与写出可以重叠。`order`批量DMA到UB，当前支持的最大BS8192每核最多1171行，一次预取即可，payload循环不再从GM逐行标量读取路由。UB占用65.5 KiB。
-- Reduce使用6个BF16/FP32输入槽、独立FP32累加器和2个BF16输出槽。每核自己的`inverse + weights + readiness dependencies`一次搬入UB，BS8192时最多200个token，不再用128行metadata批次限制扫描范围。每个token的8路结果全部就绪后才预取payload；槽位按实际提交顺序复用，写回仍使用原始token行号。数据、metadata、正向缓存、提交位图和六项route ring合计191328 B，低于192 KiB。
+- Reduce使用6个BF16/FP32输入槽、独立FP32累加器和2个BF16输出槽。每核自己的`inverse + weights + readiness dependencies`一次搬入UB，BS8192时最多200个token，不再用128行metadata批次限制扫描范围。每个token的8路结果全部就绪后才预取payload；槽位按实际提交顺序复用，写回仍使用原始token行号。数据、metadata、正向缓存、提交位图和六项route ring合计191136 B，低于192 KiB。
 - 返回布局、FP32乘加顺序和最终BF16舍入不变。self直接写receive/return，远端PUT的CV粒度和数量不变。Pack仍全部完成后才进入Dispatch；Reduce可以与其他核心的计算和Combine重叠。
 
 Python会拒绝不含本分支tail调度标记的native扩展。正式耗时仍取关闭timer/trace的`CACHED_FORWARD`。Pack跨度覆盖56核；本分支Reduce跨度覆盖41核且包含等待结果就绪的时间，不能直接当作纯本地Reduce耗时，也不能与Combine跨度相加。原timer的Pack字节统计写入的FP8+scale，Reduce字节仅统计输出BF16，均不是完整HBM读写流量。
@@ -55,9 +57,9 @@ self直接写地址按现有`send_base/receive_base`映射；同一计算组可�
 
 通信域启用MTE和UDMA，每个对端独立QP0，不使用共享jetty。MTE只用于完成标志与本地搬运；远端token、scale和FFN结果均走UDMA PUT。每次调用在同一runtime stream串行执行，并在下一次写入前与各peer握手，保护上一轮Reduce尚未读完的结果。
 
-### 专家 M256 与通信 CV 解耦
+### 专家 M384 与通信 CV 解耦
 
-通信CV仍是**单个来源rank发送的一段连续行**，用`(source_rank, cv_id)`唯一标识。计算批次改为一个本地专家的全部M256组，同专家内不混入其它专家。每个M组有独立的输入依赖列表，不需要等齐全16个来源。例如BS2048均衡时，专家0第一个M256由来源0～5分别贡献43、43、42、43、43、42行。
+通信CV仍是**单个来源rank发送的一段连续行**，用`(source_rank, cv_id)`唯一标识。计算批次为一个本地专家的全部M384组，同专家内不混入其它专家。每个M组有独立的输入依赖列表，不需要等齐全16个来源。每组含10个GMM1逻辑N128 tile和28个GMM2 N128 tile；GMM2等待10份激活完成贡献，self Reduce等待28份GMM2输出贡献。
 
 计算前瞻按专家批次进行：
 
@@ -77,9 +79,9 @@ Scale准备只在详细trace中独立计时，未归入原有8个aggregate phase
 
 返回CV保存它所依赖的M组编号列表，同一组去重后只出现一次。每组全部GMM2 N tile完成分段输出后才满足依赖；仅提交Cube/FIX指令不能提前放行PUT。BS2048时一个peer的CV0大致跨6个专家，新顺序让多个peer按CV波次逐渐就绪，不保证15个peer同时开始。
 
-GMM1和GMM2分别持有可复用的上下文：同一专家、同一GMM阶段内，本核相邻的M256任务沿用L1/L0缓冲、事件及ping-pong槽位状态，仅更新当前组的地址和形状；本核在该专家上的最后一个有任务组才执行End和配对AIV0确认。两个阶段仍互斥使用同一组硬件资源，切换阶段或专家时释放旧上下文。无任务核不启动上下文，该确认不涉及通信或SwiGLU AIV1。
+GMM1和GMM2分别持有可复用的上下文：同一专家、同一GMM阶段内，本核相邻的M384任务沿用L1/L0缓冲、事件及ping-pong槽位状态，仅更新当前组的地址和形状；本核在该专家上的最后一个有任务组才执行End和配对AIV0确认。两个阶段仍互斥使用同一组硬件资源，切换阶段或专家时释放旧上下文。无任务核不启动上下文，该确认不涉及通信或SwiGLU AIV1。
 
-GMM1仍逐tile等待FIX输出完成并发布就绪标志，以便SwiGLU及时开始。GMM2改为在本核完成该专家全部任务后统一等待FIX输出完成，再按各M组实际完成的tile数批量累计`gmm2Done`；中间M256组不再执行FIX_S或发布计数，内部FIX_M事件继续保护L0C槽位。Combine和self Reduce仍检查每组的完整N方向计数，不会提前读取结果，但通知时间推迟到本核的专家批次末尾。此处不增加等待Dispatch的门槛，也不改变远端每CV的`PUT → quiet → ready flag`；通信核保留本rank所有Dispatch完成后才启动Combine的原有规则。
+GMM1仍逐tile等待FIX输出完成并发布就绪标志，以便SwiGLU及时开始。GMM2在本核完成该专家全部任务后统一等待FIX输出完成，再按各M组实际完成的tile数批量累计`gmm2Done`；中间M384组不执行FIX_S或发布计数，内部FIX_M事件继续保护L0C槽位。Combine和self Reduce仍检查每组的完整N方向计数，不会提前读取结果，但通知时间推迟到本核的专家批次末尾。此处不增加等待Dispatch的门槛，也不改变远端每CV的`PUT → quiet → ready flag`；通信核保留本rank所有Dispatch完成后才启动Combine的原有规则。
 
 trace中的最后一个参与组包含本专家该阶段的上下文收尾；若与tile条合并，该条也包含这段收尾时间。GMM2中间组不再单独产生Drain条。
 
@@ -87,13 +89,13 @@ GMM1直接Gather的X，以及AIC读取的已整理输入scale，均恢复默认L
 
 默认均衡模型的每rank任务数如下，CV128/256/1024等取值不改变这些计算组数：
 
-| BS | M256组（含专家尾组） | GMM1逻辑tile | GMM2 tile |
+| BS | M384组（含专家尾组） | GMM1逻辑tile | GMM2 tile |
 |---|---:|---:|---:|
-| 2048 | 72 | 360 | 1008 |
-| 4096 | 144 | 720 | 2016 |
-| 8192 | 264 | 1320 | 3696 |
+| 2048 | 48 | 480 | 1344 |
+| 4096 | 96 | 960 | 2688 |
+| 8192 | 192 | 1920 | 5376 |
 
-该调度默认生效，无需新开关。benchmark打印`[URMA SCHEDULE] compute=expert-m256`并写入manifest；若显示`source-cv`，当前Python加载的还是旧native扩展，需要重新编译安装。流水图和正式耗时仍需实测验证；不能将tile数量减少倍数视为耗时加速倍数。
+该调度默认生效，无需新开关。benchmark打印`[URMA SCHEDULE] compute=expert-m384-n128`及实际tile尺寸并写入manifest；Python检查native计算标记与尺寸，旧wheel需要重新编译安装。M组数减少，但N方向tile数增加、L0 K步长减半；性能收益需要实测，不能按分组数量推算。
 
 ### 本地多槽流水 A/B 验证（2026-10-20）
 
@@ -266,7 +268,7 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 
 每个rank以自己的最早事件归零，**不同rank的零点没有全局对齐**，不能将两个文件的横坐标相减计算跨卡延迟。转换先用整数tick相减再转浮点，保留大时间戳的低位；原始tick在JSON参数中用字符串保存。默认1000 ticks/us仍只是显式约定，可修改`--timer-clock-mhz`，离线解析时应使用同一值。
 
-GMM条合并只影响JSON显示，不改变kernel、同步或打点开销。GMM1的逐tile drain与同一tile合并；组级GMM1/GMM2 drain仅在该AIC于该组只有一个tile时并入，多个tile共享的组级drain保持独立，避免伪造每个tile的完成时间。当前M256、H3584/I1280配置满足单核每组至多一个tile。合并要求原始记录连续且同一引擎/专家/计算组，不能跨越隐藏的等待。原始bin和计数保留；JSON的33/34为合成事件ID，`source_records`保留源事件编号、序号及时间戳，`coalesced_record_count`记录减少的显示条数。
+GMM条合并只影响JSON显示，不改变kernel、同步或打点开销。GMM1的逐tile drain与同一tile合并；组级GMM1/GMM2 drain仅在该AIC于该组只有一个tile时并入，多个tile共享的组级drain保持独立，避免伪造每个tile的完成时间。当前M384/N128、H3584/I1280配置满足单核每组至多一个tile；最后参与组的Drain还包含专家批次收尾。合并要求原始记录连续且同一引擎/专家/计算组，不能跨越隐藏的等待。原始bin和计数保留；JSON的33/34为合成事件ID，`source_records`保留源事件编号、序号及时间戳，`coalesced_record_count`记录减少的显示条数。
 
 可以在CPU环境离线重新导出单rank，无需启动NPU：
 
@@ -313,7 +315,7 @@ python3 experiments/megamoe/scripts/urma_trace_to_text.py \
 
 - 将计数交换、前缀和、CV描述符生成移到设备，减少同步和host工作；完整E2E应始终计入实际准备成本。
 - 扫描通信CV行数和专家计算前瞻深度，两者现已独立；进一步改善不均衡路由下固定专家顺序的等待。
-- 优化分段L1加载及FIX输出的指令数量，在完整M256收益和非对齐片段搬运成本之间实测取舍；本地展开可按原始token一次读入后复制多个目标行。
+- 优化分段L1加载及FIX输出的指令数量，在更大M组的复用收益和非对齐片段搬运成本之间实测取舍；本地展开可按原始token一次读入后复制多个目标行。
 - 增加每peer队列的完成进度控制，同时保持独占提交；不能把15个peer owner直接改成多个核竞争同一队列。
 - 在正确性与真实全算子收益确认后，才考虑受credit保护的接收/返回缓冲复用，以降低全量中间结果的HBM占用。
 

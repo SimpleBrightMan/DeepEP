@@ -285,8 +285,9 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
     buffer = urma.UrmaBuffer(StoreGroup(None, 0, 16, prefix="test"), allow_multi_host=allow)
     assert buffer.allow_multi_host is allow
     assert created == [allow]
-    assert checks[0][1][-2] is allow
-    assert checks[0][1][-1] == "combine-ready-scan-reduce41"
+    assert checks[0][1][-3] is allow
+    assert checks[0][1][-2] == "combine-ready-scan-reduce41"
+    assert checks[0][1][-1] == "expert-m384-n128"
 
 
 @pytest.mark.parametrize(
@@ -294,7 +295,14 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
 )
 def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, tail):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
-    extension = SimpleNamespace(urma_api_protocol=1, urma_tail_schedule=tail)
+    extension = SimpleNamespace(
+        urma_api_protocol=1,
+        urma_tail_schedule=tail,
+        urma_compute_schedule="expert-m384-n128",
+        urma_compute_tile_m=384,
+        urma_compute_tile_n=128,
+        urma_compute_tile_k0=64,
+    )
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
     urma._extension.cache_clear()
     try:
@@ -303,6 +311,36 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
                 urma._extension()
         else:
             assert urma._extension() is extension
+    finally:
+        urma._extension.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"urma_compute_schedule": "expert-m256"},
+        {"urma_compute_tile_m": 256},
+        {"urma_compute_tile_n": 256},
+        {"urma_compute_tile_k0": 128},
+        {"urma_compute_tile_k0": None},
+    ],
+)
+def test_m384_compute_wheel_mismatch_rejected_before_native_runtime(monkeypatch, changes):
+    monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
+    values = dict(
+        urma_api_protocol=1,
+        urma_tail_schedule="combine-ready-scan-reduce41",
+        urma_compute_schedule="expert-m384-n128",
+        urma_compute_tile_m=384,
+        urma_compute_tile_n=128,
+        urma_compute_tile_k0=64,
+    )
+    values.update(changes)
+    monkeypatch.setattr(urma.importlib, "import_module", lambda *_: SimpleNamespace(**values))
+    urma._extension.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="M384/N128 Python/native versions differ"):
+            urma._extension()
     finally:
         urma._extension.cache_clear()
 

@@ -223,7 +223,10 @@ def run(args, config, group):
         numerical_validation="cpu_golden" if args.golden_dir else "skipped",
         input="prequantized FP8 E4M3 + E8M0; conversion/input generation outside measurement",
         native_urma_protocol=int(_extension().urma_api_protocol),
-        compute_schedule=getattr(_extension(), "urma_compute_schedule", "source-cv"),
+        compute_schedule=_extension().urma_compute_schedule,
+        compute_tile_m=int(_extension().urma_compute_tile_m),
+        compute_tile_n=int(_extension().urma_compute_tile_n),
+        compute_tile_k0=int(_extension().urma_compute_tile_k0),
         local_pipeline=getattr(_extension(), "urma_local_pipeline", "single-slot"),
         tail_schedule=_extension().urma_tail_schedule,
         timer_clock_mhz=args.timer_clock_mhz,
@@ -238,6 +241,7 @@ def run(args, config, group):
     if rank == 0:
         print(
             f"[URMA SCHEDULE] compute={manifest['compute_schedule']} communication_cv_rows={args.cv_rows} "
+            f"gmm_tile={manifest['compute_tile_m']}x{manifest['compute_tile_n']} l0_k={manifest['compute_tile_k0']} "
             f"local_pipeline={manifest['local_pipeline']} tail={manifest['tail_schedule']}",
             flush=True,
         )
