@@ -113,6 +113,15 @@ struct ComputeBatch {
     uint32_t fragmentCount;
 };
 
+enum class ComputeBatchStage : uint32_t { None = 0U, Gmm1 = 1U, Gmm2 = 2U };
+
+// Host-planned order shared by each AIC and its paired AIV0. Whole expert
+// batches retain their existing context and global tile ownership boundaries.
+struct ComputeBatchTask {
+    ComputeBatchStage stage;
+    uint32_t batchIndex;
+};
+
 // Send chunks use local expanded-row offsets. Receive chunks describe the
 // corresponding source-major input and full-width GMM2 output interval.
 // A receive chunk's fragmentBegin/Count index chunkGroupIndices, not fragments:
@@ -140,6 +149,8 @@ struct Config {
     uint32_t fragmentCount;
     uint32_t sendChunkCount;
     uint32_t recvChunkCount;
+    uint32_t gmm1AheadMGroups = 12U;
+    uint32_t computeTaskCount;
     uint32_t reserved;
     uint64_t receiveRows;
     uint64_t gmm1Tiles;
@@ -184,6 +195,7 @@ struct Arguments {
     uint64_t fragments;
     uint64_t segments;
     uint64_t computeBatches;
+    uint64_t computeTasks;
     uint64_t chunkGroupIndices;
     uint64_t sendChunks;
     uint64_t recvChunks;
@@ -201,6 +213,7 @@ struct Arguments {
 static_assert(sizeof(Fragment) == 40);
 static_assert(sizeof(RowSegment) == 40);
 static_assert(sizeof(ComputeBatch) == 8);
+static_assert(sizeof(ComputeBatchTask) == 8);
 static_assert(sizeof(Chunk) == 40);
 }  // namespace MegaMoeUrma
 

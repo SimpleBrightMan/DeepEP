@@ -17,7 +17,7 @@ def summarize_metric(per_rank, metric, scope, ranks_per_node=16):
     report.update(
         metric=metric,
         measured_scope=scope,
-        excludes="weights/input generation, runtime creation, pre-iteration host barrier",
+        excludes="weights/input generation, runtime creation, synchronization/launch guards outside measured scope",
         timer_pass=False,
     )
     return report
@@ -29,6 +29,27 @@ def parse_args(argv=None):
     parser.add_argument("--bs-values", default="2048,4096,8192")
     parser.add_argument("--routing", choices=("balanced", "random", "skewed"), default="balanced")
     parser.add_argument("--cv-rows", type=int, default=256)
+    parser.add_argument(
+        "--gmm1-ahead-mgroups",
+        type=int,
+        default=12,
+        help="Sustained pending GMM1 M-group window; 0 preserves the two-expert baseline",
+    )
+    parser.add_argument(
+        "--exp-shape",
+        type=int,
+        nargs=2,
+        default=(100000, 20000),
+        metavar=("ROWS", "COLS"),
+        help="FP32 launch-guard tensor shape; two buffers, default 14.90 GiB/rank (same as mega_test)",
+    )
+    parser.add_argument(
+        "--exp-repeat",
+        type=int,
+        default=50,
+        help="Exp repetitions once before each cached/timer/trace block; 0 retains only HCCL barrier",
+    )
+    parser.add_argument("--launch-timeout", type=int, default=300, help="Benchmark HCCL group timeout in seconds")
     parser.add_argument(
         "--allow-multi-host",
         action="store_true",
@@ -72,6 +93,10 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if not 1 <= args.trace_capacity <= 65536:
         parser.error("trace-capacity must be in [1,65536]")
+    if not 0 <= args.gmm1_ahead_mgroups <= 65536:
+        parser.error("gmm1-ahead-mgroups must be in [0,65536]")
+    if any(n <= 0 for n in args.exp_shape) or args.exp_repeat < 0 or args.launch_timeout <= 0:
+        parser.error("exp-shape/launch-timeout must be positive; exp-repeat must be nonnegative")
     args.timer = args.timer or args.trace
     return args
 
@@ -141,6 +166,7 @@ def run(args, config, group):
     from .api import transform_weights_for_mega_moe
     from .reference import make_weights, quantize_input
     from .urma import UrmaBuffer, _extension
+    from .urma_timing import UrmaLaunchGuard, measure_cached_forward
     from .validation import collective_check
 
     rank, world = group.rank(), group.size()
@@ -153,6 +179,10 @@ def run(args, config, group):
             config,
             args.routing,
             args.cv_rows,
+            args.gmm1_ahead_mgroups,
+            args.exp_shape,
+            args.exp_repeat,
+            args.launch_timeout,
             args.max_recv_rows,
             args.timer,
             args.timer_clock_mhz,
@@ -188,6 +218,7 @@ def run(args, config, group):
         **model,
         num_max_tokens_per_rank=max(config["bs_values"]),
         cv_rows=args.cv_rows,
+        gmm1_ahead_mgroups=args.gmm1_ahead_mgroups,
         max_recv_rows=args.max_recv_rows,
         allow_multi_host=args.allow_multi_host,
     )
@@ -203,6 +234,7 @@ def run(args, config, group):
     )
     weights = transform_weights_for_mega_moe(*map(device_pair, raw))
     del raw
+    launch_guard = UrmaLaunchGuard(group, args.exp_shape, args.exp_repeat, args.launch_timeout)
     manifest = dict(
         created_utc=datetime.now(timezone.utc).isoformat(),
         config=config,
@@ -216,6 +248,10 @@ def run(args, config, group):
         swiglu_workers=13,
         routing=args.routing,
         cv_rows=args.cv_rows,
+        gmm1_ahead_mgroups=args.gmm1_ahead_mgroups,
+        launch_guard=launch_guard.describe(),
+        cached_forward_timing="continuous warmup+iters; event samples exclude guard and warmup; one final synchronize",
+        route_and_full_timing="host-wall scope with per-iteration synchronization; not continuous device timing",
         max_recv_rows=owner.max_recv_rows,
         symmetric_buffer_bytes=owner.symmetric_buffer_bytes,
         full_e2e_includes_route_preparation=True,
@@ -238,7 +274,14 @@ def run(args, config, group):
     if rank == 0:
         print(
             f"[URMA SCHEDULE] compute={manifest['compute_schedule']} communication_cv_rows={args.cv_rows} "
+            f"gmm1_ahead_mgroups={args.gmm1_ahead_mgroups} "
             f"local_pipeline={manifest['local_pipeline']} tail={manifest['tail_schedule']}",
+            flush=True,
+        )
+        print(
+            f"[URMA LAUNCH GUARD] HCCL barrier + exp shape={tuple(args.exp_shape)} repeat={args.exp_repeat}; "
+            f"buffers={manifest['launch_guard']['allocated_bytes_per_rank'] / 2**30:.2f} GiB/rank; "
+            "once per continuous cached/timer/trace block; guard excluded from timings",
             flush=True,
         )
     all_reports = []
@@ -274,17 +317,13 @@ def run(args, config, group):
 
         # NPU event interval contains the entire native forward, including local
         # expansion and final reduction. It is not a communication-only timer.
-        cached_events = []
-        group.barrier(f"URMA cached timing BS={bs}")
-        for _ in range(config["iters"]):
-            begin = torch.npu.Event(enable_timing=True)
-            end = torch.npu.Event(enable_timing=True)
-            begin.record()
-            owner.forward_prepared(x, topk_weights, *weights, prepared, out=output)
-            end.record()
-            cached_events.append((begin, end))
-        torch.npu.synchronize()
-        cached_times = [begin.elapsed_time(end) * 1000 for begin, end in cached_events]
+        startup_mgroups = int(prepared.native.gmm1_startup_mgroups)
+        cached_times = measure_cached_forward(
+            lambda: owner.forward_prepared(x, topk_weights, *weights, prepared, out=output),
+            warmup=config["warmup"],
+            iters=config["iters"],
+            guard=launch_guard,
+        )
         cached_records = group.all_gather(cached_times, f"URMA cached samples BS={bs}")
         cached_report = summarize_metric(
             cached_records,
@@ -292,8 +331,12 @@ def run(args, config, group):
             "NPU event interval: local expand through final weighted reduction; routes cached",
             ranks_per_node,
         )
+        cached_report["launch_guard"] = launch_guard.describe()
+        cached_report["warmup_iterations"] = config["warmup"]
+        cached_report["continuous_iterations"] = config["warmup"] + config["iters"]
+        cached_report["raw_per_rank_rounds_us"] = cached_records
         received_rows = prepared.received_rows
-        del prepared, cached_events
+        del prepared
 
         full_times = []
         for iteration in range(config["iters"]):
@@ -313,6 +356,8 @@ def run(args, config, group):
         reports = {
             "bs": bs,
             "received_rows_local": received_rows,
+            "gmm1_ahead_mgroups": args.gmm1_ahead_mgroups,
+            "gmm1_startup_mgroups_local": startup_mgroups,
             "route_preparation": route_report,
             "cached_forward": cached_report,
             "full_e2e": full_report,
@@ -337,9 +382,9 @@ def run(args, config, group):
 
             prepared = owner.prepare_routes(ids)
             timer = owner.allocate_timer()
-            group.barrier(f"URMA timer BS={bs}")
+            launch_guard.begin()
             owner.forward_prepared(x, topk_weights, *weights, prepared, timer=timer, out=output)
-            torch.npu.synchronize()
+            launch_guard.end()
             raw_timer = timer.cpu().numpy().astype("<i8", copy=False)
             raw_timer.tofile(case / "urma_timer.bin")
             timer_metadata = dict(
@@ -378,9 +423,9 @@ def run(args, config, group):
             except Exception as failure:
                 error = f"{type(failure).__name__}: {failure}"
             collective_check(group, f"URMA trace allocation BS={bs}", error)
-            group.barrier(f"URMA detailed trace BS={bs}")
+            launch_guard.begin()
             owner.forward_prepared(x, topk_weights, *weights, prepared, trace=trace, out=output)
-            torch.npu.synchronize()
+            launch_guard.end()
             raw_trace = trace.cpu().numpy()
             reports["trace_per_rank"] = export_trace_collective(
                 group,
@@ -409,6 +454,11 @@ def run(args, config, group):
         (case / "summary.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
         all_reports.append(reports)
         if rank == 0:
+            print(
+                f"[URMA LOOKAHEAD] BS={bs} requested_mgroups={args.gmm1_ahead_mgroups} "
+                f"rank0_startup_mgroups={startup_mgroups}",
+                flush=True,
+            )
             for report in (route_report, cached_report, full_report):
                 print(
                     f"[URMA {report['metric']}] BS={bs} cv_rows={args.cv_rows} "
@@ -423,6 +473,7 @@ def run(args, config, group):
         (args.output_dir / "summary.json").write_text(json.dumps(all_reports, indent=2), encoding="utf-8")
     group.barrier("URMA before teardown")
     owner.destroy()
+    launch_guard.close()
     group.close()
 
 

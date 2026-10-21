@@ -285,8 +285,10 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
     buffer = urma.UrmaBuffer(StoreGroup(None, 0, 16, prefix="test"), allow_multi_host=allow)
     assert buffer.allow_multi_host is allow
     assert created == [allow]
-    assert checks[0][1][-2] is allow
-    assert checks[0][1][-1] == "combine-ready-scan-reduce41"
+    assert checks[0][1][-3] is allow
+    assert checks[0][1][-2] == "combine-ready-scan-reduce41"
+    assert checks[0][1][-1] == "expert-m256-mgroup-lookahead-v1"
+    assert buffer.gmm1_ahead_mgroups == 12
 
 
 @pytest.mark.parametrize(
@@ -294,7 +296,9 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
 )
 def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, tail):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
-    extension = SimpleNamespace(urma_api_protocol=1, urma_tail_schedule=tail)
+    extension = SimpleNamespace(
+        urma_api_protocol=1, urma_tail_schedule=tail, urma_compute_schedule="expert-m256-mgroup-lookahead-v1"
+    )
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
     urma._extension.cache_clear()
     try:
@@ -303,6 +307,21 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
                 urma._extension()
         else:
             assert urma._extension() is extension
+    finally:
+        urma._extension.cache_clear()
+
+
+@pytest.mark.parametrize("schedule", [None, "expert-m256", "expert-m384-n128"])
+def test_native_mgroup_schedule_must_match_before_runtime_creation(monkeypatch, schedule):
+    monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
+    extension = SimpleNamespace(
+        urma_api_protocol=1, urma_tail_schedule="combine-ready-scan-reduce41", urma_compute_schedule=schedule
+    )
+    monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
+    urma._extension.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="M-group lookahead needs its matching native wheel"):
+            urma._extension()
     finally:
         urma._extension.cache_clear()
 

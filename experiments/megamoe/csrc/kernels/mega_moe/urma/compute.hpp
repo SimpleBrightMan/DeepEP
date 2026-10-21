@@ -319,18 +319,23 @@ __aicore__ inline ComputeBatchRange LoadComputeBatch(const Arguments& args, uint
     return ComputeBatchFragments(batch);
 }
 
+__aicore__ inline ComputeBatchTask LoadComputeTask(const Arguments& args, uint32_t index)
+{
+    const auto* gm = reinterpret_cast<__gm__ ComputeBatchTask*>(args.computeTasks) + index;
+    return {gm->stage, gm->batchIndex};
+}
+
 // Only an AIC and its paired AIV0 enter this routine. They use the identical
-// expert schedule and global tile ownership. SwiGLU remains independent:
-// the next expert's GMM1 can cover the preceding expert's activation latency.
+// host-planned expert schedule and global tile ownership. SwiGLU remains
+// independent; the GMM1 M-group window covers earlier activation latency.
 __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, Timer& timer)
 {
     // Only one stage owns the shared L1/L0/prologue buffers at a time. The
     // objects keep their views; each expert batch acquires/releases events.
     UrmaGmm1 gmm1;
     UrmaGmm2 gmm2;
-    const uint64_t taskCount = ComputeBatchTaskCount(args.config.localExperts);
-    for (uint64_t step = 0U; step < taskCount; ++step) {
-        const auto task = ComputeBatchTaskAt(step, args.config.localExperts);
+    for (uint32_t step = 0U; step < args.config.computeTaskCount; ++step) {
+        const auto task = LoadComputeTask(args, step);
         const auto range = LoadComputeBatch(args, task.batchIndex);
         if (range.begin == range.end) continue;
         const auto first = LoadFragment(args, range.begin);

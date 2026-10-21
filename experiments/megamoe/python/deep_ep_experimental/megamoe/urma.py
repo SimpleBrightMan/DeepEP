@@ -30,6 +30,10 @@ def _extension():
         raise RuntimeError("URMA Python/native versions differ; rebuild and reinstall the complete wheel")
     if getattr(extension, "urma_tail_schedule", None) != "combine-ready-scan-reduce41":
         raise RuntimeError("URMA tailCover needs its matching native wheel; rebuild and reinstall the complete wheel")
+    if getattr(extension, "urma_compute_schedule", None) != "expert-m256-mgroup-lookahead-v1":
+        raise RuntimeError(
+            "URMA M-group lookahead needs its matching native wheel; rebuild and reinstall the complete wheel"
+        )
     return extension
 
 
@@ -90,6 +94,7 @@ class UrmaBuffer:
         num_shared_experts=0,
         num_max_tokens_per_rank=8192,
         cv_rows=256,
+        gmm1_ahead_mgroups=12,
         max_recv_rows=None,
         timeout=120,
         allow_multi_host=False,
@@ -110,6 +115,7 @@ class UrmaBuffer:
                 raise ValueError("First URMA profile supports H3584/I1280/E384/topk8/S0 only")
             integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 2048, 8192)
             integer("cv_rows", cv_rows, 128, 4096)
+            integer("gmm1_ahead_mgroups", gmm1_ahead_mgroups, 0, 65536)
             if cv_rows % 128:
                 raise ValueError("cv_rows must be a multiple of 128")
             integer("max_recv_rows", max_recv_rows, 1, 16 * num_max_tokens_per_rank * num_topk)
@@ -127,10 +133,12 @@ class UrmaBuffer:
                 num_shared_experts,
                 num_max_tokens_per_rank,
                 cv_rows,
+                gmm1_ahead_mgroups,
                 max_recv_rows,
                 timeout,
                 allow_multi_host,
                 "combine-ready-scan-reduce41",
+                "expert-m256-mgroup-lookahead-v1",
             ),
         )
         self.group = group
@@ -138,6 +146,7 @@ class UrmaBuffer:
         self.num_experts, self.num_topk = num_experts, num_topk
         self.num_max_tokens_per_rank, self.max_recv_rows = num_max_tokens_per_rank, max_recv_rows
         self.cv_rows = cv_rows
+        self.gmm1_ahead_mgroups = gmm1_ahead_mgroups
         self.allow_multi_host = allow_multi_host
         self._device = torch.device(f"npu:{npu_api().current_device()}")
         self._lock = threading.RLock()
@@ -302,6 +311,7 @@ class UrmaBuffer:
                     _extension().ffts_config(),
                     address,
                     self._runtime.native.capacity,
+                    self.gmm1_ahead_mgroups,
                 )
                 self._bind_reduce_dependencies(plan, routing.reduce_index)
             except Exception as failure:

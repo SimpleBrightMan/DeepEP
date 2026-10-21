@@ -59,15 +59,25 @@ self直接写地址按现有`send_base/receive_base`映射；同一计算组可�
 
 通信CV仍是**单个来源rank发送的一段连续行**，用`(source_rank, cv_id)`唯一标识。计算批次改为一个本地专家的全部M256组，同专家内不混入其它专家。每个M组有独立的输入依赖列表，不需要等齐全16个来源。例如BS2048均衡时，专家0第一个M256由来源0～5分别贡献43、43、42、43、43、42行。
 
-计算前瞻按专家批次进行：
+计算前瞻按 **M256 group 数量**配置，默认 `--gmm1-ahead-mgroups 12`。每次执行下一个专家的 GMM2 前，先按专家顺序补充 GMM1，直到已排入 GMM1、尚未排入 GMM2 的 group 数达到下限；同时保留原有至少一个后续专家的前瞻。为复用上下文，同一专家仍整体计算，窗口在专家边界向上取整；专家尾组不足256行也计一个 group。它是每核遵循的任务顺序，不引入全核同步，也不表示这些 group 在同一时刻全部完成。
 
 ```text
-GMM1(expert0)
-for e = 0 .. localExperts-2:
-    GMM1(expert[e+1])
+pending_groups = 0
+next_gmm1 = 0
+for e = 0 .. localExperts-1:
+    while next_gmm1 < localExperts and (
+        next_gmm1 < min(e + 2, localExperts) or pending_groups < ahead_mgroups
+    ):
+        GMM1(expert[next_gmm1])
+        pending_groups += actual_group_count[next_gmm1]
+        next_gmm1 += 1
     GMM2(expert[e])
-GMM2(expert[last])
+    pending_groups -= actual_group_count[e]
 ```
+
+H3584/I1280/E384/TopK8、EP16均衡时，每个M256 group有5个GMM1逻辑tile（gate/up成对），让28个AIC每核至少领到2个tile需要 `ceil(28*2/5)=12` 个group；至少3个需要17个group，可设置18进行实验。默认12时，BS2048首轮从原6个group增加到12个（60tile，每核2～3个）；BS4096原本就是12个、BS8192原本是22个，两个规模的整条专家任务顺序与旧版相同。真实路由按实际group计数，不能用此均衡算例保证任意路由的并行度。
+
+`--gmm1-ahead-mgroups 0` 精确恢复原调度，便于对照。窗口持续补充，不仅影响启动预热；所有GMM1和GMM2仍各执行一次。Host在路由准备时生成任务数组，AIC和对应AIV0读取同一份顺序；中间结果使用既有独立GM行，不新增L1/L0/UB槽位，专家结束握手保留。更深窗口可能推迟Combine/Reduce或提前遇到尚未到达的Dispatch CV，应同时比较完整算子耗时。新的起跑对齐和连续采样方式见 [URMA_TIMING.md](URMA_TIMING.md)。
 
 MX scale在L1中的zZ布局按16行组织，任意来源边界可能落在2字节偏移，不能直接调用要求32字节LocalTensor起址的DMA。为此只增加`receiveRows*(H/32)`字节的scale GM工作区：准备时UB每行补齐到32字节，写回GM时压紧；不新增完整X重排。该缓冲在每次调用重新填充，组完成标志逐次清零。13个AIV1分别推进scale准备和activation两个游标，只有依赖就绪才执行任务，避免等待GMM1时阻止后续scale准备。trace中的`InputScaleGather`记录该额外搬运，`WaitInputScale`记录AIC等待。
 
@@ -93,7 +103,7 @@ GMM1直接Gather的X，以及AIC读取的已整理输入scale，均恢复默认L
 | 4096 | 144 | 720 | 2016 |
 | 8192 | 264 | 1320 | 3696 |
 
-该调度默认生效，无需新开关。benchmark打印`[URMA SCHEDULE] compute=expert-m256`并写入manifest；若显示`source-cv`，当前Python加载的还是旧native扩展，需要重新编译安装。流水图和正式耗时仍需实测验证；不能将tile数量减少倍数视为耗时加速倍数。
+benchmark打印`[URMA SCHEDULE] compute=expert-m256-mgroup-lookahead-v1`及M-group窗口并写入manifest；Python会拒绝不匹配的native扩展，需要重新编译安装完整wheel。流水图和正式耗时仍需实测验证；不能将tile数量减少倍数视为耗时加速倍数。
 
 ### 本地多槽流水 A/B 验证（2026-10-20）
 
@@ -114,7 +124,7 @@ Pack/Reduce来自单独aggregate timer调用：先计算每rank全部56 AIV的�
 ```python
 from deep_ep_experimental.megamoe.urma import UrmaBuffer
 
-buffer = UrmaBuffer(group, num_max_tokens_per_rank=8192, cv_rows=256)
+buffer = UrmaBuffer(group, num_max_tokens_per_rank=8192, cv_rows=256, gmm1_ahead_mgroups=12)
 # x = (FP8 E4M3 tensor, E8M0 scale tensor)
 # weights1/2 来自 transform_weights_for_mega_moe；不要拆掉GMM1准备对象。
 y = buffer.forward(x, topk_idx, topk_weights, weights1, weights2)

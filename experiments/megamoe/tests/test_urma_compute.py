@@ -36,7 +36,34 @@ def scheduler_binary(tmp_path_factory):
 #include <vector>
 using namespace MegaMoeUrma;
 struct Task { uint32_t kind, fragment; uint64_t tile; };
+void CheckUniformWindow(uint32_t groupsPerExpert, uint32_t target, uint32_t initialExperts) {
+    std::vector<ComputeBatch> batches;
+    for (uint32_t e = 0; e < 24; ++e) batches.push_back({e * groupsPerExpert, groupsPerExpert});
+    const auto tasks = BuildComputeTasks(batches, target);
+    assert(tasks.size() == 48);
+    uint32_t cursor = 0;
+    auto expect = [&](ComputeBatchStage stage, uint32_t expert) {
+        assert(tasks[cursor].stage == stage && tasks[cursor].batchIndex == expert);
+        ++cursor;
+    };
+    for (uint32_t e = 0; e < initialExperts; ++e) expect(ComputeBatchStage::Gmm1, e);
+    for (uint32_t e = 0; e < 24; ++e) {
+        expect(ComputeBatchStage::Gmm2, e);
+        if (e + initialExperts < 24) expect(ComputeBatchStage::Gmm1, e + initialExperts);
+    }
+    assert(cursor == tasks.size());
+}
 int main() {
+    // Balanced BS2048/4096/8192: preserve the enlarged window throughout
+    // computation, including the final drain, rather than just front-loading.
+    CheckUniformWindow(3, 12, 4);
+    CheckUniformWindow(6, 12, 2);
+    CheckUniformWindow(11, 12, 2);
+    CheckUniformWindow(3, 0, 2);
+    CheckUniformWindow(3, 18, 6);
+    CheckUniformWindow(3, 65536, 24);
+    CheckUniformWindow(0, 12, 24);
+    assert(BuildComputeTasks({}, 12).empty());
     static_assert(kComputeTileM == 256 && kActivationTileM == 128);
     static_assert(kRequiredUbBytes == 196608);
     static_assert(ActivationUbContract::inputEnd == 131072);
@@ -50,7 +77,7 @@ int main() {
     assert(ActivationSlice(512, 0, 0).rows == 0);
     assert(ActivationSlice(512, 128, 128).rows == 0);
     Config config{};
-    assert(std::cin >> config.bs >> config.rank >> config.cvRows);
+    assert(std::cin >> config.bs >> config.rank >> config.cvRows >> config.gmm1AheadMGroups);
     config.hidden = 3584;
     config.intermediate = 1280;
     config.localExperts = 24;
@@ -173,18 +200,25 @@ int main() {
     // Exercise the real expert-batch schedule. Empty experts remain explicit
     // batches; communication CV count/identity never controls compute order.
     using Stage = ComputeBatchStage;
-    std::vector<ComputeBatchTask> expected;
+    std::vector<ComputeBatchTask> legacy;
     if (!batches.empty()) {
-        expected.push_back({Stage::Gmm1, 0});
+        legacy.push_back({Stage::Gmm1, 0});
         for (uint32_t i = 1; i < batches.size(); ++i) {
-            expected.push_back({Stage::Gmm1, i});
-            expected.push_back({Stage::Gmm2, i - 1});
+            legacy.push_back({Stage::Gmm1, i});
+            legacy.push_back({Stage::Gmm2, i - 1});
         }
-        expected.push_back({Stage::Gmm2, batchCount - 1});
+        legacy.push_back({Stage::Gmm2, batchCount - 1});
     }
-    assert(ComputeBatchTaskCount(batchCount) == expected.size());
+    const auto oldTasks = BuildComputeTasks(batches, 0);
+    assert(oldTasks.size() == legacy.size());
+    for (uint32_t step = 0; step < legacy.size(); ++step) {
+        const auto old = ComputeBatchTaskAt(step, batchCount);
+        assert(old.stage == legacy[step].stage && old.batchIndex == legacy[step].batchIndex);
+        assert(oldTasks[step].stage == old.stage && oldTasks[step].batchIndex == old.batchIndex);
+    }
+    assert(ComputeBatchTaskCount(batchCount) == legacy.size());
     assert(ComputeBatchTaskAt(0, 0).stage == Stage::None);
-    assert(ComputeBatchTaskAt(expected.size(), batchCount).stage == Stage::None);
+    assert(ComputeBatchTaskAt(legacy.size(), batchCount).stage == Stage::None);
     for (uint32_t n : {0U, 1U, 2U, 3U, 7U, 24U}) {
         assert(ComputeBatchTaskCount(n) == 2ULL * n);
         assert(ComputeBatchTaskAt(2ULL * n, n).stage == Stage::None);
@@ -193,11 +227,22 @@ int main() {
         assert(first.stage == Stage::Gmm1 && first.batchIndex == 0);
         assert(last.stage == Stage::Gmm2 && last.batchIndex == n - 1);
     }
+    assert(plan.computeTasks.size() == legacy.size());
+    assert(plan.config.computeTaskCount == plan.computeTasks.size());
+    uint32_t nextG1 = 0, nextG2 = 0;
     std::vector<uint32_t> g1Visits(prefix1), g2Visits(prefix2), g1BatchVisits(batchCount), g2BatchVisits(batchCount);
-    for (uint32_t step = 0; step < expected.size(); ++step) {
-        const auto task = ComputeBatchTaskAt(step, batchCount);
-        assert(task.stage == expected[step].stage && task.batchIndex == expected[step].batchIndex);
+    for (const auto task : plan.computeTasks) {
         assert(task.batchIndex < batches.size());
+        if (task.stage == Stage::Gmm1) {
+            assert(task.batchIndex == nextG1++);
+        } else {
+            assert(task.stage == Stage::Gmm2 && task.batchIndex == nextG2);
+            assert(nextG1 >= std::min(batchCount, nextG2 + 2U));
+            uint64_t queued = 0;
+            for (uint32_t b = nextG2; b < nextG1; ++b) queued += batches[b].fragmentCount;
+            assert(nextG1 == batchCount || queued >= config.gmm1AheadMGroups);
+            ++nextG2;
+        }
         auto& batchVisits = task.stage == Stage::Gmm1 ? g1BatchVisits : g2BatchVisits;
         assert(++batchVisits[task.batchIndex] == 1);
         if (task.stage == Stage::Gmm2) assert(g1BatchVisits[task.batchIndex] == 1);
@@ -220,6 +265,7 @@ int main() {
                 }
         }
     }
+    assert(nextG1 == batchCount && nextG2 == batchCount);
     for (auto* visits : {&g1Visits, &g2Visits, &g1BatchVisits, &g2BatchVisits})
         assert(std::all_of(visits->begin(), visits->end(), [](auto n) { return n == 1; }));
     // Prefix arithmetic must remain correct beyond a 32-bit global tile ID.
@@ -355,12 +401,12 @@ int main() {
     return binary
 
 
-def run_scheduler(scheduler_binary, counts, bs, rank=7, cv_rows=256):
+def run_scheduler(scheduler_binary, counts, bs, rank=7, cv_rows=256, ahead_mgroups=12):
     """Build the production host plan, then execute its real device schedule."""
     counts = np.asarray(counts, dtype=np.int64)
     assert counts.shape == (16, 384)
     assert np.all(counts.sum(axis=1) == bs * 8)
-    lines = [f"{bs} {rank} {cv_rows}", " ".join(map(str, counts.reshape(-1)))]
+    lines = [f"{bs} {rank} {cv_rows} {ahead_mgroups}", " ".join(map(str, counts.reshape(-1)))]
     result = subprocess.run(
         [str(scheduler_binary)],
         input="\n".join(lines),
@@ -405,13 +451,14 @@ def test_activation_subtile_bounds_and_one_completion_per_original_tile(schedule
 
 
 @pytest.mark.parametrize("active_experts", [0, 1, 2, 3, 7, 16, 24])
-def test_expert_warmup_alternating_lookahead_empty_batches_and_tail(scheduler_binary, active_experts):
+@pytest.mark.parametrize("ahead_mgroups", [0, 12, 18, 65536])
+def test_expert_warmup_alternating_lookahead_empty_batches_and_tail(scheduler_binary, active_experts, ahead_mgroups):
     counts = empty_destination_counts(128)
     for expert in range(active_experts):
         source = expert % 16
         counts[source, 7 * 24 + expert] = expert + 1
         counts[source, 0] -= expert + 1
-    run_scheduler(scheduler_binary, counts, 128)
+    run_scheduler(scheduler_binary, counts, 128, ahead_mgroups=ahead_mgroups)
 
 
 @pytest.mark.parametrize("cv_rows", [128, 256, 1024, 4096])

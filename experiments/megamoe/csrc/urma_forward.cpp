@@ -76,12 +76,14 @@ int64_t urma_buffer_size(int64_t world, int64_t max_tokens, int64_t topk, int64_
 
 UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t intermediate, int64_t topk, int64_t cv_rows,
                    int64_t max_recv_rows, int64_t max_tokens, int64_t rank, uint64_t ffts, uint64_t symmetric_address,
-                   int64_t symmetric_bytes)
+                   int64_t symmetric_bytes, int64_t gmm1_ahead_mgroups)
 {
     TORCH_CHECK(example.device().type() == c10::DeviceType::PrivateUse1 && example.dim() == 2 &&
                     example.is_contiguous() && example.size(0) > 0 && example.size(0) <= max_tokens,
                 "URMA example must be contiguous NPU [BS,H], with 0<BS<=max_tokens");
     TORCH_CHECK(intermediate == 1280 && rank >= 0 && rank < 16, "URMA v1 requires I1280 and rank in [0,16)");
+    TORCH_CHECK(gmm1_ahead_mgroups >= 0 && gmm1_ahead_mgroups <= 65536,
+                "gmm1_ahead_mgroups must be in [0,65536]; 0 retains the original expert schedule");
     TORCH_CHECK(counts_cpu.device().is_cpu() && counts_cpu.scalar_type() == torch::kInt64 &&
                     counts_cpu.is_contiguous() && counts_cpu.sizes() == torch::IntArrayRef({16, 384}),
                 "URMA counts must be contiguous CPU int64 [16,384]");
@@ -91,6 +93,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     config.intermediate = intermediate;
     config.localExperts = 24;
     config.rank = rank;
+    config.gmm1AheadMGroups = static_cast<uint32_t>(gmm1_ahead_mgroups);
     TORCH_CHECK(symmetric_address != 0 && symmetric_bytes >= static_cast<int64_t>(config.symmetricBytes),
                 "URMA symmetric workspace is too small: required ", config.symmetricBytes);
     args_.symmetric = symmetric_address;
@@ -141,6 +144,11 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     fragments_ = Upload(plan.fragments, options);
     segments_ = Upload(plan.segments, options);
     compute_batches_ = Upload(plan.computeBatches, options);
+    compute_tasks_ = Upload(plan.computeTasks, options);
+    for (const auto& task : plan.computeTasks) {
+        if (task.stage == MegaMoeUrma::ComputeBatchStage::Gmm2) break;
+        gmm1_startup_mgroups_ += plan.computeBatches[task.batchIndex].fragmentCount;
+    }
     chunk_group_indices_ = Upload(plan.chunkGroupIndices, options);
     auto dependency_cpu = torch::empty({static_cast<int64_t>(expanded_rows)},
                                        torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64));
@@ -165,6 +173,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     args_.fragments = Address(fragments_);
     args_.segments = Address(segments_);
     args_.computeBatches = Address(compute_batches_);
+    args_.computeTasks = Address(compute_tasks_);
     args_.chunkGroupIndices = Address(chunk_group_indices_);
     args_.sendChunks = Address(send_chunks_);
     args_.recvChunks = Address(recv_chunks_);
@@ -321,6 +330,7 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
                                &fragments_,
                                &segments_,
                                &compute_batches_,
+                               &compute_tasks_,
                                &chunk_group_indices_,
                                &expanded_reduce_dependencies_,
                                &reduce_dependencies_,
@@ -353,6 +363,7 @@ int64_t UrmaPlan::workspace_bytes() const
                                &fragments_,
                                &segments_,
                                &compute_batches_,
+                               &compute_tasks_,
                                &chunk_group_indices_,
                                &expanded_reduce_dependencies_,
                                &reduce_dependencies_,

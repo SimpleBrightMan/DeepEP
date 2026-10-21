@@ -53,6 +53,7 @@ int main(int argc, char**) {
         bad = c; bad.maxPeerChunks = 0; reject(bad, 128);
         bad = c; bad.maxPeerChunks = 513; reject(bad, 128);
         bad = c; bad.localExperts = 23; reject(bad, 128);
+        bad = c; bad.gmm1AheadMGroups = 65537; reject(bad, 128);
         counts[0] = -1; reject(c, 128);
         counts[0] = 9; reject(c, 128);
         counts[0] = 7; reject(c, 128);
@@ -75,6 +76,9 @@ int main(int argc, char**) {
                   << c.recvChunkCount << '\n';
         for (const auto& b : p.computeBatches)
             std::cout << "B " << b.fragmentBegin << ' ' << b.fragmentCount << '\n';
+        assert(c.computeTaskCount == p.computeTasks.size());
+        for (const auto& task : p.computeTasks)
+            std::cout << "A " << static_cast<uint32_t>(task.stage) << ' ' << task.batchIndex << '\n';
         for (const auto& f : p.fragments)
             std::cout << "F " << f.expert << ' ' << f.segmentBegin << ' ' << f.rowBegin << ' '
                       << f.rows << ' ' << f.segmentCount << ' ' << f.gmm1TileBegin << ' '
@@ -170,6 +174,18 @@ def check_plans(ids, cv_rows, routes, plans):
         assert groups == len(plan["F"]) and sends == len(plan["T"]) and receives == len(plan["R"])
         assert g1 == groups * 5 and g2 == groups * 14
         assert len(plan["B"]) == 24
+        assert len(plan["A"]) == 48
+        assert [expert for stage, expert in plan["A"] if stage == 1] == list(range(24))
+        assert [expert for stage, expert in plan["A"] if stage == 2] == list(range(24))
+        submitted = consumed = 0
+        for stage, expert in plan["A"]:
+            if stage == 1:
+                submitted += 1
+            else:
+                assert expert == consumed and submitted >= min(24, consumed + 2)
+                queued = sum(count for _, count in plan["B"][consumed:submitted])
+                assert submitted == 24 or queued >= 12
+                consumed += 1
         covered = np.zeros(rows, dtype=np.int8)
         compact = np.zeros(rows, dtype=np.int8)
         used_segments = np.zeros(len(plan["S"]), dtype=np.int8)

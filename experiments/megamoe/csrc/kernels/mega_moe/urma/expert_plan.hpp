@@ -19,6 +19,7 @@ struct ExpertPlan {
     std::vector<Fragment> fragments;
     std::vector<RowSegment> segments;
     std::vector<ComputeBatch> computeBatches;
+    std::vector<ComputeBatchTask> computeTasks;
     std::vector<Chunk> sendChunks;
     std::vector<Chunk> recvChunks;
     std::vector<uint32_t> chunkGroupIndices;
@@ -27,12 +28,36 @@ struct ExpertPlan {
     std::vector<uint64_t> reduceDependencies;
 };
 
+// Replenish the outstanding GMM1 group window before EACH GMM2 expert, not
+// just at startup. Count actual M-groups, including a short final group, and
+// retain at least the legacy one-expert lookahead. Zero exactly reproduces
+// the previous G1(0), G1(1), G2(0), ... order, including empty expert batches.
+// The window is a schedule distance; paired engines advance independently.
+inline std::vector<ComputeBatchTask> BuildComputeTasks(const std::vector<ComputeBatch>& batches, uint32_t aheadMGroups)
+{
+    std::vector<ComputeBatchTask> tasks;
+    tasks.reserve(batches.size() * 2U);
+    uint32_t nextGmm1 = 0U;
+    uint64_t pendingGroups = 0U;
+    for (uint32_t gmm2 = 0U; gmm2 < batches.size(); ++gmm2) {
+        const uint64_t minimumGmm1 = std::min<uint64_t>(batches.size(), static_cast<uint64_t>(gmm2) + 2U);
+        while (nextGmm1 < batches.size() && (nextGmm1 < minimumGmm1 || pendingGroups < aheadMGroups)) {
+            tasks.push_back({ComputeBatchStage::Gmm1, nextGmm1});
+            pendingGroups += batches[nextGmm1].fragmentCount;
+            ++nextGmm1;
+        }
+        tasks.push_back({ComputeBatchStage::Gmm2, gmm2});
+        pendingGroups -= batches[gmm2].fragmentCount;
+    }
+    return tasks;
+}
+
 inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, uint64_t maxReceiveRows)
 {
     if (counts == nullptr || input.rank >= kWorld || input.localExperts != 24 || input.bs == 0 || input.bs > 8192 ||
         input.topk != 8 || input.hidden != 3584 || input.intermediate != 1280 || input.cvRows < 128 ||
         input.cvRows > 4096 || input.cvRows % 128 != 0 || input.maxPeerChunks == 0 || input.maxPeerChunks > 512 ||
-        maxReceiveRows == 0) {
+        input.gmm1AheadMGroups > 65536U || maxReceiveRows == 0) {
         throw std::invalid_argument("Invalid URMA expert-plan dimensions");
     }
     ExpertPlan plan;
@@ -188,6 +213,8 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
         throw std::logic_error("URMA Reduce dependencies do not cover all expanded rows");
     }
     config.fragmentCount = static_cast<uint32_t>(plan.fragments.size());
+    plan.computeTasks = BuildComputeTasks(plan.computeBatches, config.gmm1AheadMGroups);
+    config.computeTaskCount = static_cast<uint32_t>(plan.computeTasks.size());
     config.sendChunkCount = static_cast<uint32_t>(plan.sendChunks.size());
     config.recvChunkCount = static_cast<uint32_t>(plan.recvChunks.size());
     return plan;

@@ -46,13 +46,6 @@ struct ActivationRowSlice {
     uint32_t rows;
 };
 
-enum class ComputeBatchStage : uint32_t { None = 0U, Gmm1 = 1U, Gmm2 = 2U };
-
-struct ComputeBatchTask {
-    ComputeBatchStage stage;
-    uint32_t batchIndex;
-};
-
 struct ComputeBatchRange {
     uint32_t begin;
     uint32_t end;
@@ -125,9 +118,9 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ComputeBatchTaskCount(uint32_t ba
     return static_cast<uint64_t>(batchCount) * 2U;
 }
 
-// A batch contains all M256 groups of one expert, including an empty batch for
-// an empty expert. Warmup G1(0), then G1(i) -> G2(i-1), then drain G2(last).
-// Every AIC/AIV0 follows this order independently; there is no expert barrier.
+// Legacy schedule, retained as the host-testable zero-lookahead reference.
+// The device consumes the explicit host-planned task array instead. A batch
+// contains all M256 groups of one expert, including empty experts.
 MEGAMOE_URMA_COMPUTE_INLINE constexpr ComputeBatchTask ComputeBatchTaskAt(uint64_t step, uint32_t batchCount)
 {
     const uint64_t taskCount = ComputeBatchTaskCount(batchCount);
@@ -169,8 +162,8 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t FirstOwnedComputeTile(uint64_t ti
 // same N tile count, including its short final M group. Return groupCount when
 // this worker has no tile; no hardware context may be opened in that case.
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t LastOwnedComputeGroup(uint64_t tileBegin, uint32_t groupCount,
-                                                                    uint32_t tilesPerGroup, uint32_t worker,
-                                                                    uint32_t workerCount)
+                                                                     uint32_t tilesPerGroup, uint32_t worker,
+                                                                     uint32_t workerCount)
 {
     if (groupCount == 0U || tilesPerGroup == 0U) return groupCount;
     const uint64_t tileCount = static_cast<uint64_t>(groupCount) * tilesPerGroup;
