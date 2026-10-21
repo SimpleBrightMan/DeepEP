@@ -251,13 +251,16 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 |---|---|
 | `DispatchPutX/DispatchPutScale/CombinePut [PUT submit]` | PUT指令提交区间，不代表远端数据已经完成写入 |
 | `DispatchQuiet/CombineQuiet [completion wait]` | 等待之前peer PUT完成的区间 |
-| `Gmm1Tile/Gmm2Tile [Cube submit]` | Cube任务提交区间，不伪造异步Cube执行完成时刻 |
-| `Gmm1TileDrain/Gmm1Drain/Gmm2Drain [drain]` | 显式等待计算流水排空的区间 |
+| `Gmm1Tile/Gmm2Tile [compute + drain]` | 默认将能够明确对应的AIC提交与排空记录合为一条，包含等待及上下文收尾，不是纯Cube计算时间 |
+| `Gmm1Tile/Gmm2Tile [Cube submit]` | 无法明确配对或选择原始显示时，保留任务提交区间 |
+| `Gmm1TileDrain/Gmm1Drain/Gmm2Drain [drain]` | 未合并的显式排空记录；AIV上的记录仍单独显示 |
 | `Wait*`、`LocalSync`、`RankBarrier`等灰色条 | 数据依赖、核间或rank间同步等待 |
 | `Gmm*Dequant`、`ActivationSlice`、`Pack`等 | 对应设备代码实际打点范围 |
 | `Reduce` | 每reducer一条完整跨度，含metadata预取、ready等待、计算和最终输出排空，不是纯计算时间 |
 
 每个rank以自己的最早事件归零，**不同rank的零点没有全局对齐**，不能将两个文件的横坐标相减计算跨卡延迟。转换先用整数tick相减再转浮点，保留大时间戳的低位；原始tick在JSON参数中用字符串保存。默认1000 ticks/us仍只是显式约定，可修改`--timer-clock-mhz`，离线解析时应使用同一值。
+
+GMM条合并只影响JSON显示，不改变kernel、同步或打点开销。GMM1的逐tile drain与同一tile合并；组级GMM1/GMM2 drain仅在该AIC于该组只有一个tile时并入，多个tile共享的组级drain保持独立，避免伪造每个tile的完成时间。当前M256、H3584/I1280配置满足单核每组至多一个tile。合并要求原始记录连续且同一引擎/专家/计算组，不能跨越隐藏的等待。原始bin和计数保留；JSON的33/34为合成事件ID，`source_records`保留源事件编号、序号及时间戳，`coalesced_record_count`记录减少的显示条数。
 
 可以在CPU环境离线重新导出单rank，无需启动NPU：
 
@@ -274,7 +277,7 @@ python3 experiments/megamoe/scripts/urma_merge_traces.py \
   /实际路径/已有运行目录 --bs-values 2048,4096,8192
 ```
 
-该脚本只需Python标准库，输出同样是`已有运行目录/bs_<BS>/allrank.json`，默认隐藏上述等待条；省略`--bs-values`会发现`rank_0/bs_*`下的全部case。历史双机结果需先收集全部16个`rank_*`目录；新版本在线运行则自动完成汇集。离线`--include-waits`只能保留输入JSON已有的等待，恢复已过滤事件需使用原始bin；原始bin本来没有记录的逐token Reduce等待无法恢复。
+该脚本只需Python标准库，输出同样是`已有运行目录/bs_<BS>/allrank.json`，默认隐藏上述等待条并合并能对应的GMM条；省略`--bs-values`会发现`rank_0/bs_*`下的全部case。历史双机结果需先收集全部16个`rank_*`目录；新版本在线运行则自动完成汇集。离线`--include-waits`只能保留输入JSON已有的等待，恢复已过滤事件需使用原始bin；原始bin本来没有记录的逐token Reduce等待无法恢复。两种离线导出命令均支持`--split-gmm-events`关闭进一步合并；已合并的JSON要恢复原始分条，应从bin重新导出。
 
 逐事件schema为每引擎16个uint64 header，后接`capacity*16`个uint64 record。header前五项为`schema,capacity,count,dropped,engine_id`；record前13项为`start_ticks,end_ticks,event_id,peer,cv,fragment,expert,row,rows,tileM,tileN,columns,bytes`，其余保留位为0。未知元数据为`UINT64_MAX`。解析器检查全部引擎的schema、容量、编号、计数、保留位和事件时间；同引擎事件应按平铺顺序不重叠。
 

@@ -1,7 +1,7 @@
 """Validate URMA detailed trace schema 1 and export a rank-local Chrome trace.
 
-The recorded scopes show submission, waiting and drain separately. A PUT or
-Cube submission interval is never relabelled as asynchronous completion time.
+Raw records separate submission, waiting and drain. The default display joins
+unambiguously paired Cube submission/drain records, retaining their provenance.
 """
 
 import argparse
@@ -257,9 +257,98 @@ def filter_trace_waits(trace):
     return dict(trace, traceEvents=kept, metadata=metadata)
 
 
-def export_trace(raw, output, *, rank, clock_mhz, include_waits=False):
+def coalesce_gmm_tiles(trace):
+    """Join adjacent AIC tile/drain records without changing device synchronization.
+
+    Group drains belong to a tile only when this engine submitted exactly one
+    tile in that group. Record ordinals prevent joining across hidden waits.
+    IDs 33/34 are JSON-only composite events, never raw device event IDs.
+    """
+    lanes = {}
+    for index, event in enumerate(trace["traceEvents"]):
+        if event.get("ph") == "X" and event["tid"] % 3 == 0:
+            lanes.setdefault((event["pid"], event["tid"]), []).append((index, event))
+
+    def context(event):
+        return tuple(event["args"].get(key) for key in ("peer", "cv", "fragment", "expert"))
+
+    replacements, removed = {}, set()
+    for lane in lanes.values():
+        counts = Counter(
+            (event["args"]["event_id"], context(event)) for _, event in lane if event["args"]["event_id"] in (15, 19)
+        )
+        for position, (index, tile) in enumerate(lane):
+            event_id = tile["args"]["event_id"]
+            if event_id not in (15, 19) or tile["args"].get("fragment") is None:
+                continue
+            parts = [tile]
+            candidates = (16, 27) if event_id == 15 else (21,)
+            for expected in candidates:
+                following = position + len(parts)
+                if following >= len(lane):
+                    break
+                drain_index, drain = lane[following]
+                args = drain["args"]
+                if (
+                    args["event_id"] != expected
+                    or context(drain) != context(tile)
+                    or args["record_index"] != parts[-1]["args"]["record_index"] + 1
+                    or int(args["start_tick"]) < int(parts[-1]["args"]["end_tick"])
+                ):
+                    break
+                if expected == 16:
+                    if any(args.get(key) != tile["args"].get(key) for key in METADATA_FIELDS):
+                        break
+                elif counts[(event_id, context(tile))] != 1:
+                    break
+                parts.append(drain)
+                removed.add(drain_index)
+            if len(parts) == 1:
+                continue
+            start, end = int(tile["args"]["start_tick"]), int(parts[-1]["args"]["end_tick"])
+            args = dict(
+                tile["args"],
+                event_id=33 if event_id == 15 else 34,
+                end_tick=str(end),
+                elapsed_ticks=end - start,
+                bytes=sum(part["args"].get("bytes", 0) for part in parts),
+                meaning="submission through recorded drain end; includes waits/teardown, not pure Cube execution",
+                source_records=[
+                    {key: part["args"][key] for key in ("event_id", "record_index", "start_tick", "end_tick")}
+                    for part in parts
+                ],
+            )
+            replacements[index] = dict(
+                tile,
+                name=("Gmm1Tile" if event_id == 15 else "Gmm2Tile") + " [compute + drain]",
+                cat="cube.compute_drain",
+                dur=(end - start) / trace["metadata"]["clock_mhz"],
+                args=args,
+            )
+    if not removed:
+        return trace
+    events = [
+        replacements.get(index, event) for index, event in enumerate(trace["traceEvents"]) if index not in removed
+    ]
+    counts = [0] * ENGINE_COUNT
+    for event in events:
+        if event.get("ph") == "X":
+            counts[event["tid"]] += 1
+    metadata = dict(
+        trace["metadata"],
+        coalesced_record_count=trace["metadata"].get("coalesced_record_count", 0) + len(removed),
+        visible_record_count=sum(counts),
+        visible_records_per_engine=counts,
+        gmm_display="paired AIC tile/drain envelopes; raw counts retained; IDs 33/34 are JSON-only composites",
+    )
+    return dict(trace, traceEvents=events, metadata=metadata)
+
+
+def export_trace(raw, output, *, rank, clock_mhz, include_waits=False, combine_gmm=True):
     """Validate every record before writing the Chrome JSON file."""
     trace = decode_trace(raw, rank=rank, clock_mhz=clock_mhz)
+    if combine_gmm:
+        trace = coalesce_gmm_tiles(trace)
     if not include_waits:
         trace = filter_trace_waits(trace)
     output = Path(output)
@@ -274,6 +363,7 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rank", type=int, required=True)
     parser.add_argument("--include-waits", action="store_true", help="Restore dependency waits from the raw binary")
+    parser.add_argument("--split-gmm-events", action="store_true", help="Keep raw Cube submit/drain bars separate")
     parser.add_argument(
         "--clock-mhz", type=float, required=True, help="Counter ticks/us; use the benchmark's clock setting"
     )
@@ -285,6 +375,7 @@ def main(argv=None):
             rank=args.rank,
             clock_mhz=args.clock_mhz,
             include_waits=args.include_waits,
+            combine_gmm=not args.split_gmm_events,
         )
     except (OSError, ValueError) as error:
         parser.exit(2, f"URMA trace export failed: {error}\n")

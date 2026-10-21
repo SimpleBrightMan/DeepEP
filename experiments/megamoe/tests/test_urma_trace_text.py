@@ -25,6 +25,18 @@ def trace_text():
     return module
 
 
+def test_coalesced_scopes_are_not_reported_as_missing_records(trace_text):
+    from deep_ep_experimental.megamoe.urma_trace import coalesce_gmm_tiles, decode_trace, filter_trace_waits
+    from test_urma_trace_coalesce import make_trace
+
+    raw = make_trace(["Gmm1Tile", "Gmm1TileDrain", "Gmm1Drain", "WaitActivation", "Gmm2Tile", "Gmm2Drain"])
+    trace = filter_trace_waits(coalesce_gmm_tiles(decode_trace(raw, rank=0, clock_mhz=1000)))
+    report = trace_text.render_report(trace, detail=True)
+    assert "source_status=COALESCED_GMM" in report
+    assert "33 Gmm1Tile cube.compute_drain" in report
+    assert "34 Gmm2Tile cube.compute_drain" in report
+
+
 EVENTS = {
     "Pack": (0, "compute.copy"),
     "DispatchPutX": (1, "transport.submit"),

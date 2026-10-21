@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 
-from .urma_trace import ENGINE_COUNT, TRACE_SCHEMA, filter_trace_waits
+from .urma_trace import ENGINE_COUNT, TRACE_SCHEMA, coalesce_gmm_tiles, filter_trace_waits
 
 
 def _validate_trace(trace, rank, expected_metadata=None):
@@ -49,18 +49,21 @@ def _validate_trace(trace, rank, expected_metadata=None):
             raise ValueError(f"rank={rank}: unexpected event type")
     visible = metadata.get("visible_record_count", metadata.get("record_count"))
     hidden = metadata.get("hidden_wait_count", 0)
+    coalesced = metadata.get("coalesced_record_count", 0)
     if (
         type(visible) is not int
         or type(hidden) is not int
         or hidden < 0
+        or type(coalesced) is not int
+        or coalesced < 0
         or count != visible
-        or count + hidden != metadata.get("record_count")
+        or count + hidden + coalesced != metadata.get("record_count")
     ):
         raise ValueError(f"rank={rank}: record count mismatch; refusing a partial trace")
     return metadata
 
 
-def merge_trace_files(paths, output, *, world=16, include_waits=False, expected_metadata=None):
+def merge_trace_files(paths, output, *, world=16, include_waits=False, expected_metadata=None, combine_gmm=True):
     """Read at most one rank's JSON at a time; atomically publish a complete merge."""
     if type(world) is not int or not 1 <= world <= 16 or len(paths) != world:
         raise ValueError("one trace per rank is required, with world in [1,16]")
@@ -80,6 +83,8 @@ def merge_trace_files(paths, output, *, world=16, include_waits=False, expected_
                 if clock is not None and clock != original["clock_mhz"]:
                     raise ValueError("rank traces use different clock_mhz settings")
                 clock = original["clock_mhz"]
+                if combine_gmm:
+                    trace = coalesce_gmm_tiles(trace)
                 if not include_waits:
                     trace = filter_trace_waits(trace)
                 for event in trace["traceEvents"]:
@@ -103,6 +108,7 @@ def merge_trace_files(paths, output, *, world=16, include_waits=False, expected_
                 record_count=sum(item["record_count"] for item in per_rank),
                 visible_record_count=sum(item.get("visible_record_count", item["record_count"]) for item in per_rank),
                 hidden_wait_count=sum(item.get("hidden_wait_count", 0) for item in per_rank),
+                coalesced_record_count=sum(item.get("coalesced_record_count", 0) for item in per_rank),
                 clock_mhz=clock,
                 clock_alignment="each rank starts at its own earliest event; cross-rank clocks are not synchronized",
                 scope="one BS diagnostic invocation; no timestamp shifts or gap compression",
@@ -169,6 +175,7 @@ def main(argv=None):
     parser.add_argument("--bs-values", help="Comma-separated BS values; default discovers rank_0/bs_*")
     parser.add_argument("--world-size", type=int, default=16)
     parser.add_argument("--include-waits", action="store_true", help="Keep waits that are present in the input JSON")
+    parser.add_argument("--split-gmm-events", action="store_true", help="Do not join separate GMM bars in input JSON")
     args = parser.parse_args(argv)
     try:
         batches = (
@@ -183,7 +190,13 @@ def main(argv=None):
                 args.directory / f"rank_{rank}" / f"bs_{bs}" / "urma_trace.json" for rank in range(args.world_size)
             ]
             output = args.directory / f"bs_{bs}" / "allrank.json"
-            metadata = merge_trace_files(paths, output, world=args.world_size, include_waits=args.include_waits)
+            metadata = merge_trace_files(
+                paths,
+                output,
+                world=args.world_size,
+                include_waits=args.include_waits,
+                combine_gmm=not args.split_gmm_events,
+            )
             print(
                 f"[URMA ALLRANK] BS={bs} ranks={metadata['rank_count']} events={metadata['visible_record_count']}; {output}"
             )

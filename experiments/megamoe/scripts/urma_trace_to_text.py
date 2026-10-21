@@ -130,13 +130,13 @@ def read_events(document):
     if declared is None or declared_per_engine is None:
         completeness = "UNVERIFIED"
     elif (
-        metadata.get("hidden_wait_count", 0) > 0
+        metadata.get("hidden_wait_count", 0) + metadata.get("coalesced_record_count", 0) > 0
         and metadata.get("visible_record_count") == len(events)
         and metadata.get("visible_records_per_engine") == observed
-        and declared == len(events) + metadata["hidden_wait_count"]
+        and declared == len(events) + metadata.get("hidden_wait_count", 0) + metadata.get("coalesced_record_count", 0)
         and not metadata.get("dropped", 0)
     ):
-        completeness = "FILTERED_WAITS"
+        completeness = "COALESCED_GMM" if metadata.get("coalesced_record_count", 0) else "FILTERED_WAITS"
     elif declared != len(events) or declared_per_engine != observed or metadata.get("dropped", 0):
         completeness = "INCOMPLETE"
     else:
@@ -171,7 +171,8 @@ def render_report(document, *, source="trace.json", cores=None, engines=None, de
         "NOTE sum overlaps across engines; union/span/gap describe recorded scopes, not hardware utilization.",
         "NOTE quiet/drain/wait can overlap in-flight work; submit bytes/duration is NOT link bandwidth.",
         "NOTE summaries include waits PRESENT in source; FILTERED_WAITS means intentionally hidden waits; "
-        "INCOMPLETE means unaccounted filtered/lost records. Neither means zero waiting.",
+        "COALESCED_GMM means joined tile/drain records (possibly with waits hidden); "
+        "INCOMPLETE means unaccounted filtered/lost records. None means zero waiting.",
         f"SELECTED first_us={total['first']:.3f} last_us={total['last']:.3f} span_us={total['span']:.3f} "
         f"sum_us={total['sum']:.3f} union_us={total['union']:.3f}",
         "[LEGEND] id name category",
