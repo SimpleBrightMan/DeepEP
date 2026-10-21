@@ -46,7 +46,6 @@ struct SegmentedRowIO {
         static_assert(sizeof(typename TensorL1::Element) == 1, "Segmented A gather expects an 8-bit operand");
         AscendC::GlobalTensor<uint8_t> input;
         input.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(inputX));
-        input.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
         auto output = dst.data().template ReinterpretCast<uint8_t>();
         const uint32_t c0Stride = tla::get<1, 1>(dst.stride()) / 32U;
         for (uint32_t index = 0; index < count; ++index) {

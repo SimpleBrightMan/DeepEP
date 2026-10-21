@@ -165,5 +165,20 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t FirstOwnedComputeTile(uint64_t ti
     return worker >= startOwner ? worker - startOwner : worker + workerCount - startOwner;
 }
 
+// Each nonempty fragment is at most M256, so all groups of an expert have the
+// same N tile count, including its short final M group. Return groupCount when
+// this worker has no tile; no hardware context may be opened in that case.
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t LastOwnedComputeGroup(uint64_t tileBegin, uint32_t groupCount,
+                                                                    uint32_t tilesPerGroup, uint32_t worker,
+                                                                    uint32_t workerCount)
+{
+    if (groupCount == 0U || tilesPerGroup == 0U) return groupCount;
+    const uint64_t tileCount = static_cast<uint64_t>(groupCount) * tilesPerGroup;
+    const uint64_t first = FirstOwnedComputeTile(tileBegin, worker, workerCount);
+    if (first >= tileCount) return groupCount;
+    const uint64_t last = first + ((tileCount - 1U - first) / workerCount) * workerCount;
+    return static_cast<uint32_t>(last / tilesPerGroup);
+}
+
 #undef MEGAMOE_URMA_COMPUTE_INLINE
 }  // namespace MegaMoeUrma

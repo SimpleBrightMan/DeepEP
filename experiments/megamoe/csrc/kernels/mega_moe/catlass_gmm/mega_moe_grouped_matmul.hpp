@@ -272,10 +272,19 @@ class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config, BypassInputL2, Ro
     using Pipeline = detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO>;
 
 public:
+    __aicore__ inline CatlassGmm2() = default;
+    using Pipeline::Begin;
+    using Pipeline::End;
     using Pipeline::SetRowIO;
     __aicore__ inline CatlassGmm2(const Config& config, const GMMAddrInfo& addr)
         : Pipeline(config, addr, addr.gmm2OutGlobal)
     {
+    }
+
+    template <class ProblemConfig>
+    __aicore__ inline void UpdateProblem(const ProblemConfig& config, const GMMAddrInfo& addr)
+    {
+        Pipeline::UpdateProblem(config, addr, addr.gmm2OutGlobal);
     }
 
     __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols)

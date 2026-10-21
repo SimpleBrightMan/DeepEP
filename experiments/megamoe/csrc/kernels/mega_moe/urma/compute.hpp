@@ -166,11 +166,11 @@ __aicore__ inline void CompleteComputeContext()
     }
 }
 
-using UrmaGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig, true, UrmaInputRows>;
+using UrmaGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig, false, UrmaInputRows>;
 using UrmaGmm2 = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows>;
 
 __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex, UrmaGmm1& gmm1,
-                                       Timer& timer)
+                                       bool endContext, Timer& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
@@ -232,14 +232,17 @@ __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, ui
             timer.TraceEnd(TraceEvent::Gmm1Dequant, dequantStart, tileMeta);
         }
     }
-    const uint64_t endStart = timer.TraceBegin();
-    gmm1.End(g_coreType == AIC);
-    CompleteComputeContext();
-    timer.TraceEnd(TraceEvent::Gmm1Drain, endStart, fragmentMeta);
+    if (endContext) {
+        const uint64_t endStart = timer.TraceBegin();
+        gmm1.End(g_coreType == AIC);
+        CompleteComputeContext();
+        timer.TraceEnd(TraceEvent::Gmm1Drain, endStart, fragmentMeta);
+    }
     timer.End(Phase::Gmm1);
 }
 
-__aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex, Timer& timer)
+__aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex, UrmaGmm2& gmm2,
+                                       uint32_t batchBegin, bool endContext, Timer& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
@@ -261,39 +264,50 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
         timer.TraceEnd(TraceEvent::WaitActivation, waitStart, fragmentMeta);
     }
     timer.Begin(Phase::Gmm2);
-    uint32_t completed = 0U;
-    uint64_t drainStart = 0U;
-    {
-        const auto addr = Gmm2Addresses(args, fragment);
-        UrmaGmm2 gmm2(config2, addr);
-        gmm2.SetRowIO(FragmentRowIO<UrmaOutputRows>(args, fragment));
-        for (uint32_t tile = first2; tile < count2; tile += kAic) {
-            const auto coord = schedule2.GetBlockCoord(tile);
-            const auto tileShape = schedule2.GetBlockShape(coord);
-            const uint32_t m = Get<MegaMoeImpl::M_VALUE>(coord);
-            const uint32_t n = Get<MegaMoeImpl::N_VALUE>(coord);
-            const uint32_t rows = Get<MegaMoeImpl::M_VALUE>(tileShape);
-            const uint32_t columns = Get<MegaMoeImpl::N_VALUE>(tileShape);
-            const auto tileMeta = ComputeTileTraceMeta(fragmentMeta, m, n, rows, columns);
-            if constexpr (g_coreType == AIC) {
-                // Submission time only: output completion belongs to
-                // the existing context destructor below.
-                const uint64_t computeStart = timer.TraceBegin();
-                gmm2.Compute(m, n, rows, columns);
-                timer.TraceEnd(TraceEvent::Gmm2Tile, computeStart, tileMeta);
-            } else {
-                const uint64_t dequantStart = timer.TraceBegin();
-                gmm2.Dequantize(n, rows, columns);
-                timer.TraceEnd(TraceEvent::Gmm2Dequant, dequantStart, tileMeta);
-            }
-            ++completed;
+    const auto addr = Gmm2Addresses(args, fragment);
+    gmm2.UpdateProblem(config2, addr);
+    gmm2.SetRowIO(FragmentRowIO<UrmaOutputRows>(args, fragment));
+    gmm2.Begin();
+    for (uint32_t tile = first2; tile < count2; tile += kAic) {
+        const auto coord = schedule2.GetBlockCoord(tile);
+        const auto tileShape = schedule2.GetBlockShape(coord);
+        const uint32_t m = Get<MegaMoeImpl::M_VALUE>(coord);
+        const uint32_t n = Get<MegaMoeImpl::N_VALUE>(coord);
+        const uint32_t rows = Get<MegaMoeImpl::M_VALUE>(tileShape);
+        const uint32_t columns = Get<MegaMoeImpl::N_VALUE>(tileShape);
+        const auto tileMeta = ComputeTileTraceMeta(fragmentMeta, m, n, rows, columns);
+        if constexpr (g_coreType == AIC) {
+            const uint64_t computeStart = timer.TraceBegin();
+            gmm2.Compute(m, n, rows, columns);
+            timer.TraceEnd(TraceEvent::Gmm2Tile, computeStart, tileMeta);
+        } else {
+            const uint64_t dequantStart = timer.TraceBegin();
+            gmm2.Dequantize(n, rows, columns);
+            timer.TraceEnd(TraceEvent::Gmm2Dequant, dequantStart, tileMeta);
         }
-        drainStart = timer.TraceBegin();
-    }  // CATLASS drains every segmented FIX store and paired L1 event token.
-    CompleteComputeContext();
-    timer.TraceEnd(TraceEvent::Gmm2Drain, drainStart, fragmentMeta);
-    if constexpr (g_coreType == AIC) {
-        AtomicAdd(ComputeFlag(args.gmm2Done, fragmentIndex), static_cast<int32_t>(completed));
+    }
+    if (endContext) {
+        const uint64_t drainStart = timer.TraceBegin();
+        // One FIX drain per expert batch. Intermediate M256 groups keep
+        // submitting; the block's FIX_M events still protect each L0C slot.
+        gmm2.End();
+        CompleteComputeContext();
+        timer.TraceEnd(TraceEvent::Gmm2Drain, drainStart, fragmentMeta);
+        if constexpr (g_coreType == AIC) {
+            // Every group (including a short M tail) has the same N tile
+            // count. Recover each group's contribution without rereading GM
+            // descriptors. Publish only after ALL this core's stores drain.
+            const uint64_t batchTileBegin =
+                fragment.gmm2TileBegin - static_cast<uint64_t>(fragmentIndex - batchBegin) * count2;
+            for (uint32_t index = batchBegin; index <= fragmentIndex; ++index) {
+                const uint64_t tileBegin = batchTileBegin + static_cast<uint64_t>(index - batchBegin) * count2;
+                const uint32_t first = FirstOwnedComputeTile(tileBegin, block, kAic);
+                if (first < count2) {
+                    const uint32_t completed = (count2 - 1U - first) / kAic + 1U;
+                    AtomicAdd(ComputeFlag(args.gmm2Done, index), static_cast<int32_t>(completed));
+                }
+            }
+        }
     }
     timer.End(Phase::Gmm2);
 }
@@ -310,18 +324,30 @@ __aicore__ inline ComputeBatchRange LoadComputeBatch(const Arguments& args, uint
 // the next expert's GMM1 can cover the preceding expert's activation latency.
 __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, Timer& timer)
 {
-    // URMA updates receive GM outside this core's cache hierarchy. Keep input
-    // and scale reads uncached; every existing MTE caller still defaults off.
+    // Only one stage owns the shared L1/L0/prologue buffers at a time. The
+    // objects keep their views; each expert batch acquires/releases events.
     UrmaGmm1 gmm1;
+    UrmaGmm2 gmm2;
     const uint64_t taskCount = ComputeBatchTaskCount(args.config.localExperts);
     for (uint64_t step = 0U; step < taskCount; ++step) {
         const auto task = ComputeBatchTaskAt(step, args.config.localExperts);
         const auto range = LoadComputeBatch(args, task.batchIndex);
-        for (uint32_t fragmentIndex = range.begin; fragmentIndex < range.end; ++fragmentIndex) {
+        if (range.begin == range.end) continue;
+        const auto first = LoadFragment(args, range.begin);
+        const bool isGmm1 = task.stage == ComputeBatchStage::Gmm1;
+        const uint64_t tileBegin = isGmm1 ? first.gmm1TileBegin : first.gmm2TileBegin;
+        const uint32_t tilesPerGroup = isGmm1 ? FragmentGmm1Tiles(args, first) : FragmentGmm2Tiles(args, first);
+        const uint32_t lastOwned =
+            LastOwnedComputeGroup(tileBegin, range.end - range.begin, tilesPerGroup, block, kAic);
+        if (lastOwned == range.end - range.begin) continue;
+        const uint32_t lastFragment = range.begin + lastOwned;
+        // A core can skip groups between its own tiles. Both paired engines
+        // close on their last owned group, not necessarily the expert's last.
+        for (uint32_t fragmentIndex = range.begin; fragmentIndex <= lastFragment; ++fragmentIndex) {
             if (task.stage == ComputeBatchStage::Gmm1) {
-                RunGmm1Fragment(args, block, fragmentIndex, gmm1, timer);
+                RunGmm1Fragment(args, block, fragmentIndex, gmm1, fragmentIndex == lastFragment, timer);
             } else {
-                RunGmm2Fragment(args, block, fragmentIndex, timer);
+                RunGmm2Fragment(args, block, fragmentIndex, gmm2, range.begin, fragmentIndex == lastFragment, timer);
             }
         }
     }

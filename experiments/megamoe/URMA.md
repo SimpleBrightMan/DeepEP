@@ -77,7 +77,13 @@ Scale准备只在详细trace中独立计时，未归入原有8个aggregate phase
 
 返回CV保存它所依赖的M组编号列表，同一组去重后只出现一次。每组全部GMM2 N tile完成分段输出后才满足依赖；仅提交Cube/FIX指令不能提前放行PUT。BS2048时一个peer的CV0大致跨6个专家，新顺序让多个peer按CV波次逐渐就绪，不保证15个peer同时开始。
 
-每段GMM结束后仍由配对AIV0向本组AIC发送End确认，确保旧段消费完流水槽信号后才复用；该确认不涉及通信或SwiGLU AIV1。接收数据读取保留URMA所需的cache bypass。
+GMM1和GMM2分别持有可复用的上下文：同一专家、同一GMM阶段内，本核相邻的M256任务沿用L1/L0缓冲、事件及ping-pong槽位状态，仅更新当前组的地址和形状；本核在该专家上的最后一个有任务组才执行End和配对AIV0确认。两个阶段仍互斥使用同一组硬件资源，切换阶段或专家时释放旧上下文。无任务核不启动上下文，该确认不涉及通信或SwiGLU AIV1。
+
+GMM1仍逐tile等待FIX输出完成并发布就绪标志，以便SwiGLU及时开始。GMM2改为在本核完成该专家全部任务后统一等待FIX输出完成，再按各M组实际完成的tile数批量累计`gmm2Done`；中间M256组不再执行FIX_S或发布计数，内部FIX_M事件继续保护L0C槽位。Combine和self Reduce仍检查每组的完整N方向计数，不会提前读取结果，但通知时间推迟到本核的专家批次末尾。此处不增加等待Dispatch的门槛，也不改变远端每CV的`PUT → quiet → ready flag`；通信核保留本rank所有Dispatch完成后才启动Combine的原有规则。
+
+trace中的最后一个参与组包含本专家该阶段的上下文收尾；若与tile条合并，该条也包含这段收尾时间。GMM2中间组不再单独产生Drain条。
+
+GMM1直接Gather的X，以及AIC读取的已整理输入scale，均恢复默认L2策略，不再强制禁用L2。AIV对接收scale的一次整理读取、Reduce读取及完成flag的缓存策略保持原样。
 
 默认均衡模型的每rank任务数如下，CV128/256/1024等取值不改变这些计算组数：
 
