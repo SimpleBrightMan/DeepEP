@@ -109,6 +109,7 @@ def merge_trace_files(paths, output, *, world=16, include_waits=False, expected_
                 visible_record_count=sum(item.get("visible_record_count", item["record_count"]) for item in per_rank),
                 hidden_wait_count=sum(item.get("hidden_wait_count", 0) for item in per_rank),
                 coalesced_record_count=sum(item.get("coalesced_record_count", 0) for item in per_rank),
+                coalesced_wait_count=sum(item.get("coalesced_wait_count", 0) for item in per_rank),
                 clock_mhz=clock,
                 clock_alignment="each rank starts at its own earliest event; cross-rank clocks are not synchronized",
                 scope="one BS diagnostic invocation; no timestamp shifts or gap compression",

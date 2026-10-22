@@ -33,8 +33,48 @@ def test_coalesced_scopes_are_not_reported_as_missing_records(trace_text):
     trace = filter_trace_waits(coalesce_gmm_tiles(decode_trace(raw, rank=0, clock_mhz=1000)))
     report = trace_text.render_report(trace, detail=True)
     assert "source_status=COALESCED_GMM" in report
-    assert "33 Gmm1Tile cube.compute_drain" in report
-    assert "34 Gmm2Tile cube.compute_drain" in report
+    assert "35 Gmm1Batch cube.batch" in report
+    assert "36 Gmm2Batch cube.batch" in report
+
+
+@pytest.mark.parametrize(
+    "names,engine,expected",
+    [
+        (
+            ["Gmm1Tile", "Gmm1TileDrain", "WaitInputScale", "Gmm1Tile", "Gmm1Drain"],
+            0,
+            ["00/AIC", "0.200", "0.000", "0.000", "0.050"],
+        ),
+        (["Gmm2Tile", "WaitActivation", "Gmm2Tile", "Gmm2Drain"], 0, ["00/AIC", "0.000", "0.150", "0.000", "0.050"]),
+        (["Gmm1Dequant", "Gmm1Dequant", "Gmm1Drain"], 1, ["00/AIV0", "0.000", "0.000", "0.150", "0.000"]),
+        (["Gmm2Dequant", "Gmm2Dequant", "Gmm2Drain"], 1, ["00/AIV0", "0.000", "0.000", "0.150", "0.000"]),
+    ],
+)
+def test_batch_report_separates_display_envelope_from_original_scope_time(trace_text, names, engine, expected):
+    from deep_ep_experimental.megamoe.urma_trace import coalesce_gmm_tiles, decode_trace
+    from test_urma_trace_coalesce import make_trace
+
+    doc = coalesce_gmm_tiles(decode_trace(make_trace(names, engine=engine), rank=0, clock_mhz=1000))
+    before = deepcopy(doc)
+    report = trace_text.render_report(doc, detail=True)
+    assert "batch duration as no-bubble compute time" in report
+    assert section_rows(report, "RAW_CORE")[0] == expected
+    # Display retains the full envelope, while raw counts retain every submit.
+    assert len(detail_times(report)) == 1
+    assert detail_times(report)[0][1] == pytest.approx((len(names) - 1) * 0.1 + 0.05)
+    raw_rows = section_rows(report, "RAW_OP")
+    assert sum(int(row[2]) for row in raw_rows) == len(names)
+    assert doc == before
+
+
+def test_legacy_tile_composite_still_expands_in_text_metrics(trace_text):
+    from deep_ep_experimental.megamoe.urma_trace import coalesce_gmm_tiles, decode_trace
+    from test_urma_trace_coalesce import make_trace
+
+    doc = coalesce_gmm_tiles(decode_trace(make_trace(["Gmm1Tile", "Gmm1TileDrain"]), rank=0, clock_mhz=1000))
+    assert doc["traceEvents"][-1]["args"]["event_id"] == 33
+    report = trace_text.render_report(doc)
+    assert section_rows(report, "RAW_CORE")[0] == ["00/AIC", "0.100", "0.000", "0.000", "0.000"]
 
 
 EVENTS = {

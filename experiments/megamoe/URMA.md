@@ -267,18 +267,22 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 |---|---|
 | `DispatchPutX/DispatchPutScale/CombinePut [PUT submit]` | PUT指令提交区间，不代表远端数据已经完成写入 |
 | `DispatchQuiet/CombineQuiet [completion wait]` | 等待之前peer PUT完成的区间 |
-| `Gmm1Tile/Gmm2Tile [compute + drain]` | 默认将能够明确对应的AIC提交与排空记录合为一条，包含等待及上下文收尾，不是纯Cube计算时间 |
-| `Gmm1Tile/Gmm2Tile [Cube submit]` | 无法明确配对或选择原始显示时，保留任务提交区间 |
-| `Gmm1TileDrain/Gmm1Drain/Gmm2Drain [drain]` | 未合并的显式排空记录；AIV上的记录仍单独显示 |
+| `Gmm1Batch/Gmm2Batch [batch + drain]` | 同一AIC、同一专家上下文从首次提交到最终drain的一条跨度；包含内部依赖等待及标量间隙，不是纯Cube忙时 |
+| `Gmm1DequantBatch/Gmm2DequantBatch [batch + drain]` | 同一AIV0反量化上下文的完整跨度，包含末尾排空和与AIC的收尾配合 |
+| `Gmm1Tile/Gmm2Tile [compute + drain]` | 不具备完整批次记录时保留旧版能明确配对的tile/drain展示 |
+| `Gmm1Tile/Gmm2Tile [Cube submit]` | 不能合并或选择原始显示时，保留任务提交区间 |
+| `Gmm1TileDrain/Gmm1Drain/Gmm2Drain [drain]` | 选择原始显示、或记录不足以安全合并时保留的显式排空记录 |
 | `Wait*`、`LocalSync`、`RankBarrier`等灰色条 | 数据依赖、核间或rank间同步等待 |
 | `Gmm*Dequant`、`ActivationSlice`、`Pack`等 | 对应设备代码实际打点范围 |
 | `Reduce` | 每reducer一条完整跨度，含metadata预取、ready等待、计算和最终输出排空，不是纯计算时间 |
 
 每个rank以自己的最早事件归零，**不同rank的零点没有全局对齐**，不能将两个文件的横坐标相减计算跨卡延迟。转换先用整数tick相减再转浮点，保留大时间戳的低位；原始tick在JSON参数中用字符串保存。默认1000 ticks/us仍只是显式约定，可修改`--timer-clock-mhz`，离线解析时应使用同一值。
 
-GMM条合并只影响JSON显示，不改变kernel、同步或打点开销。GMM1的逐tile drain与同一tile合并。GMM2则连续提交本核在同一专家批次内的多个M-group，最后统一drain；前面的`Cube submit`并不表示计算已经完成。现有导出只合并同一引擎/专家/计算组中原始记录连续的tile与drain，不跨越隐藏的等待。因而当前形状下通常前面是多条submit，最后一条是`compute + drain`；这个最终drain也可能等待本批次先前提交的工作，不能全部归因为最后一个tile。
+GMM条合并只影响JSON显示，不改变kernel、同步或打点开销。默认先在完整原始记录上合并同一引擎/专家的上下文批次，再隐藏外部等待。AIC的GMM1/GMM2、AIV0的GMM1Dequant/GMM2Dequant均从首个提交/反量化记录延伸到该上下文最终drain。GMM2的drain是整个批次共享的，不归属于最后一个tile；没有为显示新增逐tile排空。批次开始前的输入等待不并入该批次。
 
-整个GMM2批次可以展示成从首次提交到最终drain的一条跨度，但该跨度还包含M-group之间的激活等待、调度和记录开销，不能作为“不带空泡时间”。不要为了画成一条而给每个tile增加排空。原始bin和计数保留；JSON的33/34为合成事件ID，`source_records`保留源事件编号、序号及时间戳，`coalesced_record_count`记录减少的显示条数。
+批次内等待、标量调度和记录间隙仍在其时间跨度内。`active_ticks`仅累加原始非Wait区间（含原有drain，不代表纯硬件忙时），`dependency_wait_ticks`累计内部独立Wait记录，`unrecorded_gap_ticks`为其余间隙，三者之和等于`elapsed_ticks`。网页统计使用`source_records`中原始区间计算“不带空泡”累计核时，不能用整条批次跨度代替。
+
+原始bin、原始总计数和逐事件元数据均保留；JSON的35/36为AIC GMM批次，37/38为AIV0 Dequant批次，33/34仍支持旧tile合成记录。`source_records`保存源事件参数、序号和整数tick时间，`coalesced_record_count`记录减少的显示条数。完整批次匹配要求整核原始序号连续，不跨专家、阶段或rank；旧JSON若已删掉Wait或缺少记录，会保守保留旧的细条，需从bin重新导出才能完整合批。`--include-waits`保留外部Wait，批次内Wait可在源记录中查看；要恢复所有独立条，同时使用`--split-gmm-events`。
 
 GMM1的AIC输入等待每个本核拥有的M-group只检查一次`inputScaleDone`。发布该标志的AIV1先确认该组所有segment的Dispatch当前epoch就绪，再完成输入scale聚集及MTE3排空，因此标志同时覆盖X到达与scale就绪。每次调用在启动stream上清零该标志；AIC不再逐segment重复检查Dispatch。
 
