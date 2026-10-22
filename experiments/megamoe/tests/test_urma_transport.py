@@ -58,7 +58,7 @@ template <typename T> T ReadGmByPassDCache(T* ptr) { return *ptr; }
 #include <vector>
 inline uint8_t windows[16][4096]{};
 inline uint32_t currentRank = 5;
-struct Transfer { uint8_t* dst; uint8_t* src; uint32_t bytes; int peer; };
+struct Transfer { uint8_t* dst; uint8_t* src; uint32_t bytes; uint32_t peer; uint32_t qp; };
 inline std::vector<Transfer> pending;
 inline uint32_t submitted = 0, completed = 0;
 inline void* aclshmem_ptr(uint8_t* local, int peer) {
@@ -66,13 +66,19 @@ inline void* aclshmem_ptr(uint8_t* local, int peer) {
     return windows[peer] + offset;
 }
 template <typename T, pipe_t P>
-void aclshmemx_udma_put_nbi(T* dst, T* src, T* scratch, uint32_t n, int peer, uint32_t event) {
-    static_assert(P == PIPE_S); assert(scratch == nullptr && event == 0 && peer != int(currentRank));
-    pending.push_back({static_cast<uint8_t*>(aclshmem_ptr(dst, peer)), src, n, peer}); ++submitted;
+void aclshmemx_udma_qp_put_nbi(T* dst, T* src, T* scratch, uint32_t n, uint32_t peer, uint32_t qp,
+                               uint32_t event) {
+    static_assert(P == PIPE_S); assert(scratch == nullptr && event == 0 && peer != currentRank && qp < 2);
+    pending.push_back({static_cast<uint8_t*>(aclshmem_ptr(dst, peer)), src, n, peer, qp}); ++submitted;
 }
-inline void aclshmemx_udma_quiet(int peer) {
-    for (auto& t : pending) { assert(t.peer == peer); std::memcpy(t.dst, t.src, t.bytes); ++completed; }
-    pending.clear();
+inline void aclshmemx_udma_qp_quiet(uint32_t peer, uint32_t qp) {
+    for (auto it = pending.begin(); it != pending.end();) {
+        if (it->peer == peer && it->qp == qp) {
+            std::memcpy(it->dst, it->src, it->bytes); ++completed; it = pending.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 template <typename... T> void aclshmemi_kernel_abort(const char*, T...) { throw std::runtime_error("abort"); }
 """
@@ -109,6 +115,25 @@ int main() {
     bool rejected = false;
     try { Put(base, 0, x, kMaxPutBytes + 1, 9); } catch (const std::runtime_error&) { rejected = true; }
     assert(rejected && submitted == 2);
+    // One peer owner submits early Combine on QP1 while Dispatch remains on
+    // QP0. Dispatch quiet must not drain either Combine or another peer's SQ.
+    static_assert(kDispatchQp == 0 && kCombineQp == 1);
+    Put(base, 256, x, 64, 9, kDispatchQp);
+    Put(base, 384, scale, 32, 9, kCombineQp);
+    Put(base, 256, x, 64, 10, kDispatchQp);
+    assert(submitted == 5 && completed == 2);
+    Quiet(9, kDispatchQp);
+    assert(completed == 3 && pending.size() == 2);
+    assert(windows[9][256] == 7 && windows[9][384] == 0 && windows[10][256] == 0);
+    Put(base, 448, scale, 32, 9, kCombineQp);
+    assert(submitted == 6 && completed == 3 && windows[9][448] == 0);
+    Quiet(9, kCombineQp);
+    assert(completed == 5 && pending.size() == 1);
+    assert(windows[9][384] == 9 && windows[9][448] == 9 && windows[10][256] == 0);
+    PublishDone(base, 512, 9, 124, {signal}, 3);
+    WaitLocalDone(windows[9] + 512, 124);
+    Quiet(10, kDispatchQp);
+    assert(completed == 6 && pending.empty() && windows[10][256] == 7);
     // Other ranks have reached the barrier already. A later generation may
     // replace one flag; the monotone barrier must not wait for exact equality.
     for (uint32_t p = 0; p < 16; ++p) *reinterpret_cast<uint64_t*>(base + 1024 + p*128) = 202;

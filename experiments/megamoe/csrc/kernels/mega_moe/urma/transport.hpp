@@ -14,10 +14,12 @@ constexpr uint32_t kRemoteOwners = kWorldSize - 1U;
 constexpr uint32_t kSignalSlotBytes = 128U;
 constexpr uint32_t kSignalCopyBytes = 32U;
 constexpr uint32_t kMaxPutBytes = 256U * 1024U * 1024U;
+constexpr uint32_t kDispatchQp = 0U;
+constexpr uint32_t kCombineQp = 1U;
 
-// The dedicated Session creates an independent QP0/SQ for every peer and
-// disables shared jetty. Exactly one AIV1 worker owns each remote peer. Other
-// workers must not submit or quiet that peer's queue.
+// The dedicated Session creates independent Dispatch/Combine QPs for every
+// peer and disables shared jetty. Exactly one AIV1 worker owns both QPs of each
+// remote peer. Other workers must not submit or quiet either peer queue.
 __aicore__ inline uint32_t PeerForOwner(uint32_t rank, uint32_t owner)
 {
     return owner < rank ? owner : owner + 1U;
@@ -26,26 +28,27 @@ __aicore__ inline uint32_t PeerForOwner(uint32_t rank, uint32_t owner)
 // dstOffset names a LOCAL symmetric-window address; SHMEM translates it for
 // peer. Do not pass an already translated MTE peer pointer to this function.
 // The caller completes local GM producers before submitting and retains src
-// unchanged until Quiet(peer) returns. This transport deliberately has no GET.
+// unchanged until Quiet(peer, qp) returns. This transport deliberately has no GET.
 __aicore__ inline void Put(__gm__ uint8_t* symmetricBase, uint64_t dstOffset, __gm__ uint8_t* src, uint32_t bytes,
-                           uint32_t peer)
+                           uint32_t peer, uint32_t qp = kDispatchQp)
 {
     if (bytes == 0U) return;
     if (bytes > kMaxPutBytes) {
         aclshmemi_kernel_abort("MegaMoE URMA PUT exceeds 256 MiB: bytes=%u peer=%u\n", bytes, peer);
         return;
     }
-    aclshmemx_udma_put_nbi<uint8_t, PIPE_S>(symmetricBase + dstOffset, src, nullptr, bytes, peer, 0U);
+    aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_S>(symmetricBase + dstOffset, src, nullptr, bytes, peer, qp, 0U);
 }
 
-// Blocking completion of this peer's QP0, not merely WQE publication. The
-// one-owner rule also applies here: no second worker may poll the same CQ.
-__aicore__ inline void Quiet(uint32_t peer)
+// Blocking completion of only this peer/QP, not merely WQE publication. A
+// Dispatch quiet must leave speculative Combine work pending on its own QP.
+// The one-owner rule also applies here: no second worker may poll the same CQ.
+__aicore__ inline void Quiet(uint32_t peer, uint32_t qp = kDispatchQp)
 {
-    aclshmemx_udma_quiet(static_cast<int>(peer));
+    aclshmemx_udma_qp_quiet(peer, qp);
 }
 
-// Publish only AFTER Quiet(peer) covered every token/scale PUT for this chunk.
+// Publish only AFTER Quiet(peer, phaseQp) covered every payload PUT for this chunk.
 // Each (source peer, CV chunk, phase) owns a separate 128B destination slot.
 // The caller supplies 32B of UB and a free event ID; no hidden TPipe/UB state
 // is introduced. MTE3_S protects both publication and immediate UB reuse.

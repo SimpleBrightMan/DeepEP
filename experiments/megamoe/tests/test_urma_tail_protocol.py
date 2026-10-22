@@ -674,8 +674,8 @@ template<typename T> void DataCopy(GlobalTensor<T> target, LocalTensor<T> source
         r"""
 #pragma once
 inline void aclshmemi_kernel_abort(const char*, ...) {}
-template<typename T, int> void aclshmemx_udma_put_nbi(T*, T*, void*, uint32_t, uint32_t, uint32_t) {}
-inline void aclshmemx_udma_quiet(int) {}
+template<typename T, int> void aclshmemx_udma_qp_put_nbi(T*, T*, void*, uint32_t, uint32_t, uint32_t, uint32_t) {}
+inline void aclshmemx_udma_qp_quiet(uint32_t, uint32_t) {}
 inline void* aclshmem_ptr(void* address, unsigned) { return address; }
 """
     )
@@ -869,11 +869,13 @@ def test_actual_finished_helpers_count_once_publish_first_and_require_28_aic(red
 def test_finished_observation_and_aic_publication_integration():
     root = Path(__file__).resolve().parents[3]
     source = (root / "experiments/megamoe/csrc/kernels/mega_moe/urma/kernel.hpp").read_text()
-    combine = source[source.index("const uint64_t rowBytes =") : source.index("__aicore__ inline void Process")]
+    combine = source[
+        source.index("for (uint32_t index = nextCombine;") : source.index("__aicore__ inline void Process")
+    ]
     assert (
         combine.index("Put(symmetric,")
         < combine.index("ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);")
-        < combine.index("Quiet(peer);")
+        < combine.index("Quiet(peer, kCombineQp);")
         < combine.index("PublishDone(symmetric,")
         < combine.index("FinishCombinePeer(args, owner, signal, peerCounted, selfCounted);")
     )

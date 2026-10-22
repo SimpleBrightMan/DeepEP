@@ -2,7 +2,7 @@
 
 本实验是完整的 Prefill 算子：真实路由准备、本地展开、Dispatch、GMM1、SwiGLU/MXFP8 量化、GMM2、Combine PUT 和加权 Reduce。没有屏蔽计算，也没有使用预置 balanced 专用路由。
 
-本分支为 `megamoe-urma-tailCover`，基于 `megamoe-urma` 的多槽版本 `a35b4d3`。原分支保留尾部全卡同步和56核Reduce；本分支采用每CV完成信号和41核Reduce，详见下文。两版均须各自重新编译安装完整wheel，不能混用rank或Python/native版本。
+本分支为 `megamoe-urma-combineAdvance-v2`，重新基于 `megamoe-urma-tailCover` 的 `60642fb`，没有合入前版 `combineAdvance` 的激活核辅助通信方案。保留原15个通信核、13个激活核和41核Reduce，只尝试在Dispatch末尾通过独立QP提前提交Combine。各分支须重新编译安装完整wheel，不能混用rank或Python/native版本。
 
 首版范围：默认单机 EP16，固定使用28个AIC / 56个AIV、每个AIV至少192 KiB UB、H=3584、I=1280、384个专家、TopK=8、无共享专家、FP8输入/FP4权重、BS=2048/4096/8192。物理核心数更多的兼容机型仍只启动这28组计算核。任意合法路由均走同一流程；超过配置接收容量的偏斜路由会在启动计算前明确报错。
 
@@ -17,9 +17,9 @@ GMM按专家聚合不同来源的行，使用M256计算块，仅专家尾块不�
 3. 每个目标rank的连续行流按 `cv_rows` 截断，通过 URMA PUT 发送。token与scale使用各自连续平面。
 4. 对每个本地expert，把16个来源的行按source编号连接，按M256划分计算组；专家尾组可以不足256，不与下一个专家混算。每组的Segment记录来源、CV、接收行、组内行和返回展开行。Segment在source/CV边界切分，但这些边界不再切分矩阵计算。
 5. GMM1按Segment把X分段加载到同一L1计算块，只等待该组实际涉及的Dispatch CV及scale准备。scale由13个AIV1独立准备，每个M组只聚合一次到expert-major GM；AIC沿用连续MX scale加载。GMM1输出、SwiGLU及GMM2输入使用连续的expert-major计算行序。GMM2按同一映射将远端结果分段写回原source-major连续输出区，self结果直接写Reduce最终读取的位置。各peer的Combine CV等待所有覆盖它的M组完成全部H列，再按原连续区间PUT。
-6. 本rank的15个远端Dispatch全部完成且self接收区已就绪后才提交Combine PUT。每个Combine CV执行 `PUT → quiet(peer) → MTE DataCopy发布epoch flag`。计算侧AIV完成自己的任务后即可按token依赖Reduce，不再等待最终全卡同步。
+6. 同一个通信核用QP0发送Dispatch、QP1发送Combine。在各peer最后两次有数据的Dispatch中，quiet之前尝试提前提交一个已就绪的Combine CV，但不quiet QP1或发布Combine flag。本rank的15个远端Dispatch全部完成且self接收区已就绪后，才quiet已提交的Combine前缀并逐CV发布flag；剩余CV恢复 `PUT → quiet(peer, QP1) → MTE DataCopy发布epoch flag`。计算侧AIV完成自己的任务后即可按token依赖Reduce，不再等待最终全卡同步。
 
-15个通信AIV1各独占一个远端rank。通信worker `w` 的peer为 `w < rank ? w : w+1`；剩余13个AIV1执行输入scale准备和SwiGLU。28个AIV1也各自完成每轮固定的Pack行区间。self输入就绪通过本卡对应CV的Pack完成行数判断，block15不再单独发布self信号。远端两个阶段都只使用PUT，队列同一peer始终只有一个提交者。
+15个通信AIV1各独占一个远端rank的两条QP。通信worker `w` 的peer为 `w < rank ? w : w+1`；剩余13个AIV1执行输入scale准备和SwiGLU，不接管Combine。28个AIV1也各自完成每轮固定的Pack行区间。self输入就绪通过本卡对应CV的Pack完成行数判断，block15不再单独发布self信号。远端两个阶段都只使用PUT，同一peer的两条队列始终由同一个核提交和quiet。
 
 前两轮Pack使用全部56个AIV，任务编号为`block*2+subblock`；其后的Pack使用28个AIV1，任务编号为block。Reduce只使用28个AIV0和block15～27的13个AIV1，共41核；15个通信AIV1不参与Reduce。计算侧每核结束自己的反量化或scale/SwiGLU及Pack任务后，先排空本核流水以交还UB/event，再独立进入Reduce。当前内核固定启动28组；即使物理设备有64个AIV，也只使用已启动的56个。
 
@@ -39,13 +39,47 @@ Python会拒绝不含本分支tail调度标记的native扩展。正式耗时取�
 - 通信owner发送第`r`轮时，依次执行`等待本peer packReady → PUT X/scale → 准备自己第r+2轮Pack份额 → quiet → 发布远端ready`。即使该peer本轮没有数据，也必须完成第`r+2`轮的Pack份额；所有核遍历同一本卡轮次总数。
 - 13个辅助AIV1分别推进SwiGLU、scale准备和Pack三个游标。每次调度先检查自己下一项SwiGLU，只要对应GMM1 tile就绪就优先执行，不再检查各peer的Pack余量。SwiGLU未就绪时，优先准备一个输入已就绪的scale组；两者都不可执行时才完成自己的下一轮Pack份额。每次只执行一项任务，结束后重新检查SwiGLU；已经下发的任务不抢占。固定Pack分工不变，不领取其它核的份额，不增加轮次同步，也不再维护或轮询Dispatch进度表。
 - 每段Pack在X和scale写出完成后，给本卡`packReady[peer][cv]`原子累加实际行数。通信及self输入检查均以该CV的实际总行数为门槛，短尾、空peer和不均衡路由使用同一逻辑。计数每次调用清零，不发送到远端；远端仍沿用quiet后的epoch ready。
-- 所有28个AIV1完成自身Pack后各记一次完成；15个远端Dispatch完成加上全部Pack完成才放行Combine，保留原有Dispatch结束门槛。轮次之间不增加全卡或全核同步。命令参数不变，需要重新构建完整wheel。
+- 所有28个AIV1完成自身Pack后各记一次完成；15个远端Dispatch完成加上全部Pack完成才放行常规Combine节奏和QP1 quiet。此前只在各peer最后两次Dispatch尝试提前提交就绪CV，不等待Combine生产者。轮次之间不增加全卡或全核同步。命令参数不变，需要重新构建完整wheel。
+
+### CombineAdvance v2：原通信核在最后两次 Dispatch 提前提交
+
+每个peer的“最后两次”按实际有数据的发送CV数量计算，最多两次尝试；只有一段则尝试一次，出向无数据则不提前提交。不同peer发送量不同时，不使用全rank的Pack轮次总数代替。接收和发送CV数量分别取实际路由，不假定对称或均衡。
+
+```text
+原通信核固定绑定一个peer：
+for 每轮Dispatch:
+    保持原Pack/Dispatch流程
+    if 本peer这一CV有数据:
+        PUT X和scale到QP0
+        完成本核后续Pack份额
+        if 属于该peer最后两次Dispatch && 下一Combine CV所有GMM2依赖已完成:
+            PUT 下一Combine CV到QP1；游标加一
+        quiet(QP0)
+        发布该Dispatch CV的ready flag
+
+等待原有本卡Dispatch完成门槛
+if 曾提前提交Combine:
+    quiet(QP1)                     # 一次覆盖此前提交的最多两段
+    为这些CV分别发布ready flag      # 即使没有剩余Combine，也必须完成
+for 剩余Combine CV:
+    等待该CV的GMM2结果
+    PUT(QP1) -> quiet(QP1) -> 发布该CV的ready flag
+沿用原peer finished及入站完成计数逻辑
+```
+
+提前阶段按原CV顺序探测下一项，发现任一依赖未完成立即返回Dispatch，不等待、不扫描其它CV、不发布Combine flag。最多两段在途，输入结果使用原独立GM输出区，直到quiet前不会被覆盖。Dispatch结束后先回收已提前提交的前缀，不会为了等待尚未就绪的新CV而拖延已有结果的通知。
+
+只有QP1 quiet能确认Combine完成；QP0 quiet只处理Dispatch。整个过程仍由原来的15个通信核执行，激活/scale gather、Pack分工、GMM调度、Reduce和完成计数协议保持tailCover版本。没有增加全卡同步、UB缓冲或辅助核flag。
+
+Timer保留原格式和核映射，Combine aggregate起点是首次实际PUT（可能出现在Dispatch期间），终点是最后一次CV ready发布后；字节量只统计每个CV一次。Dispatch与Combine的跨度现在可以重叠，不能相加当作串行用时。详细trace保留各次CombinePut；若一次quiet覆盖两个提前CV，该quiet的CV显示null、rows为两段合计，随后仍有两条带具体CV的CombinePublish。无需修改allrank导出器。
+
+本次按要求只做源码静态检查，未编译或运行测试。运行参数沿用tailCover，切换分支后重新构建完整wheel。
 
 ### Combine 完成信号与 Reduce 重叠
 
 - 路由准备时为每个expanded row生成依赖：远端为`producer_rank * maxPeerChunks + cv_id`，self为带高位标记的GMM2组编号。再用已有`reduce_index`在NPU上执行一次`index_select`，缓存token-major `[BS,8]`依赖表。forward不重建它；native绑定inverse的地址和版本，修改后必须重新准备路由。
 - 远端每CV的`quiet`完成后，通信owner用MTE发布32B信号到独立128B槽。Reducer只在本地轮询槽，要求epoch精确相等；self等待对应组的全部GMM2列tile完成计数。AIV0结束不能代替self结果完成。
-- 每个通信owner在每次Combine `PUT`之后、`quiet`之前，非阻塞读取本卡上对应peer的`finished(epoch)`。首次观察到本轮完成才给本卡入站计数器`AtomicAdd(1)`，用核内bool记住已计入，后续不再读取该peer的finished。
+- 每个通信owner在常规Combine `PUT`之后、`quiet`之前，以及Dispatch后首次回收提前提交的前缀时，非阻塞读取本卡上对应peer的`finished(epoch)`。首次观察到本轮完成才给本卡入站计数器`AtomicAdd(1)`，用核内bool记住已计入，后续不再读取该peer的finished。
 - 本核所有Combine CV均完成`quiet + CV ready发布`后，用MTE发布自己面向该peer的`finished(epoch)`，再带200周期退避地观察尚未计入的入站完成；空edge也发一次通知。必须先发后等，且每个owner只处理自己的peer，避免相互等待形成环。该通知使用独立phase 1的128B槽，不覆盖逐CV ready。
 - 第16份是self：28个AIC各自完成全部GMM2/FIX输出后，给本卡AIC完成计数器加一。通信owner 0非阻塞检查它是否到28，再且仅再给入站计数器加一；不能预置self为完成，也不能用AIV0退出代替GMM2输出就绪。此门槛偏保守，self输出可能更早完成。
 - Reducer轮询入站计数，观察到16时，执行S→MTE2门禁并锁存“全部就绪”。剩余未提交token不再读取就绪flag、不再逐token做ready门禁，直接进入跨token六槽流水；metadata、输入槽、Vector和输出槽事件仍保留。普通payload GM读取不受影响。
@@ -63,7 +97,7 @@ self直接写地址按现有`send_base/receive_base`映射；同一计算组可�
 
 接收数据/中间结果/返回结果不按CV覆盖复用。所有BS共享固定对称heap布局，epoch由`UrmaBuffer`统一递增，不因创建新Plan或切换BS重新归零。
 
-通信域启用MTE和UDMA，每个对端独立QP0，不使用共享jetty。MTE只用于完成标志与本地搬运；远端token、scale和FFN结果均走UDMA PUT。每次调用在同一runtime stream串行执行，并在下一次写入前与各peer握手，保护上一轮Reduce尚未读完的结果。
+通信域启用MTE和UDMA，每个对端独立QP0（Dispatch）和QP1（Combine），不使用共享jetty。两条队列由同一个通信核独占，使用显式指定QP的PUT/quiet接口，避免Dispatch quiet等待Combine。MTE只用于完成标志与本地搬运；远端token、scale和FFN结果均走UDMA PUT。每次调用在同一runtime stream串行执行，并在下一次写入前与各peer握手，保护上一轮Reduce尚未读完的结果。
 
 ### 专家 M256 与通信 CV 解耦
 
@@ -101,7 +135,7 @@ AIC和配对AIV0按全局tile编号直接跳到本核拥有的M-group，避免�
 
 GMM1和GMM2分别持有可复用的上下文：同一专家、同一GMM阶段内，本核相邻的M256任务沿用L1/L0缓冲、事件及ping-pong槽位状态，仅更新当前组的地址和形状；本核在该专家上的最后一个有任务组才执行End和配对AIV0确认。两个阶段仍互斥使用同一组硬件资源，切换阶段或专家时释放旧上下文。无任务核不启动上下文，该确认不涉及通信或SwiGLU AIV1。
 
-GMM1仍逐tile等待FIX输出完成并发布就绪标志，以便SwiGLU及时开始。GMM2改为在本核完成该专家全部任务后统一等待FIX输出完成，再按各M组实际完成的tile数批量累计`gmm2Done`；中间M256组不再执行FIX_S或发布计数，内部FIX_M事件继续保护L0C槽位。Combine和self Reduce仍检查每组的完整N方向计数，不会提前读取结果，但通知时间推迟到本核的专家批次末尾。此处不增加等待Dispatch的门槛，也不改变远端每CV的`PUT → quiet → ready flag`；通信核保留本rank所有Dispatch完成后才启动Combine的原有规则。
+GMM1仍逐tile等待FIX输出完成并发布就绪标志，以便SwiGLU及时开始。GMM2改为在本核完成该专家全部任务后统一等待FIX输出完成，再按各M组实际完成的tile数批量累计`gmm2Done`；中间M256组不再执行FIX_S或发布计数，内部FIX_M事件继续保护L0C槽位。Combine和self Reduce仍检查每组的完整N方向计数，不会提前读取结果，但通知时间推迟到本核的专家批次末尾。本分支在Dispatch最后两次的提前检查也使用同一完成计数；只有PUT可以提前，Combine quiet和ready通知仍在本卡全部Dispatch完成后进行。
 
 trace中的最后一个参与组包含本专家该阶段的上下文收尾；若与tile条合并，该条也包含这段收尾时间。GMM2中间组不再单独产生Drain条。
 
