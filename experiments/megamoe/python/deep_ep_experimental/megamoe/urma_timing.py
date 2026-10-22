@@ -99,7 +99,13 @@ class UrmaLaunchGuard:
         )
 
 
-_URMA_KERNEL = re.compile(r"(?:^|::|\s)mega_moe_urma_kernel(?=\s*(?:$|\(|<))")
+# CANN may export the raw C++ symbol rather than the demangled kernel name.
+# Match the exact device entry/signature so the host launcher (_do) and other
+# kernels remain excluded; do not loosen this to a substring search.
+_URMA_KERNEL = re.compile(
+    r"(?:^|::|\s)mega_moe_urma_kernel(?=\s*(?:$|\(|<))"
+    r"|^_Z20mega_moe_urma_kernelN11MegaMoeUrma9ArgumentsE$"
+)
 
 
 def read_profiled_kernels(directory, expected_samples):

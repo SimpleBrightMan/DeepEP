@@ -41,6 +41,8 @@ def test_only_exact_urma_device_tasks_are_selected(tmp_path):
                     "mega_moe_kernel",
                     "mega_moe_urma_kernel_do",
                     "my_mega_moe_urma_kernel",
+                    "_Z23mega_moe_urma_kernel_doN11MegaMoeUrma9ArgumentsE",
+                    "_Z26my_mega_moe_urma_kernelN11MegaMoeUrma9ArgumentsE",
                 )
             ],
         ],
@@ -49,6 +51,22 @@ def test_only_exact_urma_device_tasks_are_selected(tmp_path):
     assert [sample["duration_us"] for sample in samples] == [1, 2, 3]
     assert all(sample["stream_id"] == "3" and sample["device_id"] == "0" for sample in samples)
     json.dumps(samples, allow_nan=False)
+
+
+def test_cann_mangled_kernel_name_from_ubx_capture(tmp_path, monkeypatch):
+    directory, log = tmp_path / "profile", []
+    name = "_Z20mega_moe_urma_kernelN11MegaMoeUrma9ArgumentsE"
+    rows = [kernel(i, i + 1, name) for i in range(41)]
+    fake_profiler(monkeypatch, directory, rows, log)
+    guard = SimpleNamespace(begin=lambda: None, end=lambda: None)
+    result = measure_profiled_forward(
+        lambda: None, warmup=20, iters=20, guard=guard, directory=directory, last_forward=lambda: None
+    )
+    assert len(result["samples"]) == 41
+    assert result["durations_us"] == list(range(21, 41))
+    assert result["diagnostic_sample"]["duration_us"] == 41
+    assert result["diagnostic_sample"]["phase"] == "diagnostic"
+    assert all(sample["name"] == name for sample in result["samples"])
 
 
 def test_decimal_timestamp_order_survives_float_rounding_across_shards(tmp_path):
