@@ -33,6 +33,8 @@ constexpr uint32_t kTraceRecordElements = 16U;
 constexpr uint32_t kTraceHeaderElements = 16U;
 constexpr uint32_t kTraceMaxCapacity = 65536U;
 constexpr uint64_t kTraceUnknown = UINT64_MAX;
+// Record word 13 is a flag bitset; old schema-1 records have zero here.
+constexpr uint64_t kTraceFlagDeferredCompletion = 1U;
 
 enum class TraceEvent : uint32_t {
     Pack = 0,

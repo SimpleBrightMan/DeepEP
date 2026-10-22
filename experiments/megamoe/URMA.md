@@ -95,15 +95,19 @@ Scale准备只在详细trace中独立计时，未归入原有8个aggregate phase
 
 空专家没有计算任务。各AIC及其配对AIV0按本核任务独立推进，专家批次之间没有全核barrier；GMM1下一批可以与上一批的SwiGLU/GMM2重叠。13个SwiGLU核使用新的M组任务编号，GMM2等待同组全部1280列activation完成，不能只等待其中一个N tile。
 
-AIC和配对AIV0按全局tile编号直接跳到本核拥有的M-group，避免逐组加载描述、构造matmul参数后再判断是否属于本核。GMM2批末完成计数也只遍历本核参与的组。全局tile编号模28的归属、专家/阶段顺序、最后一个本核组的上下文收尾和完成计数均保持不变；该遍历适用于任意路由、空专家及不足256行的尾组，不依赖均衡分布。
+AIC和配对AIV0按全局tile编号直接跳到本核拥有的M-group，避免逐组加载描述、构造matmul参数后再判断是否属于本核。全局tile编号模28的归属、专家/阶段顺序、最后一个本核组的上下文收尾和完成计数总量均保持不变；该遍历适用于任意路由、空专家及不足256行的尾组，不依赖均衡分布。
 
 返回CV保存它所依赖的M组编号列表，同一组去重后只出现一次。每组全部GMM2 N tile完成分段输出后才满足依赖；仅提交Cube/FIX指令不能提前放行PUT。BS2048时一个peer的CV0大致跨6个专家，新顺序让多个peer按CV波次逐渐就绪，不保证15个peer同时开始。
 
 GMM1和GMM2分别持有可复用的上下文：同一专家、同一GMM阶段内，本核相邻的M256任务沿用L1/L0缓冲、事件及ping-pong槽位状态，仅更新当前组的地址和形状；本核在该专家上的最后一个有任务组才执行End和配对AIV0确认。两个阶段仍互斥使用同一组硬件资源，切换阶段或专家时释放旧上下文。无任务核不启动上下文，该确认不涉及通信或SwiGLU AIV1。
 
-GMM1仍逐tile等待FIX输出完成并发布就绪标志，以便SwiGLU及时开始。GMM2改为在本核完成该专家全部任务后统一等待FIX输出完成，再按各M组实际完成的tile数批量累计`gmm2Done`；中间M256组不再执行FIX_S或发布计数，内部FIX_M事件继续保护L0C槽位。Combine和self Reduce仍检查每组的完整N方向计数，不会提前读取结果，但通知时间推迟到本核的专家批次末尾。此处不增加等待Dispatch的门槛，也不改变远端每CV的`PUT → quiet → ready flag`；通信核保留本rank所有Dispatch完成后才启动Combine的原有规则。
+`megamoe-urma-gmmOpt`分支让每个AIC保留一笔待发布的GMM完成通知。当前tile提交后，在FIX队列中放置独占的`FIX_S 1`完成标记；下一tile提交后，再等待上一标记并发布上一tile的flag，随后为当前tile放置新的标记。GMM1写对应逻辑tile的`gmm1Done=1`，GMM2为对应M组`gmm2Done`原子加1，不再在专家批末重复批量计数。标记始终位于所属tile的全部输出之后、下一tile输出之前，因此等待上一标记不会排空下一tile，也没有新增`PIPE_ALL`。
 
-trace中的最后一个参与组包含本专家该阶段的上下文收尾；若与tile条合并，该条也包含这段收尾时间。GMM2中间组不再单独产生Drain条。
+如果下一组的`inputScaleDone`或`activationDone`尚未就绪，先发布pending再阻塞等待，避免SwiGLU等着本核尚未发布的GMM1通知形成环。最后一笔在AIC退出计算循环、发布本核完成计数之前补发。专家/阶段切换仍执行`End(false)`和AIC/AIV0上下文握手，保证输出落地后才复用缓冲和矩阵布局；这里只延后通知，未取消这些资源依赖。
+
+GMM2相对tailCover的专家批末方案新增每tile一个延迟`FIX_S`标记；当前支持的形状每核每M组至多一个tile，因此原子计数次数不变，但通知会更早到达消费者。GMM1则会延后一笔通知，可能影响SwiGLU启动；两者的收益应以实际profiler结果判断。Combine和self Reduce继续检查M组完整计数，远端每CV的`PUT → quiet → ready flag`及Dispatch全部完成后才开始Combine的规则保持不变。
+
+AIC的`Gmm1Tile`/`Gmm2Tile`只在完成flag发布后结束计时，包含提交下一任务以及可能的上下文收尾。新trace用记录第13号word的`kTraceFlagDeferredCompletion`标识该语义，导出为`completion_deferred=true`；旧trace仍可读取。这些条可能互相重叠，不能简单求和当作纯计算时间。上下文Drain条仍单独记录且不与这些tile条再次合并。计时不增加同步；aggregate phase计数仍是函数调用范围，与tile提交至通知跨度不同。
 
 GMM1直接Gather的X，以及AIC读取的已整理输入scale，均恢复默认L2策略，不再强制禁用L2。AIV对接收scale的一次整理读取、Reduce读取及完成flag的缓存策略保持原样。
 

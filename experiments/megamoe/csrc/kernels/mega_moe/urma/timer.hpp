@@ -37,9 +37,10 @@ public:
     }
 
     // This interval measures the instrumented call, not a synthesized DMA or
-    // Cube hardware duration. Submission and existing completion waits are
-    // separate events; recording never introduces an extra pipeline drain.
-    __aicore__ inline void TraceEnd(TraceEvent event, uint64_t start, const TraceMeta& meta = TraceMeta{})
+    // Cube hardware duration. Deferred tiles end at completion-flag publication
+    // and can overlap other records. Recording adds no pipeline drain.
+    __aicore__ inline void TraceEnd(TraceEvent event, uint64_t start, const TraceMeta& meta = TraceMeta{},
+                                    uint64_t flags = 0U)
     {
         if (traceAddress_ == 0U) return;
         const uint64_t end = AscendC::GetSystemCycle();
@@ -61,7 +62,7 @@ public:
         record[10] = meta.tileN;
         record[11] = meta.columns;
         record[12] = meta.bytes;
-        record[13] = 0U;
+        record[13] = flags;
         record[14] = 0U;
         record[15] = 0U;
         FlushTraceLine(record);

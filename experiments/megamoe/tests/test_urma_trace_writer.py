@@ -85,6 +85,22 @@ int main() {
     disabled.TraceEnd(TraceEvent::Pack, 0);
     disabled.FinishTrace();
     assert(AscendC::cycles == cycles && AscendC::flushes == flushes);
+    std::vector<uint64_t> deferredMemory(kTimerCores * stride, guard);
+    Timer deferred;
+    deferred.Init(0, reinterpret_cast<uint64_t>(deferredMemory.data()), 1);
+    start = deferred.TraceBegin();
+    deferred.TraceEnd(TraceEvent::Gmm1Tile, start, meta, kTraceFlagDeferredCompletion);
+    deferred.FinishTrace();
+#ifdef DEEPEP_MEGAMOE_TIMER
+    auto* deferredRecord = deferredMemory.data() + core * stride + kTraceHeaderElements;
+    assert(deferredRecord[2] == static_cast<uint64_t>(TraceEvent::Gmm1Tile));
+    assert(deferredRecord[13] == kTraceFlagDeferredCompletion);
+    assert(deferredRecord[14] == 0 && deferredRecord[15] == 0);
+    assert(AscendC::cycles == cycles + 2 && AscendC::flushes == flushes + 2);
+#else
+    for (auto value : deferredMemory) assert(value == guard);
+    assert(AscendC::cycles == cycles && AscendC::flushes == flushes);
+#endif
 }
 """,
         encoding="utf-8",

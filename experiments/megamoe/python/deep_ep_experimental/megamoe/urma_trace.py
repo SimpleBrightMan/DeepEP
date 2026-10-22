@@ -1,7 +1,8 @@
 """Validate URMA detailed trace schema 1 and export a rank-local Chrome trace.
 
-Raw records separate submission, waiting and drain. The default display joins
-unambiguously paired Cube submission/drain records, retaining their provenance.
+Legacy records separate submission, waiting and drain. Deferred Cube records
+instead end at completion-flag publication and can overlap the next submission.
+The default display joins only unambiguously paired legacy submission/drains.
 """
 
 import argparse
@@ -14,6 +15,7 @@ TRACE_SCHEMA = 1
 ENGINE_COUNT = 84
 HEADER_WORDS = RECORD_WORDS = 16
 UNKNOWN = (1 << 64) - 1
+TRACE_FLAG_DEFERRED_COMPLETION = 1
 EVENTS = (
     "Pack",
     "DispatchPutX",
@@ -143,6 +145,7 @@ def decode_trace(raw, *, rank, clock_mhz):
     records = []
     for engine, (data, count) in enumerate(zip(slices, counts)):
         previous_end = None
+        previous_regular_end = None
         for ordinal in range(count):
             offset = HEADER_WORDS + ordinal * RECORD_WORDS
             row = tuple(map(int, data[offset : offset + RECORD_WORDS]))
@@ -151,11 +154,22 @@ def decode_trace(raw, *, rank, clock_mhz):
                 raise ValueError(f"engine={engine} record={ordinal}: unknown event id={event_id}")
             if end < start or start == UNKNOWN or end == UNKNOWN:
                 raise ValueError(f"engine={engine} record={ordinal}: invalid ticks start={start} end={end}")
-            if previous_end is not None and start < previous_end:
+            flags = row[13]
+            if flags & ~TRACE_FLAG_DEFERRED_COMPLETION or any(row[14:]):
+                raise ValueError(f"engine={engine} record={ordinal}: nonzero reserved record fields")
+            deferred = bool(flags & TRACE_FLAG_DEFERRED_COMPLETION)
+            if deferred and (event_id not in (15, 19) or engine % 3 != 0):
+                raise ValueError(f"engine={engine} record={ordinal}: deferred completion requires an AIC GMM tile")
+            # TraceEnd emits in completion order, not necessarily start order.
+            # Delayed tile envelopes can contain regular waits/drains; retain
+            # the old non-overlap validation for those regular scopes.
+            if (previous_end is not None and end < previous_end) or (
+                not deferred and previous_regular_end is not None and start < previous_regular_end
+            ):
                 raise ValueError(f"engine={engine} record={ordinal}: overlapping or out-of-order event ticks")
             previous_end = end
-            if any(row[13:]):
-                raise ValueError(f"engine={engine} record={ordinal}: nonzero reserved record fields")
+            if not deferred:
+                previous_regular_end = end
             if row[3] != UNKNOWN and row[3] >= 16:
                 raise ValueError(f"engine={engine} record={ordinal}: peer must be in [0,16) or unknown")
             records.append((start, end, engine, ordinal, row))
@@ -180,7 +194,10 @@ def decode_trace(raw, *, rank, clock_mhz):
         envelope_us=(last - origin) / clock_mhz,
         clock_alignment="each rank starts at its own earliest event; cross-rank clocks are not synchronized",
         scope="diagnostic invocation; excluded from formal performance samples",
-        interpretation="PUT/Cube submit bars do not measure asynchronous completion; inspect quiet/drain/wait separately",
+        interpretation=(
+            "PUT/Cube submit bars do not measure asynchronous completion; inspect quiet/drain/wait separately; "
+            "marked deferred Cube bars end at completion-flag publication and may overlap subsequent submission"
+        ),
         events=dict(Counter(EVENTS[record[4][2]] for record in records)),
     )
     events = [dict(ph="M", pid=rank, tid=0, name="process_name", args=dict(name=f"rank {rank} (independent clock)"))]
@@ -201,6 +218,14 @@ def decode_trace(raw, *, rank, clock_mhz):
     for start, end, engine, ordinal, row in sorted(records, key=lambda value: (value[0], value[2], value[3])):
         event = EVENTS[row[2]]
         name, category, color, meaning = event_style(event)
+        deferred = bool(row[13] & TRACE_FLAG_DEFERRED_COMPLETION)
+        if deferred:
+            name = event + " [submit to completion flag]"
+            category = "cube.deferred_completion"
+            meaning = (
+                "submission through completion-flag publication; may include next task submission/overlap; "
+                "not pure Cube hardware duration"
+            )
         args = {field: None if value == UNKNOWN else value for field, value in zip(METADATA_FIELDS, row[3:12])}
         if event == "LocalSync":
             stage = args.pop("cv")
@@ -214,6 +239,8 @@ def decode_trace(raw, *, rank, clock_mhz):
             elapsed_ticks=end - start,
             meaning=meaning,
         )
+        if deferred:
+            args["completion_deferred"] = True
         events.append(
             dict(
                 ph="X",
@@ -260,8 +287,9 @@ def filter_trace_waits(trace):
 def coalesce_gmm_tiles(trace):
     """Join adjacent AIC tile/drain records without changing device synchronization.
 
-    Group drains belong to a tile only when this engine submitted exactly one
-    tile in that group. Record ordinals prevent joining across hidden waits.
+    Group drains belong to a legacy tile only when this engine submitted exactly
+    one tile in that group. Deferred completion tiles already include completion
+    and are never joined. Record ordinals prevent joining across hidden waits.
     IDs 33/34 are JSON-only composite events, never raw device event IDs.
     """
     lanes = {}
@@ -274,12 +302,19 @@ def coalesce_gmm_tiles(trace):
 
     replacements, removed = {}, set()
     for lane in lanes.values():
+        # Deferred tile events may be emitted after scopes that start later;
+        # chronological display order is not raw writer adjacency.
+        lane.sort(key=lambda item: item[1]["args"]["record_index"])
         counts = Counter(
             (event["args"]["event_id"], context(event)) for _, event in lane if event["args"]["event_id"] in (15, 19)
         )
         for position, (index, tile) in enumerate(lane):
             event_id = tile["args"]["event_id"]
-            if event_id not in (15, 19) or tile["args"].get("fragment") is None:
+            if (
+                event_id not in (15, 19)
+                or tile["args"].get("fragment") is None
+                or tile["args"].get("completion_deferred")
+            ):
                 continue
             parts = [tile]
             candidates = (16, 27) if event_id == 15 else (21,)

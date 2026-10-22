@@ -9,6 +9,7 @@ from deep_ep_experimental.megamoe.urma_trace import (
     EVENTS,
     HEADER_WORDS,
     RECORD_WORDS,
+    TRACE_FLAG_DEFERRED_COMPLETION,
     UNKNOWN,
     TraceOverflowError,
     decode_trace,
@@ -25,11 +26,12 @@ def trace_buffer(capacity=4):
     return raw
 
 
-def add_record(raw, engine=2, event="DispatchPutX", start=1000, end=1010, **metadata):
+def add_record(raw, engine=2, event="DispatchPutX", start=1000, end=1010, flags=0, **metadata):
     index = int(raw[engine, 2])
     record = raw[engine, HEADER_WORDS + index * RECORD_WORDS : HEADER_WORDS + (index + 1) * RECORD_WORDS]
     record[:3] = [start, end, EVENTS.index(event)]
     record[3:12] = UNKNOWN
+    record[13] = flags
     fields = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns", "bytes")
     for key, value in metadata.items():
         record[3 + fields.index(key)] = value
@@ -58,6 +60,7 @@ def test_export_fields_thread_mapping_and_submission_semantics():
     assert rows[0]["args"]["tile_m"] is None
     assert "not remote completion" in rows[0]["args"]["meaning"]
     assert "not Cube completion" in rows[1]["args"]["meaning"]
+    assert "completion_deferred" not in rows[1]["args"]
     names = {row["tid"]: row["args"]["name"] for row in result["traceEvents"] if row["name"] == "thread_name"}
     assert names[0] == "block 00 AIC" and names[1] == "block 00 AIV0" and names[2] == "block 00 AIV1"
     assert names[83] == "block 27 AIV1"
@@ -236,7 +239,10 @@ def test_overflow_lists_all_affected_engines_and_writes_no_partial_trace(tmp_pat
         (1, UNKNOWN, "ticks"),
         (2, len(EVENTS), "event id"),
         (3, 16, "peer"),
-        (13, 1, "reserved record"),
+        (13, 1, "deferred completion requires"),
+        (13, 2, "reserved record"),
+        (14, 1, "reserved record"),
+        (15, 1, "reserved record"),
     ],
 )
 def test_reject_invalid_record(field, value, message):
@@ -260,6 +266,48 @@ def test_same_engine_records_cannot_overlap_or_go_backwards(second_start):
     add_record(raw, start=1000, end=1010)
     add_record(raw, start=second_start, end=1020)
     with pytest.raises(ValueError, match="overlapping or out-of-order"):
+        decode_trace(raw, rank=0, clock_mhz=1000)
+
+
+def test_deferred_tiles_keep_ids_and_accept_completion_order_with_overlapping_starts():
+    raw = trace_buffer(4)
+    add_record(raw, engine=0, event="WaitInputScale", start=1010, end=1020)
+    add_record(raw, engine=0, event="Gmm1Tile", start=1000, end=1040, flags=TRACE_FLAG_DEFERRED_COMPLETION)
+    add_record(raw, engine=0, event="WaitActivation", start=1040, end=1050)
+    add_record(raw, engine=0, event="Gmm2Tile", start=1030, end=1080, flags=TRACE_FLAG_DEFERRED_COMPLETION)
+    decoded = decode_trace(raw, rank=0, clock_mhz=1000)
+    rows = events(decoded)
+    assert [row["args"]["record_index"] for row in rows] == [1, 0, 3, 2]
+    tiles = [row for row in rows if row["args"].get("completion_deferred")]
+    assert [row["args"]["event_id"] for row in tiles] == [15, 19]
+    assert [row["dur"] for row in tiles] == [0.04, 0.05]
+    assert all(row["cat"] == "cube.deferred_completion" for row in tiles)
+    assert all("next task submission/overlap" in row["args"]["meaning"] for row in tiles)
+    assert decoded["metadata"]["envelope_ticks"] == 80
+
+
+@pytest.mark.parametrize("engine,event", [(1, "Gmm1Tile"), (2, "Gmm2Tile"), (0, "Gmm1Drain")])
+def test_deferred_marker_is_restricted_to_aic_tiles(engine, event):
+    raw = trace_buffer()
+    add_record(raw, engine=engine, event=event, flags=TRACE_FLAG_DEFERRED_COMPLETION)
+    with pytest.raises(ValueError, match="deferred completion requires an AIC GMM tile"):
+        decode_trace(raw, rank=0, clock_mhz=1000)
+
+
+def test_deferred_tiles_do_not_allow_completion_ticks_to_go_backwards():
+    raw = trace_buffer()
+    add_record(raw, engine=0, event="Gmm1Tile", start=1000, end=1040, flags=1)
+    add_record(raw, engine=0, event="Gmm2Tile", start=1020, end=1030, flags=1)
+    with pytest.raises(ValueError, match="out-of-order"):
+        decode_trace(raw, rank=0, clock_mhz=1000)
+
+
+def test_deferred_tile_does_not_hide_overlap_between_regular_scopes():
+    raw = trace_buffer()
+    add_record(raw, engine=0, event="WaitInputScale", start=1010, end=1020)
+    add_record(raw, engine=0, event="Gmm1Tile", start=1000, end=1030, flags=1)
+    add_record(raw, engine=0, event="WaitActivation", start=1015, end=1040)
+    with pytest.raises(ValueError, match="overlapping"):
         decode_trace(raw, rank=0, clock_mhz=1000)
 
 

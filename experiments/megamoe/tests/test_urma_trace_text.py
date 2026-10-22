@@ -37,6 +37,20 @@ def test_coalesced_scopes_are_not_reported_as_missing_records(trace_text):
     assert "34 Gmm2Tile cube.compute_drain" in report
 
 
+def test_deferred_scopes_preserve_overlap_without_fabricating_gaps(trace_text):
+    from deep_ep_experimental.megamoe.urma_trace import decode_trace
+    from test_urma_trace import add_record, trace_buffer
+
+    raw = trace_buffer(2)
+    add_record(raw, engine=0, event="Gmm1Tile", start=1000, end=1040, flags=1)
+    add_record(raw, engine=0, event="Gmm2Tile", start=1030, end=1080, flags=1)
+    report = trace_text.render_report(decode_trace(raw, rank=0, clock_mhz=1000), detail=True)
+    assert "source_status=COMPLETE" in report
+    assert "15 Gmm1Tile cube.deferred_completion" in report
+    assert "19 Gmm2Tile cube.deferred_completion" in report
+    assert "sum_us=0.090 union_us=0.080 gap_us=0.000" in report
+
+
 EVENTS = {
     "Pack": (0, "compute.copy"),
     "DispatchPutX": (1, "transport.submit"),
