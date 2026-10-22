@@ -162,7 +162,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     input_scale_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
     activation_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
     gmm2_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
-    local_flags_ = allocate(16 * MegaMoeUrma::kFlagBytes);
+    local_flags_ = allocate(MegaMoeUrma::kLocalFlagCount * MegaMoeUrma::kFlagBytes);
     system_workspace_ = allocate(platform_.system_workspace + (2ULL << 20));
 
     args_.expandedX = Address(expanded_x_);

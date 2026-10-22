@@ -10,6 +10,29 @@ TIMER_NUMEL = 28 * 3 * 8 * 16
 TIMER_SCHEMA = 1
 
 
+def _transport_peer(rank, owner, phase, record):
+    """Word 5 is peer + 1 for explicitly mapped transport records; zero is legacy."""
+    marker = int(record[5])
+    if marker == 0:
+        if owner >= 16:
+            raise ValueError("helper transport payload requires an explicit peer marker")
+        return remote_peer_for_worker(rank, owner) if owner < 15 else rank
+    if not 1 <= marker <= 16:
+        raise ValueError("transport peer marker must encode a rank in [0,16)")
+    peer = marker - 1
+    if owner < 15:
+        expected = remote_peer_for_worker(rank, owner)
+    elif phase == "Combine" and owner < 27:
+        helper = owner - 15
+        group_begin = rank // 4 * 4
+        expected = helper + (4 if helper >= group_begin else 0)
+    else:
+        raise ValueError("explicit transport peer marker on a non-transport worker")
+    if peer != expected:
+        raise ValueError("transport peer marker disagrees with the worker's static assignment")
+    return peer
+
+
 def communication_bandwidth(raw, rank, *, clock_mhz=1000.0):
     """Effective aggregate payload divided by the class's first-to-last span.
 
@@ -17,6 +40,7 @@ def communication_bandwidth(raw, rank, *, clock_mhz=1000.0):
     assumption, not a device-frequency measurement. Pass None for raw ticks.
     Older records may include self-copy in INTRA. Detect it from recorded
     payload; direct self Pack/GMM2 writes are not communication payload.
+    Explicit peer markers also cover activation helpers' disjoint Combine CVs.
     """
     import numpy as np
 
@@ -45,16 +69,21 @@ def communication_bandwidth(raw, rank, *, clock_mhz=1000.0):
     )
     for phase in ("Dispatch", "Combine"):
         phase_idx = PHASES.index(phase)
+        phase_records = []
+        for owner in range(28):
+            record = values[owner, 2, phase_idx]
+            if record[3] <= 0:
+                continue
+            if record[4] <= 0 or record[6] != TIMER_SCHEMA:
+                raise ValueError("payload without a completed timer record")
+            peer = _transport_peer(rank, owner, phase, record)
+            phase_records.append((owner, peer, record))
         for kind in ("INTRA", "CROSS"):
-            selected = []
-            for owner in range(16):
-                peer = remote_peer_for_worker(rank, owner) if owner < 15 else rank
-                owner_kind = "INTRA" if peer // 4 == rank // 4 else "CROSS"
-                record = values[owner, 2, phase_idx]
-                if owner_kind == kind and record[3] > 0:
-                    if record[4] <= 0 or record[6] != TIMER_SCHEMA:
-                        raise ValueError("payload without a completed timer record")
-                    selected.append((owner, peer, record))
+            selected = [
+                (owner, peer, record)
+                for owner, peer, record in phase_records
+                if ("INTRA" if peer // 4 == rank // 4 else "CROSS") == kind
+            ]
             payload = sum(int(record[3]) for _, _, record in selected)
             includes_self_copy = any(peer == rank for _, peer, _ in selected)
             result["includes_self_copy_in_intra"] |= includes_self_copy

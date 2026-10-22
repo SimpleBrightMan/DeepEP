@@ -674,8 +674,8 @@ template<typename T> void DataCopy(GlobalTensor<T> target, LocalTensor<T> source
         r"""
 #pragma once
 inline void aclshmemi_kernel_abort(const char*, ...) {}
-template<typename T, int> void aclshmemx_udma_put_nbi(T*, T*, void*, uint32_t, uint32_t, uint32_t) {}
-inline void aclshmemx_udma_quiet(int) {}
+template<typename T, int> void aclshmemx_udma_qp_put_nbi(T*, T*, void*, uint32_t, int, uint32_t, uint32_t) {}
+inline void aclshmemx_udma_qp_quiet(int, uint32_t) {}
 inline void* aclshmem_ptr(void* address, unsigned) { return address; }
 """
     )
@@ -875,6 +875,7 @@ def test_finished_observation_and_aic_publication_integration():
         < combine.index("ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);")
         < combine.index("Quiet(peer);")
         < combine.index("PublishDone(symmetric,")
+        < combine.index("LocalCompletionFlag(args, kLocalFlagHelperDoneBase + helper)")
         < combine.index("FinishCombinePeer(args, owner, signal, peerCounted, selfCounted);")
     )
     process = source[source.index("__aicore__ inline void Process") :]

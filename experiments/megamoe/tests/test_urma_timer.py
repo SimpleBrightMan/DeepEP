@@ -95,3 +95,62 @@ def test_summary_retains_self_copy_label_for_older_timer_payloads():
     assert summary["Dispatch", "INTRA"]["includes_self_copy"]
     assert not summary["Dispatch", "CROSS"]["includes_self_copy"]
     assert not summary["Combine", "INTRA"]["includes_self_copy"]
+
+
+@pytest.mark.parametrize("rank", range(16))
+def test_early_combine_helpers_count_only_their_disjoint_payload(rank):
+    raw = np.zeros((28, 3, 8, 16), dtype=np.int64)
+    cross_peers = [peer for peer in range(16) if peer // 4 != rank // 4]
+    expected = {
+        ("Dispatch", "INTRA"): 0,
+        ("Dispatch", "CROSS"): 0,
+        ("Combine", "INTRA"): 0,
+        ("Combine", "CROSS"): 0,
+    }
+    for peer in range(16):
+        if peer == rank:
+            continue
+        owner = peer if peer < rank else peer - 1
+        # Empty peers, uneven tails, and odd CV counts must not change accounting.
+        rows = (peer % 5) * 33
+        kind = "INTRA" if peer // 4 == rank // 4 else "CROSS"
+        dispatch_bytes, combine_bytes = rows * 3696, rows * 7168
+        raw[owner, 2, 1, :7] = [10, 50, 40, dispatch_bytes, 1, peer + 1, 1]
+        helper_rows = 0
+        if kind == "CROSS":
+            chunks = (rows + 31) // 32
+            helper_rows = min(rows, ((chunks + 1) // 2) * 32)
+            helper_owner = 15 + cross_peers.index(peer)
+            raw[helper_owner, 2, 5, :7] = [100, 200, 100, helper_rows * 7168, 1, peer + 1, 1]
+        raw[owner, 2, 5, :7] = [300, 500, 200, (rows - helper_rows) * 7168, 1, peer + 1, 1]
+        expected["Dispatch", kind] += dispatch_bytes
+        expected["Combine", kind] += combine_bytes
+    report = communication_bandwidth(raw, rank)
+    classes = {(row["phase"], row["communication_class"]): row for row in report["classes"]}
+    assert {key: row["payload_bytes"] for key, row in classes.items()} == expected
+    assert not report["includes_self_copy_in_intra"]
+    cross = classes["Combine", "CROSS"]
+    assert cross["first_tick"] == 100 and cross["last_tick"] == 500
+    assert cross["envelope_ticks"] == 400
+    assert cross["bandwidth_gbps"] == expected["Combine", "CROSS"] / 400
+    assert any(owner >= 15 for owner in cross["workers"])
+    assert all(peer // 4 != rank // 4 for peer in cross["peers"])
+    assert all(owner < 15 for owner in classes["Combine", "INTRA"]["workers"])
+
+
+@pytest.mark.parametrize(
+    "owner,phase,marker,message",
+    [
+        (16, 1, 6, "non-transport"),
+        (27, 5, 5, "non-transport"),
+        (16, 5, 0, "explicit peer marker"),
+        (15, 5, 1, "static assignment"),
+        (0, 5, 3, "static assignment"),
+        (3, 5, 17, "peer marker"),
+    ],
+)
+def test_reject_unmapped_or_inconsistent_transport_workers(owner, phase, marker, message):
+    raw = np.zeros((28, 3, 8, 16), dtype=np.int64)
+    raw[owner, 2, phase, :7] = [10, 50, 40, 64, 1, marker, 1]
+    with pytest.raises(ValueError, match=message):
+        communication_bandwidth(raw, 0)

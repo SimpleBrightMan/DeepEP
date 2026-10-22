@@ -15,9 +15,10 @@ constexpr uint32_t kSignalSlotBytes = 128U;
 constexpr uint32_t kSignalCopyBytes = 32U;
 constexpr uint32_t kMaxPutBytes = 256U * 1024U * 1024U;
 
-// The dedicated Session creates an independent QP0/SQ for every peer and
-// disables shared jetty. Exactly one AIV1 worker owns each remote peer. Other
-// workers must not submit or quiet that peer's queue.
+// The dedicated Session creates two independent QPs per peer with shared jetty
+// disabled. The original owner uses QP0 for Dispatch and its Combine suffix;
+// one statically assigned activation helper uses QP1 for the Combine prefix.
+// Each (peer, QP) still has exactly one submitter and completion poller.
 __aicore__ inline uint32_t PeerForOwner(uint32_t rank, uint32_t owner)
 {
     return owner < rank ? owner : owner + 1U;
@@ -28,21 +29,21 @@ __aicore__ inline uint32_t PeerForOwner(uint32_t rank, uint32_t owner)
 // The caller completes local GM producers before submitting and retains src
 // unchanged until Quiet(peer) returns. This transport deliberately has no GET.
 __aicore__ inline void Put(__gm__ uint8_t* symmetricBase, uint64_t dstOffset, __gm__ uint8_t* src, uint32_t bytes,
-                           uint32_t peer)
+                           uint32_t peer, uint32_t qp = 0U)
 {
     if (bytes == 0U) return;
     if (bytes > kMaxPutBytes) {
         aclshmemi_kernel_abort("MegaMoE URMA PUT exceeds 256 MiB: bytes=%u peer=%u\n", bytes, peer);
         return;
     }
-    aclshmemx_udma_put_nbi<uint8_t, PIPE_S>(symmetricBase + dstOffset, src, nullptr, bytes, peer, 0U);
+    aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_S>(symmetricBase + dstOffset, src, nullptr, bytes, peer, qp, 0U);
 }
 
-// Blocking completion of this peer's QP0, not merely WQE publication. The
+// Blocking completion of only this peer/QP, not merely WQE publication. The
 // one-owner rule also applies here: no second worker may poll the same CQ.
-__aicore__ inline void Quiet(uint32_t peer)
+__aicore__ inline void Quiet(uint32_t peer, uint32_t qp = 0U)
 {
-    aclshmemx_udma_quiet(static_cast<int>(peer));
+    aclshmemx_udma_qp_quiet(static_cast<int>(peer), qp);
 }
 
 // Publish only AFTER Quiet(peer) covered every token/scale PUT for this chunk.

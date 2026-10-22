@@ -10,12 +10,17 @@ constexpr uint32_t kAic = 28;
 constexpr uint32_t kLocalWorkers = 2U * kAic;
 constexpr uint32_t kCommunicationWorkers = 15;
 constexpr uint32_t kActivationWorkers = 13;
+constexpr uint32_t kGroupSize = 4U;
+constexpr uint32_t kCombineHelpers = kWorld - kGroupSize;
 constexpr uint64_t kFlagBytes = 128;
 // Per-invocation counters in localFlags, cleared before the start handshake.
 constexpr uint32_t kLocalFlagDispatchDone = 0U;
 constexpr uint32_t kLocalFlagAicDone = 1U;
 constexpr uint32_t kLocalFlagIncomingDone = 2U;
 constexpr uint32_t kLocalFlagPackDone = 3U;
+constexpr uint32_t kLocalFlagHelperDoneBase = 4U;
+constexpr uint32_t kLocalFlagCount = kLocalFlagHelperDoneBase + kCombineHelpers;
+static_assert(kCombineHelpers < kActivationWorkers);
 // Reduce dependency values are uint64 bit patterns stored in an int64 tensor.
 // Low values address a producer/CV completion flag; tagged values address a
 // local GMM2 group that writes its self return rows directly.

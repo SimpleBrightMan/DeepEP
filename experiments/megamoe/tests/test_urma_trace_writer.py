@@ -85,6 +85,29 @@ int main() {
     disabled.TraceEnd(TraceEvent::Pack, 0);
     disabled.FinishTrace();
     assert(AscendC::cycles == cycles && AscendC::flushes == flushes);
+    // Aggregated transport markers disambiguate helper block 15 from old
+    // self-copy traces. Payload accumulates only on this worker's phase slot.
+    std::vector<uint64_t> totals(kTimerCores * kTimerPhases * kTimerRecordElements + 2, guard);
+    auto* aggregate = totals.data() + 1;
+    Timer aggregateTimer;
+    aggregateTimer.Init(reinterpret_cast<uint64_t>(aggregate));
+    aggregateTimer.Begin(Phase::Pack);
+    aggregateTimer.End(Phase::Pack, 32);
+    aggregateTimer.Begin(Phase::Combine);
+    aggregateTimer.End(Phase::Combine, 7168, 7);
+    aggregateTimer.Begin(Phase::Combine);
+    aggregateTimer.End(Phase::Combine, 14336, 7);
+    assert(totals.front() == guard && totals.back() == guard);
+#ifdef DEEPEP_MEGAMOE_TIMER
+    auto* packed = aggregate + (core * kTimerPhases + Phase::Pack) * kTimerRecordElements;
+    auto* combined = aggregate + (core * kTimerPhases + Phase::Combine) * kTimerRecordElements;
+    assert(packed[3] == 32 && packed[4] == 1 && packed[5] == 0 && packed[6] == kProtocol);
+    assert(combined[3] == 21504 && combined[4] == 2 && combined[5] == 8 && combined[6] == kProtocol);
+    assert(combined[0] < combined[1]);
+#else
+    for (auto value : totals) assert(value == guard);
+    assert(AscendC::cycles == cycles && AscendC::flushes == flushes);
+#endif
 }
 """,
         encoding="utf-8",

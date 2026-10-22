@@ -13,23 +13,6 @@
 namespace MegaMoeUrma {
 using namespace AscendC;
 
-__aicore__ inline Chunk LoadChunk(uint64_t address, uint32_t index)
-{
-    const auto* gm = reinterpret_cast<__gm__ Chunk*>(address) + index;
-    return {gm->peer,          gm->cv,      gm->localRow, gm->remoteRow, gm->rows, gm->fragmentBegin,
-            gm->fragmentCount, gm->reserved};
-}
-
-__aicore__ inline TraceMeta ChunkTraceMeta(const Chunk& chunk)
-{
-    TraceMeta meta;
-    meta.peer = chunk.peer;
-    meta.cv = chunk.cv;
-    meta.row = chunk.localRow;
-    meta.rows = chunk.rows;
-    return meta;
-}
-
 __aicore__ inline void TraceLocalSync(Timer& timer, uint32_t stage)
 {
     TraceMeta meta;
@@ -77,9 +60,9 @@ __aicore__ inline void WaitChunkComputed(const Arguments& args, const Chunk& chu
     }
 }
 
-// One and only one AIV1 owns all PUT/quiet operations for this peer for the
-// entire invocation. Dispatch and Combine share that owner's QP serially;
-// no queue tail or CQ head has multiple writers.
+// Original owners keep QP0, all Dispatch, and the Combine suffix for cross
+// peers (all CVs for intra peers). Helpers own disjoint CV prefixes on QP1;
+// queue tails and CQ heads still have one writer each.
 __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Timer& timer)
 {
     const uint32_t peer = PeerForOwner(args.config.rank, owner);
@@ -87,6 +70,8 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     LocalTensor<uint64_t> signal(TPosition::VECCALC, 0U, 4U);
     TraceMeta peerMeta;
     peerMeta.peer = peer;
+    bool packFinished = args.config.packRoundCount <= kPackStartupRounds;
+    if (packFinished) MarkPackWorkerComplete(args);
     timer.Begin(Phase::Barrier);
     // Start was published before the startup Pack. Wait only now, immediately
     // before this owner's first possible payload write to the peer.
@@ -103,6 +88,10 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         // round, including data for other peers and self. Never exit early.
         if (chunk.rows == 0U) {
             PackOneRound(args, round + kPackStartupRounds, owner, kAic, timer);
+            if (!packFinished && round + kPackStartupRounds + 1U >= args.config.packRoundCount) {
+                MarkPackWorkerComplete(args);
+                packFinished = true;
+            }
             continue;
         }
         TraceMeta meta = ChunkTraceMeta(chunk);
@@ -129,6 +118,12 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         // The current URMA write progresses while MTE prepares this worker's
         // fixed quota two CVs ahead. No claims, extra work stealing or phase join.
         PackOneRound(args, round + kPackStartupRounds, owner, kAic, timer);
+        // Publish immediately after this worker's final Pack quota, before
+        // quiet and the final Dispatch rounds, so QP1 can overlap that tail.
+        if (!packFinished && round + kPackStartupRounds + 1U >= args.config.packRoundCount) {
+            MarkPackWorkerComplete(args);
+            packFinished = true;
+        }
         meta.bytes = 0U;
         start = timer.TraceBegin();
         Quiet(peer);
@@ -138,9 +133,8 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         PublishDone(symmetric, args.config.dispatchReadyOffset + readyIndex * kFlagBytes, peer, args.config.epoch,
                     signal, EVENT_ID0);
         timer.TraceEnd(TraceEvent::DispatchPublish, start, meta);
-        timer.End(Phase::Dispatch, chunk.rows * (h + scales));
+        timer.End(Phase::Dispatch, chunk.rows * (h + scales), peer);
     }
-    MarkPackWorkerComplete(args);
     // Empty peers must still join the local dispatch phase. Owner 0 accounts
     // self only when every steady Pack worker has finished, including helpers.
     AtomicAdd(ComputeFlag(args.localFlags, kLocalFlagDispatchDone), 1);
@@ -157,9 +151,11 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     bool combineStarted = false;
     bool peerCounted = false;
     bool selfCounted = false;
-    for (uint32_t index = 0U; index < args.config.recvChunkCount; ++index) {
+    const uint32_t helper = CrossHelperForPeer(args.config.rank, peer);
+    const auto range = FindCombinePeerRange(args, peer);
+    const uint32_t begin = helper < kCombineHelpers ? range.middle : range.begin;
+    for (uint32_t index = begin; index < range.end; ++index) {
         const Chunk chunk = LoadChunk(args.recvChunks, index);
-        if (chunk.peer != peer) continue;
         WaitChunkComputed(args, chunk, timer);
         if (!combineStarted) {
             timer.Begin(Phase::Combine);
@@ -189,7 +185,19 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     // Every CV now has its own completion flag, so the source can reduce
     // completed tokens while other peers are still computing/returning rows.
     // The aggregate envelope includes producer gaps between CVs.
-    if (combineStarted) timer.End(Phase::Combine, combineBytes);
+    if (combineStarted) timer.End(Phase::Combine, combineBytes, peer);
+    if (helper < kCombineHelpers) {
+        start = timer.TraceBegin();
+        while (ReadGmByPassDCache(LocalCompletionFlag(args, kLocalFlagHelperDoneBase + helper)) == 0) {
+            ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);
+            const uint64_t backoff = GetSystemCycle();
+            while (GetSystemCycle() - backoff < 200U) {
+            }
+        }
+        timer.TraceEnd(TraceEvent::WaitCombineReady, start, peerMeta);
+    }
+    // The helper prefix and our suffix both completed quiet and CV-ready.
+    // Only this original owner publishes whole-peer finished and counts inbound.
     // Once all sends finish, this owner only monitors its remaining inbound
     // contribution (plus self on owner 0). No per-token monitor or rank barrier.
     FinishCombinePeer(args, owner, signal, peerCounted, selfCounted);

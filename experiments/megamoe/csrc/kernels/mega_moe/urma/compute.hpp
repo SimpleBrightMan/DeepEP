@@ -5,6 +5,7 @@
 #include <cfloat>
 
 #include "abi.hpp"
+#include "combine_advance.hpp"
 #include "compute_contract.hpp"
 #include "pack_round.hpp"
 #include "transport.hpp"
@@ -442,10 +443,10 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
     timer.End(Phase::Activation);
 }
 
-// Each helper owns independent cursors for activation, input-scale groups and
-// its fixed Pack quota. A ready activation always wins; otherwise gather one
-// ready scale group or pack one quota. Recheck activation after each task.
-// Readiness checks never block another cursor. No dynamic task claims.
+// Static cursors retain activation priority over gather and Pack. After all
+// local Pack quotas finish, 12 workers also submit one ready cross-peer CV,
+// run ready activation/gather tasks until neither can progress, then quiet
+// their private QP1 and publish that CV. Readiness probes never block compute.
 __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Timer& timer)
 {
     UrmaActivation epilogue;
@@ -464,45 +465,74 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
     uint64_t idleStart = 0U;
     TraceEvent idleEvent = TraceEvent::WaitGmm1;
     TraceMeta idleMeta;
+    CombineHelper combine;
+    combine.Init(args, worker);
+    // Startup-only and empty Pack workloads must contribute before polling
+    // helper readiness; otherwise all workers could wait on their own counter.
+    if (nextPackRound >= args.config.packRoundCount) {
+        MarkPackWorkerComplete(args);
+        packFinished = true;
+    }
     while (nextGather < args.config.fragmentCount || nextActivation < args.config.fragmentCount ||
-           nextPackRound < args.config.packRoundCount) {
+           nextPackRound < args.config.packRoundCount || combine.HasWork()) {
         bool progress = false;
-        // Skip groups without this worker's activation tile, but never skip a
-        // scale gather merely because its owner has no activation in that group.
-        while (nextActivation < args.config.fragmentCount) {
-            const auto fragment = LoadFragment(args, nextActivation);
-            const uint32_t tileCount = FragmentGmm1Tiles(args, fragment);
-            if (!activationPrepared) {
-                activationTile = FirstOwnedComputeTile(fragment.gmm1TileBegin, worker, kActivationWorkers);
-                activationPrepared = true;
+        if (combine.ReadyToSubmit(args)) {
+            if (idle) {
+                timer.TraceEnd(idleEvent, idleStart, idleMeta);
+                idle = false;
             }
-            if (activationTile >= tileCount) {
-                ++nextActivation;
-                activationPrepared = false;
-                continue;
-            }
-            if (ReadGmByPassDCache(ComputeFlag(args.gmm1Done, fragment.gmm1TileBegin + activationTile)) != 0) {
-                if (idle) {
-                    timer.TraceEnd(idleEvent, idleStart, idleMeta);
-                    idle = false;
-                }
-                RunReadyActivationTile(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
-                activationTile += kActivationWorkers;
-                progress = true;
-            }
-            break;
+            combine.Submit(args, timer);
+            progress = true;
         }
-        if (!progress && nextGather < args.config.fragmentCount) {
-            const auto fragment = LoadFragment(args, nextGather);
-            if (AreGroupInputsReady(args, fragment)) {
-                if (idle) {
-                    timer.TraceEnd(idleEvent, idleStart, idleMeta);
-                    idle = false;
+        // While QP1 writes in the background, consume every currently ready
+        // compute task. Recheck activation after each task, never wait for it.
+        bool computeProgress;
+        do {
+            computeProgress = false;
+            // A group without an owned activation tile may still have a scale
+            // gather owned by this worker; the two cursors stay independent.
+            while (nextActivation < args.config.fragmentCount) {
+                const auto fragment = LoadFragment(args, nextActivation);
+                const uint32_t tileCount = FragmentGmm1Tiles(args, fragment);
+                if (!activationPrepared) {
+                    activationTile = FirstOwnedComputeTile(fragment.gmm1TileBegin, worker, kActivationWorkers);
+                    activationPrepared = true;
                 }
-                GatherInputScale(args, fragment, nextGather, timer);
-                nextGather += kActivationWorkers;
-                progress = true;
+                if (activationTile >= tileCount) {
+                    ++nextActivation;
+                    activationPrepared = false;
+                    continue;
+                }
+                if (ReadGmByPassDCache(ComputeFlag(args.gmm1Done, fragment.gmm1TileBegin + activationTile)) != 0) {
+                    if (idle) {
+                        timer.TraceEnd(idleEvent, idleStart, idleMeta);
+                        idle = false;
+                    }
+                    RunReadyActivationTile(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
+                    activationTile += kActivationWorkers;
+                    computeProgress = true;
+                }
+                break;
             }
+            if (!computeProgress && nextGather < args.config.fragmentCount) {
+                const auto fragment = LoadFragment(args, nextGather);
+                if (AreGroupInputsReady(args, fragment)) {
+                    if (idle) {
+                        timer.TraceEnd(idleEvent, idleStart, idleMeta);
+                        idle = false;
+                    }
+                    GatherInputScale(args, fragment, nextGather, timer);
+                    nextGather += kActivationWorkers;
+                    computeProgress = true;
+                }
+            }
+            progress = progress || computeProgress;
+            // Without an in-flight PUT, return to the helper readiness probe
+            // after each compute task so newly ready Combine is not starved.
+        } while (computeProgress && combine.Pending());
+        if (combine.Pending()) {
+            combine.CompletePending(args, timer);
+            progress = true;
         }
         // Only fall back to Pack when neither activation nor a scale gather
         // ran. Keep the same fixed quota and close its events before returning
@@ -520,14 +550,20 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
             MarkPackWorkerComplete(args);
             packFinished = true;
         }
-        if (!progress && (nextGather < args.config.fragmentCount || nextActivation < args.config.fragmentCount)) {
+        if (!progress && (nextGather < args.config.fragmentCount || nextActivation < args.config.fragmentCount ||
+                          combine.HasWork())) {
             if (!idle) {
                 idleStart = timer.TraceBegin();
                 idle = true;
                 const bool waitingActivation = nextActivation < args.config.fragmentCount;
-                const uint32_t index = waitingActivation ? nextActivation : nextGather;
-                idleEvent = waitingActivation ? TraceEvent::WaitGmm1 : TraceEvent::WaitDispatch;
-                idleMeta = FragmentTraceMeta(LoadFragment(args, index), index);
+                if (waitingActivation || nextGather < args.config.fragmentCount) {
+                    const uint32_t index = waitingActivation ? nextActivation : nextGather;
+                    idleEvent = waitingActivation ? TraceEvent::WaitGmm1 : TraceEvent::WaitDispatch;
+                    idleMeta = FragmentTraceMeta(LoadFragment(args, index), index);
+                } else {
+                    idleEvent = TraceEvent::WaitCombineReady;
+                    idleMeta = combine.CurrentMeta();
+                }
             }
             const uint64_t backoff = GetSystemCycle();
             while (GetSystemCycle() - backoff < 64U) {

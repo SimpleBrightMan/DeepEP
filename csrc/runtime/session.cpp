@@ -137,10 +137,10 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     bool runtime_started = false;
     try {
         if (megamoe_urma) {
-            // Each of the fifteen communication workers owns one remote PE.
-            // An independent QP0/SQ per PE is essential: shared Clos SQs would
-            // permit concurrent producers despite disjoint peer ownership.
-            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 1U), "aclshmemx_set_qp_num(MegaMoE URMA)");
+            // QP0 belongs to the original peer owner (Dispatch and late Combine).
+            // QP1 belongs to its cross-group activation helper (early Combine).
+            // Keep both SQs independent per PE; no two cores may produce to one SQ.
+            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 2U), "aclshmemx_set_qp_num(MegaMoE URMA)");
             check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, false),
                   "aclshmemx_set_shared_jetty(false, MegaMoE URMA)");
             if (set_masks) {

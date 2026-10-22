@@ -10,7 +10,8 @@ enum Phase : uint32_t { Pack = 0, Dispatch, Gmm1, Activation, Gmm2, Combine, Bar
 
 // Each engine/phase owns a complete 128B cache line. Values are raw system
 // counter ticks: first start, last end, sum of measured intervals, bytes,
-// interval count, reserved, schema. No cross-rank clock subtraction is valid.
+// interval count, transport peer+1 (0=legacy/unassigned), schema.
+// No cross-rank clock subtraction is valid.
 class Timer {
 public:
     __aicore__ inline void Init(uint64_t address, uint64_t traceAddress = 0U, uint64_t traceCapacity = 0U)
@@ -89,7 +90,7 @@ public:
         if (count_[phase] == 0U) first_[phase] = start_[phase];
     }
 
-    __aicore__ inline void End(Phase phase, uint64_t bytes = 0U)
+    __aicore__ inline void End(Phase phase, uint64_t bytes = 0U, uint32_t peer = kWorld)
     {
         if (address_ == 0U) return;
         const uint64_t end = AscendC::GetSystemCycle();
@@ -103,7 +104,7 @@ public:
         record[2] = total_[phase];
         record[3] = bytes_[phase];
         record[4] = count_[phase];
-        record[5] = 0;
+        record[5] = peer < kWorld ? peer + 1U : 0U;
         record[6] = kProtocol;
         AscendC::GlobalTensor<uint64_t> tensor;
         tensor.SetGlobalBuffer(record);
