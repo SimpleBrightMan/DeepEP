@@ -2,6 +2,8 @@
 // Modified by SimpleBright_Man 2026
 #pragma once
 
+#include <cfloat>
+
 #include "abi.hpp"
 #include "compute_contract.hpp"
 #include "pack_round.hpp"
@@ -91,8 +93,9 @@ using UrmaGmmConfig = MegaMoeImpl::GmmKernel::Config<true, 0, fp8_e4m3fn_t, fp4x
 using UrmaProblemConfig = UrmaGmmConfig::ProblemConfig;
 using UrmaInputRows = MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false>;
 using UrmaOutputRows = MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, false, true>;
-using UrmaActivation =
-    MegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, kActivationTileM, kComputeTileN, false>;
+// Only URMA uses a separate FP32 sigmoid, matching the NPU cascade's operation order.
+using UrmaActivation = MegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, kActivationTileM,
+                                                                   kComputeTileN, false, false, true>;
 
 // Tie the host-testable memory contract to the shared arithmetic's real UB
 // layout. Top-k weights are consumed by Reduce, so no prefetch buffer exists.
@@ -448,8 +451,11 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
 __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Timer& timer)
 {
     UrmaActivation epilogue;
+    // Match main MegaMoE's unclamped SwiGLU. The epilogue default is zero,
+    // which clamps every up value to zero and makes the entire FFN zero.
     epilogue.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(args.activation),
-                   .yScaleGmAddr = reinterpret_cast<GM_ADDR>(args.activationScale)});
+                   .yScaleGmAddr = reinterpret_cast<GM_ADDR>(args.activationScale),
+                   .clampLimit = FLT_MAX});
     uint32_t nextGather = worker;
     uint32_t nextActivation = 0U;
     uint32_t activationTile = 0U;

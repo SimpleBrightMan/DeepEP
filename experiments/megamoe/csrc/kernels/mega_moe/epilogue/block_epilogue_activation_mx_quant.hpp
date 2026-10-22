@@ -49,7 +49,7 @@ using namespace AscendC;
 using namespace ActivationQuantMsg;
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM = 256, uint32_t TileN = 256,
-          bool TopkWeightsPrefetch = false, bool IsInterleaved_ = false>
+          bool TopkWeightsPrefetch = false, bool IsInterleaved_ = false, bool SeparateSwiGluSigmoid_ = false>
 class BlockEpilogueActivationMxQuant {
 public:
     __aicore__ inline BlockEpilogueActivationMxQuant() {}
@@ -137,12 +137,13 @@ private:
 };
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
+          bool IsInterleaved_, bool SeparateSwiGluSigmoid_>
 __aicore__ inline void
-BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                               IsInterleaved_>::StoreQuantOutput(AscendC::GlobalTensor<int8_t>& dst,
-                                                                 AscendC::LocalTensor<int8_t>& src, uint64_t blockCount,
-                                                                 uint64_t offset, uint64_t n, uint64_t singleN)
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               SeparateSwiGluSigmoid_>::StoreQuantOutput(AscendC::GlobalTensor<int8_t>& dst,
+                                                                         AscendC::LocalTensor<int8_t>& src,
+                                                                         uint64_t blockCount, uint64_t offset,
+                                                                         uint64_t n, uint64_t singleN)
 {
     AscendC::DataCopyExtParams ub2GmParams{1, 0, 0, 0, 0};
     ub2GmParams.blockCount = blockCount;  // 128
@@ -162,13 +163,13 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
+          bool IsInterleaved_, bool SeparateSwiGluSigmoid_>
 __aicore__ inline void
-BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                               IsInterleaved_>::StoreQuantScaleCompact(AscendC::GlobalTensor<int8_t>& dst,
-                                                                       AscendC::LocalTensor<int8_t>& src,
-                                                                       uint64_t blockCount, uint64_t offset,
-                                                                       uint64_t scaleN, uint64_t singleN)
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               SeparateSwiGluSigmoid_>::StoreQuantScaleCompact(AscendC::GlobalTensor<int8_t>& dst,
+                                                                               AscendC::LocalTensor<int8_t>& src,
+                                                                               uint64_t blockCount, uint64_t offset,
+                                                                               uint64_t scaleN, uint64_t singleN)
 {
     AscendC::DataCopyExtParams ub2GmParams{0, 0, 0, 0, 0};
     auto blockScaleN = Ops::Base::CeilDiv(static_cast<uint64_t>(singleN), static_cast<uint64_t>(MXFP_DIVISOR_SIZE)) *
@@ -182,9 +183,10 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
-__aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                                                      IsInterleaved_>::Init(Params const& params)
+          bool IsInterleaved_, bool SeparateSwiGluSigmoid_>
+__aicore__ inline void
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               SeparateSwiGluSigmoid_>::Init(Params const& params)
 {
     if constexpr (g_coreType == AIC) {
         return;
@@ -217,9 +219,10 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
-__aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                                                      IsInterleaved_>::UpdateGlobalAddr(const BlockCoord& baseOffset)
+          bool IsInterleaved_, bool SeparateSwiGluSigmoid_>
+__aicore__ inline void
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               SeparateSwiGluSigmoid_>::UpdateGlobalAddr(const BlockCoord& baseOffset)
 {
     if constexpr (g_coreType == AIV) {
         quantOutputGlobal_.SetGlobalBuffer((__gm__ int8_t*)yGmAddr_ + Get<Y_IDX>(baseOffset));
@@ -228,10 +231,10 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
+          bool IsInterleaved_, bool SeparateSwiGluSigmoid_>
 __aicore__ inline void
-BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                               IsInterleaved_>::UpdateNextProblem(const ProblemShape& problemShape)
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               SeparateSwiGluSigmoid_>::UpdateNextProblem(const ProblemShape& problemShape)
 {
     intermediateHiddenSize_ = Get<N_VALUE>(problemShape);
     intermediateHiddenScaleElements_ =
@@ -240,15 +243,15 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
+          bool IsInterleaved_, bool SeparateSwiGluSigmoid_>
 __aicore__ inline void
-BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                               IsInterleaved_>::RunGatedActivationTile(__ubuf__ DataTypeIn* firstSrc,
-                                                                       __ubuf__ DataTypeIn* secondSrc,
-                                                                       __ubuf__ bfloat16_t* gluResAddr,
-                                                                       uint16_t validRowCount,
-                                                                       uint16_t validColumnCount,
-                                                                       uint32_t outputRowStrideElements)
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               SeparateSwiGluSigmoid_>::RunGatedActivationTile(__ubuf__ DataTypeIn* firstSrc,
+                                                                               __ubuf__ DataTypeIn* secondSrc,
+                                                                               __ubuf__ bfloat16_t* gluResAddr,
+                                                                               uint16_t validRowCount,
+                                                                               uint16_t validColumnCount,
+                                                                               uint32_t outputRowStrideElements)
 {
     uint32_t inputRowStrideElements;
     if constexpr (IsInterleaved_) {
@@ -333,22 +336,25 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
         }
     } else if (actMode == ActMode::SWIGLU_STEP) {
         const Activation::SwiGluParams swiGluParams{clampLimit_};
-        Activation::RunSwiGLU<DataTypeIn, TopkWeightsPrefetch, true>(gatedActivationContext, swiGluParams);
+        Activation::RunSwiGLU<DataTypeIn, TopkWeightsPrefetch, true, SeparateSwiGluSigmoid_>(gatedActivationContext,
+                                                                                             swiGluParams);
     } else if (actMode == ActMode::SWIGLU_OAI) {
         const Activation::SwiGluOaiParams swiGluOaiParams{clampLimit_, activationAlpha_, activationBeta_};
         Activation::RunSwiGLUOAI<DataTypeIn, TopkWeightsPrefetch>(gatedActivationContext, swiGluOaiParams);
     } else {
         const Activation::SwiGluParams swiGluParams{clampLimit_};
-        Activation::RunSwiGLU<DataTypeIn, TopkWeightsPrefetch, false>(gatedActivationContext, swiGluParams);
+        Activation::RunSwiGLU<DataTypeIn, TopkWeightsPrefetch, false, SeparateSwiGluSigmoid_>(gatedActivationContext,
+                                                                                              swiGluParams);
     }
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
-__aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                                                      IsInterleaved_>::RunMxQuantTile(const UbPointers& ubPointers,
-                                                                                      uint16_t validRowCount,
-                                                                                      uint32_t outputRowStrideElements)
+          bool IsInterleaved_, bool SeparateSwiGluSigmoid_>
+__aicore__ inline void
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               SeparateSwiGluSigmoid_>::RunMxQuantTile(const UbPointers& ubPointers,
+                                                                       uint16_t validRowCount,
+                                                                       uint32_t outputRowStrideElements)
 {
     const uint32_t dataCount = validRowCount * outputRowStrideElements;
     const uint32_t scaleCount = dataCount / ONE_BLK_SIZE;
@@ -371,19 +377,19 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
+          bool IsInterleaved_, bool SeparateSwiGluSigmoid_>
 __aicore__ inline auto BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                                                      IsInterleaved_>::GetTopkWeightTensor()
+                                                      IsInterleaved_, SeparateSwiGluSigmoid_>::GetTopkWeightTensor()
 {
     return weightUb_;
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
-          bool IsInterleaved_>
-__aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
-                                                      IsInterleaved_>::operator()(const BlockShape& blockShape,
-                                                                                  const BlockCoord& blockCoord,
-                                                                                  uint16_t pingpongIdx)
+          bool IsInterleaved_, bool SeparateSwiGluSigmoid_>
+__aicore__ inline void
+BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch, IsInterleaved_,
+                               SeparateSwiGluSigmoid_>::operator()(const BlockShape& blockShape,
+                                                                   const BlockCoord& blockCoord, uint16_t pingpongIdx)
 {
     uint32_t tileRowCount = Get<M_VALUE>(blockShape);     // 128
     uint32_t tileColumnCount = Get<N_VALUE>(blockShape);  // 256

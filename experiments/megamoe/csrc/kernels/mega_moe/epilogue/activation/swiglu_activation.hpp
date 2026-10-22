@@ -20,7 +20,7 @@ struct SwiGluParams {
     float clampLimit = 0.0F;
 };
 
-template <typename InputType, bool FuseTopkWeight, bool IsStep>
+template <typename InputType, bool FuseTopkWeight, bool IsStep, bool SeparateSigmoid = false>
 __aicore__ inline void RunSwiGLU(const GatedActivationTileContext<InputType>& context, const SwiGluParams& params)
 {
     const float scalarOne = 1.0F;
@@ -78,7 +78,16 @@ __aicore__ inline void RunSwiGLU(const GatedActivationTileContext<InputType>& co
                 AscendC::Reg::Muls(negReg, gateFp32Reg, negScalarOne, fullMask);
                 AscendC::Reg::Exp(expReg, negReg, fullMask);
                 AscendC::Reg::Adds(denominatorReg, expReg, scalarOne, fullMask);
-                AscendC::Reg::Div(sigmoidReg, gateFp32Reg, denominatorReg, fullMask);
+                if constexpr (SeparateSigmoid) {
+                    // Match the cascade's FP32 gate * sigmoid(gate) order.
+                    // Keep BF16 rounding and the following MX quantization unchanged.
+                    AscendC::Reg::RegTensor<float> oneReg;
+                    AscendC::Reg::Duplicate(oneReg, scalarOne);
+                    AscendC::Reg::Div(sigmoidReg, oneReg, denominatorReg, fullMask);
+                    AscendC::Reg::Mul(sigmoidReg, gateFp32Reg, sigmoidReg, fullMask);
+                } else {
+                    AscendC::Reg::Div(sigmoidReg, gateFp32Reg, denominatorReg, fullMask);
+                }
                 if constexpr (IsStep) {
                     AscendC::Reg::Mins(sigmoidReg, sigmoidReg, params.clampLimit, fullMask);
                 }
@@ -115,7 +124,14 @@ __aicore__ inline void RunSwiGLU(const GatedActivationTileContext<InputType>& co
                 AscendC::Reg::Muls(negReg, gateFp32Reg, negScalarOne, tailComputeMask);
                 AscendC::Reg::Exp(expReg, negReg, tailComputeMask);
                 AscendC::Reg::Adds(denominatorReg, expReg, scalarOne, tailComputeMask);
-                AscendC::Reg::Div(sigmoidReg, gateFp32Reg, denominatorReg, tailComputeMask);
+                if constexpr (SeparateSigmoid) {
+                    AscendC::Reg::RegTensor<float> oneReg;
+                    AscendC::Reg::Duplicate(oneReg, scalarOne);
+                    AscendC::Reg::Div(sigmoidReg, oneReg, denominatorReg, tailComputeMask);
+                    AscendC::Reg::Mul(sigmoidReg, gateFp32Reg, sigmoidReg, tailComputeMask);
+                } else {
+                    AscendC::Reg::Div(sigmoidReg, gateFp32Reg, denominatorReg, tailComputeMask);
+                }
                 if constexpr (IsStep) {
                     AscendC::Reg::Mins(sigmoidReg, sigmoidReg, params.clampLimit, tailComputeMask);
                 }
