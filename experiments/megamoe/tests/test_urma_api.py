@@ -327,9 +327,9 @@ def test_native_mgroup_schedule_must_match_before_runtime_creation(monkeypatch, 
 
 
 def test_benchmark_summaries_preserve_two_eight_rank_nodes():
-    from deep_ep_experimental.megamoe.urma_benchmark import summarize_metric
+    from deep_ep_experimental.megamoe.urma_timing import summarize_profile_rounds
 
-    report = summarize_metric([[float(rank + 1)] * 4 for rank in range(16)], "FULL_E2E", "test", ranks_per_node=8)
+    report = summarize_profile_rounds([[float(rank + 1)] * 4 for rank in range(16)], ranks_per_node=8)
     assert [node["rank_start"] for node in report["per_node"]] == [0, 8]
 
 

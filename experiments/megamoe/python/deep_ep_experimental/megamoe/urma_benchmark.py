@@ -2,25 +2,13 @@
 
 import argparse
 from datetime import datetime, timezone
+from functools import partial
 import json
 import math
 import os
 from pathlib import Path
-import time
 
 from .benchmark import inputs, load_config
-from .performance import summarize_rounds
-
-
-def summarize_metric(per_rank, metric, scope, ranks_per_node=16):
-    report = summarize_rounds(per_rank, ranks_per_node)
-    report.update(
-        metric=metric,
-        measured_scope=scope,
-        excludes="weights/input generation, runtime creation, synchronization/launch guards outside measured scope",
-        timer_pass=False,
-    )
-    return report
 
 
 def parse_args(argv=None):
@@ -47,7 +35,7 @@ def parse_args(argv=None):
         "--exp-repeat",
         type=int,
         default=50,
-        help="Exp repetitions once before each cached/timer/trace block; 0 retains only HCCL barrier",
+        help="Exp repetitions once before each continuous profile block; 0 retains only HCCL barrier",
     )
     parser.add_argument("--launch-timeout", type=int, default=300, help="Benchmark HCCL group timeout in seconds")
     parser.add_argument(
@@ -61,11 +49,15 @@ def parse_args(argv=None):
     parser.add_argument("--warmup", type=int)
     parser.add_argument("--iters", type=int)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--timer", action="store_true", help="Separate native URMA timer pass, outside formal timing")
+    parser.add_argument(
+        "--timer",
+        action="store_true",
+        help="Native aggregate timer on the final extra invocation, excluded from performance",
+    )
     parser.add_argument(
         "--trace",
         action="store_true",
-        help="Additional detailed Chrome trace pass; implies --timer; neither pass enters formal timing",
+        help="Trace only the final extra invocation; implies --timer; this invocation is excluded from performance",
     )
     parser.add_argument(
         "--trace-include-waits",
@@ -166,7 +158,7 @@ def run(args, config, group):
     from .api import transform_weights_for_mega_moe
     from .reference import make_weights, quantize_input
     from .urma import UrmaBuffer, _extension
-    from .urma_timing import UrmaLaunchGuard, measure_cached_forward
+    from .urma_timing import UrmaLaunchGuard, measure_profiled_forward, summarize_profile_rounds
     from .validation import collective_check
 
     rank, world = group.rank(), group.size()
@@ -250,11 +242,12 @@ def run(args, config, group):
         cv_rows=args.cv_rows,
         gmm1_ahead_mgroups=args.gmm1_ahead_mgroups,
         launch_guard=launch_guard.describe(),
-        cached_forward_timing="continuous warmup+iters; event samples exclude guard and warmup; one final synchronize",
-        route_and_full_timing="host-wall scope with per-iteration synchronization; not continuous device timing",
+        performance_timing="torch_npu profiler device kernel duration; no Event or host-wall timing",
+        performance_scope="mega_moe_urma_kernel only; routes prepared once before profiling",
+        performance_rounds="all iters after warmup; final instrumented diagnostic invocation excluded",
+        profile_config="Level0/AiCoreNone/Text; shapes/memory/stack/FLOPs/modules disabled",
         max_recv_rows=owner.max_recv_rows,
         symmetric_buffer_bytes=owner.symmetric_buffer_bytes,
-        full_e2e_includes_route_preparation=True,
         route_preparation="NPU sort/count/inverse + D2H counts + Store count exchange + native descriptors",
         numerical_validation="cpu_golden" if args.golden_dir else "skipped",
         input="prequantized FP8 E4M3 + E8M0; conversion/input generation outside measurement",
@@ -268,7 +261,7 @@ def run(args, config, group):
         trace_capacity_per_engine=args.trace_capacity,
         trace_include_waits=args.trace_include_waits,
         trace_clock_alignment="per-rank independent zero; no synchronized cross-rank timeline",
-        trace_scope="additional diagnostic invocation after aggregate timer pass; formal measurements have both disabled",
+        trace_scope="only the last extra invocation of each BS block; aggregate timer shares it; excluded from performance",
     )
     (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     if rank == 0:
@@ -281,7 +274,7 @@ def run(args, config, group):
         print(
             f"[URMA LAUNCH GUARD] HCCL barrier + exp shape={tuple(args.exp_shape)} repeat={args.exp_repeat}; "
             f"buffers={manifest['launch_guard']['allocated_bytes_per_rank'] / 2**30:.2f} GiB/rank; "
-            "once per continuous cached/timer/trace block; guard excluded from timings",
+            "once per continuous profile block; guard excluded from kernel timings",
             flush=True,
         )
     all_reports = []
@@ -297,72 +290,58 @@ def run(args, config, group):
         ids = torch.from_numpy(host_ids).npu()
         topk_weights = torch.from_numpy(host_weights).npu()
         output = torch.empty((bs, model["hidden"]), dtype=torch.bfloat16, device="npu")
-        for _ in range(config["warmup"]):
-            owner.forward(x, ids, topk_weights, *weights, out=output)
+        prepared = owner.prepare_routes(ids)
+        # Allocate once before profiling. Only the final extra invocation gets
+        # these buffers; all formal samples execute without internal timers.
+        timer, trace, error = None, None, None
+        try:
+            if args.timer:
+                timer = owner.allocate_timer()
+            if args.trace:
+                trace = owner.allocate_trace(args.trace_capacity)
+        except Exception as failure:
+            error = f"{type(failure).__name__}: {failure}"
+        collective_check(group, f"URMA diagnostic allocation BS={bs}", error)
         torch.npu.synchronize()
-        group.barrier(f"URMA warmup BS={bs}")
-
-        route_times = []
-        for iteration in range(config["iters"]):
-            torch.npu.synchronize()
-            group.barrier(f"URMA route timing BS={bs} round={iteration}")
-            start = time.perf_counter_ns()
-            prepared = owner.prepare_routes(ids)
-            torch.npu.synchronize()
-            route_times.append((time.perf_counter_ns() - start) / 1000)
-        route_records = group.all_gather(route_times, f"URMA route samples BS={bs}")
-        route_report = summarize_metric(
-            route_records, "ROUTE_PREP", "host wall time of complete route/descriptor preparation", ranks_per_node
-        )
-
-        # NPU event interval contains the entire native forward, including local
-        # expansion and final reduction. It is not a communication-only timer.
         startup_mgroups = int(prepared.native.gmm1_startup_mgroups)
-        cached_times = measure_cached_forward(
-            lambda: owner.forward_prepared(x, topk_weights, *weights, prepared, out=output),
+        forward = partial(owner.forward_prepared, x, topk_weights, *weights, prepared, out=output)
+        diagnostic = partial(forward, timer=timer, trace=trace) if args.timer else None
+        capture = measure_profiled_forward(
+            forward,
             warmup=config["warmup"],
             iters=config["iters"],
             guard=launch_guard,
+            directory=case / "profile",
+            last_forward=diagnostic,
         )
-        cached_records = group.all_gather(cached_times, f"URMA cached samples BS={bs}")
-        cached_report = summarize_metric(
-            cached_records,
-            "CACHED_FORWARD",
-            "NPU event interval: local expand through final weighted reduction; routes cached",
-            ranks_per_node,
-        )
-        cached_report["launch_guard"] = launch_guard.describe()
-        cached_report["warmup_iterations"] = config["warmup"]
-        cached_report["continuous_iterations"] = config["warmup"] + config["iters"]
-        cached_report["raw_per_rank_rounds_us"] = cached_records
-        received_rows = prepared.received_rows
-        del prepared
-
-        full_times = []
-        for iteration in range(config["iters"]):
-            torch.npu.synchronize()
-            group.barrier(f"URMA full timing BS={bs} round={iteration}")
-            start = time.perf_counter_ns()
-            owner.forward(x, ids, topk_weights, *weights, out=output)
-            torch.npu.synchronize()
-            full_times.append((time.perf_counter_ns() - start) / 1000)
-        full_records = group.all_gather(full_times, f"URMA full samples BS={bs}")
-        full_report = summarize_metric(
-            full_records,
-            "FULL_E2E",
-            "host wall time: fresh route preparation + local expand + complete native operator + synchronize",
-            ranks_per_node,
+        (case / "kernel_samples.json").write_text(json.dumps(capture, indent=2), encoding="utf-8")
+        profile_records = group.all_gather(capture["durations_us"], f"URMA profile samples BS={bs}")
+        profile_report = summarize_profile_rounds(profile_records, ranks_per_node=ranks_per_node)
+        profile_report.update(
+            launch_guard=launch_guard.describe(),
+            warmup_iterations=config["warmup"],
+            continuous_iterations=config["warmup"] + config["iters"] + int(args.timer),
+            diagnostic_iterations=int(args.timer),
+            measured_scope="profiler device mega_moe_urma_kernel task; no Event timing",
         )
         reports = {
             "bs": bs,
-            "received_rows_local": received_rows,
+            "received_rows_local": prepared.received_rows,
             "gmm1_ahead_mgroups": args.gmm1_ahead_mgroups,
             "gmm1_startup_mgroups_local": startup_mgroups,
-            "route_preparation": route_report,
-            "cached_forward": cached_report,
-            "full_e2e": full_report,
+            "profile": profile_report,
+            "profile_directory": capture["profile_dir"],
+            "diagnostic_sample": capture["diagnostic_sample"],
             "validation": "skipped",
         }
+        if rank == 0:
+            print(
+                f"[URMA PROFILE] BS={bs} cv_rows={args.cv_rows} "
+                f"round-max-mean={profile_report['rank_max_mean_us']:.3f}us "
+                f"round-min-mean={profile_report['rank_min_mean_us']:.3f}us "
+                f"rounds={profile_report['rounds']} (device kernel; timer/trace off)",
+                flush=True,
+            )
         if args.golden_dir:
             from .golden import compare, contract, load
 
@@ -380,11 +359,6 @@ def run(args, config, group):
         if args.timer:
             from .urma_timer import communication_bandwidth, summarize_bandwidth
 
-            prepared = owner.prepare_routes(ids)
-            timer = owner.allocate_timer()
-            launch_guard.begin()
-            owner.forward_prepared(x, topk_weights, *weights, prepared, timer=timer, out=output)
-            launch_guard.end()
             raw_timer = timer.cpu().numpy().astype("<i8", copy=False)
             raw_timer.tofile(case / "urma_timer.bin")
             timer_metadata = dict(
@@ -392,12 +366,16 @@ def run(args, config, group):
                 dtype="little-endian int64",
                 schema=getattr(_extension(), "urma_timer_schema", None),
                 note="URMA format; do not parse using the legacy MegaMoE Wave timer parser",
+                scope="final diagnostic invocation; excluded from formal profile samples",
+                detailed_trace_enabled=args.trace,
             )
             (case / "timer.json").write_text(json.dumps(timer_metadata, indent=2), encoding="utf-8")
             bandwidth = communication_bandwidth(raw_timer, rank, clock_mhz=args.timer_clock_mhz)
             bandwidth_records = group.all_gather(bandwidth, f"URMA bandwidth BS={bs}")
             reports["bandwidth"] = summarize_bandwidth(bandwidth_records)
             reports["bandwidth_per_rank"] = bandwidth_records
+            reports["bandwidth_scope"] = timer_metadata["scope"]
+            reports["bandwidth_with_trace"] = args.trace
             if rank == 0:
                 for row in reports["bandwidth"]:
                     if row["mean_gbps"] is not None:
@@ -407,25 +385,15 @@ def run(args, config, group):
                             f"mean={row['mean_gbps']:.3f} GB/s/card "
                             f"rank-min/max={row['rank_min_gbps']:.3f}/{row['rank_max_gbps']:.3f} "
                             f"payload={payload_scope} "
-                            "(one-way payload / same-rank class envelope)",
+                            "(final diagnostic; one-way payload / same-rank class envelope)",
                             flush=True,
                         )
-            del prepared, timer, raw_timer
+            del raw_timer
         if args.trace:
             from .urma_trace_merge import merge_trace_collective
 
-            # Keep the aggregate bandwidth pass free from detailed trace costs.
-            # Formal cached/full samples above pass neither timer nor trace.
-            prepared = owner.prepare_routes(ids)
-            trace, error = None, None
-            try:
-                trace = owner.allocate_trace(args.trace_capacity)
-            except Exception as failure:
-                error = f"{type(failure).__name__}: {failure}"
-            collective_check(group, f"URMA trace allocation BS={bs}", error)
-            launch_guard.begin()
-            owner.forward_prepared(x, topk_weights, *weights, prepared, trace=trace, out=output)
-            launch_guard.end()
+            # The only detailed trace is the final extra invocation already
+            # enqueued above. No second run, launch guard, or profiled sample.
             raw_trace = trace.cpu().numpy()
             reports["trace_per_rank"] = export_trace_collective(
                 group,
@@ -450,7 +418,8 @@ def run(args, config, group):
                     flush=True,
                 )
                 print(f"[URMA ALLRANK] BS={bs}; {reports['trace_allrank']['path']}", flush=True)
-            del prepared, trace, raw_trace
+            del raw_trace
+        del prepared, timer, trace, diagnostic, forward
         (case / "summary.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
         all_reports.append(reports)
         if rank == 0:
@@ -459,14 +428,6 @@ def run(args, config, group):
                 f"rank0_startup_mgroups={startup_mgroups}",
                 flush=True,
             )
-            for report in (route_report, cached_report, full_report):
-                print(
-                    f"[URMA {report['metric']}] BS={bs} cv_rows={args.cv_rows} "
-                    f"rank-max-mean={report['rank_max_mean_us']:.3f}us "
-                    f"rank-min-mean={report['mean_us']:.3f}us "
-                    f"rounds={report['rounds']}/{report['recorded_rounds']}",
-                    flush=True,
-                )
             print(f"[URMA VALIDATION] BS={bs} " + ("CPU Golden passed" if args.golden_dir else "skipped"), flush=True)
         group.barrier(f"URMA case complete BS={bs}")
     if rank == 0:

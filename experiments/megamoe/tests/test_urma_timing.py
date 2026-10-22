@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from deep_ep_experimental.megamoe.urma_timing import UrmaLaunchGuard, measure_cached_forward
+from deep_ep_experimental.megamoe.urma_timing import UrmaLaunchGuard
 
 
 def fake_runtime(monkeypatch, *, peer_errors=None, initialized=False):
@@ -17,23 +17,7 @@ def fake_runtime(monkeypatch, *, peer_errors=None, initialized=False):
     torch.zeros = lambda shape, **kw: calls.append(("zeros", tuple(shape), kw)) or "finite-input"
     torch.empty_like = lambda value: calls.append(("empty_like", value)) or "output"
     torch.exp = lambda value, out: calls.append(("exp", value, out))
-    serial = [0]
-
-    class Event:
-        def __init__(self, **kwargs):
-            self.index = serial[0]
-            serial[0] += 1
-            calls.append(("event-create", self.index))
-
-        def record(self):
-            calls.append(("record", self.index))
-
-        def elapsed_time(self, end):
-            assert any(call[0] == "synchronize" for call in calls)
-            calls.append(("elapsed", self.index, end.index))
-            return float(self.index + 1)
-
-    torch.npu = SimpleNamespace(Event=Event, synchronize=lambda: calls.append(("synchronize",)))
+    torch.npu = SimpleNamespace(synchronize=lambda: calls.append(("synchronize",)))
     dist.is_initialized = lambda: initialized
     dist.PrefixStore = lambda prefix, store: calls.append(("prefix", prefix, store)) or "private-store"
     dist.init_process_group = lambda **kwargs: calls.append(("init", kwargs))
@@ -52,16 +36,13 @@ def fake_runtime(monkeypatch, *, peer_errors=None, initialized=False):
     return group, calls
 
 
-def test_continuous_block_uses_one_guard_and_one_drain_then_discards_warmup(monkeypatch):
+def test_continuous_block_preserves_one_guard_and_one_drain(monkeypatch):
     group, calls = fake_runtime(monkeypatch)
     guard = UrmaLaunchGuard(group, shape=(2, 3), repeat=2, timeout=71)
-    values = measure_cached_forward(
-        lambda: calls.append(("forward",)),
-        warmup=1,
-        iters=2,
-        guard=guard,
-    )
-    assert values == [3000.0, 5000.0]
+    guard.begin()
+    for _ in range(3):
+        calls.append(("forward",))
+    guard.end()
     assert [call[0] for call in calls if call[0] in ("device-barrier", "exp", "forward", "synchronize")] == [
         "device-barrier",
         "exp",
@@ -72,8 +53,6 @@ def test_continuous_block_uses_one_guard_and_one_drain_then_discards_warmup(monk
         "device-barrier",
         "synchronize",
     ]
-    assert [call for call in calls if call[0] == "record"] == [("record", n) for n in range(6)]
-    assert [call for call in calls if call[0] == "elapsed"] == [("elapsed", 2, 3), ("elapsed", 4, 5)]
     init = next(call[1] for call in calls if call[0] == "init")
     assert init["backend"] == "hccl" and init["store"] == "private-store"
     assert init["rank"] == 3 and init["world_size"] == 16 and init["timeout"].total_seconds() == 71

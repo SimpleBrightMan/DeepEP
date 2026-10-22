@@ -179,7 +179,7 @@ def decode_trace(raw, *, rank, clock_mhz):
         envelope_ticks=last - origin,
         envelope_us=(last - origin) / clock_mhz,
         clock_alignment="each rank starts at its own earliest event; cross-rank clocks are not synchronized",
-        scope="independent diagnostic pass; not the formal performance samples or aggregate bandwidth pass",
+        scope="diagnostic invocation; excluded from formal performance samples",
         interpretation="PUT/Cube submit bars do not measure asynchronous completion; inspect quiet/drain/wait separately",
         events=dict(Counter(EVENTS[record[4][2]] for record in records)),
     )

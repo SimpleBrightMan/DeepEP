@@ -6,7 +6,12 @@ It reduces host launch skew; it cannot remove physical rank speed differences.
 """
 
 from datetime import timedelta
+import csv
+from decimal import Decimal, InvalidOperation
 import math
+from pathlib import Path
+import re
+import statistics
 
 
 class UrmaLaunchGuard:
@@ -88,21 +93,154 @@ class UrmaLaunchGuard:
             exp_shape=list(self.shape),
             exp_repeat=self.repeat,
             allocated_bytes_per_rank=self.bytes if self.repeat else 0,
-            scope="CACHED_FORWARD and each separate timer/trace diagnostic pass",
+            scope="one continuous profiler block: warmup + formal iterations + optional final diagnostic",
             stream_order="caller barrier/exp -> owner.wait_stream(caller) -> native -> caller.wait_stream(owner)",
             limitations="reduces host launch skew; does not equalize physical device speeds or synchronize every iteration",
         )
 
 
-def measure_cached_forward(forward, *, warmup, iters, guard):
-    """Enqueue warmup and samples together; inspect Events only after one drain."""
-    torch = guard.torch
-    events = [(torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)) for _ in range(warmup + iters)]
-    guard.begin()
-    for begin, end in events:
-        begin.record()
-        forward()
-        end.record()
-    guard.end()
-    # Warmup execution shares the same continuous block but not statistics.
-    return [begin.elapsed_time(end) * 1000 for begin, end in events[warmup:]]
+_URMA_KERNEL = re.compile(r"(?:^|::|\s)mega_moe_urma_kernel(?=\s*(?:$|\(|<))")
+
+
+def read_profiled_kernels(directory, expected_samples):
+    """Read exact URMA device tasks, retaining precise timestamps for ordering.
+
+    No timestamp subtraction across ranks: timestamps only establish each
+    rank's launch order; device task duration supplies the measured time.
+    """
+    samples = []
+    paths = sorted(Path(directory).rglob("kernel_details*.csv"))
+    for path in paths:
+        with path.open(newline="", encoding="utf-8-sig") as stream:
+            for index, raw in enumerate(csv.DictReader(stream), start=2):
+                row = {key.strip(): (value or "").strip() for key, value in raw.items() if key is not None}
+                name = next(
+                    (row[key] for key in ("Name", "Kernel Name", "Op Name") if _URMA_KERNEL.search(row.get(key, ""))),
+                    None,
+                )
+                if name is None:
+                    continue
+                try:
+                    start = Decimal(row["Start Time(us)"])
+                    duration = Decimal(row["Duration(us)"])
+                except (KeyError, InvalidOperation) as error:
+                    raise ValueError(f"Invalid URMA profiler row {path}:{index}: {row}") from error
+                if not start.is_finite() or not duration.is_finite() or start < 0 or duration <= 0:
+                    raise ValueError(f"Nonfinite/negative/nonpositive URMA timing: {path}:{index}")
+                if not math.isfinite(float(start)) or not math.isfinite(float(duration)) or float(duration) <= 0:
+                    raise ValueError(f"URMA timing outside supported numeric range: {path}:{index}")
+                samples.append(
+                    dict(
+                        start_us=float(start),
+                        start_us_decimal=str(start),
+                        duration_us=float(duration),
+                        name=name,
+                        stream_id=row.get("Stream ID") or row.get("Stream Id"),
+                        device_id=row.get("Device_id") or row.get("Device ID"),
+                        file=str(path),
+                        row=index,
+                    )
+                )
+    samples.sort(key=lambda sample: Decimal(sample["start_us_decimal"]))
+    keys = [(s["device_id"], s["stream_id"], Decimal(s["start_us_decimal"])) for s in samples]
+    if len(keys) != len(set(keys)):
+        raise ValueError(f"Duplicate URMA kernel samples under {directory}; refuse misaligned rounds")
+    if len({s["stream_id"] for s in samples}) > 1 or len({s["device_id"] for s in samples}) > 1:
+        raise ValueError(f"Multiple URMA device/stream IDs under {directory}; expected one rank-local owner stream")
+    if len(samples) != expected_samples:
+        raise ValueError(
+            f"{directory}: expected {expected_samples} mega_moe_urma_kernel tasks, found {len(samples)} "
+            f"in {len(paths)} kernel_details CSV files; inspect the raw profiler export"
+        )
+    return samples
+
+
+def measure_profiled_forward(forward, *, warmup, iters, guard, directory, last_forward=None):
+    """Profile one guarded continuous block, with no Events or per-round sync.
+
+    The optional final call owns timer/trace buffers. It is captured exactly
+    once after the formal samples, and is excluded from performance statistics.
+    """
+    import torch_npu
+
+    if type(warmup) is not int or warmup < 0 or type(iters) is not int or iters < 1:
+        raise ValueError("warmup must be a nonnegative integer and iters a positive integer")
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=False)
+    profiler = torch_npu.profiler
+    with profiler.profile(
+        activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.NPU],
+        schedule=profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
+        on_trace_ready=profiler.tensorboard_trace_handler(str(directory)),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+        experimental_config=profiler._ExperimentalConfig(
+            export_type=[profiler.ExportType.Text],
+            profiler_level=profiler.ProfilerLevel.Level0,
+            aic_metrics=profiler.AiCMetrics.AiCoreNone,
+            data_simplification=False,
+        ),
+    ) as capture:
+        # Initialize profiler before the existing guard; never drain between
+        # exp and the continuous launches or insert a profiler step per round.
+        guard.begin()
+        for _ in range(warmup + iters):
+            forward()
+        if last_forward is not None:
+            last_forward()
+        guard.end()
+        capture.step()
+    samples = read_profiled_kernels(directory, warmup + iters + int(last_forward is not None))
+    for iteration, sample in enumerate(samples):
+        sample["iteration"] = iteration
+        sample["phase"] = "warmup" if iteration < warmup else "formal" if iteration < warmup + iters else "diagnostic"
+    return dict(
+        samples=samples,
+        durations_us=[sample["duration_us"] for sample in samples[warmup : warmup + iters]],
+        diagnostic_sample=samples[-1] if last_forward is not None else None,
+        profile_dir=str(directory),
+    )
+
+
+def summarize_profile_rounds(per_rank, ranks_per_node=16):
+    """Average cross-rank minima/maxima per iteration, using every formal round."""
+    if not per_rank or not per_rank[0] or any(len(row) != len(per_rank[0]) for row in per_rank):
+        raise ValueError("Missing ranks or mismatched profiling rounds")
+    if any(isinstance(value, bool) or not math.isfinite(value) or value <= 0 for row in per_rank for value in row):
+        raise ValueError("Non-finite/nonpositive timing sample")
+    if type(ranks_per_node) is not int or ranks_per_node < 1 or len(per_rank) % ranks_per_node:
+        raise ValueError("ranks_per_node must divide the sampled world size")
+    rows = [[float(value) for value in row] for row in per_rank]
+    minimum = [min(values) for values in zip(*rows)]
+    maximum = [max(values) for values in zip(*rows)]
+    report = dict(
+        metric="mega_moe_urma_kernel_device_duration_us",
+        aggregation="mean_of_per_round_cross_rank_extrema",
+        iteration_selection="all_formal_rounds",
+        recorded_rounds=len(minimum),
+        first_selected_iteration=0,
+        rounds=len(minimum),
+        rank_max_mean_us=statistics.mean(maximum),
+        rank_min_mean_us=statistics.mean(minimum),
+        rank_min_rounds_us=minimum,
+        rank_max_rounds_us=maximum,
+        raw_per_rank_rounds_us=rows,
+        per_rank_rounds_us=rows,
+        timer_pass=False,
+        scope="all_ep_ranks",
+    )
+    report["per_node"] = []
+    for node, offset in enumerate(range(0, len(rows), ranks_per_node)):
+        node_rounds = list(zip(*rows[offset : offset + ranks_per_node]))
+        report["per_node"].append(
+            dict(
+                node=node,
+                rank_start=offset,
+                rank_max_mean_us=statistics.mean(max(values) for values in node_rounds),
+                rank_min_mean_us=statistics.mean(min(values) for values in node_rounds),
+            )
+        )
+    return report

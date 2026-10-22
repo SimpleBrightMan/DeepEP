@@ -29,7 +29,7 @@ Pack使用全部56个AIV，任务编号为`block*2+subblock`。Reduce只使用28
 - Reduce使用6个BF16/FP32输入槽、独立FP32累加器和2个BF16输出槽。每核自己的`inverse + weights + readiness dependencies`一次搬入UB，BS8192时最多200个token，不再用128行metadata批次限制扫描范围。每个token的8路结果全部就绪后才预取payload；槽位按实际提交顺序复用，写回仍使用原始token行号。数据、metadata、正向缓存、提交位图和六项route ring合计191328 B，低于192 KiB。
 - 返回布局、FP32乘加顺序和最终BF16舍入不变。self直接写receive/return，远端PUT的CV粒度和数量不变。Pack仍全部完成后才进入Dispatch；Reduce可以与其他核心的计算和Combine重叠。
 
-Python会拒绝不含本分支tail调度标记的native扩展。正式耗时仍取关闭timer/trace的`CACHED_FORWARD`。Pack跨度覆盖56核；本分支Reduce跨度覆盖41核且包含等待结果就绪的时间，不能直接当作纯本地Reduce耗时，也不能与Combine跨度相加。原timer的Pack字节统计写入的FP8+scale，Reduce字节仅统计输出BF16，均不是完整HBM读写流量。
+Python会拒绝不含本分支tail调度标记的native扩展。正式耗时取关闭内部timer/trace的profiler设备kernel时间。Pack跨度覆盖56核；本分支Reduce跨度覆盖41核且包含等待结果就绪的时间，不能直接当作纯本地Reduce耗时，也不能与Combine跨度相加。原timer的Pack字节统计写入的FP8+scale，Reduce字节仅统计输出BF16，均不是完整HBM读写流量。
 
 ### Combine 完成信号与 Reduce 重叠
 
@@ -43,7 +43,7 @@ Python会拒绝不含本分支tail调度标记的native扩展。正式耗时仍�
 - 下一次调用仍在Pack完成后进行peer Start握手。Start接受`>= epoch`，防止双向空路由的peer提前进入下一轮、覆盖旧Start而造成死等。有效CV的ready仍使用`== epoch`，并且不逐轮清空对称ready区。
 - 每个worker循环扫描自己的未提交token。遇到首个未就绪依赖就跳过该token，遇到可执行token立即提交，不等待凑满一批；提交时即标记，避免重复执行。只在整轮扫描没有进展时退避200个周期。不同token允许乱序执行，同一token的8路FP32乘加顺序保持不变。
 - 已观察到就绪的远端`(producer_rank, CV)`和self计算组记录在本核UB正向缓存中，本次调用不再重复读取对应GM flag；未就绪结果不缓存，下轮重新检查。提交标记每次初始化；正向缓存在需要依赖检查时清零，不跨epoch复用。该流程使用实际路由依赖，不要求balanced或固定token分布。
-- 扫描与下发共用Scalar，GM flag读取仍可能延迟后续指令下发。已有MTE/Vector任务可与扫描重叠，但不保证流水始终饱和；切换token不会主动排空流水，只有最终输出完成后统一退出。全入站计数只用于提前解锁连续流水，不要求Reduce先整体等到16。性能以关闭timer/trace的完整`CACHED_FORWARD`实测判断。
+- 扫描与下发共用Scalar，GM flag读取仍可能延迟后续指令下发。已有MTE/Vector任务可与扫描重叠，但不保证流水始终饱和；切换token不会主动排空流水，只有最终输出完成后统一退出。全入站计数只用于提前解锁连续流水，不要求Reduce先整体等到16。性能以关闭内部timer/trace的profiler设备kernel实测判断。
 
 trace保留每CV的`CombinePublish`。Reduce在每个有任务的reducer上只记录一条：从Reduce函数入口到既有的最终流水排空完成，包含metadata预取、token结果就绪等待、计算及输出写回；在当前三个BS下共41条Reduce。这条跨度不能解释为纯Vector工作时间，也不能通过隐藏等待条扣除其中的ready等待。
 
@@ -81,7 +81,7 @@ H3584/I1280/E384/TopK8、EP16均衡时，每个M256 group有5个GMM1逻辑tile�
 
 MX scale在L1中的zZ布局按16行组织，任意来源边界可能落在2字节偏移，不能直接调用要求32字节LocalTensor起址的DMA。为此只增加`receiveRows*(H/32)`字节的scale GM工作区：准备时UB每行补齐到32字节，写回GM时压紧；不新增完整X重排。该缓冲在每次调用重新填充，组完成标志逐次清零。13个AIV1分别推进scale准备和activation两个游标，只有依赖就绪才执行任务，避免等待GMM1时阻止后续scale准备。trace中的`InputScaleGather`记录该额外搬运，`WaitInputScale`记录AIC等待。
 
-Scale准备只在详细trace中独立计时，未归入原有8个aggregate phase；因此不能用这些phase的累计时间代表完整算子耗时。正式`CACHED_FORWARD`和`FULL_E2E`均包含该步骤。
+Scale准备只在详细trace中独立计时，未归入原有8个aggregate phase；因此不能用这些phase的累计时间代表完整算子耗时。正式profiler设备kernel时间包含该步骤。AIC仅等待该M组的`inputScaleDone`一次，逐Segment的Dispatch到达检查仍由AIV1聚合输入时完成，不在AIC重复检查。
 
 空专家没有计算任务。各AIC及其配对AIV0按本核任务独立推进，专家批次之间没有全核barrier；GMM1下一批可以与上一批的SwiGLU/GMM2重叠。13个SwiGLU核使用新的M组任务编号，GMM2等待同组全部1280列activation完成，不能只等待其中一个N tile。
 
@@ -129,7 +129,7 @@ buffer = UrmaBuffer(group, num_max_tokens_per_rank=8192, cv_rows=256, gmm1_ahead
 # weights1/2 来自 transform_weights_for_mega_moe；不要拆掉GMM1准备对象。
 y = buffer.forward(x, topk_idx, topk_weights, weights1, weights2)
 
-# 仅用于显式复用不变路由，benchmark单独标成CACHED_FORWARD：
+# 显式复用不变路由；benchmark在profiler采集前完成prepare_routes：
 prepared = buffer.prepare_routes(topk_idx)
 y = buffer.forward_prepared(x, topk_weights, weights1, weights2, prepared)
 buffer.destroy()
@@ -193,17 +193,11 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib${CONDA_PREFIX:+:$CONDA_PREFIX/lib}${LD_L
 
 ## 计时和带宽
 
-每种BS输出三项相互独立的实测，正式统计取后半轮：
+每种BS只输出`[URMA PROFILE]`的目标kernel设备耗时，不再测量或输出`ROUTE_PREP`、`CACHED_FORWARD`、`FULL_E2E`，不使用Event计时。准备一次路由后，启动profiler，再保留原HCCL barrier + Exp拉齐；连续执行warmup和iters，末尾统一同步。只统计`mega_moe_urma_kernel`，不包含路由、Exp、HCCL及独立清零kernel；kernel内的Pack至Reduce完整流程都在其中。
 
-| 指标 | 计入范围 | 时钟 |
-|---|---|---|
-| `ROUTE_PREP` | NPU路由操作、D2H计数、Store交换、native描述符构建/拷贝 | Host wall time，完成后同步 |
-| `CACHED_FORWARD` | 本地展开、两次GMM、SwiGLU、双向阶段PUT、Reduce与本机退出汇合 | NPU Event区间，不含预先准备路由 |
-| `FULL_E2E` | 每次全新路由准备 + 完整forward + 完成同步 | Host wall time |
+正式统计包含全部iters轮（剔除warmup，不再取后半轮）。`round-max-mean`先对每轮跨rank取最大值再求均值，`round-min-mean`对应每轮最小值的均值。原始profiler CSV、每次kernel记录和各rank每轮耗时均保存，详见[URMA_TIMING.md](URMA_TIMING.md)。
 
-输入/权重生成、权重格式转换、通信域创建、计时前的host对齐屏障均不计入上述区间。输入契约是预量化FP8，BF16到FP8输入量化不在本接口内。`FULL_E2E`是单独执行的完整测量，不是将前两项相加。
-
-`--timer`另跑一次诊断调用，保存每rank原始`urma_timer.bin`及schema。URMA格式为`int64[28,3,8,16]`，引擎顺序AIC/AIV0/AIV1，阶段为Pack/Dispatch/Gmm1/Activation/Gmm2/Combine/Barrier/Reduce。每记录前七个字段为`first_tick,last_tick,sum_ticks,payload_bytes,count,reserved,schema`。不要用旧Wave timer parser读取。
+`--timer`只在该BS连续块末尾追加的一次诊断调用开启，该轮不计入正式性能；`--trace`与它共用这最后一次调用。保存每rank原始`urma_timer.bin`及schema。URMA格式为`int64[28,3,8,16]`，引擎顺序AIC/AIV0/AIV1，阶段为Pack/Dispatch/Gmm1/Activation/Gmm2/Combine/Barrier/Reduce。每记录前七个字段为`first_tick,last_tick,sum_ticks,payload_bytes,count,reserved,schema`。不要用旧Wave timer parser读取。
 
 带宽分开报告Dispatch/Combine各自的INTRA/CROSS：
 
@@ -220,7 +214,7 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib${CONDA_PREFIX:+:$CONDA_PREFIX/lib}${LD_L
 
 ## 逐事件流水 trace
 
-增加`--trace`会隐含开启`--timer`。每种BS先完成关闭timer和trace的正式测量，再单独执行一次原有aggregate timer诊断，最后额外执行一次详细trace诊断。因此，详细打点开销不会混入正式耗时或原有带宽统计。它会改变诊断调用自身的耗时，应使用正式测量判断优化收益。
+增加`--trace`会隐含开启`--timer`。每种BS的warmup和正式iters均关闭内部timer/trace，只在同一连续块最后追加一次诊断，两种打点共享这次调用；不会每轮导出trace，也不再拆成两个诊断调用。最后一轮不进入profiler正式均值，但详细打点会影响该诊断调用的流水及带宽统计。应使用正式profiler样本判断算子性能。
 
 `--trace`现在自动合并全部rank，每种BS生成`$OUT/bs_<BS>/allrank.json`，可直接在Perfetto/Chrome Trace Viewer打开。每个rank作为独立process，内部保留84条AIC/AIV轨道，按rank编号排列；原有每rank JSON也保留。默认导出的两种JSON均隐藏`Wait*`及普通`LocalSync`；解析旧trace时仍保留尾部`FinalPeerHandshake`、`RankBarrier`和`LocalSync(sync_stage=2)`，本分支已不生成这三类尾部同步事件。`Quiet/Drain`继续显示实际通信完成等待和流水排空。过滤不移动时间戳、不压缩空白，不修改设备同步、原始bin或带宽统计。
 
@@ -251,7 +245,8 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 
 | 文件 | 内容 |
 |---|---|
-| `urma_timer.bin`、`timer.json` | 原有aggregate timer及schema；来自独立timer调用 |
+| `profile/`、`kernel_samples.json` | 原始profiler输出及逐kernel样本；保留warmup、正式轮和末尾诊断的区分 |
+| `urma_timer.bin`、`timer.json` | aggregate timer及schema；来自末尾一次诊断，与trace共用调用 |
 | `urma_trace.bin` | 逐事件原始little-endian int64存储，按uint64解释 |
 | `urma_trace.json` | 可在Perfetto或Chrome Trace Viewer打开的流水 |
 | `trace_metadata.json` | rank、容量、各引擎记录数、时钟设置、raw路径或解析错误 |
