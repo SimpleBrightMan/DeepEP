@@ -4,6 +4,7 @@
 
 #include "abi.hpp"
 #include "compute_contract.hpp"
+#include "pack_round.hpp"
 #include "transport.hpp"
 #include "timer.hpp"
 #include "../stage/mega_moe_gmm1_activation.hpp"
@@ -354,6 +355,15 @@ __aicore__ inline bool AreGroupInputsReady(const Arguments& args, const Fragment
 {
     for (uint32_t index = 0U; index < fragment.segmentCount; ++index) {
         const auto segment = LoadRowSegment(args, fragment.segmentBegin + index);
+        if (segment.sourceRank == args.config.rank) {
+            const uint64_t begin = static_cast<uint64_t>(segment.cv) * args.config.cvRows;
+            if (begin >= args.config.selfRows) return false;
+            const uint64_t remaining = args.config.selfRows - begin;
+            const uint32_t rows = remaining < args.config.cvRows ? remaining : args.config.cvRows;
+            if (ReadGmByPassDCache(PackReadyFlag(args, args.config.rank, segment.cv)) < static_cast<int32_t>(rows))
+                return false;
+            continue;
+        }
         auto* ready = reinterpret_cast<__gm__ uint64_t*>(args.symmetric + args.config.dispatchReadyOffset +
                                                          segment.inputReadyIndex * kFlagBytes);
         if (ReadGmByPassDCache(ready) != args.config.epoch) return false;
@@ -431,9 +441,9 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
     timer.End(Phase::Activation);
 }
 
-// Each AIV1 owns independent cursors for input-scale groups and activation
-// tiles. Never block one cursor on a producer: GMM1 needs future scale gathers
-// even while earlier activations are pending on the very same worker.
+// Each helper owns independent cursors for input-scale groups, activation and
+// its fixed Pack quota. None may block another: GMM1 needs future scale gathers
+// and input packs even while earlier activations wait. No dynamic task claims.
 __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Timer& timer)
 {
     UrmaActivation epilogue;
@@ -442,13 +452,18 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
     uint32_t nextGather = worker;
     uint32_t nextActivation = 0U;
     uint32_t activationTile = 0U;
+    uint32_t nextPackRound = kPackStartupRounds;
+    bool packFinished = false;
+    PackReserve packReserve;
     bool activationPrepared = false;
     bool idle = false;
     uint64_t idleStart = 0U;
     TraceEvent idleEvent = TraceEvent::WaitGmm1;
     TraceMeta idleMeta;
-    while (nextGather < args.config.fragmentCount || nextActivation < args.config.fragmentCount) {
+    while (nextGather < args.config.fragmentCount || nextActivation < args.config.fragmentCount ||
+           nextPackRound < args.config.packRoundCount) {
         bool progress = false;
+        bool ranActivation = false;
         if (nextGather < args.config.fragmentCount) {
             const auto fragment = LoadFragment(args, nextGather);
             if (AreGroupInputsReady(args, fragment)) {
@@ -475,7 +490,8 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
                 activationPrepared = false;
                 continue;
             }
-            if (ReadGmByPassDCache(ComputeFlag(args.gmm1Done, fragment.gmm1TileBegin + activationTile)) != 0) {
+            if (ReadGmByPassDCache(ComputeFlag(args.gmm1Done, fragment.gmm1TileBegin + activationTile)) != 0 &&
+                (nextPackRound >= args.config.packRoundCount || packReserve.HasNextDispatchReady(args))) {
                 if (idle) {
                     timer.TraceEnd(idleEvent, idleStart, idleMeta);
                     idle = false;
@@ -483,8 +499,25 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
                 RunReadyActivationTile(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
                 activationTile += kActivationWorkers;
                 progress = true;
+                ranActivation = true;
             }
             break;
+        }
+        // One whole fixed quota, not an arbitrary later CV. If activation is
+        // unavailable or any sender lacks one ready CV, replenish the next
+        // Pack round. The copy closes its own events before the next task.
+        if (!ranActivation && nextPackRound < args.config.packRoundCount) {
+            if (idle) {
+                timer.TraceEnd(idleEvent, idleStart, idleMeta);
+                idle = false;
+            }
+            PackOneRound(args, nextPackRound, worker + kCommunicationWorkers, kAic, timer);
+            ++nextPackRound;
+            progress = true;
+        }
+        if (!packFinished && nextPackRound >= args.config.packRoundCount) {
+            MarkPackWorkerComplete(args);
+            packFinished = true;
         }
         if (!progress && (nextGather < args.config.fragmentCount || nextActivation < args.config.fragmentCount)) {
             if (!idle) {
@@ -501,6 +534,8 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
         }
     }
     if (idle) timer.TraceEnd(idleEvent, idleStart, idleMeta);
+    // Empty compute workloads and <=2 Pack rounds can skip the loop entirely.
+    if (!packFinished) MarkPackWorkerComplete(args);
 }
 
 }  // namespace MegaMoeUrma

@@ -13,23 +13,33 @@ GMM按专家聚合不同来源的行，使用M256计算块，仅专家尾块不�
 ## 数据与通信顺序
 
 1. 每个输入 `[token, topk_slot]` 都是独立路由实例。按 `[目标rank][目标本地expert][原始token/topk位置]` 稳定排序，建立 `order` 和逆映射 `reduce_index[token,slot]=expanded_row`。
-2. 56个AIV共同展开FP8 token和E8M0 scale：远端路由写连续发送区，self路由直接写本rank接收区；不再从发送区执行一次SelfDispatch拷贝。一个token命中多个expert时复制对应多行，本版不做去重。
+2. 通信核先发布Start，再由56个AIV共同展开前两轮通信CV的FP8 token和E8M0 scale，剩余轮次由28个AIV1静态均分Pack行数并与Dispatch重叠。远端路由写连续发送区，self路由直接写本rank接收区；不再从发送区执行一次SelfDispatch拷贝。一个token命中多个expert时复制对应多行，本版不做去重。
 3. 每个目标rank的连续行流按 `cv_rows` 截断，通过 URMA PUT 发送。token与scale使用各自连续平面。
 4. 对每个本地expert，把16个来源的行按source编号连接，按M256划分计算组；专家尾组可以不足256，不与下一个专家混算。每组的Segment记录来源、CV、接收行、组内行和返回展开行。Segment在source/CV边界切分，但这些边界不再切分矩阵计算。
 5. GMM1按Segment把X分段加载到同一L1计算块，只等待该组实际涉及的Dispatch CV及scale准备。scale由13个AIV1独立准备，每个M组只聚合一次到expert-major GM；AIC沿用连续MX scale加载。GMM1输出、SwiGLU及GMM2输入使用连续的expert-major计算行序。GMM2按同一映射将远端结果分段写回原source-major连续输出区，self结果直接写Reduce最终读取的位置。各peer的Combine CV等待所有覆盖它的M组完成全部H列，再按原连续区间PUT。
 6. 本rank的15个远端Dispatch全部完成且self接收区已就绪后才提交Combine PUT。每个Combine CV执行 `PUT → quiet(peer) → MTE DataCopy发布epoch flag`。计算侧AIV完成自己的任务后即可按token依赖Reduce，不再等待最终全卡同步。
 
-15个通信AIV1各独占一个远端rank。通信worker `w` 的peer为 `w < rank ? w : w+1`；剩余13个AIV1执行SwiGLU。self就绪标志在Pack本地同步后发布，原来承担self拷贝的block15随后直接进入SwiGLU。远端两个阶段都只使用PUT，队列同一peer始终只有一个提交者。
+15个通信AIV1各独占一个远端rank。通信worker `w` 的peer为 `w < rank ? w : w+1`；剩余13个AIV1执行输入scale准备和SwiGLU。28个AIV1也各自完成每轮固定的Pack行区间。self输入就绪通过本卡对应CV的Pack完成行数判断，block15不再单独发布self信号。远端两个阶段都只使用PUT，队列同一peer始终只有一个提交者。
 
-Pack使用全部56个AIV，任务编号为`block*2+subblock`。Reduce只使用28个AIV0和block15～27的13个AIV1，共41核；15个通信AIV1不参与Reduce。计算侧每核结束自己的反量化或scale/SwiGLU任务后，先排空本核流水以交还UB/event，再独立进入Reduce。当前内核固定启动28组；即使物理设备有64个AIV，也只使用已启动的56个。
+前两轮Pack使用全部56个AIV，任务编号为`block*2+subblock`；其后的Pack使用28个AIV1，任务编号为block。Reduce只使用28个AIV0和block15～27的13个AIV1，共41核；15个通信AIV1不参与Reduce。计算侧每核结束自己的反量化或scale/SwiGLU及Pack任务后，先排空本核流水以交还UB/event，再独立进入Reduce。当前内核固定启动28组；即使物理设备有64个AIV，也只使用已启动的56个。
 
-本地阶段使用多槽流水，benchmark打印`local_pipeline=pack6-reduce6-output2 tail=combine-ready-scan-reduce41`。Pack按56核、Reduce按41核分配连续行区间：
+本地阶段使用多槽流水，benchmark打印`local_pipeline=pack6-reduce6-output2 tail=combine-ready-scan-reduce41`。Pack在每轮内部按56或28核分配连续虚拟行区间，Reduce按41核分配连续token区间：
 
-- Pack使用6个token/scale槽，按槽等待上一次MTE3完成，再下发新的MTE2；不同槽的读取与写出可以重叠。`order`批量DMA到UB，当前支持的最大BS8192每核最多1171行，一次预取即可，payload循环不再从GM逐行标量读取路由。UB占用65.5 KiB。
+- Pack使用6个token/scale槽，按槽等待上一次MTE3完成，再下发新的MTE2；不同槽的读取与写出可以重叠。`order`按最多1024行批量DMA到UB，payload循环不再从GM逐行标量读取路由。Pack占用UB高128 KiB以上的57.5 KiB，末地址185.5 KiB，与scale准备及激活的低128 KiB分开；每段结束回收MTE事件并确认写出完成，再累加ready行数，不添加PIPE_ALL。
 - Reduce使用6个BF16/FP32输入槽、独立FP32累加器和2个BF16输出槽。每核自己的`inverse + weights + readiness dependencies`一次搬入UB，BS8192时最多200个token，不再用128行metadata批次限制扫描范围。每个token的8路结果全部就绪后才预取payload；槽位按实际提交顺序复用，写回仍使用原始token行号。数据、metadata、正向缓存、提交位图和六项route ring合计191328 B，低于192 KiB。
-- 返回布局、FP32乘加顺序和最终BF16舍入不变。self直接写receive/return，远端PUT的CV粒度和数量不变。Pack仍全部完成后才进入Dispatch；Reduce可以与其他核心的计算和Combine重叠。
+- 返回布局、FP32乘加顺序和最终BF16舍入不变。self直接写receive/return，远端PUT的CV粒度和数量不变。前两轮Pack完成后即可进入Dispatch，后续Pack与通信及计算交错；Reduce可以与其他核心的计算和Combine重叠。
 
-Python会拒绝不含本分支tail调度标记的native扩展。正式耗时取关闭内部timer/trace的profiler设备kernel时间。Pack跨度覆盖56核；本分支Reduce跨度覆盖41核且包含等待结果就绪的时间，不能直接当作纯本地Reduce耗时，也不能与Combine跨度相加。原timer的Pack字节统计写入的FP8+scale，Reduce字节仅统计输出BF16，均不是完整HBM读写流量。
+Python会拒绝不含本分支tail调度标记的native扩展。正式耗时取关闭内部timer/trace的profiler设备kernel时间。Pack在启动阶段覆盖56核，后续在28个AIV1上形成多段；通信核的Pack位于Dispatch提交与quiet之间，已包含在该核aggregate Dispatch跨度内，两者不能相加当串行耗时。本分支Reduce跨度覆盖41核且包含等待结果就绪的时间，不能直接当作纯本地Reduce耗时，也不能与Combine跨度相加。原timer的Pack字节统计写入的FP8+scale，Reduce字节仅统计输出BF16，均不是完整HBM读写流量。
+
+### 固定轮次 Pack 与 Dispatch 重叠
+
+一轮是每个目标rank的同编号CV组成的虚拟行流，包含self，按peer顺序连接；CV表示通信分块，不是专家M256 group。路由准备时生成轮次表，不在kernel里重新遍历topk。将本轮实际总行数商余均分到参与核，允许一个CV跨核，每个核只处理自己的固定区间，没有动态领取或补做其它核任务。默认CV256均衡时每轮4096行：启动56核中前8核各74行，其余73行；稳态28核中前8核各147行，其余146行。
+
+- 15个通信核在Pack前发布Start，不在此处等待peer。全部AIV完成第0、1轮后做一次本机汇合，AIV0转入反量化，通信核在首次PUT前确认peer Start。
+- 通信owner发送第`r`轮时，依次执行`等待本peer packReady → PUT X/scale → 准备自己第r+2轮Pack份额 → quiet → 发布远端ready`。即使该peer本轮没有数据，也必须完成第`r+2`轮的Pack份额；所有核遍历同一本卡轮次总数。
+- 13个辅助AIV1分别推进scale准备、SwiGLU和Pack三个游标。可执行SwiGLU且每个仍有发送任务的peer至少有一个已完成Pack、尚未提交的CV时，优先SwiGLU；否则准备自己的下一轮Pack份额。该判断只决定优先级，不领取其它核的份额，也不要求各核轮次严格同步。
+- 每段Pack在X和scale写出完成后，给本卡`packReady[peer][cv]`原子累加实际行数。通信及self输入检查均以该CV的实际总行数为门槛，短尾、空peer和不均衡路由使用同一逻辑。计数每次调用清零，不发送到远端；远端仍沿用quiet后的epoch ready。
+- 所有28个AIV1完成自身Pack后各记一次完成；15个远端Dispatch完成加上全部Pack完成才放行Combine，保留原有Dispatch结束门槛。轮次之间不增加全卡或全核同步。命令参数不变，需要重新构建完整wheel。
 
 ### Combine 完成信号与 Reduce 重叠
 
@@ -39,8 +49,8 @@ Python会拒绝不含本分支tail调度标记的native扩展。正式耗时取�
 - 本核所有Combine CV均完成`quiet + CV ready发布`后，用MTE发布自己面向该peer的`finished(epoch)`，再带200周期退避地观察尚未计入的入站完成；空edge也发一次通知。必须先发后等，且每个owner只处理自己的peer，避免相互等待形成环。该通知使用独立phase 1的128B槽，不覆盖逐CV ready。
 - 第16份是self：28个AIC各自完成全部GMM2/FIX输出后，给本卡AIC完成计数器加一。通信owner 0非阻塞检查它是否到28，再且仅再给入站计数器加一；不能预置self为完成，也不能用AIV0退出代替GMM2输出就绪。此门槛偏保守，self输出可能更早完成。
 - Reducer轮询入站计数，观察到16时，执行S→MTE2门禁并锁存“全部就绪”。剩余未提交token不再读取就绪flag、不再逐token做ready门禁，直接进入跨token六槽流水；metadata、输入槽、Vector和输出槽事件仍保留。普通payload GM读取不受影响。
-- 没有尾部全卡barrier或Reduce之前的全本机汇合。只保留Pack后的本机汇合和函数退出前的本机MIX汇合；后者包括28 AIC、56 AIV和完成计数的所有贡献者，保护workspace及下一轮复用。本轮计数器在发布Start前由原有清零操作重置；finished区保留epoch，不逐轮清空。
-- 下一次调用仍在Pack完成后进行peer Start握手。Start接受`>= epoch`，防止双向空路由的peer提前进入下一轮、覆盖旧Start而造成死等。有效CV的ready仍使用`== epoch`，并且不逐轮清空对称ready区。
+- 没有尾部全卡barrier或Reduce之前的全本机汇合。只保留前两轮Pack后的本机汇合和函数退出前的本机MIX汇合；后者包括28 AIC、56 AIV和完成计数的所有贡献者，保护workspace及下一轮复用。本轮计数器在发布Start前由原有清零操作重置；finished区保留epoch，不逐轮清空。
+- 下一次调用在Pack前发布peer Start，完成前两轮Pack后才等待peer Start并开始PUT。Start接受`>= epoch`，防止双向空路由的peer提前进入下一轮、覆盖旧Start而造成死等。有效CV的ready仍使用`== epoch`，并且不逐轮清空对称ready区。
 - 每个worker循环扫描自己的未提交token。遇到首个未就绪依赖就跳过该token，遇到可执行token立即提交，不等待凑满一批；提交时即标记，避免重复执行。只在整轮扫描没有进展时退避200个周期。不同token允许乱序执行，同一token的8路FP32乘加顺序保持不变。
 - 已观察到就绪的远端`(producer_rank, CV)`和self计算组记录在本核UB正向缓存中，本次调用不再重复读取对应GM flag；未就绪结果不缓存，下轮重新检查。提交标记每次初始化；正向缓存在需要依赖检查时清零，不跨epoch复用。该流程使用实际路由依赖，不要求balanced或固定token分布。
 - 扫描与下发共用Scalar，GM flag读取仍可能延迟后续指令下发。已有MTE/Vector任务可与扫描重叠，但不保证流水始终饱和；切换token不会主动排空流水，只有最终输出完成后统一退出。全入站计数只用于提前解锁连续流水，不要求Reduce先整体等到16。性能以关闭内部timer/trace的profiler设备kernel实测判断。
@@ -49,7 +59,7 @@ trace保留每CV的`CombinePublish`。Reduce在每个有任务的reducer上只�
 
 新版不再逐token记录`WaitReduceReady`和`Reduce`，也不单独记录`ReduceDrain`，减少循环中的scalar日志写出与cache flush。计时结束使用原有排空位置，不添加同步；其它trace事件不变。`WaitReduceReady`和`ReduceDrain`编号仍保留供历史bin解码，当前设备不会生成这两类事件。`--trace-include-waits`只显示实际记录的等待，不能恢复新版已不记录的逐token等待。旧版本尾部同步事件仍可解码，本分支不会生成已删除的全卡同步事件。
 
-self直接写地址按现有`send_base/receive_base`映射；同一计算组可同时含self和远端行，逐Segment决定输出地址。远端PUT的地址、顺序、CV和数量不变，计算按expert顺序推进多个peer的返回结果。当前Pack完成前不会对peer发布新epoch的Start；上一轮本地计算/返回/Reduce由同一runtime stream串行完成，因此self直接写不会覆盖尚在使用的上一轮数据。
+self直接写地址按现有`send_base/receive_base`映射；同一计算组可同时含self和远端行，逐Segment决定输出地址。远端PUT的地址、顺序、CV和数量不变，计算按expert顺序推进多个peer的返回结果。Start提前到Pack之前，依赖上一轮的本机退出汇合以及同一runtime stream上的顺序执行来保护旧数据；本轮self写入和远端PUT使用互不重叠的source接收区间。
 
 接收数据/中间结果/返回结果不按CV覆盖复用。所有BS共享固定对称heap布局，epoch由`UrmaBuffer`统一递增，不因创建新Plan或切换BS重新归零。
 
@@ -79,7 +89,7 @@ H3584/I1280/E384/TopK8、EP16均衡时，每个M256 group有5个GMM1逻辑tile�
 
 `--gmm1-ahead-mgroups 0` 精确恢复原调度，便于对照。窗口持续补充，不仅影响启动预热；所有GMM1和GMM2仍各执行一次。Host在路由准备时生成任务数组，AIC和对应AIV0读取同一份顺序；中间结果使用既有独立GM行，不新增L1/L0/UB槽位，专家结束握手保留。更深窗口可能推迟Combine/Reduce或提前遇到尚未到达的Dispatch CV，应同时比较完整算子耗时。新的起跑对齐和连续采样方式见 [URMA_TIMING.md](URMA_TIMING.md)。
 
-MX scale在L1中的zZ布局按16行组织，任意来源边界可能落在2字节偏移，不能直接调用要求32字节LocalTensor起址的DMA。为此只增加`receiveRows*(H/32)`字节的scale GM工作区：准备时UB每行补齐到32字节，写回GM时压紧；不新增完整X重排。该缓冲在每次调用重新填充，组完成标志逐次清零。13个AIV1分别推进scale准备和activation两个游标，只有依赖就绪才执行任务，避免等待GMM1时阻止后续scale准备。trace中的`InputScaleGather`记录该额外搬运，`WaitInputScale`记录AIC等待。
+MX scale在L1中的zZ布局按16行组织，任意来源边界可能落在2字节偏移，不能直接调用要求32字节LocalTensor起址的DMA。为此只增加`receiveRows*(H/32)`字节的scale GM工作区：准备时UB每行补齐到32字节，写回GM时压紧；不新增完整X重排。该缓冲在每次调用重新填充，组完成标志逐次清零。13个AIV1分别推进scale准备、activation和Pack三个游标，只有依赖就绪才执行计算侧任务，避免等待GMM1时阻止后续scale准备和Pack。trace中的`InputScaleGather`记录该额外搬运，`WaitInputScale`记录AIC等待。
 
 Scale准备只在详细trace中独立计时，未归入原有8个aggregate phase；因此不能用这些phase的累计时间代表完整算子耗时。正式profiler设备kernel时间包含该步骤。AIC仅等待该M组的`inputScaleDone`一次，逐Segment的Dispatch到达检查仍由AIV1聚合输入时完成，不在AIC重复检查。
 
@@ -254,9 +264,9 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 
 此外，`$OUT/bs_<BS>/allrank.json`保存该BS全部rank的合并流水，`summary.json`的`trace_allrank`记录其路径及统计。不同BS分别导出，避免混用不同调用的时间轴。各rank的零点依旧独立；合并只方便浏览，不能用跨rank横坐标差计算通信延迟或推断真实同时性。
 
-每条轨道对应`block 00..27`的`AIC/AIV0/AIV1`，引擎编号为`block*3+0/1/2`。Pack出现在全部56条AIV轨道；Reduce在28个AIV0及block15～27的13个AIV1上各有一条完整跨度，15个通信AIV1不记录Reduce。SelfDispatch/SelfCombine不再产生拷贝事件，旧事件编号保留供历史trace解析。事件参数包含可用的peer、CV、fragment、expert、行起点/行数、M/N tile位置、列数和字节数；不适用字段显示null。Reduce的行起点/行数表示该reducer的完整token区间，字节数仅为输出BF16写入量。`LocalSync`的CV字段另解释为`sync_stage`：0=pack、3=本次调用的本机退出汇合；1=compute/return、2=rank barrier仅供历史trace解析。
+每条轨道对应`block 00..27`的`AIC/AIV0/AIV1`，引擎编号为`block*3+0/1/2`。Pack在前两轮出现在全部56条AIV轨道，随后只出现在28条AIV1轨道；每段记录目标peer、CV和本核实际行数。Reduce在28个AIV0及block15～27的13个AIV1上各有一条完整跨度，15个通信AIV1不记录Reduce。SelfDispatch/SelfCombine不再产生拷贝事件，旧事件编号保留供历史trace解析。事件参数包含可用的peer、CV、fragment、expert、行起点/行数、M/N tile位置、列数和字节数；不适用字段显示null。Reduce的行起点/行数表示该reducer的完整token区间，字节数仅为输出BF16写入量。`LocalSync`的CV字段另解释为`sync_stage`：0=前两轮Pack启动汇合、3=本次调用的本机退出汇合；1=compute/return、2=rank barrier仅供历史trace解析。
 
-编译和trace运行仍使用上面的命令，不增加调度或采样参数。新计算事件中的`fragment`字段表示专家M组编号，`row`表示expert-major计算行；一个组可以跨多个peer/CV，因此这两个字段为null。`WaitDispatch`保留实际等待的peer/CV及接收行，通信事件仍表示原peer/CV。核对前瞻时按`expert,fragment`观察GMM1与GMM2先后，不能再按peer解释计算轨道。单个核心只记录分给自己的tile，缺少某组的条不等于该组未计算。`WaitActivation`仍表示执行GMM2前尚未满足的依赖；aggregate timer阶段与逐事件schema不变。
+编译和trace运行仍使用上面的命令，不增加调度或采样参数。新计算事件中的`fragment`字段表示专家M组编号，`row`表示expert-major计算行；一个组可以跨多个peer/CV，因此这两个字段为null。`WaitDispatch`保留实际等待的peer/CV；通信AIV1上的该事件表示等待本地Pack完成，行号为发送展开行，历史计算侧事件的行号为接收行。通信事件仍表示原peer/CV。核对前瞻时按`expert,fragment`观察GMM1与GMM2先后，不能再按peer解释计算轨道。单个核心只记录分给自己的tile，缺少某组的条不等于该组未计算。`WaitActivation`仍表示执行GMM2前尚未满足的依赖；aggregate timer阶段与逐事件schema不变。
 
 | 图中标签 | 应如何理解 |
 |---|---|

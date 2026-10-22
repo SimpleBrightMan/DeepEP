@@ -5,6 +5,7 @@
 // Host-only routing planner. Keep it independent of torch/CANN so the exact
 // descriptors consumed by the kernel can be exercised in CPU regression tests.
 #include "abi.hpp"
+#include "pack_plan.hpp"
 
 #include <algorithm>
 #include <array>
@@ -22,6 +23,7 @@ struct ExpertPlan {
     std::vector<ComputeBatchTask> computeTasks;
     std::vector<Chunk> sendChunks;
     std::vector<Chunk> recvChunks;
+    std::vector<PackRound> packRounds;
     std::vector<uint32_t> chunkGroupIndices;
     // Original expanded-row order. UrmaPlan binds this once through the NPU
     // inverse map to cache token-major descriptors consumed by Reduce.
@@ -217,6 +219,8 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
     config.computeTaskCount = static_cast<uint32_t>(plan.computeTasks.size());
     config.sendChunkCount = static_cast<uint32_t>(plan.sendChunks.size());
     config.recvChunkCount = static_cast<uint32_t>(plan.recvChunks.size());
+    plan.packRounds = BuildPackRounds(plan.sendChunks, config.maxPeerChunks);
+    config.packRoundCount = static_cast<uint32_t>(plan.packRounds.size());
     return plan;
 }
 }  // namespace MegaMoeUrma

@@ -15,6 +15,7 @@ constexpr uint64_t kFlagBytes = 128;
 constexpr uint32_t kLocalFlagDispatchDone = 0U;
 constexpr uint32_t kLocalFlagAicDone = 1U;
 constexpr uint32_t kLocalFlagIncomingDone = 2U;
+constexpr uint32_t kLocalFlagPackDone = 3U;
 // Reduce dependency values are uint64 bit patterns stored in an int64 tensor.
 // Low values address a producer/CV completion flag; tagged values address a
 // local GMM2 group that writes its self return rows directly.
@@ -137,6 +138,14 @@ struct Chunk {
     uint32_t reserved;
 };
 
+// A fixed Pack round contains CV r for every destination, including self.
+// Empty peer streams retain their fixed peer slot with rows=0. The device
+// divides the concatenated virtual row interval equally among Pack workers.
+struct PackRound {
+    Chunk chunks[kWorld];
+    uint64_t rows;
+};
+
 struct Config {
     uint32_t bs;
     uint32_t hidden;
@@ -151,7 +160,7 @@ struct Config {
     uint32_t recvChunkCount;
     uint32_t gmm1AheadMGroups = 12U;
     uint32_t computeTaskCount;
-    uint32_t reserved;
+    uint32_t packRoundCount;
     uint64_t receiveRows;
     uint64_t gmm1Tiles;
     uint64_t gmm2Tiles;
@@ -199,6 +208,9 @@ struct Arguments {
     uint64_t chunkGroupIndices;
     uint64_t sendChunks;
     uint64_t recvChunks;
+    uint64_t packRounds;
+    uint64_t packReady;         // Local int32 completed rows per peer/CV, 128B slots.
+    uint64_t dispatchProgress;  // Local int32 submitted CV count per peer, 128B slots.
     uint64_t gmm1Done;
     uint64_t inputScaleDone;
     uint64_t activationDone;
@@ -215,6 +227,7 @@ static_assert(sizeof(RowSegment) == 40);
 static_assert(sizeof(ComputeBatch) == 8);
 static_assert(sizeof(ComputeBatchTask) == 8);
 static_assert(sizeof(Chunk) == 40);
+static_assert(sizeof(PackRound) == kWorld * sizeof(Chunk) + sizeof(uint64_t));
 }  // namespace MegaMoeUrma
 
 extern "C" void mega_moe_urma_kernel_do(uint32_t block_dim, uint32_t ub_bytes, void* stream,

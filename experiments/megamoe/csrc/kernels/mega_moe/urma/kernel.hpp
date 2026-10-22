@@ -5,6 +5,7 @@
 #include "abi.hpp"
 #include "compute.hpp"
 #include "pack_reduce.hpp"
+#include "pack_round.hpp"
 #include "tail_completion.hpp"
 #include "timer.hpp"
 #include "transport.hpp"
@@ -32,25 +33,29 @@ __aicore__ inline TraceMeta ChunkTraceMeta(const Chunk& chunk)
 __aicore__ inline void TraceLocalSync(Timer& timer, uint32_t stage)
 {
     TraceMeta meta;
-    meta.cv = stage;  // 0=pack, 3=local invocation completion; 1/2 reserved.
+    meta.cv = stage;  // 0=two-round startup pack, 3=local invocation completion.
     const uint64_t start = timer.TraceBegin();
     SyncAll<false>();
     timer.TraceEnd(TraceEvent::LocalSync, start, meta);
 }
 
-// Pack writes self rows directly into their final receive interval. It drains
-// all AIV DMA before the local pack barrier; only then can this single publisher
-// expose every self CV. This also supplies the one self dispatch contribution,
-// including when this rank has no self routes.
-__aicore__ inline void PublishSelfDispatchReady(const Arguments& args)
+// Publish before packing so remote startup can overlap local DMA. Do not
+// wait here: all workers must reach the two-round startup join. Previous-call
+// receive/return consumers finished at the prior local join, and this call's
+// counter resets precede the kernel on the same stream. Self pack and remote
+// PUTs address disjoint source intervals in receive storage.
+__aicore__ inline void PublishPeerStart(const Arguments& args, uint32_t owner, Timer& timer)
 {
-    for (uint64_t begin = 0U, cv = 0U; begin < args.config.selfRows; begin += args.config.cvRows, ++cv) {
-        auto* ready = reinterpret_cast<__gm__ uint64_t*>(
-            args.symmetric + args.config.dispatchReadyOffset +
-            (static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + cv) * kFlagBytes);
-        WriteGmByPassDCache(ready, args.config.epoch);
-    }
-    AtomicAdd(ComputeFlag(args.localFlags, kLocalFlagDispatchDone), 1);
+    const uint32_t peer = PeerForOwner(args.config.rank, owner);
+    LocalTensor<uint64_t> signal(TPosition::VECCALC, 0U, 4U);
+    TraceMeta meta;
+    meta.peer = peer;
+    timer.Begin(Phase::Barrier);
+    const uint64_t start = timer.TraceBegin();
+    PublishDone(reinterpret_cast<__gm__ uint8_t*>(args.symmetric), PeerPhaseSlot(args, 0U, args.config.rank), peer,
+                args.config.epoch, signal, EVENT_ID0);
+    timer.TraceEnd(TraceEvent::PublishStart, start, meta);
+    timer.End(Phase::Barrier);
 }
 
 __aicore__ inline void WaitChunkComputed(const Arguments& args, const Chunk& chunk, Timer& timer)
@@ -83,23 +88,31 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     TraceMeta peerMeta;
     peerMeta.peer = peer;
     timer.Begin(Phase::Barrier);
-    // Start is sent only after all local Expand work and the preceding call's
-    // Reduce have completed. A peer must acknowledge this epoch before any
-    // payload overwrites its symmetric receive/return storage.
+    // Start was published before the startup Pack. Wait only now, immediately
+    // before this owner's first possible payload write to the peer.
     uint64_t start = timer.TraceBegin();
-    PublishDone(symmetric, PeerPhaseSlot(args, 0U, args.config.rank), peer, args.config.epoch, signal, EVENT_ID0);
-    timer.TraceEnd(TraceEvent::PublishStart, start, peerMeta);
-    start = timer.TraceBegin();
     WaitStartAtLeast(symmetric + PeerPhaseSlot(args, 0U, peer), args.config.epoch);
     timer.TraceEnd(TraceEvent::WaitStartPeer, start, peerMeta);
     timer.End(Phase::Barrier);
 
     const uint64_t h = args.config.hidden;
     const uint64_t scales = h / 32U;
-    for (uint32_t index = 0U; index < args.config.sendChunkCount; ++index) {
-        const Chunk chunk = LoadChunk(args.sendChunks, index);
-        if (chunk.peer != peer) continue;
+    for (uint32_t round = 0U; round < args.config.packRoundCount; ++round) {
+        const Chunk chunk = LoadPackChunk(args, round, peer);
+        // An empty peer must still produce its fixed share of every Pack
+        // round, including data for other peers and self. Never exit early.
+        if (chunk.rows == 0U) {
+            PackOneRound(args, round + kPackStartupRounds, owner, kAic, timer);
+            continue;
+        }
         TraceMeta meta = ChunkTraceMeta(chunk);
+        start = timer.TraceBegin();
+        while (ReadGmByPassDCache(PackReadyFlag(args, peer, round)) < static_cast<int32_t>(chunk.rows)) {
+            const uint64_t backoff = GetSystemCycle();
+            while (GetSystemCycle() - backoff < 64U) {
+            }
+        }
+        timer.TraceEnd(TraceEvent::WaitDispatch, start, meta);
         meta.bytes = chunk.rows * h;
         timer.Begin(Phase::Dispatch);
         start = timer.TraceBegin();
@@ -113,6 +126,10 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             reinterpret_cast<__gm__ uint8_t*>(args.expandedScale + chunk.localRow * scales),
             static_cast<uint32_t>(chunk.rows * scales), peer);
         timer.TraceEnd(TraceEvent::DispatchPutScale, start, meta);
+        WriteGmByPassDCache(DispatchProgressFlag(args, peer), static_cast<int32_t>(round + 1U));
+        // The current URMA write progresses while MTE prepares this worker's
+        // fixed quota two CVs ahead. No claims, extra work stealing or phase join.
+        PackOneRound(args, round + kPackStartupRounds, owner, kAic, timer);
         meta.bytes = 0U;
         start = timer.TraceBegin();
         Quiet(peer);
@@ -124,9 +141,15 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         timer.TraceEnd(TraceEvent::DispatchPublish, start, meta);
         timer.End(Phase::Dispatch, chunk.rows * (h + scales));
     }
-    // Empty peers must still join the local dispatch phase.
+    MarkPackWorkerComplete(args);
+    // Empty peers must still join the local dispatch phase. Owner 0 accounts
+    // self only when every steady Pack worker has finished, including helpers.
     AtomicAdd(ComputeFlag(args.localFlags, kLocalFlagDispatchDone), 1);
     start = timer.TraceBegin();
+    if (owner == 0U) {
+        WaitComputeFlag(args.localFlags, kLocalFlagPackDone, kAic);
+        AtomicAdd(ComputeFlag(args.localFlags, kLocalFlagDispatchDone), 1);
+    }
     WaitComputeFlag(args.localFlags, kLocalFlagDispatchDone, kWorld);
     timer.TraceEnd(TraceEvent::WaitLocalDispatch, start, peerMeta);
 
@@ -182,18 +205,13 @@ __aicore__ inline void Process(const Arguments& args)
     SetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL, MegaMoeImpl::OVERFLOW_MODE_CTRL>(0);
 
     if constexpr (g_coreType == AIV) {
+        if (GetSubBlockIdx() == 1U && block < kCommunicationWorkers) {
+            PublishPeerStart(args, block, timer);
+        }
         const uint32_t worker = LocalWorkerIndex(block, GetSubBlockIdx());
-        timer.Begin(Phase::Pack);
-        const uint64_t start = timer.TraceBegin();
-        Expand(args, worker);
-        const uint64_t routes = static_cast<uint64_t>(args.config.bs) * args.config.topk;
-        const uint64_t owned = LocalOwnedRows(routes, worker);
-        TraceMeta meta;
-        meta.rows = owned;
-        meta.bytes = owned * (args.config.hidden + args.config.hidden / 32U);
-        timer.TraceEnd(TraceEvent::Pack, start, meta);
-        timer.End(Phase::Pack, owned * (args.config.hidden + args.config.hidden / 32U));
-        PipeBarrier<PIPE_ALL>();
+        for (uint32_t round = 0U; round < kPackStartupRounds; ++round) {
+            PackOneRound(args, round, worker, kLocalWorkers, timer);
+        }
     }
     // No CV loop contains a rank-wide or local full-core synchronization.
     TraceLocalSync(timer, 0U);
@@ -205,7 +223,6 @@ __aicore__ inline void Process(const Arguments& args)
     } else if (block < kCommunicationWorkers) {
         CommunicatePeer(args, block, timer);
     } else {
-        if (block == kCommunicationWorkers) PublishSelfDispatchReady(args);
         RunActivation(args, block - kCommunicationWorkers, timer);
     }
     if constexpr (g_coreType == AIV) {
