@@ -10,8 +10,7 @@
     'Gmm1TileDrain','Gmm1Dequant','WaitActivation','Gmm2Tile','Gmm2Dequant','Gmm2Drain',
     'WaitGmm1','ActivationSlice','RankBarrier','Reduce','LocalSync','Gmm1Drain',
     'InputScaleGather','WaitInputScale','CombinePublish','WaitReduceReady','ReduceDrain',
-    'Gmm1Tile','Gmm2Tile','Gmm1Batch','Gmm2Batch','Gmm1DequantBatch','Gmm2DequantBatch',
-    'Gmm1Batch','Gmm2Batch','Gmm1DequantBatch','Gmm2DequantBatch'];
+    'Gmm1Tile','Gmm2Tile','Gmm1Batch','Gmm2Batch','Gmm1DequantBatch','Gmm2DequantBatch'];
   const COMPOSITE_IDS = {
     33:[15,16,27],34:[19,21],35:[15,16,27,14,29],36:[19,21,18],37:[17,27],38:[20,21]
   };
@@ -83,14 +82,12 @@
       '排除条与条之间的空隙和独立 Wait；条内的等待/流水阻塞无法由此 JSON 再细分，不能视为纯硬件忙碌时间。']);
   }
   function aicBusyRange(scopes) {
-    const native=scopes.some(e=>[39,40].includes(e.id));
-    const totals=coreBusyTimes(scopes.filter(e=>e.tid%3===0&&[15,16,27,19,21,39,40].includes(e.id)));
+    const totals=coreBusyTimes(scopes.filter(e=>e.tid%3===0&&[15,16,27,19,21].includes(e.id)));
     const longest=totals.reduce((a,b)=>b[1]>a[1]?b:a,[-1,-Infinity]);
     const shortest=totals.reduce((a,b)=>b[1]<a[1]?b:a,[-1,Infinity]);
-    return metric(native?'AIC 累计批次时长极差':'AIC 不带空泡时长极差',totals.length?longest[1]-shortest[1]:null,'µs',[
+    return metric('AIC 不带空泡时长极差',totals.length?longest[1]-shortest[1]:null,'µs',[
       '先对本 rank 每个 AIC 分别累计 GMM1 + GMM2（包含各自 Drain），再计算最长核时 − 最短核时；不是分别取两个阶段的最大值再相加。',
       '合并条按 source_records 拆解；同核区间取并集去重，排除条间空隙和独立 Wait，不计 AIV 反量化。',
-      ...(native?['设备批次没有内部打点，累计包含批次内部等待及标量间隙，仅排除批次之间的空泡。']:[]),
       ...totals.map(([tid,t])=>`AIC block ${Math.floor(tid/3)}（tid=${tid}）：${fmt(t)} µs。`),
       totals.length?`最长：block ${Math.floor(longest[0]/3)}，${fmt(longest[1])} µs；最短：block ${Math.floor(shortest[0]/3)}，${fmt(shortest[1])} µs（并列时显示编号最小的核）。`:'未找到 AIC GMM 记录。',
       totals.length?`极差 = ${fmt(longest[1])} − ${fmt(shortest[1])} = ${fmt(longest[1]-shortest[1])} µs。`:'极差不可计算。',
@@ -101,8 +98,7 @@
     const warnings=[], metrics={};
     const clock=meta.clock_mhz;
     const scopes=rows.flatMap(e=>sourceScopes(e,clock));
-    const aic=scopes.filter(e=>e.tid%3===0 && [15,16,19,21,27,39,40].includes(e.id));
-    const nativeBatch=aic.some(e=>[39,40].includes(e.id));
+    const aic=scopes.filter(e=>e.tid%3===0 && [15,16,19,21,27].includes(e.id));
     const aicBounds=bounds(aic), allBounds=bounds(rows);
     const total=finite(meta.envelope_us)&&meta.envelope_us>=0?meta.envelope_us:allBounds.span;
     metrics.fused=metric('融合算子诊断时间',total,'µs',[
@@ -116,8 +112,8 @@
       '取整个 AIC 阵列的首尾包络，包含中间等待和空泡；不累计并行核心时长，也不含首个 GMM 之前的输入等待。']);
     metrics.dBusy=busy(scopes.filter(e=>[1,2,3,4,5].includes(e.id)),'Dispatch 最长累计核时','范围：DispatchPutX / PutScale / Quiet / Publish；历史 SelfDispatch 如存在也计入。');
     metrics.cBusy=busy(scopes.filter(e=>[10,11,12,30].includes(e.id)),'Combine 最长累计核时','范围：CombinePut / Quiet / Publish；历史 SelfCombine 如存在也计入。');
-    metrics.g1Busy=busy(scopes.filter(e=>e.tid%3===0&&[15,16,27,39].includes(e.id)),nativeBatch?'GMM1 最长累计批次时间':'GMM1 最长累计核时','范围：AIC GMM1。设备批次记录包含内部等待和间隙；历史合并记录按 source_records 拆解。');
-    metrics.g2Busy=busy(scopes.filter(e=>e.tid%3===0&&[19,21,40].includes(e.id)),nativeBatch?'GMM2 最长累计批次时间':'GMM2 最长累计核时','范围：AIC GMM2，设备批次包含内部等待和间隙；AIV 反量化不重复算作 AIC 计算。');
+    metrics.g1Busy=busy(scopes.filter(e=>e.tid%3===0&&[15,16,27].includes(e.id)),'GMM1 最长累计核时','范围：AIC Gmm1Tile + TileDrain + Gmm1Drain。合并条按 source_records 拆解，避免把打点间隙算进来。');
+    metrics.g2Busy=busy(scopes.filter(e=>e.tid%3===0&&[19,21].includes(e.id)),'GMM2 最长累计核时','范围：AIC Gmm2Tile + Gmm2Drain；AIV 反量化不重复算作 AIC 计算。');
     metrics.aicBusyRange=aicBusyRange(scopes);
     function bandwidth(stage) {
       const putIds=stage==='D'?[1,2]:[10],quietId=stage==='D'?3:11;
@@ -178,15 +174,15 @@
       if(e.id===15){f1+=4*p.hidden*n*c;tiles1++;}
       else {f2+=2*p.intermediate*n*c;tiles2++;}
     }
-    const actual=!nativeBatch&&tiles1>0&&tiles2>0&&!invalidTiles;
+    const actual=tiles1>0&&tiles2>0&&!invalidTiles;
     const f=actual?f1+f2:6*p.bs*p.topk*p.hidden*p.intermediate;
     const flopDetail=actual?[
-      `按本 rank 历史 trace 的实际 AIC tile 形状计算（可反映路由不均衡）：GMM1 ${tiles1} 条，GMM2 ${tiles2} 条。`,
+      `按本 rank 的真实 AIC tile 计数（可反映路由不均衡）：GMM1 ${tiles1} tiles，GMM2 ${tiles2} tiles。`,
       `GMM1 gate/up 两路：Σ(4 × H × tile.rows × tile.columns) = ${fmt(f1)} FLOP。`,
       `GMM2：Σ(2 × I × tile.rows × tile.columns) = ${fmt(f2)} FLOP。`,
       `F = ${fmt(f1)} + ${fmt(f2)} = ${fmt(f)} FLOP = ${fmt(f/1e9)} GFLOP。`
     ]:[
-      nativeBatch?'设备批次仅记录编号和起止时间；直接按配置参数计算均衡负载的矩阵计算量。BS 指每 rank 原始 token 数。':'tile 行列信息不全，回退到本 rank 接收负载绝对均衡的估计。BS 指每 rank 原始 token 数。',
+      'tile 行列信息不全，回退到本 rank 接收负载绝对均衡的估计。BS 指每 rank 原始 token 数。',
       `F = 6 × BS × TopK × H × I = 6 × ${p.bs} × ${p.topk} × ${p.hidden} × ${p.intermediate} = ${fmt(f)} FLOP。`,
       `EP 个来源合计后每 rank 处理 BS×TopK；不再乘 EP 或除 EP，专家数 ${p.experts} 只决定分布。`
     ];
@@ -235,7 +231,7 @@
       '不裁剪到 0–100%。负值表示实际总耗时超过理想串行时间（可能包含 Pack、Reduce、同步、吞吐损失等），不是负的物理重叠；>100% 需检查模型/参数。'
     ],true);
     if(mfu>100)warnings.push('MFU 超过 100%，请核对峰值、维度、时钟或 trace 是否包含重复调用。');
-    if(!actual&&!nativeBatch)warnings.push('缺少完整 tile 几何信息；计算量使用绝对均衡模型。');
+    if(!actual)warnings.push('缺少完整 tile 几何信息；计算量使用绝对均衡模型。');
     if(!finite(meta.envelope_us))warnings.push('缺少原始 envelope_us；总时间只能使用可见事件的首尾跨度。');
     if(meta.hidden_wait_count)warnings.push(`已隐藏 ${meta.hidden_wait_count} 条 Wait；原始总跨度仍保留。`);
     return {rank,metrics,warnings};
@@ -252,7 +248,7 @@
       const args=raw.args||{},name=String(raw.name||'').split(' [')[0];
       let id=args.event_id;
       if(!Number.isInteger(id))id=NAMES.indexOf(name);
-      if(id<0||id>=NAMES.length)continue;
+      if(id<0||id>38)continue;
       if(!byRank.has(rank))byRank.set(rank,[]);
       byRank.get(rank).push({rank,tid,ts,dur,end:ts+dur,args,id,name});
     }
@@ -312,7 +308,7 @@
         if([0.5,1,2,4,8].includes(n))params[key]=n;
       }
     }
-    if(params.hidden||params.intermediate)notes.push('H/I 来自历史 AIC tile 的 N 方向末端；记录缺失末尾 tile 时请人工核对。设备批次使用页面配置的 H/I。');
+    if(params.hidden||params.intermediate)notes.push('H/I 由 AIC tile 的 N 方向末端推断；缺失末尾 tile 时请人工核对。');
     return {params,notes};
   }
   const api={DEFAULTS,analyze,inferParams,union};

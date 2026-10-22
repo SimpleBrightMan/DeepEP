@@ -85,43 +85,6 @@ int main() {
     disabled.TraceEnd(TraceEvent::Pack, 0);
     disabled.FinishTrace();
     assert(AscendC::cycles == cycles && AscendC::flushes == flushes);
-
-    // Execute the real coarse timer: repeated M-group entries/tiles do not
-    // touch the clock or flush GM; only the two context boundaries do so.
-    constexpr uint64_t batchStride = kTraceHeaderElements + 2 * kTraceRecordElements;
-    std::vector<uint64_t> batchMemory(kTimerCores * batchStride, 0);
-    Timer coarse;
-    coarse.Init(0, reinterpret_cast<uint64_t>(batchMemory.data()), 2);
-    AscendC::cycles = 1000; AscendC::flushes = 0;
-    ComputeBatchTimer first(coarse, Phase::Gmm1, TraceEvent::Gmm1Batch, 3, 9);
-    AscendC::cycles += 50;  // First input wait: outside the batch.
-    first.BeginOnce();
-    const auto afterBegin = AscendC::cycles;
-    first.BeginOnce();
-    assert(AscendC::cycles == afterBegin && AscendC::flushes == 0);
-    AscendC::cycles += 100; // Internal compute/waits: one unsplit span.
-    first.End();
-    AscendC::cycles += 70;  // Next expert's readiness wait remains a gap.
-    ComputeBatchTimer second(coarse, Phase::Gmm2, TraceEvent::Gmm2Batch, 4, 10);
-    second.BeginOnce(); second.End();
-    ComputeBatchTimer empty(coarse, Phase::Gmm2, TraceEvent::Gmm2Batch, 5, 11);
-    empty.End(); // No owned work: no event.
-    coarse.FinishTrace();
-#ifdef DEEPEP_MEGAMOE_TIMER
-    auto* batchHeader = batchMemory.data() + core * batchStride;
-    auto* a = batchHeader + kTraceHeaderElements;
-    auto* b = a + kTraceRecordElements;
-    assert(batchHeader[2] == 2 && batchHeader[3] == 0);
-    assert(a[0] == 1050 && a[1] == 1151 && a[2] == 39);
-    assert(a[5] == 3 && a[6] == 9);
-    for (uint32_t i = 7; i <= 11; ++i) assert(a[i] == kTraceUnknown);
-    assert(a[12] == 0);
-    assert(b[0] == 1222 && b[1] == 1223 && b[2] == 40);
-    assert(b[0] - a[1] == 71 && AscendC::flushes == 3);
-#else
-    assert(AscendC::cycles == 1220 && AscendC::flushes == 0);
-    for (auto value : batchMemory) assert(value == 0);
-#endif
 }
 """,
         encoding="utf-8",

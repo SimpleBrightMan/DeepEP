@@ -7,7 +7,6 @@ import pytest
 from deep_ep_experimental.megamoe.urma_trace import (
     ENGINE_COUNT,
     EVENTS,
-    RAW_EVENT_IDS,
     HEADER_WORDS,
     RECORD_WORDS,
     UNKNOWN,
@@ -67,49 +66,12 @@ def test_export_fields_thread_mapping_and_submission_semantics():
 
 def test_every_event_id_has_a_name_and_no_fabricated_async_events():
     raw = trace_buffer(1)
-    for event_id in RAW_EVENT_IDS:
-        add_record(raw, engine=event_id, event=EVENTS[event_id])
+    for event_id, name in enumerate(EVENTS):
+        add_record(raw, engine=event_id, event=name)
     result = decode_trace(raw, rank=0, clock_mhz=1000)
-    assert len(events(result)) == len(RAW_EVENT_IDS) == 37
+    assert len(events(result)) == len(EVENTS) == 33
     assert {row["ph"] for row in result["traceEvents"]} == {"M", "X"}
-    assert {row["args"]["event_id"] for row in events(result)} == set(RAW_EVENT_IDS)
-
-
-@pytest.mark.parametrize(
-    "engine,name,event_id",
-    [(0, "Gmm1Batch", 39), (0, "Gmm2Batch", 40), (1, "Gmm1DequantBatch", 41), (1, "Gmm2DequantBatch", 42)],
-)
-def test_native_batch_has_no_invented_internal_scopes(engine, name, event_id, tmp_path):
-    raw = trace_buffer(2)
-    for index in range(2):
-        add_record(
-            raw,
-            engine=engine,
-            event=name,
-            start=2**60 + index * 200,
-            end=2**60 + index * 200 + 100,
-            fragment=index,
-            expert=index + 3,
-        )
-    path = tmp_path / "native.json"
-    export_trace(raw, path, rank=0, clock_mhz=1000)
-    rows = events(json.loads(path.read_text()))
-    assert len(rows) == 2
-    assert rows[1]["ts"] - (rows[0]["ts"] + rows[0]["dur"]) == pytest.approx(0.1)
-    args = rows[0]["args"]
-    assert args["event_id"] == event_id and args["batch"] == 0 and args["expert"] == 3
-    assert args["timing_scope"] == "device_batch"
-    assert not {"fragment_count", "mn_elements", "k_dim", "output_columns"} & args.keys()
-    assert "source_records" not in args and "tile_m" not in args and "rows" not in args
-
-
-@pytest.mark.parametrize("event_id", range(33, 39))
-def test_json_composite_ids_cannot_appear_in_raw_device_data(event_id):
-    raw = trace_buffer(1)
-    record = add_record(raw)
-    record[2] = event_id
-    with pytest.raises(ValueError, match="event id"):
-        decode_trace(raw, rank=0, clock_mhz=1000)
+    assert {row["args"]["event_id"] for row in events(result)} == set(range(len(EVENTS)))
 
 
 def test_historical_tail_cover_events_keep_completion_signal_and_hide_only_ready_wait():

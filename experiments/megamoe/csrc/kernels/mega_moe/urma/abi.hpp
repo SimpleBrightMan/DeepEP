@@ -66,12 +66,7 @@ enum class TraceEvent : uint32_t {
     WaitInputScale,
     CombinePublish,
     WaitReduceReady,  // Reserved for historical per-token Reduce traces.
-    ReduceDrain,      // Reserved: the Reduce envelope now includes its drain.
-    // 33..38 remain reserved for historical JSON-only composites.
-    Gmm1Batch = 39,
-    Gmm2Batch,
-    Gmm1DequantBatch,
-    Gmm2DequantBatch
+    ReduceDrain       // Reserved: the Reduce envelope now includes its drain.
 };
 
 struct TraceMeta {

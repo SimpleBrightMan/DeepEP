@@ -37,8 +37,8 @@ public:
     }
 
     // This interval measures the instrumented call, not a synthesized DMA or
-    // Cube hardware duration. Compute batches include existing completion
-    // waits; recording never introduces an extra pipeline drain.
+    // Cube hardware duration. Submission and existing completion waits are
+    // separate events; recording never introduces an extra pipeline drain.
     __aicore__ inline void TraceEnd(TraceEvent event, uint64_t start, const TraceMeta& meta = TraceMeta{})
     {
         if (traceAddress_ == 0U) return;
@@ -137,42 +137,5 @@ private:
     uint64_t total_[kTimerPhases]{};
     uint64_t bytes_[kTimerPhases]{};
     uint64_t count_[kTimerPhases]{};
-};
-
-// One real device record per expert context, not per tile or per M-group.
-// BeginOnce is called AFTER the first owned group's input-ready wait. Further
-// group waits stay inside the span but never write records or read the clock.
-class ComputeBatchTimer {
-public:
-    __aicore__ inline ComputeBatchTimer(Timer& timer, Phase phase, TraceEvent event, uint32_t batch, uint32_t expert)
-        : timer_(timer), phase_(phase), event_(event)
-    {
-        meta_.fragment = batch;
-        meta_.expert = expert;
-    }
-
-    __aicore__ inline void BeginOnce()
-    {
-        if (started_) return;
-        timer_.Begin(phase_);
-        start_ = timer_.TraceBegin();
-        started_ = true;
-    }
-
-    __aicore__ inline void End()
-    {
-        if (!started_) return;
-        timer_.TraceEnd(event_, start_, meta_);
-        timer_.End(phase_);
-        started_ = false;
-    }
-
-private:
-    Timer& timer_;
-    Phase phase_;
-    TraceEvent event_;
-    TraceMeta meta_;
-    uint64_t start_ = 0U;
-    bool started_ = false;
 };
 }  // namespace MegaMoeUrma

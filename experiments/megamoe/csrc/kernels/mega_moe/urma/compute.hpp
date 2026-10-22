@@ -170,10 +170,11 @@ using UrmaGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig, false, U
 using UrmaGmm2 = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows>;
 
 __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex, UrmaGmm1& gmm1,
-                                       bool endContext, ComputeBatchTimer& batchTimer)
+                                       bool endContext, Timer& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
+    const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
     const auto shape = FragmentShape(args, fragment);
     auto config1 = UrmaGmmConfig::BuildGmm1ProblemConfig(shape, job, kComputeTileM);
     MegaMoeImpl::GmmKernel::BlockScheduler schedule1(
@@ -189,9 +190,11 @@ __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, ui
         // It therefore covers both X arrival and scale readiness; rereading
         // every segment here only repeats that fan-in on each owning AIC.
         // Forward clears inputScaleDone on the launch stream every invocation.
+        const uint64_t scaleWait = timer.TraceBegin();
         WaitComputeFlag(args.inputScaleDone, fragmentIndex, 1U);
+        timer.TraceEnd(TraceEvent::WaitInputScale, scaleWait, fragmentMeta);
     }
-    batchTimer.BeginOnce();
+    timer.Begin(Phase::Gmm1);
     const auto addr = Gmm1Addresses(args, fragment);
     gmm1.UpdateProblem(config1, addr);
     gmm1.SetRowIO(FragmentRowIO<UrmaInputRows>(args, fragment));
@@ -203,27 +206,39 @@ __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, ui
         const uint32_t n = Get<MegaMoeImpl::N_VALUE>(coord);
         const uint32_t rows = Get<MegaMoeImpl::M_VALUE>(tileShape);
         const uint32_t columns = Get<MegaMoeImpl::N_VALUE>(tileShape);
+        const auto tileMeta = ComputeTileTraceMeta(fragmentMeta, m, n, rows, columns);
         if constexpr (g_coreType == AIC) {
+            // Compute submits asynchronous work and may wait on its
+            // existing internal dependencies; it is not a FIX drain.
+            const uint64_t computeStart = timer.TraceBegin();
             gmm1.Compute(m, n, rows, columns);
-            // Required for publishing gmm1Done to SwiGLU, independent of timer.
+            timer.TraceEnd(TraceEvent::Gmm1Tile, computeStart, tileMeta);
+            const uint64_t drainStart = timer.TraceBegin();
             SetFlag<HardEvent::FIX_S>(EVENT_ID0);
             WaitFlag<HardEvent::FIX_S>(EVENT_ID0);
+            timer.TraceEnd(TraceEvent::Gmm1TileDrain, drainStart, tileMeta);
             WriteGmByPassDCache(ComputeFlag(args.gmm1Done, fragment.gmm1TileBegin + tile), 1);
         } else {
+            const uint64_t dequantStart = timer.TraceBegin();
             gmm1.Dequantize(n, rows, columns);
+            timer.TraceEnd(TraceEvent::Gmm1Dequant, dequantStart, tileMeta);
         }
     }
     if (endContext) {
+        const uint64_t endStart = timer.TraceBegin();
         gmm1.End(g_coreType == AIC);
         CompleteComputeContext();
+        timer.TraceEnd(TraceEvent::Gmm1Drain, endStart, fragmentMeta);
     }
+    timer.End(Phase::Gmm1);
 }
 
 __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex, UrmaGmm2& gmm2,
-                                       uint32_t batchBegin, bool endContext, ComputeBatchTimer& batchTimer)
+                                       uint32_t batchBegin, bool endContext, Timer& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
+    const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
     const auto shape = FragmentShape(args, fragment);
     auto config2 = UrmaGmmConfig::BuildGmm2ProblemConfig(shape, job, kComputeTileM);
     MegaMoeImpl::GmmKernel::BlockScheduler schedule2(
@@ -236,9 +251,11 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
     if constexpr (g_coreType == AIC) {
         // The 13 independent activation workers collectively publish one
         // contribution per original GMM1 tile after both FP8 planes drain.
+        const uint64_t waitStart = timer.TraceBegin();
         WaitComputeFlag(args.activationDone, fragmentIndex, FragmentGmm1Tiles(args, fragment));
+        timer.TraceEnd(TraceEvent::WaitActivation, waitStart, fragmentMeta);
     }
-    batchTimer.BeginOnce();
+    timer.Begin(Phase::Gmm2);
     const auto addr = Gmm2Addresses(args, fragment);
     gmm2.UpdateProblem(config2, addr);
     gmm2.SetRowIO(FragmentRowIO<UrmaOutputRows>(args, fragment));
@@ -250,17 +267,24 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
         const uint32_t n = Get<MegaMoeImpl::N_VALUE>(coord);
         const uint32_t rows = Get<MegaMoeImpl::M_VALUE>(tileShape);
         const uint32_t columns = Get<MegaMoeImpl::N_VALUE>(tileShape);
+        const auto tileMeta = ComputeTileTraceMeta(fragmentMeta, m, n, rows, columns);
         if constexpr (g_coreType == AIC) {
+            const uint64_t computeStart = timer.TraceBegin();
             gmm2.Compute(m, n, rows, columns);
+            timer.TraceEnd(TraceEvent::Gmm2Tile, computeStart, tileMeta);
         } else {
+            const uint64_t dequantStart = timer.TraceBegin();
             gmm2.Dequantize(n, rows, columns);
+            timer.TraceEnd(TraceEvent::Gmm2Dequant, dequantStart, tileMeta);
         }
     }
     if (endContext) {
+        const uint64_t drainStart = timer.TraceBegin();
         // One FIX drain per expert batch. Intermediate M256 groups keep
         // submitting; the block's FIX_M events still protect each L0C slot.
         gmm2.End();
         CompleteComputeContext();
+        timer.TraceEnd(TraceEvent::Gmm2Drain, drainStart, fragmentMeta);
         if constexpr (g_coreType == AIC) {
             // Every group (including a short M tail) has the same N tile
             // count. Recover each group's contribution without rereading GM
@@ -277,6 +301,7 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
             }
         }
     }
+    timer.End(Phase::Gmm2);
 }
 
 __aicore__ inline ComputeBatchRange LoadComputeBatch(const Arguments& args, uint32_t index)
@@ -313,20 +338,15 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
             LastOwnedComputeGroup(tileBegin, range.end - range.begin, tilesPerGroup, block, kAic);
         if (lastOwned == range.end - range.begin) continue;
         const uint32_t lastFragment = range.begin + lastOwned;
-        const auto event = g_coreType == AIC ? (isGmm1 ? TraceEvent::Gmm1Batch : TraceEvent::Gmm2Batch)
-                                             : (isGmm1 ? TraceEvent::Gmm1DequantBatch : TraceEvent::Gmm2DequantBatch);
-        ComputeBatchTimer batchTimer(timer, isGmm1 ? Phase::Gmm1 : Phase::Gmm2, event, task.batchIndex, first.expert);
         // A core can skip groups between its own tiles. Both paired engines
         // close on their last owned group, not necessarily the expert's last.
         for (uint32_t fragmentIndex = range.begin; fragmentIndex <= lastFragment; ++fragmentIndex) {
             if (task.stage == ComputeBatchStage::Gmm1) {
-                RunGmm1Fragment(args, block, fragmentIndex, gmm1, fragmentIndex == lastFragment, batchTimer);
+                RunGmm1Fragment(args, block, fragmentIndex, gmm1, fragmentIndex == lastFragment, timer);
             } else {
-                RunGmm2Fragment(args, block, fragmentIndex, gmm2, range.begin, fragmentIndex == lastFragment,
-                                batchTimer);
+                RunGmm2Fragment(args, block, fragmentIndex, gmm2, range.begin, fragmentIndex == lastFragment, timer);
             }
         }
-        batchTimer.End();
     }
 }
 

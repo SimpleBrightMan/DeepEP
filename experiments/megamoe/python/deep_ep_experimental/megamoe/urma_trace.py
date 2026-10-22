@@ -48,19 +48,7 @@ EVENTS = (
     "CombinePublish",
     "WaitReduceReady",
     "ReduceDrain",
-    "ReservedJson33",
-    "ReservedJson34",
-    "ReservedJson35",
-    "ReservedJson36",
-    "ReservedJson37",
-    "ReservedJson38",
-    "Gmm1Batch",
-    "Gmm2Batch",
-    "Gmm1DequantBatch",
-    "Gmm2DequantBatch",
 )
-RAW_EVENT_IDS = tuple(index for index in range(len(EVENTS)) if not 33 <= index <= 38)
-NATIVE_BATCH_IDS = (39, 40, 41, 42)
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
 SYNC_STAGES = {0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
 
@@ -70,14 +58,6 @@ class TraceOverflowError(ValueError):
 
 
 def event_style(event):
-    if event in ("Gmm1Batch", "Gmm2Batch", "Gmm1DequantBatch", "Gmm2DequantBatch"):
-        return (
-            event + " [device batch]",
-            "cube.batch" if "Dequant" not in event else "compute.dequant_batch",
-            "good" if "Dequant" not in event else "rail_animation",
-            "one device scope per expert context; includes internal waits and drain; "
-            "first input wait is outside AIC scope; no internal timing records",
-        )
     if event == "Reduce":
         return (
             event,
@@ -167,7 +147,7 @@ def decode_trace(raw, *, rank, clock_mhz):
             offset = HEADER_WORDS + ordinal * RECORD_WORDS
             row = tuple(map(int, data[offset : offset + RECORD_WORDS]))
             start, end, event_id = row[:3]
-            if event_id not in RAW_EVENT_IDS:
+            if event_id >= len(EVENTS):
                 raise ValueError(f"engine={engine} record={ordinal}: unknown event id={event_id}")
             if end < start or start == UNKNOWN or end == UNKNOWN:
                 raise ValueError(f"engine={engine} record={ordinal}: invalid ticks start={start} end={end}")
@@ -225,10 +205,6 @@ def decode_trace(raw, *, rank, clock_mhz):
         if event == "LocalSync":
             stage = args.pop("cv")
             args.update(sync_stage=stage, sync_stage_name=SYNC_STAGES.get(stage, "unknown"))
-        if row[2] in NATIVE_BATCH_IDS:
-            args.update(batch=args.pop("fragment"), timing_scope="device_batch")
-            for field in ("row", "rows", "tile_m", "tile_n", "columns"):
-                args.pop(field)
         args.update(
             event_id=row[2],
             bytes=row[12],
