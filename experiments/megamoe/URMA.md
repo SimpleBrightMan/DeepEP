@@ -265,6 +265,8 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 
 | 图中标签 | 应如何理解 |
 |---|---|
+| `Gmm1Batch/Gmm2Batch [device batch]` | 当前设备端每个AIC、每个专家批次仅记录一条；首个输入就绪后开始，包含批内等待、计算、最终drain和完成发布；批间等待留为空泡 |
+| `Gmm1DequantBatch/Gmm2DequantBatch [device batch]` | 当前设备端每个AIV0、每个专家反量化上下文一条，包含真实上下文收尾；没有内部Dequant/drain打点 |
 | `DispatchPutX/DispatchPutScale/CombinePut [PUT submit]` | PUT指令提交区间，不代表远端数据已经完成写入 |
 | `DispatchQuiet/CombineQuiet [completion wait]` | 等待之前peer PUT完成的区间 |
 | `Gmm1Batch/Gmm2Batch [batch + drain]` | 同一AIC、同一专家上下文从首次提交到最终drain的一条跨度；包含内部依赖等待及标量间隙，不是纯Cube忙时 |
@@ -278,7 +280,13 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 
 每个rank以自己的最早事件归零，**不同rank的零点没有全局对齐**，不能将两个文件的横坐标相减计算跨卡延迟。转换先用整数tick相减再转浮点，保留大时间戳的低位；原始tick在JSON参数中用字符串保存。默认1000 ticks/us仍只是显式约定，可修改`--timer-clock-mhz`，离线解析时应使用同一值。
 
-GMM条合并只影响JSON显示，不改变kernel、同步或打点开销。默认先在完整原始记录上合并同一引擎/专家的上下文批次，再隐藏外部等待。AIC的GMM1/GMM2、AIV0的GMM1Dequant/GMM2Dequant均从首个提交/反量化记录延伸到该上下文最终drain。GMM2的drain是整个批次共享的，不归属于最后一个tile；没有为显示新增逐tile排空。批次开始前的输入等待不并入该批次。
+当前设备端直接记录粗粒度批次（原始事件ID 39–42），GMM/Dequant内部不再记录tile、Wait和drain，也不再每个M-group写汇总timer。AIC首次拥有的M-group先完成`inputScaleDone`/`activationDone`等待，再开启该专家批次；之后本批次的内部等待都包含在条内。不同专家/批次不会合成一条，批间等待保留为横轴空泡。AIV0保留提前准备权重的原执行顺序，不人为增加等待来对齐AIC。
+
+每批一次汇总timer和一次trace记录。没有为了计时新增`PIPE_ALL`；URMA计时器自身仍有读取时钟、写GM和cache clean的成本。GMM1发布`gmm1Done`前的`FIX_S`及真正的上下文收尾属于计算正确性要求，计时开关不改变它们。当前批次的内部时长无法恢复，`--split-gmm-events`对新数据不会生成不存在的细条。
+
+批次记录只携带批次编号、专家编号和起止时间，不逐tile统计数据量或计算量。网页按配置用`6×BS×TopK×H×I`计算均衡场景的单卡计算量，再结合AIC整体跨度计算MFU。网页中的累计批次时间包含内部等待，只排除批次之间空泡。
+
+下面的JSON合并规则仅适用于历史细粒度数据：它只影响显示，不改变旧kernel的打点开销。默认先在完整原始记录上合并同一引擎/专家的上下文批次，再隐藏外部等待。GMM2的drain是整个批次共享的，不归属于最后一个tile；没有为显示新增逐tile排空。
 
 批次内等待、标量调度和记录间隙仍在其时间跨度内。`active_ticks`仅累加原始非Wait区间（含原有drain，不代表纯硬件忙时），`dependency_wait_ticks`累计内部独立Wait记录，`unrecorded_gap_ticks`为其余间隙，三者之和等于`elapsed_ticks`。网页统计使用`source_records`中原始区间计算“不带空泡”累计核时，不能用整条批次跨度代替。
 

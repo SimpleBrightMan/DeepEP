@@ -36,6 +36,7 @@ SOURCE_IDS = {
     38: {20, 21},
 }
 FIELDS = {
+    "batch": "B",
     "peer": "p",
     "cv": "c",
     "fragment": "f",
@@ -267,7 +268,7 @@ def render_report(document, *, source="trace.json", cores=None, engines=None, de
             f"span_us={s['span']:.3f} sum_us={s['sum']:.3f} union_us={s['union']:.3f} "
             f"gap_us={max(0.0, s['span'] - s['union']):.3f} op={by_phase}"
         )
-    if any(event["id"] in SOURCE_IDS for event in events):
+    if any(event["id"] in SOURCE_IDS or 39 <= event["id"] <= 42 for event in events):
         scopes = source_scopes(events, metadata)
         raw_ops, raw_cores = defaultdict(list), defaultdict(list)
         for event in scopes:
@@ -282,9 +283,9 @@ def render_report(document, *, source="trace.json", cores=None, engines=None, de
             "same-engine unions; GMM includes Drain, excludes independent Wait and gaps"
         )
         for tid, rows in sorted(raw_cores.items()):
-            g1 = [row for row in rows if tid % 3 == 0 and row["id"] in (15, 16, 27)]
-            g2 = [row for row in rows if tid % 3 == 0 and row["id"] in (19, 21)]
-            dequant = [row for row in rows if tid % 3 == 1 and row["id"] in (17, 20, 21, 27)]
+            g1 = [row for row in rows if tid % 3 == 0 and row["id"] in (15, 16, 27, 39)]
+            g2 = [row for row in rows if tid % 3 == 0 and row["id"] in (19, 21, 40)]
+            dequant = [row for row in rows if tid % 3 == 1 and row["id"] in (17, 20, 21, 27, 41, 42)]
             waits = [row for row in rows if row["cat"] == "wait.sync"]
             lines.append(
                 f"{engine_label(tid)} {intervals(g1):.3f} {intervals(g2):.3f} "
@@ -294,6 +295,11 @@ def render_report(document, *, source="trace.json", cores=None, engines=None, de
             "NOTE RAW_CORE excludes only separately recorded waits/gaps; stalls inside original scopes remain. "
             "Wait scopes already removed from source cannot be reconstructed."
         )
+        if any(39 <= event["id"] <= 42 for event in events):
+            lines.append(
+                "NOTE IDs 39..42 are native device batches with NO internal records; RAW_CORE counts their "
+                "whole spans including internal waits/gaps. Inter-batch gaps remain outside the bars."
+            )
     lines.append("[PEER] peer DX_n DX_B DS_n DS_B CY_n CY_B Dquiet_us Cquiet_us; submit payload only")
     for peer, rows in sorted(by_peer.items()):
         parts = [str(peer)]

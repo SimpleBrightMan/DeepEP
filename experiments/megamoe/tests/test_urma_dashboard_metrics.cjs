@@ -443,3 +443,34 @@ test('malformed composite source records are rejected instead of falsifying GMM 
   const doc = coalesce(rankTrace()); delete doc.metadata.clock_mhz;
   assert.throws(() => analyze(doc, PARAMETERS), /clock_mhz/);
 });
+
+test('native device batches use configured FLOPs and preserve spans without work counters', () => {
+  const doc = rankTrace(), before = metrics(doc);
+  const original = doc.traceEvents.slice();
+  doc.traceEvents = original.filter(e=>![15,16,27,19,21,17,20].includes(e.args.event_id));
+  for(const tid of [0,3]) {
+    for(const [ids,id] of [[[15,16,27],39],[[19,21],40]]) {
+      const rows = original.filter(e=>e.tid===tid&&ids.includes(e.args.event_id));
+      const start=Math.min(...rows.map(e=>e.ts)), end=Math.max(...rows.map(e=>e.ts+e.dur));
+      doc.traceEvents.push(event(0,tid,id,start,end-start,{batch:0,expert:0}));
+    }
+  }
+  doc.traceEvents.push(event(0,1,41,0,99,{batch:0,expert:0}));
+  doc.traceEvents.push(event(0,4,42,0,99,{batch:0,expert:0}));
+  seal(doc);
+  const after=metrics(doc);
+  for(const key of ['aicSpan','referenceCover','dIntra','dCross','cIntra','cCross'])
+    close(after[key].value,before[key].value,key);
+  const f=6*PARAMETERS.bs*PARAMETERS.topk*PARAMETERS.hidden*PARAMETERS.intermediate;
+  close(after.flops.value,f/1e9);
+  close(after.mfu.value,f/after.aicSpan.value/(PARAMETERS.peak*1e6)*100);
+  const changed=metrics(doc,{hidden:64,intermediate:48});
+  close(changed.flops.value,after.flops.value*6);
+  close(changed.mfu.value,after.mfu.value*6);
+  assert.ok(after.g1Busy.value>before.g1Busy.value); // Internal gaps now deliberately included.
+  assert.match(after.g1Busy.label,/批次/);
+  assert.match(after.aicBusyRange.label,/批次/);
+  const inferred=inferParams(doc).params;
+  assert.equal(inferred.hidden,undefined); assert.equal(inferred.intermediate,undefined);
+  assert.ok(!analyze(doc,PARAMETERS).ranks[0].warnings.some(w=>w.includes('缺少完整 tile')));
+});

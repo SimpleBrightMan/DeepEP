@@ -4,7 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from deep_ep_experimental.megamoe.urma_trace import EVENTS, export_trace, filter_trace_waits, decode_trace
+from deep_ep_experimental.megamoe.urma_trace import (
+    EVENTS,
+    RAW_EVENT_IDS,
+    export_trace,
+    filter_trace_waits,
+    decode_trace,
+)
 from deep_ep_experimental.megamoe.urma_trace_merge import main, merge_trace_collective, merge_trace_files
 from test_store import groups, together
 from test_urma_trace import add_record, events, trace_buffer
@@ -76,15 +82,15 @@ def test_filter_keeps_final_global_sync_and_never_compresses_time():
 
 def test_default_export_filters_but_optional_full_export_preserves_all_ids(tmp_path):
     raw = trace_buffer(1)
-    for index, name in enumerate(EVENTS):
-        add_record(raw, engine=index, event=name)
+    for index in RAW_EVENT_IDS:
+        add_record(raw, engine=index, event=EVENTS[index])
     default, full = tmp_path / "default.json", tmp_path / "full.json"
     export_trace(raw, default, rank=0, clock_mhz=1000)
     export_trace(raw, full, rank=0, clock_mhz=1000, include_waits=True)
     filtered = json.loads(default.read_text())
     assert all(not row["name"].startswith("Wait") for row in events(filtered))
     assert any(row["name"] == "RankBarrier" for row in events(filtered))
-    assert len(events(json.loads(full.read_text()))) == len(EVENTS)
+    assert len(events(json.loads(full.read_text()))) == len(RAW_EVENT_IDS)
 
 
 def test_merge_all_16_ranks_preserves_identity_clocks_and_raw_metadata(tmp_path):
