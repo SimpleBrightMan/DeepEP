@@ -285,7 +285,8 @@ int main() {
         std::vector<uint32_t> actors(tasks.size());
         std::iota(actors.begin(), actors.end(), 0);
         // Dispatch producers are independent of GMM2/Combine. Different CVs
-        // feeding the same M256 may arrive far apart; every segment must wait.
+        // feeding the same M256 may arrive far apart; the gather owner joins
+        // them before publishing the single input-ready flag consumed by AIC.
         std::vector<uint32_t> readyAt(chunkCount);
         for (uint32_t index = 0; index < chunkCount; ++index)
             readyAt[index] = chunks[index].peer == config.rank ? 0 : 1 + random() % 80;
@@ -322,14 +323,18 @@ int main() {
                 }
                 if (cursor[actor] == tasks[actor].size()) continue;
                 auto t = tasks[actor][cursor[actor]];
-                if (t.kind == 0 && std::any_of(fragmentChunks[t.fragment].begin(), fragmentChunks[t.fragment].end(),
-                                             [&](auto chunk) { return tick < readyAt[chunk]; })) continue;
                 if (t.kind == 0 && !scaleDone[t.fragment]) continue;
                 if (t.kind == 1 && tick < activationStart[actor - 28]) continue;
                 if (t.kind == 1 && !g1Done[t.tile]) continue;
                 if (t.kind == 2 && actDone[t.fragment] != ComputeTileCount(fragments[t.fragment].rows, 1280))
                     continue;
-                if (t.kind == 0) ++g1Done[t.tile];
+                if (t.kind == 0) {
+                    // AIC gates only on scaleDone. Under arbitrary arrivals,
+                    // that aggregate flag must imply every input is ready.
+                    assert(std::all_of(fragmentChunks[t.fragment].begin(), fragmentChunks[t.fragment].end(),
+                                       [&](auto chunk) { return tick >= readyAt[chunk]; }));
+                    ++g1Done[t.tile];
+                }
                 else if (t.kind == 1) ++actDone[t.fragment];
                 else {
                     const auto& group = fragments[t.fragment];

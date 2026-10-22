@@ -130,8 +130,8 @@ __aicore__ inline MegaMoeImpl::ProblemShape FragmentShape(const Arguments& args,
 __aicore__ inline TraceMeta FragmentTraceMeta(const Fragment& fragment, uint32_t index)
 {
     TraceMeta meta;
-    // A compute group may span several peers/CVs; only individual input waits
-    // carry those fields. Reuse fragment as the stable compute-group ID.
+    // A compute group may span several peers/CVs. Its aggregate input-ready
+    // wait uses the fragment as the stable compute-group ID.
     meta.fragment = index;
     meta.expert = fragment.expert;
     meta.row = fragment.rowBegin;
@@ -185,19 +185,11 @@ __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, ui
     const uint32_t first1 = FirstOwnedComputeTile(fragment.gmm1TileBegin, block, kAic);
     if (first1 >= count1) return;
     if constexpr (g_coreType == AIC) {
-        for (uint32_t index = 0U; index < fragment.segmentCount; ++index) {
-            const auto segment = LoadRowSegment(args, fragment.segmentBegin + index);
-            auto waitMeta = fragmentMeta;
-            waitMeta.peer = segment.sourceRank;
-            waitMeta.cv = segment.cv;
-            waitMeta.row = segment.receiveRow;
-            waitMeta.rows = segment.rows;
-            const uint64_t waitStart = timer.TraceBegin();
-            WaitLocalDone(reinterpret_cast<__gm__ uint8_t*>(args.symmetric + args.config.dispatchReadyOffset +
-                                                            segment.inputReadyIndex * kFlagBytes),
-                          args.config.epoch);
-            timer.TraceEnd(TraceEvent::WaitDispatch, waitStart, waitMeta);
-        }
+        // The AIV1 gather owner checks every segment's current dispatch epoch,
+        // then drains the compact scale stores before publishing this flag.
+        // It therefore covers both X arrival and scale readiness; rereading
+        // every segment here only repeats that fan-in on each owning AIC.
+        // Forward clears inputScaleDone on the launch stream every invocation.
         const uint64_t scaleWait = timer.TraceBegin();
         WaitComputeFlag(args.inputScaleDone, fragmentIndex, 1U);
         timer.TraceEnd(TraceEvent::WaitInputScale, scaleWait, fragmentMeta);

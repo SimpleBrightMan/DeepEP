@@ -276,7 +276,11 @@ export DEEPEP_SHMEM_ENDPOINT=tcp://127.0.0.1:19091
 
 每个rank以自己的最早事件归零，**不同rank的零点没有全局对齐**，不能将两个文件的横坐标相减计算跨卡延迟。转换先用整数tick相减再转浮点，保留大时间戳的低位；原始tick在JSON参数中用字符串保存。默认1000 ticks/us仍只是显式约定，可修改`--timer-clock-mhz`，离线解析时应使用同一值。
 
-GMM条合并只影响JSON显示，不改变kernel、同步或打点开销。GMM1的逐tile drain与同一tile合并；组级GMM1/GMM2 drain仅在该AIC于该组只有一个tile时并入，多个tile共享的组级drain保持独立，避免伪造每个tile的完成时间。当前M256、H3584/I1280配置满足单核每组至多一个tile。合并要求原始记录连续且同一引擎/专家/计算组，不能跨越隐藏的等待。原始bin和计数保留；JSON的33/34为合成事件ID，`source_records`保留源事件编号、序号及时间戳，`coalesced_record_count`记录减少的显示条数。
+GMM条合并只影响JSON显示，不改变kernel、同步或打点开销。GMM1的逐tile drain与同一tile合并。GMM2则连续提交本核在同一专家批次内的多个M-group，最后统一drain；前面的`Cube submit`并不表示计算已经完成。现有导出只合并同一引擎/专家/计算组中原始记录连续的tile与drain，不跨越隐藏的等待。因而当前形状下通常前面是多条submit，最后一条是`compute + drain`；这个最终drain也可能等待本批次先前提交的工作，不能全部归因为最后一个tile。
+
+整个GMM2批次可以展示成从首次提交到最终drain的一条跨度，但该跨度还包含M-group之间的激活等待、调度和记录开销，不能作为“不带空泡时间”。不要为了画成一条而给每个tile增加排空。原始bin和计数保留；JSON的33/34为合成事件ID，`source_records`保留源事件编号、序号及时间戳，`coalesced_record_count`记录减少的显示条数。
+
+GMM1的AIC输入等待每个本核拥有的M-group只检查一次`inputScaleDone`。发布该标志的AIV1先确认该组所有segment的Dispatch当前epoch就绪，再完成输入scale聚集及MTE3排空，因此标志同时覆盖X到达与scale就绪。每次调用在启动stream上清零该标志；AIC不再逐segment重复检查Dispatch。
 
 可以在CPU环境离线重新导出单rank，无需启动NPU：
 
