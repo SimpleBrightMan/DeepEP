@@ -1,7 +1,7 @@
 """Validate URMA detailed trace schema 1 and export a rank-local Chrome trace.
 
 Raw records separate submission, waiting and drain. The default display joins
-complete GMM/Dequant context batches, retaining the original scopes for metrics.
+unambiguously paired Cube submission/drain records, retaining their provenance.
 """
 
 import argparse
@@ -257,7 +257,7 @@ def filter_trace_waits(trace):
     return dict(trace, traceEvents=kept, metadata=metadata)
 
 
-def _coalesce_tile_drains(trace):
+def coalesce_gmm_tiles(trace):
     """Join adjacent AIC tile/drain records without changing device synchronization.
 
     Group drains belong to a tile only when this engine submitted exactly one
@@ -339,188 +339,9 @@ def _coalesce_tile_drains(trace):
         coalesced_record_count=trace["metadata"].get("coalesced_record_count", 0) + len(removed),
         visible_record_count=sum(counts),
         visible_records_per_engine=counts,
-        gmm_display=trace["metadata"].get(
-            "gmm_display", "paired AIC tile/drain envelopes; raw counts retained; IDs 33/34 are JSON-only composites"
-        ),
+        gmm_display="paired AIC tile/drain envelopes; raw counts retained; IDs 33/34 are JSON-only composites",
     )
     return dict(trace, traceEvents=events, metadata=metadata)
-
-
-def _source_events(event, clock):
-    """Expand legacy tile composites for matching; leave new batches intact."""
-    args = event["args"]
-    if args["event_id"] not in (33, 34):
-        return [event]
-    parts = []
-    for source in args["source_records"]:
-        raw_args = {key: value for key, value in args.items() if key != "source_records"}
-        raw_args.update(source)
-        raw_args["metadata_inferred_from_legacy_tile"] = True
-        start, end = int(source["start_tick"]), int(source["end_tick"])
-        name, category, color, meaning = event_style(EVENTS[source["event_id"]])
-        raw_args.update(elapsed_ticks=end - start, meaning=meaning)
-        parts.append(
-            dict(
-                event,
-                name=name,
-                cat=category,
-                cname=color,
-                ts=event["ts"] + (start - int(args["start_tick"])) / clock,
-                dur=(end - start) / clock,
-                args=raw_args,
-            )
-        )
-    return parts
-
-
-def coalesce_gmm_tiles(trace):
-    """Display each complete AIC/AIV0 expert context through its shared drain.
-
-    Internal dependency waits stay in source_records, never in active_ticks.
-    Missing/filtered records or a stage switch stop matching. No new device
-    synchronization is introduced. IDs 35..38 are JSON-only batch envelopes;
-    legacy 33/34 tile composites remain readable and can join a complete batch.
-    """
-    clock = trace["metadata"]["clock_mhz"]
-    lanes = {}
-    for index, event in enumerate(trace["traceEvents"]):
-        if event.get("ph") == "X" and event["tid"] % 3 in (0, 1):
-            lane = lanes.setdefault((event["pid"], event["tid"]), [])
-            lane.extend((index, part) for part in _source_events(event, clock))
-
-    # engine kind / first event -> terminal drain, permitted intermediate IDs,
-    # display ID/name/category. AIV0 has no separate activation-input wait.
-    specs = {
-        (0, 15): (27, {15, 16, 14, 29}, 35, "Gmm1Batch", "cube.batch"),
-        (0, 19): (21, {19, 18}, 36, "Gmm2Batch", "cube.batch"),
-        (1, 17): (27, {17}, 37, "Gmm1DequantBatch", "compute.dequant_batch"),
-        (1, 20): (21, {20}, 38, "Gmm2DequantBatch", "compute.dequant_batch"),
-    }
-    replacements, removed = {}, set()
-    absorbed_waits = 0
-    for (_, engine), lane in lanes.items():
-        # A filtered/missing prefix could otherwise make a later tile look
-        # like the start of a complete context. Conservatively require full
-        # lane provenance before introducing batch semantics. Existing batch
-        # records remain opaque for matching but expose their raw ordinals.
-        ordinals = [
-            record["record_index"]
-            for _, event in lane
-            for record in (
-                event["args"]["source_records"] if event["args"]["event_id"] in (35, 36, 37, 38) else [event["args"]]
-            )
-        ]
-        if ordinals != list(range(len(ordinals))):
-            continue
-        position = 0
-        blocked = set()
-        while position < len(lane):
-            first_index, first = lane[position]
-            first_args = first["args"]
-            blocked.discard((first_args["event_id"], first_args.get("expert")))
-            spec = specs.get((engine % 3, first_args["event_id"]))
-            if spec is None or first_args.get("expert") is None or first_args.get("fragment") is None:
-                position += 1
-                continue
-            terminal, permitted, composite_id, name, category = spec
-            if (terminal, first_args["expert"]) in blocked:
-                position += 1
-                continue
-            parts = [(first_index, first)]
-            last_submit = first
-            finished = False
-            for following in range(position + 1, len(lane)):
-                index, part = lane[following]
-                args, previous = part["args"], parts[-1][1]["args"]
-                event_id = args["event_id"]
-                if (
-                    args.get("expert") != first_args["expert"]
-                    or args.get("fragment") is None
-                    or args["record_index"] != previous["record_index"] + 1
-                    or int(args["start_tick"]) < int(previous["end_tick"])
-                    or event_id not in permitted | {terminal}
-                ):
-                    break
-                if event_id == 16 and any(args.get(key) != last_submit["args"].get(key) for key in METADATA_FIELDS):
-                    break
-                if event_id == terminal and args["fragment"] != last_submit["args"]["fragment"]:
-                    break
-                parts.append((index, part))
-                if event_id == first_args["event_id"]:
-                    last_submit = part
-                if event_id == terminal:
-                    finished = True
-                    break
-            if not finished:
-                blocked.add((terminal, first_args["expert"]))
-                position += 1
-                continue
-            # Never consume only half of a historical composite display event.
-            end_position = position + len(parts)
-            owners = {index for index, _ in parts}
-            if (
-                position > 0
-                and lane[position - 1][0] in owners
-                or end_position < len(lane)
-                and lane[end_position][0] in owners
-            ):
-                position += 1
-                continue
-            source_records = [dict(part["args"]) for _, part in parts]
-            start, end = int(first_args["start_tick"]), int(source_records[-1]["end_tick"])
-            active = sum(
-                int(part["args"]["end_tick"]) - int(part["args"]["start_tick"])
-                for _, part in parts
-                if part["cat"] != "wait.sync"
-            )
-            waiting = sum(
-                int(part["args"]["end_tick"]) - int(part["args"]["start_tick"])
-                for _, part in parts
-                if part["cat"] == "wait.sync"
-            )
-            batch_args = {key: None for key in METADATA_FIELDS}
-            batch_args.update(
-                expert=first_args["expert"],
-                fragments=list(dict.fromkeys(record["fragment"] for record in source_records)),
-                tile_count=sum(record["event_id"] == first_args["event_id"] for record in source_records),
-                event_id=composite_id,
-                record_index=first_args["record_index"],
-                start_tick=str(start),
-                end_tick=str(end),
-                elapsed_ticks=end - start,
-                active_ticks=active,
-                dependency_wait_ticks=waiting,
-                unrecorded_gap_ticks=end - start - active - waiting,
-                bytes=sum(record.get("bytes", 0) for record in source_records),
-                meaning="expert context envelope through shared drain; includes dependency waits and scalar gaps; "
-                "use source_records for non-wait recorded time, not this envelope",
-                source_records=source_records,
-            )
-            replacements[first_index] = dict(
-                first, name=name + " [batch + drain]", cat=category, dur=(end - start) / clock, args=batch_args
-            )
-            removed.update(owners - {first_index})
-            absorbed_waits += sum(part["cat"] == "wait.sync" for _, part in parts)
-            position = end_position
-    if not replacements:
-        return _coalesce_tile_drains(trace)
-    events = [
-        replacements.get(index, event) for index, event in enumerate(trace["traceEvents"]) if index not in removed
-    ]
-    counts = [0] * ENGINE_COUNT
-    for event in events:
-        if event.get("ph") == "X":
-            counts[event["tid"]] += 1
-    metadata = dict(
-        trace["metadata"],
-        coalesced_record_count=trace["metadata"].get("coalesced_record_count", 0) + len(removed),
-        coalesced_wait_count=trace["metadata"].get("coalesced_wait_count", 0) + absorbed_waits,
-        visible_record_count=sum(counts),
-        visible_records_per_engine=counts,
-        gmm_display="AIC and AIV0 expert batch envelopes through shared drain; "
-        "source_records retain waits and original scopes; IDs 35..38 are JSON-only",
-    )
-    return _coalesce_tile_drains(dict(trace, traceEvents=events, metadata=metadata))
 
 
 def export_trace(raw, output, *, rank, clock_mhz, include_waits=False, combine_gmm=True):

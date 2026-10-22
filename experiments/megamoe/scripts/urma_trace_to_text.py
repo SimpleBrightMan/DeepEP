@@ -15,26 +15,6 @@ from pathlib import Path
 
 KINDS = ("AIC", "AIV0", "AIV1")
 WAIT_CATEGORIES = ("wait.sync", "transport.quiet", "compute.drain")
-SOURCE_NAMES = {
-    14: ("WaitDispatch", "wait.sync"),
-    15: ("Gmm1Tile", "cube.submit"),
-    16: ("Gmm1TileDrain", "compute.drain"),
-    17: ("Gmm1Dequant", "compute.copy"),
-    18: ("WaitActivation", "wait.sync"),
-    19: ("Gmm2Tile", "cube.submit"),
-    20: ("Gmm2Dequant", "compute.copy"),
-    21: ("Gmm2Drain", "compute.drain"),
-    27: ("Gmm1Drain", "compute.drain"),
-    29: ("WaitInputScale", "wait.sync"),
-}
-SOURCE_IDS = {
-    33: {15, 16, 27},
-    34: {19, 21},
-    35: {14, 15, 16, 27, 29},
-    36: {18, 19, 21},
-    37: {17, 27},
-    38: {20, 21},
-}
 FIELDS = {
     "peer": "p",
     "cv": "c",
@@ -164,46 +144,6 @@ def read_events(document):
     return metadata, events, definitions, completeness
 
 
-def source_scopes(events, metadata):
-    """Recover exact scopes, including internal waits, from display batches.
-
-    Legacy tile composites (33/34) may omit per-source geometry. Their outer
-    geometry is safe as a fallback because they contain just one logical tile.
-    """
-    scopes = []
-    for event in events:
-        sources = event["args"].get("source_records")
-        if sources is None and event["id"] not in SOURCE_IDS:
-            scopes.append(event)
-            continue
-        if not isinstance(sources, list) or not sources:
-            raise ValueError("GMM composite requires nonempty source_records")
-        clock = number(metadata.get("clock_mhz"), "clock_mhz")
-        if clock <= 0:
-            raise ValueError("clock_mhz must be positive")
-        base, limit = int(event["args"]["start_tick"]), int(event["args"]["end_tick"])
-        previous = base
-        for raw in sources:
-            event_id = raw.get("event_id")
-            start, end = int(raw["start_tick"]), int(raw["end_tick"])
-            if event_id not in SOURCE_IDS.get(event["id"], ()) or not previous <= start <= end <= limit:
-                raise ValueError("Invalid, overlapping or out-of-bounds GMM source record")
-            name, category = SOURCE_NAMES[event_id]
-            scopes.append(
-                dict(
-                    event,
-                    id=event_id,
-                    name=name,
-                    cat=category,
-                    ts=event["ts"] + (start - base) / clock,
-                    dur=(end - start) / clock,
-                    args={**event["args"], **raw},
-                )
-            )
-            previous = end
-    return scopes
-
-
 def render_report(document, *, source="trace.json", cores=None, engines=None, detail=False, include_waits=False, top=8):
     metadata, original, definitions, completeness = read_events(document)
     if type(top) is not int or top < 0:
@@ -229,11 +169,9 @@ def render_report(document, *, source="trace.json", cores=None, engines=None, de
         f"detail_wait_sync={'keep' if include_waits else 'hide'}",
         "NOTE time=us; independent diagnostic pass; rank-local timestamps; no time compression; summaries rounded to .001us.",
         "NOTE sum overlaps across engines; union/span/gap describe recorded scopes, not hardware utilization.",
-        "NOTE OP/CORE summarize DISPLAY scopes; GMM batches include internal Wait and unrecorded gaps. "
-        "Use RAW_OP/RAW_CORE for original scope time; never interpret a batch duration as no-bubble compute time.",
         "NOTE quiet/drain/wait can overlap in-flight work; submit bytes/duration is NOT link bandwidth.",
         "NOTE summaries include waits PRESENT in source; FILTERED_WAITS means intentionally hidden waits; "
-        "COALESCED_GMM means joined GMM/Dequant records (possibly with internal waits and hidden waits); "
+        "COALESCED_GMM means joined tile/drain records (possibly with waits hidden); "
         "INCOMPLETE means unaccounted filtered/lost records. None means zero waiting.",
         f"SELECTED first_us={total['first']:.3f} last_us={total['last']:.3f} span_us={total['span']:.3f} "
         f"sum_us={total['sum']:.3f} union_us={total['union']:.3f}",
@@ -266,33 +204,6 @@ def render_report(document, *, source="trace.json", cores=None, engines=None, de
             f"{engine_label(tid)} n={len(rows)} first_us={s['first']:.3f} last_us={s['last']:.3f} "
             f"span_us={s['span']:.3f} sum_us={s['sum']:.3f} union_us={s['union']:.3f} "
             f"gap_us={max(0.0, s['span'] - s['union']):.3f} op={by_phase}"
-        )
-    if any(event["id"] in SOURCE_IDS for event in events):
-        scopes = source_scopes(events, metadata)
-        raw_ops, raw_cores = defaultdict(list), defaultdict(list)
-        for event in scopes:
-            raw_ops[event["id"]].append(event)
-            raw_cores[event["tid"]].append(event)
-        lines.append("[RAW_OP] id name count sum_us union_us; original scopes, excluding inter-scope gaps")
-        for event_id, rows in sorted(raw_ops.items()):
-            s = stats(rows)
-            lines.append(f"{event_id} {rows[0]['name']} {len(rows)} {s['sum']:.3f} {s['union']:.3f}")
-        lines.append(
-            "[RAW_CORE] block/engine GMM1_us GMM2_us Dequant_us wait_us; "
-            "same-engine unions; GMM includes Drain, excludes independent Wait and gaps"
-        )
-        for tid, rows in sorted(raw_cores.items()):
-            g1 = [row for row in rows if tid % 3 == 0 and row["id"] in (15, 16, 27)]
-            g2 = [row for row in rows if tid % 3 == 0 and row["id"] in (19, 21)]
-            dequant = [row for row in rows if tid % 3 == 1 and row["id"] in (17, 20, 21, 27)]
-            waits = [row for row in rows if row["cat"] == "wait.sync"]
-            lines.append(
-                f"{engine_label(tid)} {intervals(g1):.3f} {intervals(g2):.3f} "
-                f"{intervals(dequant):.3f} {intervals(waits):.3f}"
-            )
-        lines.append(
-            "NOTE RAW_CORE excludes only separately recorded waits/gaps; stalls inside original scopes remain. "
-            "Wait scopes already removed from source cannot be reconstructed."
         )
     lines.append("[PEER] peer DX_n DX_B DS_n DS_B CY_n CY_B Dquiet_us Cquiet_us; submit payload only")
     for peer, rows in sorted(by_peer.items()):
