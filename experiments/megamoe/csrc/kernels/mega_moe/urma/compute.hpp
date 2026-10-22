@@ -173,8 +173,8 @@ __aicore__ inline void CompleteComputeContext()
 using UrmaGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig, false, UrmaInputRows>;
 using UrmaGmm2 = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows>;
 
-__aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex, UrmaGmm1& gmm1,
-                                       bool endContext, Timer& timer)
+__aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
+                                       uint32_t firstTile, UrmaGmm1& gmm1, bool endContext, Timer& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
@@ -186,8 +186,6 @@ __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, ui
         MegaMoeImpl::GmmKernel::BlockScheduler::Params{
             Te::MakeCoord(static_cast<int64_t>(config1.tileM), static_cast<int64_t>(config1.tileN))});
     const uint32_t count1 = schedule1.GetTileNum();
-    const uint32_t first1 = FirstOwnedComputeTile(fragment.gmm1TileBegin, block, kAic);
-    if (first1 >= count1) return;
     if constexpr (g_coreType == AIC) {
         // The AIV1 gather owner checks every segment's current dispatch epoch,
         // then drains the compact scale stores before publishing this flag.
@@ -203,7 +201,7 @@ __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, ui
     gmm1.UpdateProblem(config1, addr);
     gmm1.SetRowIO(FragmentRowIO<UrmaInputRows>(args, fragment));
     gmm1.Begin();
-    for (uint32_t tile = first1; tile < count1; tile += kAic) {
+    for (uint32_t tile = firstTile; tile < count1; tile += kAic) {
         const auto coord = schedule1.GetBlockCoord(tile);
         const auto tileShape = schedule1.GetBlockShape(coord);
         const uint32_t m = Get<MegaMoeImpl::M_VALUE>(coord);
@@ -237,8 +235,9 @@ __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, ui
     timer.End(Phase::Gmm1);
 }
 
-__aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex, UrmaGmm2& gmm2,
-                                       uint32_t batchBegin, bool endContext, Timer& timer)
+__aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
+                                       uint32_t firstTile, UrmaGmm2& gmm2, uint32_t batchBegin, bool endContext,
+                                       Timer& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
@@ -250,8 +249,6 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
         MegaMoeImpl::GmmKernel::BlockScheduler::Params{
             Te::MakeCoord(static_cast<int64_t>(config2.tileM), static_cast<int64_t>(config2.tileN))});
     const uint32_t count2 = schedule2.GetTileNum();
-    const uint32_t first2 = FirstOwnedComputeTile(fragment.gmm2TileBegin, block, kAic);
-    if (first2 >= count2) return;
     if constexpr (g_coreType == AIC) {
         // The 13 independent activation workers collectively publish one
         // contribution per original GMM1 tile after both FP8 planes drain.
@@ -264,7 +261,7 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
     gmm2.UpdateProblem(config2, addr);
     gmm2.SetRowIO(FragmentRowIO<UrmaOutputRows>(args, fragment));
     gmm2.Begin();
-    for (uint32_t tile = first2; tile < count2; tile += kAic) {
+    for (uint32_t tile = firstTile; tile < count2; tile += kAic) {
         const auto coord = schedule2.GetBlockCoord(tile);
         const auto tileShape = schedule2.GetBlockShape(coord);
         const uint32_t m = Get<MegaMoeImpl::M_VALUE>(coord);
@@ -295,13 +292,11 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
             // descriptors. Publish only after ALL this core's stores drain.
             const uint64_t batchTileBegin =
                 fragment.gmm2TileBegin - static_cast<uint64_t>(fragmentIndex - batchBegin) * count2;
-            for (uint32_t index = batchBegin; index <= fragmentIndex; ++index) {
-                const uint64_t tileBegin = batchTileBegin + static_cast<uint64_t>(index - batchBegin) * count2;
-                const uint32_t first = FirstOwnedComputeTile(tileBegin, block, kAic);
-                if (first < count2) {
-                    const uint32_t completed = (count2 - 1U - first) / kAic + 1U;
-                    AtomicAdd(ComputeFlag(args.gmm2Done, index), static_cast<int32_t>(completed));
-                }
+            const uint64_t tileLimit = static_cast<uint64_t>(fragmentIndex - batchBegin + 1U) * count2;
+            for (uint64_t tile = FirstOwnedComputeTile(batchTileBegin, block, kAic); tile < tileLimit;) {
+                const auto owned = OwnedComputeGroupAt(tile, count2, kAic);
+                AtomicAdd(ComputeFlag(args.gmm2Done, batchBegin + owned.group), static_cast<int32_t>(owned.tileCount));
+                tile += static_cast<uint64_t>(owned.tileCount) * kAic;
             }
         }
     }
@@ -338,18 +333,21 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
         const bool isGmm1 = task.stage == ComputeBatchStage::Gmm1;
         const uint64_t tileBegin = isGmm1 ? first.gmm1TileBegin : first.gmm2TileBegin;
         const uint32_t tilesPerGroup = isGmm1 ? FragmentGmm1Tiles(args, first) : FragmentGmm2Tiles(args, first);
-        const uint32_t lastOwned =
-            LastOwnedComputeGroup(tileBegin, range.end - range.begin, tilesPerGroup, block, kAic);
-        if (lastOwned == range.end - range.begin) continue;
-        const uint32_t lastFragment = range.begin + lastOwned;
-        // A core can skip groups between its own tiles. Both paired engines
-        // close on their last owned group, not necessarily the expert's last.
-        for (uint32_t fragmentIndex = range.begin; fragmentIndex <= lastFragment; ++fragmentIndex) {
-            if (task.stage == ComputeBatchStage::Gmm1) {
-                RunGmm1Fragment(args, block, fragmentIndex, gmm1, fragmentIndex == lastFragment, timer);
+        const uint64_t tileLimit = static_cast<uint64_t>(range.end - range.begin) * tilesPerGroup;
+        // Jump directly between this core's groups before loading their GM
+        // descriptors or building matmul configs. AIC/AIV0 keep identical
+        // tile order and close the context on their last owned group.
+        for (uint64_t tile = FirstOwnedComputeTile(tileBegin, block, kAic); tile < tileLimit;) {
+            const auto owned = OwnedComputeGroupAt(tile, tilesPerGroup, kAic);
+            const uint64_t nextTile = tile + static_cast<uint64_t>(owned.tileCount) * kAic;
+            const uint32_t fragmentIndex = range.begin + owned.group;
+            const bool endContext = nextTile >= tileLimit;
+            if (isGmm1) {
+                RunGmm1Fragment(args, block, fragmentIndex, owned.firstTile, gmm1, endContext, timer);
             } else {
-                RunGmm2Fragment(args, block, fragmentIndex, gmm2, range.begin, fragmentIndex == lastFragment, timer);
+                RunGmm2Fragment(args, block, fragmentIndex, owned.firstTile, gmm2, range.begin, endContext, timer);
             }
+            tile = nextTile;
         }
     }
 }

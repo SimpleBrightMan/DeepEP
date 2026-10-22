@@ -158,6 +158,25 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t FirstOwnedComputeTile(uint64_t ti
     return worker >= startOwner ? worker - startOwner : worker + workerCount - startOwner;
 }
 
+struct OwnedComputeGroup {
+    uint32_t group;
+    uint32_t firstTile;
+    uint32_t tileCount;
+};
+
+// ownedTile is a batch-relative tile offset, starting at FirstOwnedComputeTile.
+// All nonempty M256 groups have the same N tile count, even with a short M tail.
+// Advance by tileCount * workerCount to visit only this worker's next group;
+// consuming all owned tiles at once also supports groups wider than workerCount.
+// Call only with nonzero tilesPerGroup/workerCount and an in-range ownedTile.
+MEGAMOE_URMA_COMPUTE_INLINE constexpr OwnedComputeGroup OwnedComputeGroupAt(uint64_t ownedTile, uint32_t tilesPerGroup,
+                                                                            uint32_t workerCount)
+{
+    const uint32_t group = static_cast<uint32_t>(ownedTile / tilesPerGroup);
+    const uint32_t firstTile = ownedTile % tilesPerGroup;
+    return {group, firstTile, (tilesPerGroup - 1U - firstTile) / workerCount + 1U};
+}
+
 // Each nonempty fragment is at most M256, so all groups of an expert have the
 // same N tile count, including its short final M group. Return groupCount when
 // this worker has no tile; no hardware context may be opened in that case.

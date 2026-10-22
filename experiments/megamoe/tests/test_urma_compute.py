@@ -36,6 +36,35 @@ def scheduler_binary(tmp_path_factory):
 #include <vector>
 using namespace MegaMoeUrma;
 struct Task { uint32_t kind, fragment; uint64_t tile; };
+void CheckOwnedGroups(uint64_t prefix, uint32_t groups, uint32_t width, uint32_t workers) {
+    for (uint32_t worker = 0; worker < workers; ++worker) {
+        std::vector<uint64_t> reference, actual;
+        std::vector<uint32_t> expectedDone(groups), actualDone(groups);
+        for (uint32_t group = 0; group < groups; ++group)
+            for (uint32_t tile = 0; tile < width; ++tile) {
+                const uint64_t id = uint64_t(group) * width + tile;
+                if ((prefix + id) % workers == worker) {
+                    reference.push_back(id);
+                    ++expectedDone[group];
+                }
+            }
+        const uint64_t limit = uint64_t(groups) * width;
+        uint32_t lastGroup = groups;
+        for (uint64_t tile = FirstOwnedComputeTile(prefix, worker, workers); tile < limit;) {
+            const auto owned = OwnedComputeGroupAt(tile, width, workers);
+            assert(owned.group < groups && owned.firstTile < width && owned.tileCount > 0);
+            assert(actualDone[owned.group] == 0);  // One visit/notification per owned group.
+            actualDone[owned.group] = owned.tileCount;
+            for (uint32_t local = owned.firstTile; local < width; local += workers)
+                actual.push_back(uint64_t(owned.group) * width + local);
+            const uint64_t next = tile + uint64_t(owned.tileCount) * workers;
+            if (next >= limit) lastGroup = owned.group;
+            tile = next;
+        }
+        assert(actual == reference && actualDone == expectedDone);
+        assert(lastGroup == LastOwnedComputeGroup(prefix, groups, width, worker, workers));
+    }
+}
 void CheckUniformWindow(uint32_t groupsPerExpert, uint32_t target, uint32_t initialExperts) {
     std::vector<ComputeBatch> batches;
     for (uint32_t e = 0; e < 24; ++e) batches.push_back({e * groupsPerExpert, groupsPerExpert});
@@ -54,6 +83,12 @@ void CheckUniformWindow(uint32_t groupsPerExpert, uint32_t target, uint32_t init
     assert(cursor == tasks.size());
 }
 int main() {
+    // Include empty batches, multiple owned tiles within a group, partial
+    // ownership, and tile prefixes above 32 bits. No routing assumption.
+    for (uint64_t prefix : {0ULL, 27ULL, (1ULL << 32) + 31ULL})
+        for (uint32_t groups : {0U, 1U, 3U, 11U})
+            for (uint32_t width : {1U, 5U, 14U, 28U, 29U, 57U})
+                for (uint32_t workers : {13U, 28U}) CheckOwnedGroups(prefix, groups, width, workers);
     // Balanced BS2048/4096/8192: preserve the enlarged window throughout
     // computation, including the final drain, rather than just front-loading.
     CheckUniformWindow(3, 12, 4);
@@ -249,6 +284,7 @@ int main() {
         const auto& batch = batches[task.batchIndex];
         const auto range = ComputeBatchFragments(batch);
         assert(range.begin == batch.fragmentBegin && range.end == batch.fragmentBegin + batch.fragmentCount);
+        std::vector<std::vector<Task>> reference(28);
         for (uint32_t f = range.begin; f < range.end; ++f) {
             const auto& fragment = fragments[f];
             assert(fragment.expert == task.batchIndex);
@@ -261,8 +297,38 @@ int main() {
                     assert(id % 28 == core);  // Global prefix ownership remains independent of source/CV.
                     auto& visits = first ? g1Visits : g2Visits;
                     assert(++visits[id] == 1);
-                    tasks[core].push_back({first ? 0U : 2U, f, id});
+                    reference[core].push_back({first ? 0U : 2U, f, id});
                 }
+        }
+        if (range.begin == range.end) continue;
+        const bool firstStage = task.stage == Stage::Gmm1;
+        const auto& firstFragment = fragments[range.begin];
+        const uint64_t prefix = firstStage ? firstFragment.gmm1TileBegin : firstFragment.gmm2TileBegin;
+        const auto width = ComputeTileCount(firstFragment.rows, firstStage ? 1280 : 3584);
+        const uint64_t limit = uint64_t(batch.fragmentCount) * width;
+        for (uint32_t core = 0; core < 28; ++core) {
+            size_t cursor = 0;
+            for (uint64_t tile = FirstOwnedComputeTile(prefix, core, 28); tile < limit;) {
+                const auto owned = OwnedComputeGroupAt(tile, width, 28);
+                const auto f = range.begin + owned.group;
+                const auto& fragment = fragments[f];
+                assert(ComputeTileCount(fragment.rows, firstStage ? 1280 : 3584) == width);
+                const uint64_t fragmentPrefix = firstStage ? fragment.gmm1TileBegin : fragment.gmm2TileBegin;
+                assert(fragmentPrefix == prefix + uint64_t(owned.group) * width);
+                uint32_t completed = 0;
+                for (uint32_t local = owned.firstTile; local < width; local += 28) {
+                    const auto expected = reference[core].at(cursor++);
+                    assert(expected.fragment == f && expected.tile == fragmentPrefix + local);
+                    tasks[core].push_back(expected);  // Dependency simulation uses the new traversal.
+                    ++completed;
+                }
+                assert(completed == owned.tileCount);  // Same gmm2Done AtomicAdd contribution.
+                const uint64_t next = tile + uint64_t(owned.tileCount) * 28;
+                assert((next >= limit) ==
+                       (owned.group == LastOwnedComputeGroup(prefix, batch.fragmentCount, width, core, 28)));
+                tile = next;
+            }
+            assert(cursor == reference[core].size());
         }
     }
     assert(nextG1 == batchCount && nextG2 == batchCount);
