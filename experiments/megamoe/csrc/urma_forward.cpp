@@ -158,7 +158,6 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     recv_chunks_ = Upload(plan.recvChunks, options);
     pack_rounds_ = Upload(plan.packRounds, options);
     pack_ready_ = allocate(static_cast<uint64_t>(MegaMoeUrma::kWorld) * config.maxPeerChunks * MegaMoeUrma::kFlagBytes);
-    dispatch_progress_ = allocate(MegaMoeUrma::kWorld * MegaMoeUrma::kFlagBytes);
     gmm1_done_ = allocate(config.gmm1Tiles * MegaMoeUrma::kFlagBytes);
     input_scale_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
     activation_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
@@ -182,7 +181,6 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     args_.recvChunks = Address(recv_chunks_);
     args_.packRounds = Address(pack_rounds_);
     args_.packReady = Address(pack_ready_);
-    args_.dispatchProgress = Address(dispatch_progress_);
     args_.gmm1Done = Address(gmm1_done_);
     args_.inputScaleDone = Address(input_scale_done_);
     args_.activationDone = Address(activation_done_);
@@ -288,8 +286,8 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     CheckTensor(output, 2, "out", device);
     TORCH_CHECK(output.scalar_type() == torch::kBFloat16 && output.sizes() == x.sizes(), "out must be BF16 [BS,H]");
     auto stream = c10_npu::getCurrentNPUStream();
-    for (auto* tensor : {&gmm1_done_, &input_scale_done_, &activation_done_, &gmm2_done_, &local_flags_, &pack_ready_,
-                         &dispatch_progress_}) {
+    for (auto* tensor :
+         {&gmm1_done_, &input_scale_done_, &activation_done_, &gmm2_done_, &local_flags_, &pack_ready_}) {
         ASCEND_DEEPEP_CHECK_ACL(
             aclrtMemsetAsync(tensor->data_ptr(), tensor->numel(), 0, tensor->numel(), stream.stream()));
     }
@@ -346,7 +344,6 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
                                &recv_chunks_,
                                &pack_rounds_,
                                &pack_ready_,
-                               &dispatch_progress_,
                                &gmm1_done_,
                                &input_scale_done_,
                                &activation_done_,
@@ -381,7 +378,6 @@ int64_t UrmaPlan::workspace_bytes() const
                                &recv_chunks_,
                                &pack_rounds_,
                                &pack_ready_,
-                               &dispatch_progress_,
                                &gmm1_done_,
                                &input_scale_done_,
                                &activation_done_,

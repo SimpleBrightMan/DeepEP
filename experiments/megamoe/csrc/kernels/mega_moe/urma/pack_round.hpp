@@ -15,11 +15,6 @@ __aicore__ inline __gm__ int32_t* PackReadyFlag(const Arguments& args, uint32_t 
         args.packReady + (static_cast<uint64_t>(peer) * args.config.maxPeerChunks + cv) * kFlagBytes);
 }
 
-__aicore__ inline __gm__ int32_t* DispatchProgressFlag(const Arguments& args, uint32_t peer)
-{
-    return reinterpret_cast<__gm__ int32_t*>(args.dispatchProgress + static_cast<uint64_t>(peer) * kFlagBytes);
-}
-
 __aicore__ inline Chunk LoadPackChunk(const Arguments& args, uint32_t round, uint32_t peer)
 {
     const auto* gm = &reinterpret_cast<const __gm__ PackRound*>(args.packRounds)[round].chunks[peer];
@@ -77,32 +72,5 @@ __aicore__ inline void MarkPackWorkerComplete(const Arguments& args)
     auto* done = reinterpret_cast<__gm__ int32_t*>(args.localFlags + kLocalFlagPackDone * kFlagBytes);
     AscendC::AtomicAdd(done, 1);
 }
-
-// The reserve is a soft scheduling hint, not a synchronization primitive.
-// Read it once per activation decision, never once per token. Cache readiness
-// only after observing a complete counter, so out-of-order partial packs
-// cannot masquerade as ready. Startup CVs are certified on the first lookup.
-class PackReserve {
-public:
-    __aicore__ inline bool HasNextDispatchReady(const Arguments& args)
-    {
-        for (uint32_t peer = 0U; peer < kWorld; ++peer) {
-            if (peer == args.config.rank) continue;
-            const uint32_t submitted =
-                static_cast<uint32_t>(AscendC::ReadGmByPassDCache(DispatchProgressFlag(args, peer)));
-            if (submitted < readyThrough_[peer] || submitted >= args.config.packRoundCount) continue;
-            const Chunk chunk = LoadPackChunk(args, submitted, peer);
-            // Peer streams are dense CV prefixes; an empty entry is finished.
-            if (chunk.rows == 0U) continue;
-            if (AscendC::ReadGmByPassDCache(PackReadyFlag(args, peer, submitted)) < static_cast<int32_t>(chunk.rows))
-                return false;
-            readyThrough_[peer] = submitted + 1U;
-        }
-        return true;
-    }
-
-private:
-    uint32_t readyThrough_[kWorld]{};
-};
 
 }  // namespace MegaMoeUrma

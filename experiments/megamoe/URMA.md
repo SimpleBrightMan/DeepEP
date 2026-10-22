@@ -37,7 +37,7 @@ Python会拒绝不含本分支tail调度标记的native扩展。正式耗时取�
 
 - 15个通信核在Pack前发布Start，不在此处等待peer。全部AIV完成第0、1轮后做一次本机汇合，AIV0转入反量化，通信核在首次PUT前确认peer Start。
 - 通信owner发送第`r`轮时，依次执行`等待本peer packReady → PUT X/scale → 准备自己第r+2轮Pack份额 → quiet → 发布远端ready`。即使该peer本轮没有数据，也必须完成第`r+2`轮的Pack份额；所有核遍历同一本卡轮次总数。
-- 13个辅助AIV1分别推进scale准备、SwiGLU和Pack三个游标。可执行SwiGLU且每个仍有发送任务的peer至少有一个已完成Pack、尚未提交的CV时，优先SwiGLU；否则准备自己的下一轮Pack份额。该判断只决定优先级，不领取其它核的份额，也不要求各核轮次严格同步。
+- 13个辅助AIV1分别推进SwiGLU、scale准备和Pack三个游标。每次调度先检查自己下一项SwiGLU，只要对应GMM1 tile就绪就优先执行，不再检查各peer的Pack余量。SwiGLU未就绪时，优先准备一个输入已就绪的scale组；两者都不可执行时才完成自己的下一轮Pack份额。每次只执行一项任务，结束后重新检查SwiGLU；已经下发的任务不抢占。固定Pack分工不变，不领取其它核的份额，不增加轮次同步，也不再维护或轮询Dispatch进度表。
 - 每段Pack在X和scale写出完成后，给本卡`packReady[peer][cv]`原子累加实际行数。通信及self输入检查均以该CV的实际总行数为门槛，短尾、空peer和不均衡路由使用同一逻辑。计数每次调用清零，不发送到远端；远端仍沿用quiet后的epoch ready。
 - 所有28个AIV1完成自身Pack后各记一次完成；15个远端Dispatch完成加上全部Pack完成才放行Combine，保留原有Dispatch结束门槛。轮次之间不增加全卡或全核同步。命令参数不变，需要重新构建完整wheel。
 

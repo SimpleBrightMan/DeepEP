@@ -210,7 +210,6 @@ struct Arguments {
     uint64_t recvChunks;
     uint64_t packRounds;
     uint64_t packReady;         // Local int32 completed rows per peer/CV, 128B slots.
-    uint64_t dispatchProgress;  // Local int32 submitted CV count per peer, 128B slots.
     uint64_t gmm1Done;
     uint64_t inputScaleDone;
     uint64_t activationDone;

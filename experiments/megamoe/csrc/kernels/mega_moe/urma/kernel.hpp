@@ -126,7 +126,6 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             reinterpret_cast<__gm__ uint8_t*>(args.expandedScale + chunk.localRow * scales),
             static_cast<uint32_t>(chunk.rows * scales), peer);
         timer.TraceEnd(TraceEvent::DispatchPutScale, start, meta);
-        WriteGmByPassDCache(DispatchProgressFlag(args, peer), static_cast<int32_t>(round + 1U));
         // The current URMA write progresses while MTE prepares this worker's
         // fixed quota two CVs ahead. No claims, extra work stealing or phase join.
         PackOneRound(args, round + kPackStartupRounds, owner, kAic, timer);

@@ -441,9 +441,10 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
     timer.End(Phase::Activation);
 }
 
-// Each helper owns independent cursors for input-scale groups, activation and
-// its fixed Pack quota. None may block another: GMM1 needs future scale gathers
-// and input packs even while earlier activations wait. No dynamic task claims.
+// Each helper owns independent cursors for activation, input-scale groups and
+// its fixed Pack quota. A ready activation always wins; otherwise gather one
+// ready scale group or pack one quota. Recheck activation after each task.
+// Readiness checks never block another cursor. No dynamic task claims.
 __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Timer& timer)
 {
     UrmaActivation epilogue;
@@ -454,7 +455,6 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
     uint32_t activationTile = 0U;
     uint32_t nextPackRound = kPackStartupRounds;
     bool packFinished = false;
-    PackReserve packReserve;
     bool activationPrepared = false;
     bool idle = false;
     uint64_t idleStart = 0U;
@@ -463,19 +463,6 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
     while (nextGather < args.config.fragmentCount || nextActivation < args.config.fragmentCount ||
            nextPackRound < args.config.packRoundCount) {
         bool progress = false;
-        bool ranActivation = false;
-        if (nextGather < args.config.fragmentCount) {
-            const auto fragment = LoadFragment(args, nextGather);
-            if (AreGroupInputsReady(args, fragment)) {
-                if (idle) {
-                    timer.TraceEnd(idleEvent, idleStart, idleMeta);
-                    idle = false;
-                }
-                GatherInputScale(args, fragment, nextGather, timer);
-                nextGather += kActivationWorkers;
-                progress = true;
-            }
-        }
         // Skip groups without this worker's activation tile, but never skip a
         // scale gather merely because its owner has no activation in that group.
         while (nextActivation < args.config.fragmentCount) {
@@ -490,8 +477,7 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
                 activationPrepared = false;
                 continue;
             }
-            if (ReadGmByPassDCache(ComputeFlag(args.gmm1Done, fragment.gmm1TileBegin + activationTile)) != 0 &&
-                (nextPackRound >= args.config.packRoundCount || packReserve.HasNextDispatchReady(args))) {
+            if (ReadGmByPassDCache(ComputeFlag(args.gmm1Done, fragment.gmm1TileBegin + activationTile)) != 0) {
                 if (idle) {
                     timer.TraceEnd(idleEvent, idleStart, idleMeta);
                     idle = false;
@@ -499,14 +485,25 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
                 RunReadyActivationTile(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
                 activationTile += kActivationWorkers;
                 progress = true;
-                ranActivation = true;
             }
             break;
         }
-        // One whole fixed quota, not an arbitrary later CV. If activation is
-        // unavailable or any sender lacks one ready CV, replenish the next
-        // Pack round. The copy closes its own events before the next task.
-        if (!ranActivation && nextPackRound < args.config.packRoundCount) {
+        if (!progress && nextGather < args.config.fragmentCount) {
+            const auto fragment = LoadFragment(args, nextGather);
+            if (AreGroupInputsReady(args, fragment)) {
+                if (idle) {
+                    timer.TraceEnd(idleEvent, idleStart, idleMeta);
+                    idle = false;
+                }
+                GatherInputScale(args, fragment, nextGather, timer);
+                nextGather += kActivationWorkers;
+                progress = true;
+            }
+        }
+        // Only fall back to Pack when neither activation nor a scale gather
+        // ran. Keep the same fixed quota and close its events before returning
+        // to the activation check; never gate activation on another peer.
+        if (!progress && nextPackRound < args.config.packRoundCount) {
             if (idle) {
                 timer.TraceEnd(idleEvent, idleStart, idleMeta);
                 idle = false;
