@@ -11,7 +11,6 @@
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "tiling/platform/platform_ascendc.h"
 
-extern "C" int rtGetC2cCtrlAddr(uint64_t* config, uint32_t* length);
 extern "C" void mega_moe_gmm_only_kernel_do(uint32_t, uint32_t, void*, const MegaMoeUrma::Arguments*, uint32_t);
 
 namespace deepep::megamoe {
@@ -50,9 +49,11 @@ GmmOnlyPlan::GmmOnlyPlan(torch::Tensor counts, torch::Tensor w1, torch::Tensor w
         "GMM-only requires 28 AIC / 56 AIV and 192KiB UB");
     platform_ = {28, 56, static_cast<uint32_t>(ub), platform->CalcTschBlockDim(56, 28, 56),
                  platform->GetLibApiWorkSpaceSize()};
-    uint32_t length = 0;
-    TORCH_CHECK(rtGetC2cCtrlAddr(&args_.ffts, &length) == 0,
-                "Cannot query C2C config for CATLASS AIC/AIV0 synchronization");
+    // This target is built exclusively for Ascend950 / CATLASS_ARCH=3510.
+    // Like SHMEM's C310 path, it needs no legacy FFTS address: the device
+    // util_set_ffts_config is a no-op. Internal CATLASS cross-core events remain.
+    // rtGetC2cCtrlAddr is unsupported here and must not gate plan creation.
+    args_.ffts = 0;
     auto& config = args_.config;
     config.bs = 2048;
     config.hidden = 3584;
