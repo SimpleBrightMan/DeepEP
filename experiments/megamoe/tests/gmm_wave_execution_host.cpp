@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <utility>
 #include <vector>
+#define __gm__
+constexpr uint32_t INT_CACHELINE = 16;
 
 using namespace MegaMoeImpl;
 using ProblemShape = std::array<int64_t, 4>;
@@ -30,6 +32,8 @@ struct GMMAddrInfo {};
 struct FakeParams {
     struct Workspace {
         int expertRevTokenNumsPtr = 0;
+        int32_t issued[32 * INT_CACHELINE]{};
+        void* flagGmm2IssuedPtr = issued;
         operator int() const { return 0; }
     } workspaceInfo;
     operator int() const { return 0; }
@@ -56,6 +60,10 @@ struct PipelineStub {
     void End() {}
 };
 struct Gmm1AsyncCompletion { static void DrainProducer() {} };
+struct Gmm2AivCompletion {
+    static void PublishCompleted(int32_t* p, int32_t value) { *p = value; }
+    static void DrainProducer() {}
+};
 
 template <int Core, int CombineQuantMode, bool FuseGateUp = false>
 struct WaveHarness {
@@ -68,6 +76,7 @@ struct WaveHarness {
     static constexpr bool GMM2_REVERSE_BLOCKS = false;
     uint32_t SmallLinearBlockCount() { return uint32_t(-1); }
     void ProcessSmallLinearTasks(uint32_t, int32_t&) { assert(false); }
+    int32_t gmm2IssuedSequence_ = 0;
     PipelineStub gmm1CatlassContext_, gmm2WaveContext_;
     struct { struct { uint32_t jobIndex = 0, totalJobs = 32; } blockJob; } gmmExecutionConfig_;
     int countWorkspace_ = 0;

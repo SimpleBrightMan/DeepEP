@@ -31,7 +31,7 @@ int main()
                         const uint64_t groups = (uint64_t(t.maxOutputSize) + 255) / 256;
                         // Frozen MTE contract, independent of the production allocation sequence.
                         uint64_t slots = experts * (2 * groups + t.aicNum) + t.aicNum;
-                        if (w4) slots += experts * groups;
+                        if (w4) slots += experts * groups + t.aicNum;
                         if (shared) slots += ((bs + 255) / 256) * shared + 4 * t.aicNum;
                         assert(uint64_t(layout.flagResetElementCount) == slots * INT_CACHELINE);
                         assert(layout.flagDispatchToGmm1Ptr - layout.flagActivationToGmm2Ptr ==
@@ -39,6 +39,11 @@ int main()
                         assert(layout.flagSendCntCalToUpdParamsPtr - layout.flagDispatchToGmm1Ptr ==
                                int64_t(experts * groups * INT_CACHELINE * sizeof(int32_t)));
                         assert((layout.gmm2ReadyPtr != nullptr) == w4);
+                        assert((layout.flagGmm2IssuedPtr != nullptr) == w4);
+                        if (w4) {
+                            assert(layout.flagGmm2IssuedPtr == layout.gmm2ReadyPtr + experts * groups * INT_CACHELINE * sizeof(int32_t));
+                            assert(layout.flagGmm2IssuedPtr + t.aicNum * INT_CACHELINE * sizeof(int32_t) <= layout.flagActivationToGmm2Ptr + layout.flagResetElementCount * sizeof(int32_t));
+                        }
                         assert((layout.gmm1MmadResPtr != nullptr) == w4);
                         assert((layout.cumsumInfoPtr != nullptr) == w4);
                         const auto flagsEnd = layout.flagActivationToGmm2Ptr +
