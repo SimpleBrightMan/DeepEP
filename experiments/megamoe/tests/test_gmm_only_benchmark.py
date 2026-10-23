@@ -2,10 +2,35 @@
 
 import csv
 import math
+import sys
+from types import SimpleNamespace
 
 import pytest
 
 from deep_ep_experimental.megamoe.gmm_only_benchmark import read_samples, route_counts, summarize, workload
+from deep_ep_experimental.megamoe.gmm_only_benchmark import load_gmm_extension
+
+
+def test_standalone_loader_does_not_require_core_native(monkeypatch):
+    from deep_ep_experimental.megamoe import api
+
+    def unavailable(*args):
+        raise NotImplementedError("MegaMoE is not implemented in DeepEP")
+
+    monkeypatch.setattr(api, "require_native", unavailable)
+    extension = SimpleNamespace(gmm_only_protocol=1, GmmOnlyPlan=object)
+    monkeypatch.setitem(sys.modules, "deep_ep_experimental.megamoe._C", extension)
+    assert load_gmm_extension() is extension
+
+
+def test_standalone_loader_reports_missing_or_old_extension(monkeypatch):
+    monkeypatch.setitem(sys.modules, "deep_ep_experimental.megamoe._C", None)
+    with pytest.raises(ImportError, match="Native loader error") as error:
+        load_gmm_extension()
+    assert sys.executable in str(error.value)
+    monkeypatch.setitem(sys.modules, "deep_ep_experimental.megamoe._C", SimpleNamespace())
+    with pytest.raises(RuntimeError, match="Python/native versions differ"):
+        load_gmm_extension()
 
 
 def test_original_balanced_workload_all_ranks():

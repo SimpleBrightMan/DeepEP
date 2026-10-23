@@ -6,6 +6,7 @@ actual communication rank. No SHMEM, HCCL or torch.distributed initialization.
 
 import argparse
 import csv
+import importlib
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import json
@@ -13,6 +14,7 @@ import math
 from pathlib import Path
 import re
 import statistics
+import sys
 import uuid
 
 MODES = {"both": 0, "gmm1": 1, "gmm2": 2}
@@ -20,6 +22,26 @@ KERNEL = re.compile(
     r"(?:^|::|\s)mega_moe_gmm_only_kernel(?=\s*(?:$|\())"
     r"|^_Z24mega_moe_gmm_only_kernelN11MegaMoeUrma9ArgumentsEj$"
 )
+
+
+def load_gmm_extension():
+    """Load the standalone kernel without requiring a communication runtime."""
+    name = __package__ + "._C"
+    try:
+        extension = importlib.import_module(name)
+    except ImportError as error:
+        raise ImportError(
+            f"Cannot load {name} with Python {sys.executable}; runner={__file__}. "
+            "Install the megamoe-gmm-only-bs2048 wheel into this Python environment "
+            "and configure its matching Torch, torch_npu, CANN and SHMEM libraries. "
+            f"Native loader error: {error}"
+        ) from error
+    if getattr(extension, "gmm_only_protocol", None) != 1 or not hasattr(extension, "GmmOnlyPlan"):
+        raise RuntimeError(
+            f"GMM-only Python/native versions differ: extension={getattr(extension, '__file__', name)}; "
+            f"Python={sys.executable}. Rebuild/install the megamoe-gmm-only-bs2048 branch wheel."
+        )
+    return extension
 
 
 def route_counts():
@@ -180,13 +202,11 @@ def main():
 
     import torch
     import torch_npu  # noqa: F401
-    from .api import _check_fp4_weight_format, _extension, transform_weights_for_mega_moe
+    from .api import _check_fp4_weight_format, transform_weights_for_mega_moe
     from .reference import make_weights
 
     torch.npu.set_device(args.device)
-    ext = _extension()
-    if getattr(ext, "gmm_only_protocol", None) != 1:
-        raise RuntimeError("Rebuild/install the megamoe-gmm-only-bs2048 branch wheel")
+    ext = load_gmm_extension()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
     output = args.output_dir or Path("benchmark-runs/gmm_only") / stamp
     output.mkdir(parents=True, exist_ok=False)
