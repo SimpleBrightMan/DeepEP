@@ -18,7 +18,7 @@ def test_standalone_loader_does_not_require_core_native(monkeypatch):
         raise NotImplementedError("MegaMoE is not implemented in DeepEP")
 
     monkeypatch.setattr(api, "require_native", unavailable)
-    extension = SimpleNamespace(gmm_only_protocol=1, GmmOnlyPlan=object)
+    extension = SimpleNamespace(gmm_only_protocol=2, GmmOnlyPlan=object)
     monkeypatch.setitem(sys.modules, "deep_ep_experimental.megamoe._C", extension)
     assert load_gmm_extension() is extension
 
@@ -33,19 +33,23 @@ def test_standalone_loader_reports_missing_or_old_extension(monkeypatch):
         load_gmm_extension()
 
 
-def test_original_balanced_workload_all_ranks():
-    counts = route_counts()
+@pytest.mark.parametrize("bs,groups", [(2048, 72), (4096, 144), (8192, 264)])
+def test_original_balanced_workload_all_ranks(bs, groups):
+    counts = route_counts(bs)
     assert counts.shape == (16, 384)
-    assert (counts.sum(axis=1) == 2048 * 8).all()
-    descriptions = [workload(counts, rank) for rank in range(16)]
-    assert sum(row["receive_rows"] for row in descriptions) == 16 * 2048 * 8
+    assert (counts.sum(axis=1) == bs * 8).all()
+    descriptions = [workload(counts, rank, bs) for rank in range(16)]
+    assert sum(row["receive_rows"] for row in descriptions) == 16 * bs * 8
     for row in descriptions:
-        assert row["receive_rows"] == 16384
-        assert sorted(set(row["expert_rows"])) == [682, 683]
-        assert row["m_groups"] == 72
-        assert row["gmm1_tiles"] == 360  # Each logical GMM1 tile computes gate AND up.
-        assert row["gmm2_tiles"] == 1008
-        assert row["gmm1_flops"] + row["gmm2_flops"] == 6 * 16384 * 3584 * 1280
+        assert row["bs"] == bs
+        assert row["receive_rows"] == bs * 8
+        assert sorted(set(row["expert_rows"])) == [bs * 8 // 24, bs * 8 // 24 + 1]
+        assert row["m_groups"] == groups
+        assert row["gmm1_tiles"] == groups * 5  # Each logical GMM1 tile computes gate AND up.
+        assert row["gmm2_tiles"] == groups * 14
+        assert row["gmm1_flops"] + row["gmm2_flops"] == 6 * bs * 8 * 3584 * 1280
+    with pytest.raises(ValueError, match="routing counts"):
+        workload(counts, 0, 4096 if bs == 2048 else 2048)
 
 
 def test_mfu_uses_effective_rows_and_one_device_elapsed_time():

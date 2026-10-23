@@ -15,7 +15,7 @@ extern "C" void mega_moe_gmm_only_kernel_do(uint32_t, uint32_t, void*, const Meg
 
 namespace deepep::megamoe {
 GmmOnlyPlan::GmmOnlyPlan(torch::Tensor counts, torch::Tensor w1, torch::Tensor w2, torch::Tensor s1, torch::Tensor s2,
-                         int64_t rank, int64_t cv_rows, int64_t ahead)
+                         int64_t rank, int64_t cv_rows, int64_t ahead, int64_t bs)
 {
     TORCH_CHECK(counts.device().is_cpu() && counts.scalar_type() == torch::kInt64 && counts.is_contiguous() &&
                     counts.sizes() == torch::IntArrayRef({16, 384}),
@@ -23,6 +23,17 @@ GmmOnlyPlan::GmmOnlyPlan(torch::Tensor counts, torch::Tensor w1, torch::Tensor w
     TORCH_CHECK(rank >= 0 && rank < 16 && cv_rows >= 128 && cv_rows <= 4096 && cv_rows % 128 == 0 && ahead >= 0 &&
                     ahead <= 65536,
                 "Invalid rank/CV/lookahead");
+    TORCH_CHECK(bs == 2048 || bs == 4096 || bs == 8192, "BS must be 2048, 4096 or 8192");
+    const auto* count_data = counts.data_ptr<int64_t>();
+    for (int source = 0; source < 16; ++source) {
+        int64_t total = 0;
+        for (int expert = 0; expert < 384; ++expert) {
+            const auto count = count_data[source * 384 + expert];
+            TORCH_CHECK(count >= 0 && count <= bs * 8, "Invalid source expert count");
+            total += count;
+        }
+        TORCH_CHECK(total == bs * 8, "Source routing counts do not match BS * topK");
+    }
     TORCH_CHECK(w1.device().type() == c10::DeviceType::PrivateUse1, "NPU weights required");
     device_ = w1.device().index();
     int current = -1;
@@ -55,23 +66,23 @@ GmmOnlyPlan::GmmOnlyPlan(torch::Tensor counts, torch::Tensor w1, torch::Tensor w
     // rtGetC2cCtrlAddr is unsupported here and must not gate plan creation.
     args_.ffts = 0;
     auto& config = args_.config;
-    config.bs = 2048;
+    config.bs = bs;
     config.hidden = 3584;
     config.intermediate = 1280;
     config.topk = 8;
     config.localExperts = 24;
     config.rank = rank;
     config.cvRows = cv_rows;
-    config.maxPeerChunks = (2048 * 8 + cv_rows - 1) / cv_rows;
+    config.maxPeerChunks = (bs * 8 + cv_rows - 1) / cv_rows;
     config.gmm1AheadMGroups = ahead;
-    auto plan = MegaMoeUrma::BuildExpertPlan(counts.data_ptr<int64_t>(), config, 16ULL * 2048 * 8);
+    auto plan = MegaMoeUrma::BuildExpertPlan(count_data, config, 16ULL * bs * 8);
     config = plan.config;
     TORCH_CHECK(config.receiveRows > 0, "Empty destination cannot measure GMM MFU");
     auto align = [](uint64_t bytes) { return (bytes + 511U) / 512U * 512U; };
     config.receiveXOffset = 0;
     config.receiveScaleOffset = align(config.receiveRows * config.hidden);
     config.returnYOffset = align(config.receiveScaleOffset + config.receiveRows * (config.hidden / 32));
-    config.symmetricBytes = align(config.returnYOffset + 2048ULL * 8 * config.hidden * 2);
+    config.symmetricBytes = align(config.returnYOffset + static_cast<uint64_t>(bs) * 8 * config.hidden * 2);
     const auto options = w1.options().dtype(torch::kUInt8);
     auto keep = [&](torch::Tensor tensor) {
         storage_.push_back(tensor);

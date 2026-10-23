@@ -11,7 +11,7 @@ namespace deepep::megamoe {
 class GmmOnlyPlan {
 public:
     GmmOnlyPlan(torch::Tensor counts_cpu, torch::Tensor weight1, torch::Tensor weight2, torch::Tensor scale1,
-                torch::Tensor scale2, int64_t rank, int64_t cv_rows, int64_t ahead);
+                torch::Tensor scale2, int64_t rank, int64_t cv_rows, int64_t ahead, int64_t bs);
     void forward(int64_t mode);
     std::map<std::string, int64_t> describe() const;
 

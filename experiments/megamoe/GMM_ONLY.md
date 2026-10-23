@@ -1,4 +1,4 @@
-# BS2048 CATLASS GMM-only
+# BS2048/4096/8192 CATLASS GMM-only
 
 分支 `megamoe-gmm-only-bs2048`，基于远端 `megamoe-urma-tailCover` 的 `60642fb`。
 只新增独立算子和性能入口，原 URMA/主线核函数不变。
@@ -14,9 +14,32 @@ git pull --ff-only origin megamoe-gmm-only-bs2048
 DEEPEP_MEGAMOE_TIMER=OFF bash experiments/megamoe/scripts/build.sh
 
 python3 -m deep_ep_experimental.megamoe.gmm_only_benchmark \
-  --device 0 --logical-rank 0 --cv-rows 256 --gmm1-ahead-mgroups 12 \
+  --bs 2048 --device 0 --logical-rank 0 --cv-rows 256 --gmm1-ahead-mgroups 12 \
   --modes both,gmm1,gmm2 --warmup 10 --iters 20 --peak-tflops 765
 ```
+
+`--bs` 支持 2048（默认）、4096、8192。改变真实路由 counts、接收行数、M-group、
+tile 任务表和缓冲区大小，不是重复执行 BS2048。三种规模依次运行：
+
+```bash
+export SHMEM_ROOT="$PWD/third-party/shmem/install/shmem"
+export LD_LIBRARY_PATH="$SHMEM_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+for bs in 2048 4096 8192; do
+  python3 -m deep_ep_experimental.megamoe.gmm_only_benchmark \
+    --bs "$bs" --device 0 --logical-rank 0 \
+    --cv-rows 256 --gmm1-ahead-mgroups 12 \
+    --modes both,gmm1,gmm2 --warmup 10 --iters 20 --peak-tflops 765 || break
+done
+```
+
+| BS | 每卡接收行数 | M-group | GMM1逻辑tile（每个gate+up） | GMM2 tile |
+| --- | --- | --- | --- | --- |
+| 2048 | 16384 | 72 | 360 | 1008 |
+| 4096 | 32768 | 144 | 720 | 2016 |
+| 8192 | 65536 | 264 | 1320 | 3696 |
+
+本版本 `gmm_only_protocol=2`，升级旧版本需要重新编译安装，不能只复制 Python 入口。
+下文具体行数和 FLOPs 示例以 BS2048 为例，其余规模按实际接收行数计算。
 
 `both` 在**一次 kernel 启动**中执行原 host plan 的 GMM1/GMM2 专家交替顺序；
 `gmm1`、`gmm2` 过滤同一任务表，分别测两个阶段。

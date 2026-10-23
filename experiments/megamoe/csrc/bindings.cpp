@@ -14,12 +14,12 @@ PYBIND11_MODULE(_C, module)
 {
     using deepep::megamoe::Plan;
     module.attr("api_protocol") = 4;
-    module.attr("gmm_only_protocol") = 1;
+    module.attr("gmm_only_protocol") = 2;
     py::class_<deepep::megamoe::GmmOnlyPlan>(module, "GmmOnlyPlan")
         .def(py::init<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t,
-                      int64_t>(),
+                      int64_t, int64_t>(),
              py::arg("counts_cpu"), py::arg("weight1"), py::arg("weight2"), py::arg("scale1"), py::arg("scale2"),
-             py::arg("logical_rank"), py::arg("cv_rows"), py::arg("ahead_mgroups"))
+             py::arg("logical_rank"), py::arg("cv_rows"), py::arg("ahead_mgroups"), py::arg("bs") = 2048)
         .def("forward", &deepep::megamoe::GmmOnlyPlan::forward, py::arg("mode") = 0)
         .def("describe", &deepep::megamoe::GmmOnlyPlan::describe);
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;

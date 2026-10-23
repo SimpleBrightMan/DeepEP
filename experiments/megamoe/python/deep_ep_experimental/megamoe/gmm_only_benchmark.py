@@ -1,4 +1,4 @@
-"""Single-NPU CATLASS replay of BS2048 EP16 GMM work, without external flags.
+"""Single-NPU CATLASS replay of BS2048/4096/8192 EP16 GMM work, without external flags.
 
 The logical rank controls the original routing/segmented row layout, NOT an
 actual communication rank. No SHMEM, HCCL or torch.distributed initialization.
@@ -36,7 +36,7 @@ def load_gmm_extension():
             "and configure its matching Torch, torch_npu, CANN and SHMEM libraries. "
             f"Native loader error: {error}"
         ) from error
-    if getattr(extension, "gmm_only_protocol", None) != 1 or not hasattr(extension, "GmmOnlyPlan"):
+    if getattr(extension, "gmm_only_protocol", None) != 2 or not hasattr(extension, "GmmOnlyPlan"):
         raise RuntimeError(
             f"GMM-only Python/native versions differ: extension={getattr(extension, '__file__', name)}; "
             f"Python={sys.executable}. Rebuild/install the megamoe-gmm-only-bs2048 branch wheel."
@@ -44,29 +44,33 @@ def load_gmm_extension():
     return extension
 
 
-def route_counts():
+def route_counts(bs=2048):
     """Call the repository's actual balanced generator for all 16 sources."""
     import numpy as np
     from .benchmark import inputs, load_config
 
-    config = load_config("urma", "2048")
+    if bs not in (2048, 4096, 8192):
+        raise ValueError("BS must be 2048, 4096 or 8192")
+    config = load_config("urma", str(bs))
     counts = []
     for source in range(16):
-        _, ids, _ = inputs(config, source, 2048, "balanced", world=16)
+        _, ids, _ = inputs(config, source, bs, "balanced", world=16)
         counts.append(np.bincount(ids.reshape(-1), minlength=384))
     return np.asarray(counts, dtype=np.int64)
 
 
-def workload(counts, rank):
+def workload(counts, rank, bs=2048):
     if type(rank) is not int or not 0 <= rank < 16:
         raise ValueError("logical rank must be in [0,16)")
-    if counts.shape != (16, 384) or (counts < 0).any() or (counts.sum(axis=1) != 2048 * 8).any():
-        raise ValueError("invalid BS2048 EP16 routing counts")
+    if bs not in (2048, 4096, 8192):
+        raise ValueError("BS must be 2048, 4096 or 8192")
+    if counts.shape != (16, 384) or (counts < 0).any() or (counts.sum(axis=1) != bs * 8).any():
+        raise ValueError(f"invalid BS{bs} EP16 routing counts")
     expert_rows = counts[:, rank * 24 : (rank + 1) * 24].sum(axis=0)
     rows = int(expert_rows.sum())
     groups = int(((expert_rows + 255) // 256).sum())
     return dict(
-        bs=2048,
+        bs=bs,
         logical_rank=rank,
         ep=16,
         receive_rows=rows,
@@ -166,6 +170,7 @@ def profile(plan, mode, warmup, iters, directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--bs", type=int, choices=(2048, 4096, 8192), default=2048)
     parser.add_argument("--logical-rank", type=int, default=0)
     parser.add_argument("--cv-rows", type=int, default=256)
     parser.add_argument("--gmm1-ahead-mgroups", type=int, default=12)
@@ -194,8 +199,8 @@ def main():
         or not 0 <= args.gmm1_ahead_mgroups <= 65536
     ):
         parser.error("invalid logical rank, CV rows or lookahead")
-    counts = route_counts()
-    expected = workload(counts, args.logical_rank)
+    counts = route_counts(args.bs)
+    expected = workload(counts, args.logical_rank, args.bs)
     if args.plan_only:
         print(json.dumps(expected, indent=2))
         return
@@ -222,10 +227,10 @@ def main():
     _check_fp4_weight_format(w1, "w1")
     _check_fp4_weight_format(w2, "w2")
     plan = ext.GmmOnlyPlan(
-        torch.from_numpy(counts), w1, w2, s1, s2, args.logical_rank, args.cv_rows, args.gmm1_ahead_mgroups
+        torch.from_numpy(counts), w1, w2, s1, s2, args.logical_rank, args.cv_rows, args.gmm1_ahead_mgroups, args.bs
     )
     native = plan.describe()
-    for key in ("receive_rows", "m_groups", "gmm1_tiles", "gmm2_tiles", "gmm1_flops", "gmm2_flops"):
+    for key in ("bs", "receive_rows", "m_groups", "gmm1_tiles", "gmm2_tiles", "gmm1_flops", "gmm2_flops"):
         if native[key] != expected[key]:
             raise RuntimeError(f"Native/original routing work mismatch: {key}: {native[key]} != {expected[key]}")
     del raw
@@ -253,7 +258,7 @@ def main():
             report["results"][mode] = result
             (output / "summary.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
             print(
-                f"[GMM-ONLY] BS=2048 logical-rank={args.logical_rank} mode={mode} rows={native['receive_rows']} "
+                f"[GMM-ONLY] BS={args.bs} logical-rank={args.logical_rank} mode={mode} rows={native['receive_rows']} "
                 f"mean={result['mean_us']:.3f}us min/max={result['min_us']:.3f}/{result['max_us']:.3f}us "
                 f"TFLOPS={result['effective_tflops']:.3f} MFU={result['mfu_percent']:.2f}% "
                 f"peak={args.peak_tflops:g}TFLOPS",
