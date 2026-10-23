@@ -3,6 +3,7 @@
 
 #include "forward.hpp"
 #include "urma_forward.hpp"
+#include "gmm_only.hpp"
 #include "shmem.h"
 #include "kernels/mega_moe/common/ascend_timer_v2.hpp"
 #include "kernels/mega_moe/common/mega_moe_constants.hpp"
@@ -13,6 +14,14 @@ PYBIND11_MODULE(_C, module)
 {
     using deepep::megamoe::Plan;
     module.attr("api_protocol") = 4;
+    module.attr("gmm_only_protocol") = 1;
+    py::class_<deepep::megamoe::GmmOnlyPlan>(module, "GmmOnlyPlan")
+        .def(py::init<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int64_t, int64_t,
+                      int64_t>(),
+             py::arg("counts_cpu"), py::arg("weight1"), py::arg("weight2"), py::arg("scale1"), py::arg("scale2"),
+             py::arg("logical_rank"), py::arg("cv_rows"), py::arg("ahead_mgroups"))
+        .def("forward", &deepep::megamoe::GmmOnlyPlan::forward, py::arg("mode") = 0)
+        .def("describe", &deepep::megamoe::GmmOnlyPlan::describe);
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.def("buffer_size", &deepep::megamoe::buffer_size);
     module.attr("urma_api_protocol") = MegaMoeUrma::kProtocol;

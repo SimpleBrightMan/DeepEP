@@ -71,8 +71,21 @@ add_custom_command(OUTPUT "${urma_kernel_library}"
         -o "${urma_kernel_library}"
     DEPENDS csrc/kernels/mega_moe/urma/launcher.cpp ${kernel_headers}
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
-add_custom_target(megamoe_device DEPENDS "${kernel_library}" "${urma_kernel_library}")
-pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp csrc/urma_forward.cpp)
+set(gmm_only_library "${CMAKE_CURRENT_BINARY_DIR}/libmegamoe_gmm_only_kernel.so")
+set(gmm_only_flags ${kernel_flags})
+# This benchmark always has zero internal timer instrumentation, even when the
+# rest of the wheel supports traces. Device task duration comes from profiler.
+list(REMOVE_ITEM gmm_only_flags -Wl,-soname,libmegamoe_kernel.so -DDEEPEP_MEGAMOE_TIMER=1)
+list(APPEND gmm_only_flags -Wl,-soname,libmegamoe_gmm_only_kernel.so)
+add_custom_command(OUTPUT "${gmm_only_library}"
+    COMMAND "${BISHENG}" ${gmm_only_flags} csrc/kernels/mega_moe/urma/gmm_only.cpp
+        "-L${ASCEND_HOME_PATH}/lib64" "-L${SHMEM_ROOT}/lib"
+        -lruntime -lascendcl -lshmem -lgraph_base -ltiling_api -lplatform -lregister -ldl -lstdc++ -lm
+        -o "${gmm_only_library}"
+    DEPENDS csrc/kernels/mega_moe/urma/gmm_only.cpp ${kernel_headers}
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
+add_custom_target(megamoe_device DEPENDS "${kernel_library}" "${urma_kernel_library}" "${gmm_only_library}")
+pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp csrc/urma_forward.cpp csrc/gmm_only.cpp)
 set_target_properties(megamoe_ext PROPERTIES OUTPUT_NAME _C
     INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
 target_include_directories(megamoe_ext PRIVATE ${beta_include} ${TORCH_INCLUDE_DIRS} "${torch_npu_root}/include")
@@ -84,14 +97,17 @@ if(DEEPEP_MEGAMOE_TIMER)
 endif()
 add_library(megamoe_kernel SHARED IMPORTED)
 add_library(megamoe_urma_kernel SHARED IMPORTED)
+add_library(megamoe_gmm_only_kernel SHARED IMPORTED)
+set_target_properties(megamoe_gmm_only_kernel PROPERTIES IMPORTED_LOCATION "${gmm_only_library}")
 set_target_properties(megamoe_urma_kernel PROPERTIES IMPORTED_LOCATION "${urma_kernel_library}")
 set_target_properties(megamoe_kernel PROPERTIES IMPORTED_LOCATION "${kernel_library}")
 add_dependencies(megamoe_ext megamoe_device)
 target_link_libraries(megamoe_ext PRIVATE ${TORCH_LIBRARIES} "${TORCH_PYTHON_LIBRARY}"
-    "${TORCH_NPU_LIBRARY}" megamoe_kernel megamoe_urma_kernel shmem ascendcl)
+    "${TORCH_NPU_LIBRARY}" megamoe_kernel megamoe_urma_kernel megamoe_gmm_only_kernel shmem ascendcl runtime)
 target_link_directories(megamoe_ext PRIVATE "${ASCEND_HOME_PATH}/lib64")
 target_link_libraries(megamoe_ext PRIVATE platform tiling_api)
 target_link_options(megamoe_ext PRIVATE -Wl,-z,relro,-z,now,-z,noexecstack)
 install(TARGETS megamoe_ext LIBRARY DESTINATION ../deep_ep_experimental/megamoe)
 install(FILES "${kernel_library}" DESTINATION ../deep_ep_experimental/megamoe)
 install(FILES "${urma_kernel_library}" DESTINATION ../deep_ep_experimental/megamoe)
+install(FILES "${gmm_only_library}" DESTINATION ../deep_ep_experimental/megamoe)
