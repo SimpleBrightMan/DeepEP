@@ -84,27 +84,9 @@ __aicore__ inline void PublishPeerStart(const Arguments& args, uint32_t owner, T
     timer.End(Phase::Barrier);
 }
 
-__aicore__ inline void WaitChunkComputed(const Arguments& args, const Chunk& chunk, Timer& timer)
-{
-    for (uint32_t j = 0U; j < chunk.fragmentCount; ++j) {
-        // A communication CV intersects arbitrary expert-major compute groups.
-        // Host deduplicates this adjacency list; each group counter covers its
-        // complete GMM2 N direction after every segmented FIX store completes.
-        const uint32_t index = reinterpret_cast<__gm__ uint32_t*>(args.chunkGroupIndices)[chunk.fragmentBegin + j];
-        const Fragment fragment = LoadFragment(args, index);
-        TraceMeta meta = ChunkTraceMeta(chunk);
-        meta.fragment = index;
-        meta.expert = fragment.expert;
-        meta.row = fragment.rowBegin;
-        meta.rows = fragment.rows;
-        const uint64_t start = timer.TraceBegin();
-        WaitComputeFlag(args.gmm2Done, index, FragmentGmm2Tiles(args, fragment));
-        timer.TraceEnd(TraceEvent::WaitCombineReady, start, meta);
-    }
-}
-
-// Speculative Combine must never stall Dispatch waiting for a producer.
-// Inspect each dependency once and return at the first incomplete group.
+// Neither speculative Combine nor a full scan waits on an unready CV.
+// Each dependency covers the complete GMM2 N direction and all FIX stores.
+// Inspect once and return at the first incomplete compute group.
 __aicore__ inline bool IsChunkComputed(const Arguments& args, const Chunk& chunk)
 {
     for (uint32_t j = 0U; j < chunk.fragmentCount; ++j) {
@@ -116,6 +98,39 @@ __aicore__ inline bool IsChunkComputed(const Arguments& args, const Chunk& chunk
         }
     }
     return true;
+}
+
+// Retire exactly the submitted CVs, which need not form a contiguous prefix.
+// Their disjoint remote rows and independent ready slots permit out-of-order
+// submission. Only the original owner touches this peer's QP1 and flags.
+__aicore__ inline void RetireCombineBatch(const Arguments& args, uint32_t owner, uint32_t combineBegin,
+                                          LocalTensor<uint32_t>& pending, uint32_t& pendingCount, uint64_t& pendingRows,
+                                          LocalTensor<uint64_t>& signal, Timer& timer, bool& peerCounted,
+                                          bool& selfCounted)
+{
+    if (pendingCount == 0U) return;
+    const uint32_t peer = PeerForOwner(args.config.rank, owner);
+    auto* symmetric = reinterpret_cast<__gm__ uint8_t*>(args.symmetric);
+    TraceMeta meta;
+    meta.peer = peer;
+    meta.rows = pendingRows;
+    if (pendingCount == 1U) meta = ChunkTraceMeta(LoadChunk(args.recvChunks, combineBegin + pending.GetValue(0U)));
+    // Multiple CVs may have holes: retain unknown CV/row, and sum actual rows.
+    ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);
+    uint64_t start = timer.TraceBegin();
+    Quiet(peer, kCombineQp);
+    timer.TraceEnd(TraceEvent::CombineQuiet, start, meta);
+    for (uint32_t i = 0U; i < pendingCount; ++i) {
+        const Chunk completed = LoadChunk(args.recvChunks, combineBegin + pending.GetValue(i));
+        meta = ChunkTraceMeta(completed);
+        const uint64_t readyIndex = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + completed.cv;
+        start = timer.TraceBegin();
+        PublishDone(symmetric, args.config.combineReadyOffset + readyIndex * kFlagBytes, peer, args.config.epoch,
+                    signal, EVENT_ID0);
+        timer.TraceEnd(TraceEvent::CombinePublish, start, meta);
+    }
+    pendingCount = 0U;
+    pendingRows = 0U;
 }
 
 // One and only one AIV1 owns all PUT/quiet operations for this peer for the
@@ -179,8 +194,9 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         PackOneRound(args, round + kPackStartupRounds, owner, kAic, timer);
         // Only the last two actual outgoing CVs may submit one ready Combine
         // each. A shorter peer must not use the rank-wide Pack round count.
+        // Reserve one CV for the final standalone post-Dispatch submission.
         // No Combine quiet or ready publication occurs during Dispatch.
-        if (chunk.cv + 2U >= dispatchCvs && nextCombine < combineEnd) {
+        if (chunk.cv + 2U >= dispatchCvs && nextCombine + 1U < combineEnd) {
             const Chunk early = LoadChunk(args.recvChunks, nextCombine);
             if (IsChunkComputed(args, early)) {
                 if (!combineStarted) {
@@ -223,60 +239,83 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
 
     bool peerCounted = false;
     bool selfCounted = false;
-    // Retire the submitted prefix before waiting for any new producer. This
-    // also handles a peer whose complete Combine stream was issued early.
-    // One QP1 quiet covers at most two CVs; each keeps its own ready slot.
-    if (nextCombine != combineBegin) {
-        const Chunk first = LoadChunk(args.recvChunks, combineBegin);
-        TraceMeta meta = ChunkTraceMeta(first);
-        if (nextCombine - combineBegin > 1U) {
-            const Chunk last = LoadChunk(args.recvChunks, nextCombine - 1U);
-            meta.cv = kTraceUnknown;  // One completion wait covers multiple CVs.
-            meta.rows = last.localRow + last.rows - first.localRow;
-        }
-        ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);
-        start = timer.TraceBegin();
-        Quiet(peer, kCombineQp);
-        timer.TraceEnd(TraceEvent::CombineQuiet, start, meta);
-        for (uint32_t index = combineBegin; index < nextCombine; ++index) {
-            const Chunk completed = LoadChunk(args.recvChunks, index);
-            meta = ChunkTraceMeta(completed);
-            const uint64_t readyIndex =
-                static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + completed.cv;
-            start = timer.TraceBegin();
-            PublishDone(symmetric, args.config.combineReadyOffset + readyIndex * kFlagBytes, peer, args.config.epoch,
-                        signal, EVENT_ID0);
-            timer.TraceEnd(TraceEvent::CombinePublish, start, meta);
+    // Scalar-only, owner-private metadata after Pack/Dispatch. Signal DMA uses
+    // UB [0,32); these arrays occupy [32,4128), with no payload buffers or GM
+    // spill arrays. The host planner enforces the same kMaxPeerChunks bound.
+    constexpr uint32_t kSubmittedOffset = 32U;
+    constexpr uint32_t kPendingOffset = kSubmittedOffset + kMaxPeerChunks * sizeof(uint32_t);
+    static_assert(kPendingOffset + kMaxPeerChunks * sizeof(uint32_t) <= kRequiredUbBytes);
+    LocalTensor<uint32_t> submitted(TPosition::VECCALC, kSubmittedOffset, kMaxPeerChunks);
+    LocalTensor<uint32_t> pending(TPosition::VECCALC, kPendingOffset, kMaxPeerChunks);
+    const uint32_t combineCount = combineEnd - combineBegin;
+    const uint32_t earlyCount = nextCombine - combineBegin;
+    uint32_t pendingCount = 0U;
+    uint64_t pendingRows = 0U;
+    for (uint32_t i = 0U; i < combineCount; ++i) {
+        submitted.SetValue(i, i < earlyCount ? 1U : 0U);
+        if (i < earlyCount) {
+            pending.SetValue(pendingCount++, i);
+            pendingRows += LoadChunk(args.recvChunks, combineBegin + i).rows;
         }
     }
-    // Resume one PUT -> one QP1 quiet -> one CV-ready flag, on the same core.
-    for (uint32_t index = nextCombine; index < combineEnd; ++index) {
-        const Chunk chunk = LoadChunk(args.recvChunks, index);
-        WaitChunkComputed(args, chunk, timer);
-        if (!combineStarted) {
-            timer.Begin(Phase::Combine);
-            combineStarted = true;
+    // Retire the early prefix before scanning any new producers.
+    RetireCombineBatch(args, owner, combineBegin, pending, pendingCount, pendingRows, signal, timer, peerCounted,
+                       selfCounted);
+    uint32_t remaining = combineCount - earlyCount;
+    bool waiting = false;
+    uint64_t waitStart = 0U;
+    while (remaining != 0U) {
+        // Always scan this peer's CVs from beginning to end. Already submitted
+        // or unready CVs are skipped; readiness does not imply a ready prefix.
+        const uint64_t scanStart = timer.TraceBegin();
+        for (uint32_t i = 0U; i < combineCount; ++i) {
+            if (submitted.GetValue(i) != 0U) continue;
+            const Chunk chunk = LoadChunk(args.recvChunks, combineBegin + i);
+            if (!IsChunkComputed(args, chunk)) continue;
+            if (waiting) {
+                // Close idle scope BEFORE emitting any PUT/quiet/flag trace.
+                timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
+                waiting = false;
+            }
+            if (remaining == 1U) {
+                // Last ACTUAL unsent CV, not necessarily the highest index.
+                // Publish all earlier results before submitting it alone.
+                RetireCombineBatch(args, owner, combineBegin, pending, pendingCount, pendingRows, signal, timer,
+                                   peerCounted, selfCounted);
+            }
+            if (!combineStarted) {
+                timer.Begin(Phase::Combine);
+                combineStarted = true;
+            }
+            TraceMeta meta = ChunkTraceMeta(chunk);
+            meta.bytes = chunk.rows * rowBytes;
+            start = timer.TraceBegin();
+            Put(symmetric, args.config.returnYOffset + chunk.remoteRow * rowBytes,
+                reinterpret_cast<__gm__ uint8_t*>(args.gmm2Output + chunk.localRow * rowBytes),
+                static_cast<uint32_t>(meta.bytes), peer, kCombineQp);
+            timer.TraceEnd(TraceEvent::CombinePut, start, meta);
+            combineBytes += meta.bytes;
+            submitted.SetValue(i, 1U);
+            pending.SetValue(pendingCount++, i);
+            pendingRows += chunk.rows;
+            --remaining;
+            if (remaining == 0U) break;
         }
-        TraceMeta meta = ChunkTraceMeta(chunk);
-        meta.bytes = chunk.rows * rowBytes;
-        start = timer.TraceBegin();
-        Put(symmetric, args.config.returnYOffset + chunk.remoteRow * rowBytes,
-            reinterpret_cast<__gm__ uint8_t*>(args.gmm2Output + chunk.localRow * rowBytes),
-            static_cast<uint32_t>(chunk.rows * rowBytes), peer, kCombineQp);
-        timer.TraceEnd(TraceEvent::CombinePut, start, meta);
-        // Opportunistically account this peer's incoming completion without
-        // waiting. The PUT is already submitted and can progress meanwhile.
-        ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);
-        meta.bytes = 0U;
-        start = timer.TraceBegin();
-        Quiet(peer, kCombineQp);
-        timer.TraceEnd(TraceEvent::CombineQuiet, start, meta);
-        const uint64_t readyIndex = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + chunk.cv;
-        start = timer.TraceBegin();
-        PublishDone(symmetric, args.config.combineReadyOffset + readyIndex * kFlagBytes, peer, args.config.epoch,
-                    signal, EVENT_ID0);
-        timer.TraceEnd(TraceEvent::CombinePublish, start, meta);
-        combineBytes += chunk.rows * rowBytes;
+        if (pendingCount != 0U) {
+            // One quiet for everything found ready this sweep. A final CV is
+            // the only pending entry here after the preceding batch flush.
+            RetireCombineBatch(args, owner, combineBegin, pending, pendingCount, pendingRows, signal, timer,
+                               peerCounted, selfCounted);
+        } else if (remaining != 0U) {
+            if (!waiting) {
+                waitStart = scanStart;
+                waiting = true;
+            }
+            ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);
+            const uint64_t backoff = GetSystemCycle();
+            while (GetSystemCycle() - backoff < 200U) {
+            }
+        }
     }
     // Every CV now has its own completion flag, so the source can reduce
     // completed tokens while other peers are still computing/returning rows.

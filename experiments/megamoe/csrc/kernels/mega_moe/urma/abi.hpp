@@ -10,6 +10,8 @@ constexpr uint32_t kAic = 28;
 constexpr uint32_t kLocalWorkers = 2U * kAic;
 constexpr uint32_t kCommunicationWorkers = 15;
 constexpr uint32_t kActivationWorkers = 13;
+// Host planner limit and per-peer Combine scan metadata capacity.
+constexpr uint32_t kMaxPeerChunks = 512U;
 constexpr uint64_t kFlagBytes = 128;
 // Per-invocation counters in localFlags, cleared before the start handshake.
 constexpr uint32_t kLocalFlagDispatchDone = 0U;

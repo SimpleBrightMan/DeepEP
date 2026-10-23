@@ -58,8 +58,8 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
 {
     if (counts == nullptr || input.rank >= kWorld || input.localExperts != 24 || input.bs == 0 || input.bs > 8192 ||
         input.topk != 8 || input.hidden != 3584 || input.intermediate != 1280 || input.cvRows < 128 ||
-        input.cvRows > 4096 || input.cvRows % 128 != 0 || input.maxPeerChunks == 0 || input.maxPeerChunks > 512 ||
-        input.gmm1AheadMGroups > 65536U || maxReceiveRows == 0) {
+        input.cvRows > 4096 || input.cvRows % 128 != 0 || input.maxPeerChunks == 0 ||
+        input.maxPeerChunks > kMaxPeerChunks || input.gmm1AheadMGroups > 65536U || maxReceiveRows == 0) {
         throw std::invalid_argument("Invalid URMA expert-plan dimensions");
     }
     ExpertPlan plan;
