@@ -12,7 +12,15 @@ constexpr uint32_t kComputeCores = kAic;
 constexpr uint32_t kReduceWorkers = kLocalWorkers - kCommunicationWorkers;
 constexpr uint32_t kComputeTileM = 256U;
 constexpr uint32_t kComputeTileN = 256U;
-// Keep matrix scheduling at M256; only the AIV1 epilogue works in M128
+// Only GMM2 changes geometry. Expert groups and GMM1 remain M256.
+constexpr uint32_t kGmm2TileM = 128U;
+constexpr uint32_t kGmm2TileN = 512U;
+constexpr uint32_t kGmm2TileK = 128U;
+constexpr uint32_t kGmm2L0K = 64U;
+static_assert(kGmm2TileM * kGmm2TileN == kComputeTileM * kComputeTileN);
+static_assert(kGmm2TileN * kGmm2TileK == 64U * 1024U);     // FP8 L1 B slot
+static_assert(2U * kGmm2TileN * kGmm2L0K == 64U * 1024U);  // L0B ping-pong
+// Keep expert groups/GMM1 at M256; AIV1 activation and GMM2 use M128
 // slices. The W4 AIV0 prologue remains the largest UB user at exactly 192KiB.
 constexpr uint32_t kActivationTileM = 128U;
 // The URMA v1 input is H3584: each row has 112 E8M0 bytes. GM stays
@@ -148,6 +156,11 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ComputeTileCount(uint32_t rows, u
     return ((rows + kComputeTileM - 1U) / kComputeTileM) * ((columns + kComputeTileN - 1U) / kComputeTileN);
 }
 
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm2TileCount(uint32_t rows, uint32_t columns)
+{
+    return ((rows + kGmm2TileM - 1U) / kGmm2TileM) * ((columns + kGmm2TileN - 1U) / kGmm2TileN);
+}
+
 // All stage task IDs are global prefix sums. Sparse experts cannot repeatedly
 // give the same physical core their first tile. AIC and its AIV0 call this with
 // identical inputs; the independent AIV1 activation team uses workerCount=13.
@@ -177,8 +190,23 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr OwnedComputeGroup OwnedComputeGroupAt(uint
     return {group, firstTile, (tilesPerGroup - 1U - firstTile) / workerCount + 1U};
 }
 
-// Each nonempty fragment is at most M256, so all groups of an expert have the
-// same N tile count, including its short final M group. Return groupCount when
+// Full groups have a fixed width, but a GMM2 M<=128 tail has half as many
+// tiles. Bound the final group's ownership by its actual batch-relative end.
+MEGAMOE_URMA_COMPUTE_INLINE constexpr OwnedComputeGroup OwnedComputeGroupBefore(uint64_t ownedTile,
+                                                                                uint32_t tilesPerFullGroup,
+                                                                                uint32_t workerCount,
+                                                                                uint64_t tileLimit)
+{
+    const uint32_t group = static_cast<uint32_t>(ownedTile / tilesPerFullGroup);
+    const uint32_t firstTile = ownedTile % tilesPerFullGroup;
+    const uint64_t inGroup = tilesPerFullGroup - firstTile;
+    const uint64_t remaining = tileLimit - ownedTile;
+    const uint64_t available = inGroup < remaining ? inGroup : remaining;
+    return {group, firstTile, static_cast<uint32_t>((available - 1U) / workerCount + 1U)};
+}
+
+// For a uniform-width stage (GMM1), all groups of an expert have the same
+// N tile count, including its short final M group. Return groupCount when
 // this worker has no tile; no hardware context may be opened in that case.
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t LastOwnedComputeGroup(uint64_t tileBegin, uint32_t groupCount,
                                                                      uint32_t tilesPerGroup, uint32_t worker,

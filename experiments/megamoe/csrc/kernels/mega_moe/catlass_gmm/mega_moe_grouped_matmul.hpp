@@ -27,7 +27,8 @@ struct CatlassGroupedMatmulLayouts {
 
 // Shared AIC/AIV0 pipeline mechanics; projection semantics belong to GMM1/GMM2 below.
 namespace detail {
-template <class Config, bool BypassInputL2 = false, class RowIO = ContiguousRowIO>
+template <class Config, bool BypassInputL2 = false, class RowIO = ContiguousRowIO, uint32_t TileM = 256U,
+          uint32_t TileN = 256U, uint32_t TileK = 256U, uint32_t L0K = 128U>
 class A8W4MatmulPipeline {
     using C = typename Config::KernelConfig;
     using A = typename C::ElementAType;
@@ -42,8 +43,8 @@ class A8W4MatmulPipeline {
     using LayoutScaleA = CatlassGroupedMatmulLayouts::LayoutScaleA;
     using LayoutScaleB = CatlassGroupedMatmulLayouts::LayoutScaleB;
     using LayoutDequantizedB = CatlassGroupedMatmulLayouts::LayoutDequantizedB;
-    using L1 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<256>>;
-    using L0 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<128>>;
+    using L1 = tla::Shape<tla::Int<TileM>, tla::Int<TileN>, tla::Int<TileK>>;
+    using L0 = tla::Shape<tla::Int<TileM>, tla::Int<TileN>, tla::Int<L0K>>;
     using ScaleALayout = decltype(tla::MakeMxScaleLayout<SA, LayoutScaleA, false>(uint32_t{}, uint32_t{}));
     using ScaleBLayout = decltype(tla::MakeMxScaleLayout<SB, LayoutScaleB, true>(uint32_t{}, uint32_t{}));
     using TileCopy =
@@ -267,9 +268,10 @@ public:
 };
 
 // GMM2 owns the down projection and always writes row-major output.
-template <class Config, bool BypassInputL2 = false, class RowIO = ContiguousRowIO>
-class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO> {
-    using Pipeline = detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO>;
+template <class Config, bool BypassInputL2 = false, class RowIO = ContiguousRowIO, uint32_t TileM = 256U,
+          uint32_t TileN = 256U, uint32_t TileK = 256U, uint32_t L0K = 128U>
+class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO, TileM, TileN, TileK, L0K> {
+    using Pipeline = detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO, TileM, TileN, TileK, L0K>;
 
 public:
     __aicore__ inline CatlassGmm2() = default;

@@ -172,7 +172,8 @@ def check_plans(ids, cv_rows, routes, plans):
         assert self_send == routes[rank].peer_offsets[rank]
         assert self_recv == receive_base[rank, rank] and self_rows == counts[rank, rank]
         assert groups == len(plan["F"]) and sends == len(plan["T"]) and receives == len(plan["R"])
-        assert g1 == groups * 5 and g2 == groups * 14
+        g2_prefixes = np.cumsum([0] + [((f[3] + 127) // 128) * 7 for f in plan["F"]])
+        assert g1 == groups * 5 and g2 == g2_prefixes[-1]
         assert len(plan["B"]) == 24
         assert len(plan["A"]) == 48
         assert [expert for stage, expert in plan["A"] if stage == 1] == list(range(24))
@@ -209,7 +210,7 @@ def check_plans(ids, cv_rows, routes, plans):
                 assert e == expert and 0 < group_rows <= 256
                 assert group_rows == min(256, len(expert_rows) - cursor)
                 assert row_begin == len(expected_compact_rows) + cursor
-                assert g1_begin == group_index * 5 and g2_begin == group_index * 14
+                assert g1_begin == group_index * 5 and g2_begin == g2_prefixes[group_index]
                 compact[row_begin : row_begin + group_rows] += 1
                 mapping = []
                 for segment_index in range(begin, begin + segment_count):

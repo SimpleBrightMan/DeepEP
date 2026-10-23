@@ -51,7 +51,7 @@ __aicore__ inline uint32_t FragmentGmm1Tiles(const Arguments& args, const Fragme
 
 __aicore__ inline uint32_t FragmentGmm2Tiles(const Arguments& args, const Fragment& fragment)
 {
-    return ComputeTileCount(fragment.rows, args.config.hidden);
+    return Gmm2TileCount(fragment.rows, args.config.hidden);
 }
 
 __aicore__ inline MegaMoeImpl::GMMAddrInfo Gmm1Addresses(const Arguments& args, const Fragment& fragment)
@@ -171,7 +171,8 @@ __aicore__ inline void CompleteComputeContext()
 }
 
 using UrmaGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig, false, UrmaInputRows>;
-using UrmaGmm2 = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows>;
+using UrmaGmm2 = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows, kGmm2TileM, kGmm2TileN,
+                                                     kGmm2TileK, kGmm2L0K>;
 
 __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
                                        uint32_t firstTile, UrmaGmm1& gmm1, bool endContext, Timer& timer)
@@ -244,6 +245,9 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
     const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
     const auto shape = FragmentShape(args, fragment);
     auto config2 = UrmaGmmConfig::BuildGmm2ProblemConfig(shape, job, kComputeTileM);
+    config2.tileM = config2.blockMmadTiling.tileM = kGmm2TileM;
+    config2.tileN = config2.blockMmadTiling.tileN = kGmm2TileN;
+    config2.blockMmadTiling.l1Params = {kGmm2TileK, kGmm2TileK * 16U};
     MegaMoeImpl::GmmKernel::BlockScheduler schedule2(
         {config2.m, config2.schedulerN, config2.k},
         MegaMoeImpl::GmmKernel::BlockScheduler::Params{
@@ -287,14 +291,13 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
         CompleteComputeContext();
         timer.TraceEnd(TraceEvent::Gmm2Drain, drainStart, fragmentMeta);
         if constexpr (g_coreType == AIC) {
-            // Every group (including a short M tail) has the same N tile
-            // count. Recover each group's contribution without rereading GM
-            // descriptors. Publish only after ALL this core's stores drain.
-            const uint64_t batchTileBegin =
-                fragment.gmm2TileBegin - static_cast<uint64_t>(fragmentIndex - batchBegin) * count2;
-            const uint64_t tileLimit = static_cast<uint64_t>(fragmentIndex - batchBegin + 1U) * count2;
+            // Recover actual prefix/counts: a short final group can have 7
+            // tiles instead of 14. No completion may be published early.
+            const uint64_t batchTileBegin = LoadFragment(args, batchBegin).gmm2TileBegin;
+            const uint64_t tileLimit = fragment.gmm2TileBegin - batchTileBegin + count2;
+            const uint32_t fullWidth = Gmm2TileCount(kComputeTileM, args.config.hidden);
             for (uint64_t tile = FirstOwnedComputeTile(batchTileBegin, block, kAic); tile < tileLimit;) {
-                const auto owned = OwnedComputeGroupAt(tile, count2, kAic);
+                const auto owned = OwnedComputeGroupBefore(tile, fullWidth, kAic, tileLimit);
                 AtomicAdd(ComputeFlag(args.gmm2Done, batchBegin + owned.group), static_cast<int32_t>(owned.tileCount));
                 tile += static_cast<uint64_t>(owned.tileCount) * kAic;
             }
@@ -332,13 +335,18 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
         const auto first = LoadFragment(args, range.begin);
         const bool isGmm1 = task.stage == ComputeBatchStage::Gmm1;
         const uint64_t tileBegin = isGmm1 ? first.gmm1TileBegin : first.gmm2TileBegin;
-        const uint32_t tilesPerGroup = isGmm1 ? FragmentGmm1Tiles(args, first) : FragmentGmm2Tiles(args, first);
-        const uint64_t tileLimit = static_cast<uint64_t>(range.end - range.begin) * tilesPerGroup;
+        const uint32_t tilesPerGroup = isGmm1 ? ComputeTileCount(kComputeTileM, args.config.intermediate)
+                                              : Gmm2TileCount(kComputeTileM, args.config.hidden);
+        uint64_t tileLimit = static_cast<uint64_t>(range.end - range.begin) * tilesPerGroup;
+        if (!isGmm1) {
+            const auto last = LoadFragment(args, range.end - 1U);
+            tileLimit = last.gmm2TileBegin + FragmentGmm2Tiles(args, last) - tileBegin;
+        }
         // Jump directly between this core's groups before loading their GM
         // descriptors or building matmul configs. AIC/AIV0 keep identical
         // tile order and close the context on their last owned group.
         for (uint64_t tile = FirstOwnedComputeTile(tileBegin, block, kAic); tile < tileLimit;) {
-            const auto owned = OwnedComputeGroupAt(tile, tilesPerGroup, kAic);
+            const auto owned = OwnedComputeGroupBefore(tile, tilesPerGroup, kAic, tileLimit);
             const uint64_t nextTile = tile + static_cast<uint64_t>(owned.tileCount) * kAic;
             const uint32_t fragmentIndex = range.begin + owned.group;
             const bool endContext = nextTile >= tileLimit;

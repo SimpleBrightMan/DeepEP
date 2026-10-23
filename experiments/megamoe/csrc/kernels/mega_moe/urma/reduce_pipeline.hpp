@@ -73,7 +73,6 @@ __aicore__ inline bool TryReduceToken(const Arguments& args, AscendC::LocalTenso
                                       AscendC::LocalTensor<uint32_t>& selfCache, uint32_t firstRoute)
 {
     using namespace AscendC;
-    constexpr uint32_t expectedSelfTiles = (ReduceUbContract::hidden + kComputeTileN - 1U) / kComputeTileN;
     for (uint32_t slot = 0U; slot < ReduceUbContract::topk; ++slot) {
         const uint64_t dependency = dependencies.GetValue(firstRoute + slot);
         const bool self = (dependency & kReduceSelfDependency) != 0U;
@@ -83,7 +82,8 @@ __aicore__ inline bool TryReduceToken(const Arguments& args, AscendC::LocalTenso
         bool ready;
         if (self) {
             auto* flag = reinterpret_cast<__gm__ int32_t*>(args.gmm2Done + static_cast<uint64_t>(index) * kFlagBytes);
-            ready = ReadGmByPassDCache(flag) >= static_cast<int32_t>(expectedSelfTiles);
+            const uint32_t rows = reinterpret_cast<const __gm__ Fragment*>(args.fragments)[index].rows;
+            ready = ReadGmByPassDCache(flag) >= static_cast<int32_t>(Gmm2TileCount(rows, ReduceUbContract::hidden));
         } else {
             auto* flag = reinterpret_cast<__gm__ uint64_t*>(args.symmetric + args.config.combineReadyOffset +
                                                             static_cast<uint64_t>(index) * kFlagBytes);

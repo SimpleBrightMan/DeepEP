@@ -179,9 +179,9 @@ int main() {
     std::vector<uint32_t> g1Owners(prefix1), g2Owners(prefix2), actOwners(prefix1);
     for (uint32_t f = 0; f < fragments.size(); ++f) {
         auto &d = fragments[f];
-        auto n1 = ComputeTileCount(d.rows, 1280), n2 = ComputeTileCount(d.rows, 3584);
+        auto n1 = ComputeTileCount(d.rows, 1280), n2 = Gmm2TileCount(d.rows, 3584);
         assert(n1 == ((d.rows + 255) / 256) * 5);
-        assert(n2 == ((d.rows + 255) / 256) * 14);
+        assert(n2 == ((d.rows + 127) / 128) * 7);
         std::vector<uint32_t> outputVisits(d.rows * 5), scaleVisits(d.rows * 40);
         uint32_t originalTileContributions = 0;
         for (uint32_t m = 0; m < d.rows; m += kComputeTileM) {
@@ -290,7 +290,7 @@ int main() {
             assert(fragment.expert == task.batchIndex);
             const bool first = task.stage == Stage::Gmm1;
             const auto prefix = first ? fragment.gmm1TileBegin : fragment.gmm2TileBegin;
-            const auto count = ComputeTileCount(fragment.rows, first ? 1280 : 3584);
+            const auto count = first ? ComputeTileCount(fragment.rows, 1280) : Gmm2TileCount(fragment.rows, 3584);
             for (uint32_t core = 0; core < 28; ++core)
                 for (uint32_t tile = FirstOwnedComputeTile(prefix, core, 28); tile < count; tile += 28) {
                     const auto id = prefix + tile;
@@ -304,19 +304,22 @@ int main() {
         const bool firstStage = task.stage == Stage::Gmm1;
         const auto& firstFragment = fragments[range.begin];
         const uint64_t prefix = firstStage ? firstFragment.gmm1TileBegin : firstFragment.gmm2TileBegin;
-        const auto width = ComputeTileCount(firstFragment.rows, firstStage ? 1280 : 3584);
-        const uint64_t limit = uint64_t(batch.fragmentCount) * width;
+        const auto width = firstStage ? ComputeTileCount(256, 1280) : Gmm2TileCount(256, 3584);
+        const auto& lastFragment = fragments[range.end - 1];
+        const uint64_t limit = firstStage ? uint64_t(batch.fragmentCount) * width :
+            lastFragment.gmm2TileBegin + Gmm2TileCount(lastFragment.rows, 3584) - prefix;
         for (uint32_t core = 0; core < 28; ++core) {
             size_t cursor = 0;
             for (uint64_t tile = FirstOwnedComputeTile(prefix, core, 28); tile < limit;) {
-                const auto owned = OwnedComputeGroupAt(tile, width, 28);
+                const auto owned = OwnedComputeGroupBefore(tile, width, 28, limit);
                 const auto f = range.begin + owned.group;
                 const auto& fragment = fragments[f];
-                assert(ComputeTileCount(fragment.rows, firstStage ? 1280 : 3584) == width);
+                const auto count = firstStage ? ComputeTileCount(fragment.rows, 1280) : Gmm2TileCount(fragment.rows, 3584);
+                assert(count <= width);
                 const uint64_t fragmentPrefix = firstStage ? fragment.gmm1TileBegin : fragment.gmm2TileBegin;
                 assert(fragmentPrefix == prefix + uint64_t(owned.group) * width);
                 uint32_t completed = 0;
-                for (uint32_t local = owned.firstTile; local < width; local += 28) {
+                for (uint32_t local = owned.firstTile; local < count; local += 28) {
                     const auto expected = reference[core].at(cursor++);
                     assert(expected.fragment == f && expected.tile == fragmentPrefix + local);
                     tasks[core].push_back(expected);  // Dependency simulation uses the new traversal.
@@ -324,8 +327,7 @@ int main() {
                 }
                 assert(completed == owned.tileCount);  // Same gmm2Done AtomicAdd contribution.
                 const uint64_t next = tile + uint64_t(owned.tileCount) * 28;
-                assert((next >= limit) ==
-                       (owned.group == LastOwnedComputeGroup(prefix, batch.fragmentCount, width, core, 28)));
+                assert((next >= limit) == (cursor == reference[core].size()));
                 tile = next;
             }
             assert(cursor == reference[core].size());
@@ -359,7 +361,7 @@ int main() {
         uint32_t activationStart[13]{};
         activationStart[0] = 95;  // Stress an independently delayed activation worker.
         const uint32_t dispatchCompleteAt = 140;
-        std::vector<uint32_t> outputWrites(plan.config.receiveRows * 14), nextPeerChunk(16), sent(chunkCount);
+        std::vector<uint32_t> outputWrites(plan.config.receiveRows * 7), nextPeerChunk(16), sent(chunkCount);
         uint32_t remainingChunks = 0;
         for (uint32_t index = 0; index < chunkCount; ++index) {
             if (chunks[index].peer == config.rank) sent[index] = 1;
@@ -404,14 +406,19 @@ int main() {
                 else if (t.kind == 1) ++actDone[t.fragment];
                 else {
                     const auto& group = fragments[t.fragment];
-                    const uint32_t n = t.tile - group.gmm2TileBegin;
-                    assert(n < 14);
+                    // Coverage oracle uses row-major enumeration of the same
+                    // tile set; hardware swizzle order does not affect this
+                    // whole-group completion dependency.
+                    const uint32_t local = t.tile - group.gmm2TileBegin;
+                    const uint32_t m = (local / 7) * 128, n = local % 7;
+                    assert(local < Gmm2TileCount(group.rows, 3584));
                     // This models the actual completion boundary: scatter
                     // every span of this N tile before incrementing gmm2Done.
                     for (uint32_t j = 0; j < group.segmentCount; ++j) {
                         const auto& segment = plan.segments[group.segmentBegin + j];
                         for (uint32_t row = 0; row < segment.rows; ++row)
-                            assert(++outputWrites[(segment.receiveRow + row) * 14 + n] == 1);
+                            if (segment.tileRow + row >= m && segment.tileRow + row < m + 128)
+                                assert(++outputWrites[(segment.receiveRow + row) * 7 + n] == 1);
                     }
                     ++g2Done[t.fragment];
                 }
@@ -426,12 +433,12 @@ int main() {
                 bool ready = true;
                 for (uint32_t j = 0; j < chunk.fragmentCount; ++j) {
                     const auto group = plan.chunkGroupIndices[chunk.fragmentBegin + j];
-                    if (g2Done[group] != ComputeTileCount(fragments[group].rows, 3584)) ready = false;
+                    if (g2Done[group] != Gmm2TileCount(fragments[group].rows, 3584)) ready = false;
                 }
                 if (!ready || tick < dispatchCompleteAt) continue;
                 for (uint32_t row = 0; row < chunk.rows; ++row)
-                    for (uint32_t n = 0; n < 14; ++n)
-                        assert(outputWrites[(chunk.localRow + row) * 14 + n] == 1);
+                    for (uint32_t n = 0; n < 7; ++n)
+                        assert(outputWrites[(chunk.localRow + row) * 7 + n] == 1);
                 assert(++sent[index] == 1);
                 ++nextPeerChunk[peer]; --remainingChunks; ++progress;
             }
@@ -444,7 +451,7 @@ int main() {
         for (uint32_t f = 0; f < fragments.size(); ++f) {
             assert(scaleDone[f] == 1);
             assert(actDone[f] == ComputeTileCount(fragments[f].rows, 1280));
-            assert(g2Done[f] == ComputeTileCount(fragments[f].rows, 3584));
+            assert(g2Done[f] == Gmm2TileCount(fragments[f].rows, 3584));
         }
         assert(std::all_of(sent.begin(), sent.end(), [](auto n) { return n == 1; }));
         assert(std::all_of(outputWrites.begin(), outputWrites.end(), [](auto n) { return n == 1; }));

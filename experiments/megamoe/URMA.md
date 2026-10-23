@@ -1,5 +1,15 @@
 # MegaMoE URMA 固定 CV 实验
 
+## GMM2 M128×N512 实验分支
+
+`megamoe-urma-gmm2-m128n512` 基于 `megamoe-urma-combineAdvance-v2` 的 `0c9218d4114a05547f0d7f9bdf4f7e0961b70d61`。仅 GMM2 的计算 tile 从 M256×N256 改为 M128×N512，GMM1、专家 M256 分组、SwiGLU 和通信 CV 保持原设置。
+
+- 为适配现有缓冲区，GMM2 的 L1 tile 为 M128×N512×K128，L0 tile 为 M128×N512×K64。L1 B 单槽仍为 64 KiB，L0B 双槽合计 64 KiB，L0C 单槽仍为 256 KiB，W4 反量化 UB 仍为 192 KiB。K1280 因此有更多 K 分块，是否提升 MFU 需要实测。
+- H3584 时，完整 M256 组仍包含 14 个 GMM2 tile（2×7）；1～128 行的专家尾组只包含 7 个。Host 任务前缀、AIC/AIV0 分工、完成计数和 Combine/本卡 Reduce 就绪门槛同步使用实际 tile 数。分段 Scatter 仍写回原通信行序，不改变通信数据量或提前 Combine 的调度。
+- 该次提交按要求未编译、未运行测试。两端须重新构建并安装本分支完整 wheel，不要混用旧 Host planner 与新 kernel。
+
+## 继承的 URMA 调度
+
 本实验是完整的 Prefill 算子：真实路由准备、本地展开、Dispatch、GMM1、SwiGLU/MXFP8 量化、GMM2、Combine PUT 和加权 Reduce。没有屏蔽计算，也没有使用预置 balanced 专用路由。
 
 本分支为 `megamoe-urma-combineAdvance-v2`，重新基于 `megamoe-urma-tailCover` 的 `60642fb`，没有合入前版 `combineAdvance` 的激活核辅助通信方案。保留原15个通信核、13个激活核和41核Reduce，在Dispatch末尾通过独立QP提前提交Combine；Dispatch后每轮从头到尾扫描本peer的通信CV，跳过未就绪项、批量提交并quiet，最后一个剩余CV单独提交。各分支须重新编译安装完整wheel，不能混用rank或Python/native版本。

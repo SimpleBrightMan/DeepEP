@@ -12,7 +12,8 @@ struct A8W4KPlan {
 };
 __aicore__ constexpr inline A8W4KPlan MakeA8W4KPlan(uint32_t m, uint32_t n, bool allowDynamicB)
 {
-    const uint32_t kb = allowDynamicB && m <= 256U && n <= 128U ? 512U : 256U;
+    // Keep dequantized B <=64KiB and each packed UB half <=16KiB.
+    const uint32_t kb = n > 256U ? 128U : (allowDynamicB && m <= 256U && n <= 128U ? 512U : 256U);
     const uint32_t alignedM = (m + 15U) / 16U * 16U;
     if (alignedM == 0U || m >= n) {
         return {kb, kb};
