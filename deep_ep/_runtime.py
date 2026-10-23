@@ -140,8 +140,8 @@ class Runtime:
         factory = native.Runtime
         if self._megamoe:
             integer("world_size", size, 2, 128)
-            if self._megamoe_urma and size != 16:
-                raise ValueError("MegaMoE URMA currently requires EP16")
+            if self._megamoe_urma and size not in (4, 8, 16):
+                raise ValueError("MegaMoE URMA requires EP4/EP8/EP16")
             factory_name = "create_megamoe_urma_runtime" if self._megamoe_urma else "create_megamoe_runtime"
             factory = getattr(native, factory_name, None)
             if factory is None:
@@ -222,7 +222,7 @@ class Runtime:
                     hosts = {value[4] for value in values}
                     if self._megamoe_urma and len(hosts) != 1 and not self._megamoe_urma_multi_host:
                         raise ValueError(
-                            "MegaMoE URMA requires all 16 ranks on one Linux host by default; "
+                            "MegaMoE URMA requires all ranks on one Linux host by default; "
                             "set allow_multi_host=True explicitly on every rank for multi-host validation"
                         )
                     for host in hosts:

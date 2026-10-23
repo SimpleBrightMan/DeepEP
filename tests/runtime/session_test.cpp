@@ -127,9 +127,18 @@ int aclrtFreePhysical(aclrtDrvMemHandle handle)
     physical_calls.push_back("free-physical");
     return fault == "free-physical" ? -1 : 0;
 }
+void check_runtime_config(const aclshmemx_init_attr_t* attr)
+{
+    const bool udma = (attr->option_attr.data_op_engine_type & ACLSHMEM_DATA_OP_UDMA) != 0;
+    const auto expected = udma ? (expected_shared_jetty ? ACLSHMEM_CONFIG_ENABLED : ACLSHMEM_CONFIG_DISABLED)
+                               : ACLSHMEM_CONFIG_DEFAULT;
+    assert(attr->runtime_config.udma_shared_jetty == expected && initialized == 0);
+    for (auto value : attr->runtime_config.reserved) assert(value == 0);
+}
 int aclshmemx_init_attr_with_buffers(int mode, aclshmemx_init_attr_t* attr, const aclshmemx_buffer_desc_t* descriptors,
                                      size_t count)
 {
+    check_runtime_config(attr);
     assert(mode == ACLSHMEMX_INIT_WITH_DEFAULT || mode == ACLSHMEMX_INIT_WITH_MPI);
     assert(attr->n_pes == expected_world && attr->local_mem_size == 0 && count == 1);
     assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA));
@@ -157,6 +166,8 @@ int aclshmemx_init_status()
 }
 int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
 {
+    check_runtime_config(attr);
+    if (fault == "jetty") return -1;
     assert(attr->n_pes == expected_world && attr->local_mem_size == expected_bytes);
     assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | (qp_count ? ACLSHMEM_DATA_OP_UDMA : 0)));
     if (init_status == 0) {
@@ -170,11 +181,6 @@ int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
         if (fault == "topology-state") ++host_state.npes;
     }
     return init_status;
-}
-int aclshmemx_set_shared_jetty(data_op_engine_type_t engine, bool enabled)
-{
-    assert(engine == ACLSHMEM_DATA_OP_UDMA && enabled == expected_shared_jetty && initialized == 0);
-    return fault == "jetty" ? -1 : 0;
 }
 int aclshmemx_set_qp_num(data_op_engine_type_t engine, uint32_t count)
 {
@@ -222,7 +228,7 @@ int main(int argc, char** argv)
     if (mode.rfind("megamoe-urma-", 0) == 0) {
         fault = mode.substr(13);
         setenv("DEEPEP_SHMEM_DENSE_QPS", "0", 1);
-        expected_world = 16;
+        expected_world = fault == "ep4" ? 4 : fault == "ep8" ? 8 : 16;
         expected_qp_count = 2;
         expected_shared_jetty = false;
         if (fault == "large") expected_bytes = 4ULL << 30;
@@ -230,7 +236,7 @@ int main(int argc, char** argv)
             return deepep::Session(0, expected_world, expected_bytes, "tcp://127.0.0.1:19091", 30, true, true, false,
                                    false, false, true);
         };
-        if (fault == "normal" || fault == "large") {
+        if (fault == "normal" || fault == "large" || fault == "ep4" || fault == "ep8") {
             auto session = create_urma();
             assert(session.megamoe_urma() && session.udma() && !session.peer_table() && !session.sparse_qp_enabled());
             assert(session.workspace_address() == reinterpret_cast<uintptr_t>(&storage));
@@ -254,9 +260,10 @@ int main(int argc, char** argv)
             assert(deepep::Session::busy() && !session.closed() && memsets == 1);
             assert(barriers == 0 && finalized == 0 && frees == 0);
         } else {
-            if (fault == "world") expected_world = 8;
+            if (fault == "world") expected_world = 2;
             fails(create_urma);
-            assert(initialized == 0 && allocations == 0 && finalized == 0 && !deepep::Session::busy());
+            assert(initialized == 0 && allocations == 0 && finalized == 0);
+            assert(deepep::Session::busy() == (fault == "jetty"));
         }
         return 0;
     }
@@ -333,9 +340,10 @@ int main(int argc, char** argv)
         assert(session.capacity() == (2 << 20));
         session.close();
         assert(frees == 1 && finalized == 1 && !deepep::Session::busy());
-    } else if (mode == "udma") {
+    } else if (mode == "udma" || mode == "udma-default") {
+        if (mode == "udma-default") unsetenv("DEEPEP_SHMEM_DENSE_QPS");
         deepep::Session session(0, 2, 2 << 20, "tcp://127.0.0.1:19091", 30, true);
-        assert(session.udma() && qp_count == 32);
+        assert(session.udma() && qp_count == 32 && !session.sparse_qp_enabled());
         session.close();
         assert(!deepep::Session::busy());
     } else if (mode == "megamoe") {

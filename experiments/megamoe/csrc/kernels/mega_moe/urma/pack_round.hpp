@@ -42,7 +42,7 @@ __aicore__ inline void PackOneRound(const Arguments& args, uint32_t round, uint3
     const uint64_t end = PackPartitionBegin(rows, worker + 1U, workers);
     if (begin == end) return;
     uint64_t cursor = 0U;
-    for (uint32_t peer = 0U; peer < kWorld && cursor < end; ++peer) {
+    for (uint32_t peer = 0U; peer < args.config.world && cursor < end; ++peer) {
         const Chunk chunk = LoadPackChunk(args, round, peer);
         const uint64_t next = cursor + chunk.rows;
         if (next > begin && cursor < end) {

@@ -5,11 +5,16 @@
 #include <cstdint>
 
 namespace MegaMoeUrma {
+// Fixed descriptor/cache capacity. The active communicator is Config::world.
 constexpr uint32_t kWorld = 16;
+constexpr uint32_t kMinWorld = 4;
+constexpr uint32_t kExperts = 384;
+constexpr uint32_t kMaxLocalExperts = kExperts / kMinWorld;
 constexpr uint32_t kAic = 28;
 constexpr uint32_t kLocalWorkers = 2U * kAic;
-constexpr uint32_t kCommunicationWorkers = 15;
-constexpr uint32_t kActivationWorkers = 13;
+// EP16 bounds/defaults; active work partitions are derived from Config::world.
+constexpr uint32_t kCommunicationWorkers = kWorld - 1U;
+constexpr uint32_t kActivationWorkers = kAic - kCommunicationWorkers;
 // Host planner limit and per-peer Combine scan metadata capacity.
 constexpr uint32_t kMaxPeerChunks = 512U;
 constexpr uint64_t kFlagBytes = 128;
@@ -156,6 +161,7 @@ struct Config {
     uint32_t localExperts;
     uint32_t cvRows;
     uint32_t rank;
+    uint32_t world = kWorld;
     uint32_t maxPeerChunks;
     uint32_t fragmentCount;
     uint32_t sendChunkCount;
@@ -211,7 +217,7 @@ struct Arguments {
     uint64_t sendChunks;
     uint64_t recvChunks;
     uint64_t packRounds;
-    uint64_t packReady;         // Local int32 completed rows per peer/CV, 128B slots.
+    uint64_t packReady;  // Local int32 completed rows per peer/CV, 128B slots.
     uint64_t gmm1Done;
     uint64_t inputScaleDone;
     uint64_t activationDone;

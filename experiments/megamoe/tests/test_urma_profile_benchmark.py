@@ -151,7 +151,7 @@ def test_run_profiles_all_formal_rounds_and_only_instruments_final_call(
         urma_api_protocol=1,
         urma_compute_schedule="expert-m256-mgroup-lookahead-v1",
         urma_local_pipeline="multi-slot",
-        urma_tail_schedule="combine-ready-scan-reduce41",
+        urma_tail_schedule="combine-ready-scan-reduce-world-v1",
         urma_timer_schema=1,
     )
     monkeypatch.setattr(urma, "UrmaBuffer", Buffer)
@@ -196,7 +196,8 @@ def test_run_profiles_all_formal_rounds_and_only_instruments_final_call(
     monkeypatch.setattr(urma_timing, "UrmaLaunchGuard", Guard)
     monkeypatch.setattr(urma_timing, "measure_profiled_forward", profile)
 
-    def bandwidth(raw, rank, *, clock_mhz):
+    def bandwidth(raw, rank, *, world, clock_mhz):
+        assert world == group.size()
         calls.append(("timer-export", int(raw[0])))
         assert int(raw[0]) == 6
         return {"rank": rank}

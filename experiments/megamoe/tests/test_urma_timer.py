@@ -95,3 +95,23 @@ def test_summary_retains_self_copy_label_for_older_timer_payloads():
     assert summary["Dispatch", "INTRA"]["includes_self_copy"]
     assert not summary["Dispatch", "CROSS"]["includes_self_copy"]
     assert not summary["Combine", "INTRA"]["includes_self_copy"]
+
+
+@pytest.mark.parametrize("world", [4, 8, 16])
+def test_active_ep_transport_workers_and_empty_cross_group(world):
+    records = []
+    for rank in range(world):
+        raw = np.zeros((28, 3, 8, 16), dtype=np.int64)
+        for worker in range(world - 1):
+            raw[worker, 2, 1, :7] = [100, 300, 200, 1000, 1, 0, 1]
+            raw[worker, 2, 5, :7] = [400, 800, 400, 2000, 1, 0, 1]
+        report = communication_bandwidth(raw, rank, world=world)
+        rows = {(r["phase"], r["communication_class"]): r for r in report["classes"]}
+        assert rows["Dispatch", "INTRA"]["payload_bytes"] == 3000
+        assert rows["Dispatch", "CROSS"]["payload_bytes"] == (world - 4) * 1000
+        assert rows["Combine", "CROSS"]["payload_bytes"] == (world - 4) * 2000
+        assert not report["includes_self_copy_in_intra"]
+        records.append(report)
+    summary = summarize_bandwidth(records)
+    for row in summary:
+        assert row["nonempty_ranks"] == (0 if world == 4 and row["communication_class"] == "CROSS" else world)

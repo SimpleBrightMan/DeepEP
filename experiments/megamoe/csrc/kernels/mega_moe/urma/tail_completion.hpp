@@ -14,7 +14,7 @@ __aicore__ inline __gm__ int32_t* LocalCompletionFlag(const Arguments& args, uin
 
 __aicore__ inline uint64_t PeerPhaseSlot(const Arguments& args, uint32_t phase, uint32_t source)
 {
-    return args.config.barrierOffset + (static_cast<uint64_t>(phase) * kWorld + source) * kFlagBytes;
+    return args.config.barrierOffset + (static_cast<uint64_t>(phase) * args.config.world + source) * kFlagBytes;
 }
 
 // Called once per AIC only after its final GMM2 context drained every FIX store.
@@ -35,7 +35,10 @@ __aicore__ inline bool ObserveIncomingCompletion(const Arguments& args, uint32_t
     if (!peerCounted) {
         const uint32_t peer = PeerForOwner(args.config.rank, owner);
         auto* finished = reinterpret_cast<__gm__ uint64_t*>(args.symmetric + PeerPhaseSlot(args, 1U, peer));
-        if (ReadGmByPassDCache(finished) == args.config.epoch) {
+        // Empty peer streams can finish a later invocation before this owner
+        // observes the prior one. A later finished epoch also certifies the
+        // current return data; per-CV payload flags still require exact epochs.
+        if (ReadGmByPassDCache(finished) >= args.config.epoch) {
             AtomicAdd(LocalCompletionFlag(args, kLocalFlagIncomingDone), 1);
             peerCounted = true;
         }
@@ -53,7 +56,7 @@ __aicore__ inline bool ObserveIncomingCompletion(const Arguments& args, uint32_t
 // All outbound CVs have already completed quiet and their per-CV publication.
 // Empty edges also publish once. Publish BEFORE waiting for the corresponding
 // incoming notification, so peers cannot deadlock while waiting on each other.
-// Phase 1 has separate source-owned slots, with an exact invocation epoch.
+// Phase 1 has separate source-owned slots, with monotonically increasing epochs.
 __aicore__ inline void FinishCombinePeer(const Arguments& args, uint32_t owner, AscendC::LocalTensor<uint64_t> signal,
                                          bool& peerCounted, bool& selfCounted)
 {

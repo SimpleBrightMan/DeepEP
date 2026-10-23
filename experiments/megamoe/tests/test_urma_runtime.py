@@ -1,4 +1,4 @@
-"""The EP16 PUT profile owns independent queues without changing MTE owners."""
+"""The EP4/EP8/EP16 PUT profile owns independent queues without changing MTE owners."""
 
 from types import SimpleNamespace
 
@@ -13,7 +13,7 @@ class UrmaRuntime(_runtime.Runtime):
     _megamoe_urma = True
 
 
-@pytest.mark.parametrize("case", ["normal", "large", "world", "different-host", "mixed-profile", "missing-factory"])
+@pytest.mark.parametrize("case", ["normal", "ep4", "ep8", "large", "world", "different-host", "mixed-profile", "missing-factory"])
 def test_urma_runtime_profile(monkeypatch, case):
     monkeypatch.setattr(_runtime, "endpoint", lambda: "tcp://127.0.0.1:19091")
     monkeypatch.setattr(_runtime, "_OWNER", None)
@@ -39,7 +39,8 @@ def test_urma_runtime_profile(monkeypatch, case):
             current_device=lambda: 0, Stream=lambda **kwargs: SimpleNamespace(synchronize=lambda: None)
         ),
     )
-    group = StoreGroup(None, 0, 8 if case == "world" else 16, prefix="test")
+    world = {"ep4": 4, "ep8": 8, "world": 2}.get(case, 16)
+    group = StoreGroup(None, 0, world, prefix="test")
 
     def exchange(local, stage):
         if stage == "URMA MTE domain readiness":
@@ -59,7 +60,7 @@ def test_urma_runtime_profile(monkeypatch, case):
 
     monkeypatch.setattr(group, "all_gather", exchange)
     errors = {
-        "world": "EP16",
+        "world": "EP4/EP8/EP16",
         "different-host": "one Linux host",
         "mixed-profile": "runtime engines",
         "missing-factory": "missing create_megamoe_urma_runtime",
@@ -72,7 +73,7 @@ def test_urma_runtime_profile(monkeypatch, case):
         capacity = 4 << 30 if case == "large" else 2 << 20
         runtime = UrmaRuntime(group, capacity)
         try:
-            assert created == [(0, 16, capacity, "tcp://127.0.0.1:19091", 120)]
+            assert created == [(0, world, capacity, "tcp://127.0.0.1:19091", 120)]
         finally:
             runtime.close()
 

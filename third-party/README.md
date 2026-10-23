@@ -6,11 +6,13 @@
 
 | 目录 | 用途 | 固定提交 |
 | --- | --- | --- |
-| `shmem/` | 通信 SDK，提供 shared-jetty 支持 | `7f9d961d378225e69058080532cf4f5be16cc83d` |
+| `shmem/` | 通信 SDK，PR #944 固定版本 | `94794270a9af4414c11d0f1f5636bac9b1348dbe` |
 | `catlass/` | MegaMoE 编译时使用的模板头文件，不单独编译动态库 | `2b4bd7cbf7e67ebab23d7d5a99d472c83f90d9a1` |
 
 来源见根 [.gitmodules](../.gitmodules)，版本约束见 [dependencies.lock.json](../dependencies.lock.json)。
-SHMEM 固定到 `cann/shmem` 的 dev 提交；升级后需重编 SDK 和 wheel，准备步骤见[构建指南](../docs/build.md)。
+SHMEM 固定到 [cann/shmem PR #944](https://gitcode.com/cann/shmem/pull/944) 的上述提交（2026-10-23 核对），不自动追踪 PR 后续修改。升级后需重编 SDK 和 wheel，准备步骤见[构建指南](../docs/build.md)。
+该版本使用 `attr.runtime_config.udma_shared_jetty` 替代旧 setter，并移除稀疏 peer-QP mask 接口。MegaMoE URMA 显式关闭 shared jetty，保留每 peer 两条独立 QP；普通 Elastic UDMA 显式开启 shared jetty，默认创建全部 peer/QP 通道。普通 Elastic 若显式设置 `DEEPEP_SHMEM_DENSE_QPS=0`，会在初始化前报告接口不支持；应取消该变量或设置为 `1`。
+PR #944 本身增加 HNS1825 RDMA 的编译期 doorbell 选择；本分支 MegaMoE 的通信引擎仍为 MTE+UDMA，不切换为 RDMA。
 两个子仓库的许可证均为 CANN Open Software License Agreement Version 2.0，原文保留在各自的 `LICENSE` 中。
 MegaMoE 源文件中的 CANN 版权和许可声明保留，许可全文归档于 [cann.LICENSE](cann.LICENSE)，并随启用 MegaMoE 的 wheel 分发。
 第三方许可适用于对应来源内容，不替代项目自身的发行许可；引入依赖时遵循[贡献指南](../CONTRIBUTING.md#许可证)。

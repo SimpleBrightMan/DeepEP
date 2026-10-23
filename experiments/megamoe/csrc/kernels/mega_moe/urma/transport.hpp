@@ -9,8 +9,8 @@
 
 namespace MegaMoeUrma {
 
+// Defaults/capacity only. Kernel calls pass the active Config::world.
 constexpr uint32_t kWorldSize = 16U;
-constexpr uint32_t kRemoteOwners = kWorldSize - 1U;
 constexpr uint32_t kSignalSlotBytes = 128U;
 constexpr uint32_t kSignalCopyBytes = 32U;
 constexpr uint32_t kMaxPutBytes = 256U * 1024U * 1024U;
@@ -100,13 +100,13 @@ __aicore__ inline void WaitStartAtLeast(__gm__ uint8_t* localSlot, uint64_t sequ
 // peer handshake whose publication follows completion of every local reducer.
 __aicore__ inline void RankBarrier(__gm__ uint8_t* symmetricBase, uint64_t barrierOffset, uint32_t rank,
                                    uint64_t sequence, AscendC::LocalTensor<uint64_t> signalUb,
-                                   AscendC::TEventID eventId)
+                                   AscendC::TEventID eventId, uint32_t world = kWorldSize)
 {
-    for (uint32_t peer = 0; peer < kWorldSize; ++peer) {
+    for (uint32_t peer = 0; peer < world; ++peer) {
         PublishDone(symmetricBase, barrierOffset + static_cast<uint64_t>(rank) * kSignalSlotBytes, peer, sequence,
                     signalUb, eventId);
     }
-    for (uint32_t peer = 0; peer < kWorldSize; ++peer) {
+    for (uint32_t peer = 0; peer < world; ++peer) {
         auto* localSlot = reinterpret_cast<__gm__ uint64_t*>(symmetricBase + barrierOffset +
                                                              static_cast<uint64_t>(peer) * kSignalSlotBytes);
         while (AscendC::ReadGmByPassDCache(localSlot) < sequence) {

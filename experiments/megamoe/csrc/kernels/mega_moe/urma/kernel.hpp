@@ -234,7 +234,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         WaitComputeFlag(args.localFlags, kLocalFlagPackDone, kAic);
         AtomicAdd(ComputeFlag(args.localFlags, kLocalFlagDispatchDone), 1);
     }
-    WaitComputeFlag(args.localFlags, kLocalFlagDispatchDone, kWorld);
+    WaitComputeFlag(args.localFlags, kLocalFlagDispatchDone, args.config.world);
     timer.TraceEnd(TraceEvent::WaitLocalDispatch, start, peerMeta);
 
     bool peerCounted = false;
@@ -331,11 +331,12 @@ __aicore__ inline void Process(const Arguments& args)
     Timer timer;
     timer.Init(args.timer, args.trace, args.traceCapacity);
     const uint32_t block = GetBlockIdx() / GetTaskRation();
+    const uint32_t communicationWorkers = CommunicationWorkers(args.config.world);
     const int64_t originalOverflow = GetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL, MegaMoeImpl::OVERFLOW_MODE_CTRL>();
     SetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL, MegaMoeImpl::OVERFLOW_MODE_CTRL>(0);
 
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() == 1U && block < kCommunicationWorkers) {
+        if (GetSubBlockIdx() == 1U && block < communicationWorkers) {
             PublishPeerStart(args, block, timer);
         }
         const uint32_t worker = LocalWorkerIndex(block, GetSubBlockIdx());
@@ -350,20 +351,20 @@ __aicore__ inline void Process(const Arguments& args)
         MarkCubeComplete(args);
     } else if (GetSubBlockIdx() == 0U) {
         RunCubeAndPrologue(args, block, timer);
-    } else if (block < kCommunicationWorkers) {
+    } else if (block < communicationWorkers) {
         CommunicatePeer(args, block, timer);
     } else {
-        RunActivation(args, block - kCommunicationWorkers, timer);
+        RunActivation(args, block - communicationWorkers, timer);
     }
     if constexpr (g_coreType == AIV) {
         // Only this engine releases its phase-private UB/events. Other
         // compute and communication engines may still be producing rows.
         PipeBarrier<PIPE_ALL>();
-        const uint32_t worker = ReduceWorkerIndex(block, GetSubBlockIdx());
-        if (worker < kReduceWorkers) {
+        const uint32_t worker = ReduceWorkerIndex(block, GetSubBlockIdx(), args.config.world);
+        if (worker < ReduceWorkers(args.config.world)) {
             timer.Begin(Phase::ReducePhase);
             Reduce(args, worker, timer);
-            const uint64_t owned = ReduceOwnedRows(args.config.bs, worker);
+            const uint64_t owned = ReduceOwnedRows(args.config.bs, worker, args.config.world);
             timer.End(Phase::ReducePhase, owned * args.config.hidden * sizeof(bfloat16_t));
             PipeBarrier<PIPE_ALL>();
         }

@@ -10,18 +10,22 @@
 #include <vector>
 
 namespace MegaMoeUrma {
-inline std::vector<PackRound> BuildPackRounds(const std::vector<Chunk>& sendChunks, uint32_t maxPeerChunks)
+inline std::vector<PackRound> BuildPackRounds(const std::vector<Chunk>& sendChunks, uint32_t maxPeerChunks,
+                                              uint32_t world = kWorld)
 {
+    if (world != 4U && world != 8U && world != 16U) {
+        throw std::invalid_argument("URMA Pack requires EP4/EP8/EP16");
+    }
     uint32_t count = 0U;
     for (const auto& chunk : sendChunks) {
-        if (chunk.peer >= kWorld || chunk.cv >= maxPeerChunks || chunk.rows == 0U) {
+        if (chunk.peer >= world || chunk.cv >= maxPeerChunks || chunk.rows == 0U) {
             throw std::invalid_argument("Invalid URMA Pack chunk");
         }
         count = std::max(count, chunk.cv + 1U);
     }
     std::vector<PackRound> rounds(count);
     for (uint32_t round = 0U; round < count; ++round) {
-        for (uint32_t peer = 0U; peer < kWorld; ++peer) {
+        for (uint32_t peer = 0U; peer < world; ++peer) {
             rounds[round].chunks[peer].peer = peer;
             rounds[round].chunks[peer].cv = round;
         }

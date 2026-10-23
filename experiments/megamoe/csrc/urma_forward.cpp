@@ -25,13 +25,15 @@ uint64_t Align(uint64_t value, uint64_t alignment = kAlignment)
 
 Config Layout(int64_t world, int64_t max_tokens, int64_t topk, int64_t hidden, int64_t max_recv_rows, int64_t cv_rows)
 {
-    TORCH_CHECK(world == 16 && max_tokens > 0 && max_tokens <= 8192 && topk == 8 && hidden == 3584,
-                "MegaMoE URMA v1 requires EP16, H3584, K8 and max_tokens in [1,8192]");
+    TORCH_CHECK((world == 4 || world == 8 || world == 16) && max_tokens > 0 && max_tokens <= 8192 && topk == 8 &&
+                    hidden == 3584,
+                "MegaMoE URMA v1 requires EP4/EP8/EP16, H3584, K8 and max_tokens in [1,8192]");
     TORCH_CHECK(cv_rows >= 128 && cv_rows <= 4096 && cv_rows % 128 == 0,
                 "URMA CV rows must be a multiple of 128 in [128,4096]");
     TORCH_CHECK(max_recv_rows > 0 && max_recv_rows <= world * max_tokens * topk,
                 "max_recv_rows must be positive and no larger than global expanded rows");
     Config config{};
+    config.world = static_cast<uint32_t>(world);
     config.hidden = hidden;
     config.topk = topk;
     config.cvRows = cv_rows;
@@ -40,10 +42,11 @@ Config Layout(int64_t world, int64_t max_tokens, int64_t topk, int64_t hidden, i
     config.receiveScaleOffset = Align(static_cast<uint64_t>(max_recv_rows) * hidden);
     config.returnYOffset = Align(config.receiveScaleOffset + static_cast<uint64_t>(max_recv_rows) * (hidden / 32));
     config.dispatchReadyOffset = Align(config.returnYOffset + static_cast<uint64_t>(max_tokens) * topk * hidden * 2);
-    config.combineReadyOffset =
-        Align(config.dispatchReadyOffset + 16ULL * config.maxPeerChunks * MegaMoeUrma::kFlagBytes);
-    config.barrierOffset = Align(config.combineReadyOffset + 16ULL * config.maxPeerChunks * MegaMoeUrma::kFlagBytes);
-    config.symmetricBytes = Align(config.barrierOffset + 4ULL * 16 * MegaMoeUrma::kFlagBytes, 2ULL << 20);
+    config.combineReadyOffset = Align(config.dispatchReadyOffset +
+                                      static_cast<uint64_t>(world) * config.maxPeerChunks * MegaMoeUrma::kFlagBytes);
+    config.barrierOffset = Align(config.combineReadyOffset +
+                                 static_cast<uint64_t>(world) * config.maxPeerChunks * MegaMoeUrma::kFlagBytes);
+    config.symmetricBytes = Align(config.barrierOffset + 4ULL * world * MegaMoeUrma::kFlagBytes, 2ULL << 20);
     return config;
 }
 
@@ -81,17 +84,18 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     TORCH_CHECK(example.device().type() == c10::DeviceType::PrivateUse1 && example.dim() == 2 &&
                     example.is_contiguous() && example.size(0) > 0 && example.size(0) <= max_tokens,
                 "URMA example must be contiguous NPU [BS,H], with 0<BS<=max_tokens");
-    TORCH_CHECK(intermediate == 1280 && rank >= 0 && rank < 16, "URMA v1 requires I1280 and rank in [0,16)");
     TORCH_CHECK(gmm1_ahead_mgroups >= 0 && gmm1_ahead_mgroups <= 65536,
                 "gmm1_ahead_mgroups must be in [0,65536]; 0 retains the original expert schedule");
     TORCH_CHECK(counts_cpu.device().is_cpu() && counts_cpu.scalar_type() == torch::kInt64 &&
-                    counts_cpu.is_contiguous() && counts_cpu.sizes() == torch::IntArrayRef({16, 384}),
-                "URMA counts must be contiguous CPU int64 [16,384]");
-    args_.config = Layout(16, max_tokens, topk, example.size(1), max_recv_rows, cv_rows);
+                    counts_cpu.is_contiguous() && counts_cpu.dim() == 2 && counts_cpu.size(1) == 384,
+                "URMA counts must be contiguous CPU int64 [EP,384]");
+    const int64_t world = counts_cpu.size(0);
+    TORCH_CHECK(intermediate == 1280 && rank >= 0 && rank < world, "URMA requires I1280 and rank in [0,EP)");
+    args_.config = Layout(world, max_tokens, topk, example.size(1), max_recv_rows, cv_rows);
     auto& config = args_.config;
     config.bs = example.size(0);
     config.intermediate = intermediate;
-    config.localExperts = 24;
+    config.localExperts = 384U / config.world;
     config.rank = rank;
     config.gmm1AheadMGroups = static_cast<uint32_t>(gmm1_ahead_mgroups);
     TORCH_CHECK(symmetric_address != 0 && symmetric_bytes >= static_cast<int64_t>(config.symmetricBytes),
@@ -111,15 +115,15 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     TORCH_CHECK(ub >= MegaMoeUrma::kRequiredUbBytes, "URMA v1 requires ", MegaMoeUrma::kRequiredUbBytes,
                 " bytes of UB for the W4 prologue and 128-row SwiGLU slices; detected UB=", ub, " bytes, AIC=", aic,
                 ", AIV=", aiv);
-    // Physical devices may have more cores. The kernel's 28/15/13 partitions
-    // and timer storage are fixed: never launch the extra physical blocks.
+    // Launch 28 AIC / 56 AIV on every supported EP size. AIV1 splits into
+    // world-1 communication and 28-(world-1) activation/scale workers.
     constexpr uint32_t launch_aic = MegaMoeUrma::kAic;
     constexpr uint32_t launch_aiv = 2U * launch_aic;
     platform_ = {launch_aic, launch_aiv, static_cast<uint32_t>(ub),
                  platform->CalcTschBlockDim(launch_aiv, launch_aic, launch_aiv), platform->GetLibApiWorkSpaceSize()};
 
-    TORCH_CHECK(aclshmem_my_pe() == rank && aclshmem_n_pes() == 16, "URMA plan does not match its SHMEM runtime");
-    for (int peer = 0; peer < 16; ++peer) {
+    TORCH_CHECK(aclshmem_my_pe() == rank && aclshmem_n_pes() == world, "URMA plan does not match its SHMEM runtime");
+    for (int peer = 0; peer < world; ++peer) {
         TORCH_CHECK(aclshmem_ptr(reinterpret_cast<void*>(symmetric_address), peer) != nullptr,
                     "URMA completion signals require an MTE-accessible symmetric window for every peer; rank=", rank,
                     " cannot map peer=", peer,
@@ -157,7 +161,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     send_chunks_ = Upload(plan.sendChunks, options);
     recv_chunks_ = Upload(plan.recvChunks, options);
     pack_rounds_ = Upload(plan.packRounds, options);
-    pack_ready_ = allocate(static_cast<uint64_t>(MegaMoeUrma::kWorld) * config.maxPeerChunks * MegaMoeUrma::kFlagBytes);
+    pack_ready_ = allocate(static_cast<uint64_t>(config.world) * config.maxPeerChunks * MegaMoeUrma::kFlagBytes);
     gmm1_done_ = allocate(config.gmm1Tiles * MegaMoeUrma::kFlagBytes);
     input_scale_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
     activation_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
@@ -247,14 +251,15 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
         topk_weights.scalar_type() == torch::kFloat32 && topk_weights.sizes() == torch::IntArrayRef({c.bs, c.topk}),
         "weights must be FP32 [BS,K]");
     TORCH_CHECK(weight1.scalar_type() == torch::kUInt8 && weight2.scalar_type() == torch::kUInt8 &&
-                    weight1.sizes() == torch::IntArrayRef({24, c.intermediate * 2, c.hidden / 2}) &&
-                    weight2.sizes() == torch::IntArrayRef({24, c.hidden, c.intermediate / 2}),
+                    weight1.sizes() == torch::IntArrayRef({c.localExperts, c.intermediate * 2, c.hidden / 2}) &&
+                    weight2.sizes() == torch::IntArrayRef({c.localExperts, c.hidden, c.intermediate / 2}),
                 "URMA v1 requires main MegaMoE packed FP4 NZ weight layouts");
-    TORCH_CHECK(weight_scales1.scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
-                    weight_scales2.scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
-                    weight_scales1.sizes() == torch::IntArrayRef({24, c.intermediate * 2, c.hidden / 64, 2}) &&
-                    weight_scales2.sizes() == torch::IntArrayRef({24, c.hidden, c.intermediate / 64, 2}),
-                "Invalid FP4 weight scales");
+    TORCH_CHECK(
+        weight_scales1.scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
+            weight_scales2.scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
+            weight_scales1.sizes() == torch::IntArrayRef({c.localExperts, c.intermediate * 2, c.hidden / 64, 2}) &&
+            weight_scales2.sizes() == torch::IntArrayRef({c.localExperts, c.hidden, c.intermediate / 64, 2}),
+        "Invalid FP4 weight scales");
     TORCH_CHECK(epoch > last_epoch_ && epoch < (1LL << 60), "URMA epoch must increase across calls");
     if (timer) {
 #ifndef DEEPEP_MEGAMOE_TIMER
@@ -355,6 +360,46 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     if (timer) c10_npu::NPUCachingAllocator::recordStream(timer->storage().data_ptr(), stream);
     if (trace) c10_npu::NPUCachingAllocator::recordStream(trace->storage().data_ptr(), stream);
     return output;
+}
+
+std::map<std::string, torch::Tensor> UrmaPlan::debug_snapshot() const
+{
+    TORCH_CHECK(last_epoch_ > 0, "URMA debug snapshot requires a completed forward");
+    int32_t device = -1;
+    ASCEND_DEEPEP_CHECK_ACL(aclrtGetDevice(&device));
+    TORCH_CHECK(device == expanded_x_.device().index(), "URMA debug snapshot requires the owning device");
+    ASCEND_DEEPEP_CHECK_ACL(aclrtSynchronizeDevice());
+    std::map<std::string, torch::Tensor> result;
+    auto copy = [&](const char* name, uint64_t address, uint64_t bytes) {
+        auto cpu = torch::empty({static_cast<int64_t>(bytes)},
+                                torch::TensorOptions().device(torch::kCPU).dtype(torch::kUInt8));
+        if (bytes != 0) {
+            ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(cpu.data_ptr(), bytes, reinterpret_cast<const void*>(address), bytes,
+                                                ACL_MEMCPY_DEVICE_TO_HOST));
+        }
+        result.emplace(name, std::move(cpu));
+    };
+    const auto& c = args_.config;
+    const uint64_t expanded = static_cast<uint64_t>(c.bs) * c.topk;
+    copy("expanded_x", Address(expanded_x_), expanded * c.hidden);
+    copy("expanded_scale", Address(expanded_scale_), expanded * (c.hidden / 32));
+    copy("received_x", args_.symmetric + c.receiveXOffset, c.receiveRows * c.hidden);
+    copy("received_scale", args_.symmetric + c.receiveScaleOffset, c.receiveRows * (c.hidden / 32));
+    copy("gathered_input_scale", Address(gathered_input_scale_), c.receiveRows * (c.hidden / 32));
+    copy("gmm1", Address(gmm1_), c.receiveRows * c.intermediate * 4);
+    copy("activation", Address(activation_), c.receiveRows * c.intermediate);
+    copy("activation_scale", Address(activation_scale_), c.receiveRows * (c.intermediate / 32));
+    copy("gmm2_remote", Address(gmm2_), c.receiveRows * c.hidden * 2);
+    copy("returned", args_.symmetric + c.returnYOffset, expanded * c.hidden * 2);
+    for (auto item :
+         {std::make_pair("fragments", &fragments_), std::make_pair("segments", &segments_),
+          std::make_pair("compute_tasks", &compute_tasks_), std::make_pair("send_chunks", &send_chunks_),
+          std::make_pair("recv_chunks", &recv_chunks_), std::make_pair("gmm1_done", &gmm1_done_),
+          std::make_pair("input_scale_done", &input_scale_done_), std::make_pair("activation_done", &activation_done_),
+          std::make_pair("gmm2_done", &gmm2_done_), std::make_pair("local_flags", &local_flags_)}) {
+        copy(item.first, Address(*item.second), item.second->nbytes());
+    }
+    return result;
 }
 
 int64_t UrmaPlan::workspace_bytes() const

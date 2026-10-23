@@ -7,7 +7,7 @@
 
 namespace MegaMoeUrma {
 
-// H3584/K8, at most BS8192 over 41 reducers. Every worker keeps all of its
+// H3584/K8, at most BS8192 over at least 41 reducers. Every worker keeps all of its
 // metadata resident so a late token cannot block another metadata batch.
 struct ReduceUbContract {
     static constexpr uint32_t hidden = 3584U;
@@ -18,9 +18,9 @@ struct ReduceUbContract {
     static constexpr uint32_t maxTokens = (8192U + kReduceWorkers - 1U) / kReduceWorkers;
     static constexpr uint32_t maxRoutes = maxTokens * topk;
     static constexpr uint32_t maxRemoteDependencies = kWorld * 512U;
-    // Arbitrary routing: at most 16*8192*8 received rows, partitioned into
-    // M256 groups for 24 experts. Sum(ceil(expertRows/256)) <= 4096+23.
-    static constexpr uint32_t maxSelfDependencies = kWorld * 8192U * topk / kComputeTileM + 24U;
+    // Conservative bound across EP4/8/16: at most 16*8192*8 received rows
+    // and at most 96 local experts, each contributing one partial M256 group.
+    static constexpr uint32_t maxSelfDependencies = kWorld * 8192U * topk / kComputeTileM + kMaxLocalExperts;
     static constexpr uint32_t bf16RowBytes = hidden * sizeof(uint16_t);
     static constexpr uint32_t fp32RowBytes = hidden * sizeof(float);
     static constexpr uint32_t inputBf16Offset = 0U;
@@ -52,7 +52,7 @@ __aicore__ inline bool AllReduceInputsReady(const Arguments& args)
 {
     auto* flag =
         reinterpret_cast<__gm__ int32_t*>(args.localFlags + static_cast<uint64_t>(kLocalFlagIncomingDone) * kFlagBytes);
-    return AscendC::ReadGmByPassDCache(flag) == static_cast<int32_t>(kWorld);
+    return AscendC::ReadGmByPassDCache(flag) == static_cast<int32_t>(args.config.world);
 }
 
 __aicore__ inline bool ReduceBitSet(AscendC::LocalTensor<uint32_t>& bits, uint32_t index)
@@ -232,10 +232,10 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
 {
     using namespace AscendC;
     using Ub = ReduceUbContract;
-    const uint32_t owned = static_cast<uint32_t>(ReduceOwnedRows(args.config.bs, worker));
+    const uint32_t owned = static_cast<uint32_t>(ReduceOwnedRows(args.config.bs, worker, args.config.world));
     if (owned == 0U) return;
     const uint64_t reduceStart = timer.TraceBegin();
-    const uint64_t firstToken = ReduceRowBegin(args.config.bs, worker);
+    const uint64_t firstToken = ReduceRowBegin(args.config.bs, worker, args.config.world);
     const uint64_t firstRoute = firstToken * Ub::topk;
     GlobalTensor<int64_t> inverse;
     GlobalTensor<float> weights;

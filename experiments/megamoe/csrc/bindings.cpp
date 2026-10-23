@@ -18,7 +18,7 @@ PYBIND11_MODULE(_C, module)
     module.attr("urma_api_protocol") = MegaMoeUrma::kProtocol;
     module.attr("urma_compute_schedule") = "expert-m256-mgroup-lookahead-v1";
     module.attr("urma_local_pipeline") = "pack6-reduce6-output2";
-    module.attr("urma_tail_schedule") = "combine-ready-scan-reduce41";
+    module.attr("urma_tail_schedule") = "combine-ready-scan-reduce-world-v1";
     module.attr("urma_timer_numel") = MegaMoeUrma::kTimerElements;
     module.attr("urma_timer_schema") = MegaMoeUrma::kProtocol;
     module.attr("urma_trace_schema") = MegaMoeUrma::kTraceSchema;
@@ -36,6 +36,7 @@ PYBIND11_MODULE(_C, module)
              py::arg("weight_scales1"), py::arg("weight_scales2"), py::arg("timer"), py::arg("out"), py::arg("epoch"),
              py::arg("trace") = py::none())
         .def_property_readonly("workspace_bytes", &deepep::megamoe::UrmaPlan::workspace_bytes)
+        .def("debug_snapshot", &deepep::megamoe::UrmaPlan::debug_snapshot)
         .def_property_readonly("gmm1_startup_mgroups", &deepep::megamoe::UrmaPlan::gmm1_startup_mgroups);
     py::class_<Plan>(module, "Plan")
         .def(py::init<torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t, int64_t, uint64_t,

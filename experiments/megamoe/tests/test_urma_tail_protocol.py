@@ -691,11 +691,14 @@ inline void* aclshmem_ptr(void* address, unsigned) { return address; }
 #include <vector>
 using namespace MegaMoeUrma;
 int main(int argc, char** argv) {
-    assert(argc == 2);
+    assert(argc == 3);
+    const uint32_t world = std::stoul(argv[2]);
+    assert(world == 4 || world == 8 || world == 16);
     if (std::string(argv[1]) == "completion") {
         using namespace AscendC;
         Arguments args{};
-        args.config.rank = 5;
+        args.config.rank = world - 1;
+        args.config.world = world;
         args.config.epoch = 7;
         args.config.barrierOffset = 128;
         std::vector<uint64_t> symmetric(16 + 4 * 16 * 16);
@@ -713,7 +716,7 @@ int main(int argc, char** argv) {
         assert(!ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
         *flag(0) = 8;
         assert(!ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
-        assert(*incoming == 0 && polls == 2 && selfPolls == 2);
+        assert(peerCounted && !selfCounted && *incoming == 1 && polls == 2 && selfPolls == 2);
         for (unsigned i = 0; i < 27; ++i) MarkCubeComplete(args);
         *flag(0) = 7;
         assert(!ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
@@ -732,19 +735,19 @@ int main(int argc, char** argv) {
         // remain in symmetric slots and must not contribute after this reset.
         args.config.epoch = 9;
         std::fill(local.begin(), local.end(), 0);
-        std::array<bool, 15> peerSeen{}, selfSeen{};
+        std::array<bool, kWorld - 1> peerSeen{}, selfSeen{};
         assert(!ObserveIncomingCompletion(args, 0, peerSeen[0], selfSeen[0]));
         assert(*incoming == 0);
         for (unsigned i = 0; i < 28; ++i) MarkCubeComplete(args);
-        for (unsigned owner = 0; owner < 15; ++owner) {
+        for (unsigned owner = 0; owner < world - 1; ++owner) {
             *flag(owner) = 9;
             assert(ObserveIncomingCompletion(args, owner, peerSeen[owner], selfSeen[owner]));
         }
-        assert(*incoming == 16);
+        assert(*incoming == world);
         const auto noMorePeerReads = polls, noMoreSelfReads = selfPolls;
-        for (unsigned owner = 0; owner < 15; ++owner)
+        for (unsigned owner = 0; owner < world - 1; ++owner)
             assert(ObserveIncomingCompletion(args, owner, peerSeen[owner], selfSeen[owner]));
-        assert(*incoming == 16 && polls == noMorePeerReads && selfPolls == noMoreSelfReads);
+        assert(*incoming == world && polls == noMorePeerReads && selfPolls == noMoreSelfReads);
 
         // Empty edges still publish first, even while the incoming peer and
         // self completion are delayed. Polling cannot begin before publication.
@@ -796,34 +799,61 @@ int main(int argc, char** argv) {
         return 0;
     }
     uint64_t rows = std::stoull(argv[1]), total = 0;
-    std::vector<unsigned> visits(rows), workers(kReduceWorkers);
+    const uint32_t reducers = ReduceWorkers(world);
+    const uint32_t comm = CommunicationWorkers(world);
+    const uint32_t helpers = ActivationWorkers(world);
+    assert(comm == world - 1 && helpers == 29 - world && reducers == 57 - world);
+    std::vector<unsigned> visits(rows), workers(reducers), steadyPack(kAic), startupPack(kLocalWorkers);
     unsigned communications = 0;
-    static_assert(kReduceWorkers == 41);
     for (unsigned block = 0; block < kAic; ++block) {
+        if (block < comm) ++steadyPack[block];
+        else ++steadyPack[comm + (block - comm)];
         for (unsigned sub = 0; sub < 2; ++sub) {
-            auto worker = ReduceWorkerIndex(block, sub);
-            if (worker == kReduceWorkers) {
-                assert(sub == 1 && block < kCommunicationWorkers);
-                assert(ReduceOwnedRows(rows, worker) == 0);
+            assert(++startupPack[LocalWorkerIndex(block, sub)] == 1);
+            auto worker = ReduceWorkerIndex(block, sub, world);
+            if (worker == reducers) {
+                assert(sub == 1 && block < comm);
+                assert(ReduceOwnedRows(rows, worker, world) == 0);
                 ++communications;
                 continue;
             }
-            assert(worker < kReduceWorkers && ++workers[worker] == 1);
-            auto begin = ReduceRowBegin(rows, worker);
-            auto count = ReduceOwnedRows(rows, worker);
-            assert(begin + count <= rows);
+            assert(worker < reducers && ++workers[worker] == 1);
+            auto begin = ReduceRowBegin(rows, worker, world);
+            auto count = ReduceOwnedRows(rows, worker, world);
+            assert(count <= 200 && begin + count <= rows);
             total += count;
             for (uint64_t i = begin; i < begin + count; ++i) assert(++visits[i] == 1);
         }
     }
-    assert(communications == 15 && total == rows);
+    assert(communications == comm && total == rows);
     assert(std::all_of(visits.begin(), visits.end(), [](auto n) { return n == 1; }));
     assert(std::all_of(workers.begin(), workers.end(), [](auto n) { return n == 1; }));
+    assert(std::all_of(steadyPack.begin(), steadyPack.end(), [](auto n) { return n == 1; }));
+    assert(std::all_of(startupPack.begin(), startupPack.end(), [](auto n) { return n == 1; }));
+    // Sparse groups and shifted prefixes: every GMM1 tile and input-scale
+    // group has one helper owner, including all newly available EP4/8 helpers.
+    constexpr uint32_t groups = 513;
+    std::vector<unsigned> scales(groups), activations(groups * 5);
+    std::vector<unsigned> helperVisits(helpers);
+    for (unsigned helper = 0; helper < helpers; ++helper) {
+        for (unsigned group = helper; group < groups; group += helpers) {
+            assert(++scales[group] == 1);
+            ++helperVisits[helper];
+        }
+        for (unsigned group = 0; group < groups; ++group) {
+            const uint64_t prefix = 37 + group * 5;
+            for (unsigned tile = FirstOwnedComputeTile(prefix, helper, helpers); tile < 5; tile += helpers)
+                assert(++activations[group * 5 + tile] == 1);
+        }
+    }
+    assert(std::all_of(scales.begin(), scales.end(), [](auto n) { return n == 1; }));
+    assert(std::all_of(activations.begin(), activations.end(), [](auto n) { return n == 1; }));
+    assert(std::all_of(helperVisits.begin(), helperVisits.end(), [](auto n) { return n != 0; }));
     const uint64_t large = (1ULL << 32) + 29;
     uint64_t next = 0;
-    for (unsigned worker = 0; worker < kReduceWorkers; ++worker) {
-        assert(ReduceRowBegin(large, worker) == next);
-        next += ReduceOwnedRows(large, worker);
+    for (unsigned worker = 0; worker < reducers; ++worker) {
+        assert(ReduceRowBegin(large, worker, world) == next);
+        next += ReduceOwnedRows(large, worker, world);
     }
     assert(next == large);
 }
@@ -850,19 +880,25 @@ int main(int argc, char** argv) {
     return binary
 
 
-@pytest.mark.parametrize("rows", [0, 1, 40, 41, 42, 127, 128, 129, 2048, 4096, 8192])
-def test_actual_41_reducer_partition(reduce_workers_binary, rows):
-    result = subprocess.run([str(reduce_workers_binary), str(rows)], capture_output=True, text=True, timeout=30)
+@pytest.mark.parametrize("world", [4, 8, 16])
+@pytest.mark.parametrize("rows", [0, 1, 40, 41, 42, 49, 53, 127, 128, 129, 2048, 4096, 8192])
+def test_actual_reducer_and_helper_partition(reduce_workers_binary, rows, world):
+    result = subprocess.run(
+        [str(reduce_workers_binary), str(rows), str(world)], capture_output=True, text=True, timeout=30
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_actual_start_and_payload_wait_predicates(reduce_workers_binary):
-    result = subprocess.run([str(reduce_workers_binary), "flags"], capture_output=True, text=True, timeout=30)
+    result = subprocess.run([str(reduce_workers_binary), "flags", "16"], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_actual_finished_helpers_count_once_publish_first_and_require_28_aic(reduce_workers_binary):
-    result = subprocess.run([str(reduce_workers_binary), "completion"], capture_output=True, text=True, timeout=30)
+@pytest.mark.parametrize("world", [4, 8, 16])
+def test_actual_finished_helpers_count_once_publish_first_and_require_28_aic(reduce_workers_binary, world):
+    result = subprocess.run(
+        [str(reduce_workers_binary), "completion", str(world)], capture_output=True, text=True, timeout=30
+    )
     assert result.returncode == 0, result.stdout + result.stderr
 
 

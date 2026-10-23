@@ -1,4 +1,4 @@
-"""Full URMA MegaMoE benchmark; EP16, with explicit opt-in for multiple hosts."""
+"""Full URMA MegaMoE benchmark; EP4/EP8/EP16, with explicit opt-in for multiple hosts."""
 
 import argparse
 from datetime import datetime, timezone
@@ -41,7 +41,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--allow-multi-host",
         action="store_true",
-        help="Explicitly allow EP16 across hosts; requires cross-host SHMEM mapping and URMA connectivity",
+        help="Explicitly allow EP4/EP8/EP16 across hosts; requires cross-host SHMEM mapping and URMA connectivity",
     )
     parser.add_argument(
         "--max-recv-rows", type=int, help="Per-rank capacity; default 2 * max(BS) * topk; excessive skew is rejected"
@@ -77,12 +77,26 @@ def parse_args(argv=None):
         help="Counter ticks/us; default follows legacy MegaMoE protocol, not hardware detection",
     )
     parser.add_argument(
-        "--golden-dir", type=Path, help="Optional prebuilt FP8 CPU Golden; absent means numerical validation skipped"
+        "--golden-dir",
+        type=Path,
+        help="Prebuilt FP8 CPU Golden for URMA/NPU-cascade error budgets; absent skips accuracy",
+    )
+    parser.add_argument(
+        "--accuracy-only", action="store_true", help="Run forwards and dual-reference accuracy without profiler"
+    )
+    parser.add_argument(
+        "--debug-intermediates",
+        action="store_true",
+        help="Copy completed intermediates to CPU; accuracy-only diagnosis",
     )
     parser.add_argument(
         "--check-tokens", type=int, default=0, help="Must match --check-tokens used to create the optional Golden cache"
     )
     args = parser.parse_args(argv)
+    if args.accuracy_only and not args.golden_dir:
+        parser.error("--accuracy-only requires --golden-dir; generate the FP8 CPU Golden first")
+    if args.debug_intermediates and not args.accuracy_only:
+        parser.error("--debug-intermediates requires --accuracy-only")
     if not 1 <= args.trace_capacity <= 65536:
         parser.error("trace-capacity must be in [1,65536]")
     if not 0 <= args.gmm1_ahead_mgroups <= 65536:
@@ -162,7 +176,7 @@ def run(args, config, group):
     from .validation import collective_check
 
     rank, world = group.rank(), group.size()
-    ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", "16"))
+    ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", str(world)))
     collective_check(
         group,
         "URMA benchmark options",
@@ -182,6 +196,8 @@ def run(args, config, group):
             args.trace_capacity,
             args.trace_include_waits,
             str(args.golden_dir),
+            args.accuracy_only,
+            args.debug_intermediates,
             args.check_tokens,
             args.allow_multi_host,
             ranks_per_node,
@@ -224,9 +240,24 @@ def run(args, config, group):
     raw = make_weights(
         model["num_experts"] // world, model["hidden"], model["intermediate_hidden"], config["seed"] + rank
     )
+    debug_weight_sources = None
+    if args.debug_intermediates:
+        from .urma_debug import source_weight_prefixes
+
+        debug_weight_sources = source_weight_prefixes(raw)
     weights = transform_weights_for_mega_moe(*map(device_pair, raw))
-    del raw
     launch_guard = UrmaLaunchGuard(group, args.exp_shape, args.exp_repeat, args.launch_timeout)
+    cascade_reference = None
+    if args.golden_dir:
+        from .cascade import CascadeReference
+
+        error = None
+        try:
+            cascade_reference = CascadeReference(model, raw, host_group=group)
+        except Exception as failure:
+            error = f"{type(failure).__name__}: {failure}"
+        collective_check(group, "URMA cascade preparation", error)
+    del raw
     manifest = dict(
         created_utc=datetime.now(timezone.utc).isoformat(),
         config=config,
@@ -236,20 +267,27 @@ def run(args, config, group):
         allow_multi_host=args.allow_multi_host,
         bandwidth_topology="logical contiguous rank groups of four; multi-host validation is not UBX bandwidth equivalence",
         transport="URMA PUT-only",
-        remote_workers=15,
-        swiglu_workers=13,
+        remote_workers=world - 1,
+        swiglu_workers=28 - (world - 1),
+        reduce_workers=56 - (world - 1),
         routing=args.routing,
         cv_rows=args.cv_rows,
         gmm1_ahead_mgroups=args.gmm1_ahead_mgroups,
         launch_guard=launch_guard.describe(),
-        performance_timing="torch_npu profiler device kernel duration; no Event or host-wall timing",
+        performance_timing=(
+            "disabled for accuracy-only"
+            if args.accuracy_only
+            else "torch_npu profiler device kernel duration; no Event or host-wall timing"
+        ),
         performance_scope="mega_moe_urma_kernel only; routes prepared once before profiling",
         performance_rounds="all iters after warmup; final instrumented diagnostic invocation excluded",
         profile_config="Level0/AiCoreNone/Text; shapes/memory/stack/FLOPs/modules disabled",
         max_recv_rows=owner.max_recv_rows,
         symmetric_buffer_bytes=owner.symmetric_buffer_bytes,
         route_preparation="NPU sort/count/inverse + D2H counts + Store count exchange + native descriptors",
-        numerical_validation="cpu_golden" if args.golden_dir else "skipped",
+        numerical_validation="cpu_golden_and_npu_cascade_error_budget" if args.golden_dir else "skipped",
+        accuracy_policy_source="local DeepEP 5a9d6ffad7474137fa134cd7a60aebb2c8ee3089",
+        accuracy_only=args.accuracy_only,
         input="prequantized FP8 E4M3 + E8M0; conversion/input generation outside measurement",
         native_urma_protocol=int(_extension().urma_api_protocol),
         compute_schedule=getattr(_extension(), "urma_compute_schedule", "source-cv"),
@@ -290,6 +328,9 @@ def run(args, config, group):
         ids = torch.from_numpy(host_ids).npu()
         topk_weights = torch.from_numpy(host_weights).npu()
         output = torch.empty((bs, model["hidden"]), dtype=torch.bfloat16, device="npu")
+        if args.debug_intermediates:
+            # Diagnose missing stores separately from stores that produce zero.
+            output.fill_(float("nan"))
         prepared = owner.prepare_routes(ids)
         # Allocate once before profiling. Only the final extra invocation gets
         # these buffers; all formal samples execute without internal timers.
@@ -306,24 +347,34 @@ def run(args, config, group):
         startup_mgroups = int(prepared.native.gmm1_startup_mgroups)
         forward = partial(owner.forward_prepared, x, topk_weights, *weights, prepared, out=output)
         diagnostic = partial(forward, timer=timer, trace=trace) if args.timer else None
-        capture = measure_profiled_forward(
-            forward,
-            warmup=config["warmup"],
-            iters=config["iters"],
-            guard=launch_guard,
-            directory=case / "profile",
-            last_forward=diagnostic,
-        )
-        (case / "kernel_samples.json").write_text(json.dumps(capture, indent=2), encoding="utf-8")
-        profile_records = group.all_gather(capture["durations_us"], f"URMA profile samples BS={bs}")
-        profile_report = summarize_profile_rounds(profile_records, ranks_per_node=ranks_per_node)
-        profile_report.update(
-            launch_guard=launch_guard.describe(),
-            warmup_iterations=config["warmup"],
-            continuous_iterations=config["warmup"] + config["iters"] + int(args.timer),
-            diagnostic_iterations=int(args.timer),
-            measured_scope="profiler device mega_moe_urma_kernel task; no Event timing",
-        )
+        if args.accuracy_only:
+            launch_guard.begin()
+            for _ in range(config["warmup"] + config["iters"]):
+                forward()
+            if diagnostic is not None:
+                diagnostic()
+            launch_guard.end()
+            capture = dict(profile_dir=None, diagnostic_sample=None)
+            profile_report = dict(skipped=True, reason="accuracy-only; no profiler or Event timing")
+        else:
+            capture = measure_profiled_forward(
+                forward,
+                warmup=config["warmup"],
+                iters=config["iters"],
+                guard=launch_guard,
+                directory=case / "profile",
+                last_forward=diagnostic,
+            )
+            (case / "kernel_samples.json").write_text(json.dumps(capture, indent=2), encoding="utf-8")
+            profile_records = group.all_gather(capture["durations_us"], f"URMA profile samples BS={bs}")
+            profile_report = summarize_profile_rounds(profile_records, ranks_per_node=ranks_per_node)
+            profile_report.update(
+                launch_guard=launch_guard.describe(),
+                warmup_iterations=config["warmup"],
+                continuous_iterations=config["warmup"] + config["iters"] + int(args.timer),
+                diagnostic_iterations=int(args.timer),
+                measured_scope="profiler device mega_moe_urma_kernel task; no Event timing",
+            )
         reports = {
             "bs": bs,
             "received_rows_local": prepared.received_rows,
@@ -334,7 +385,7 @@ def run(args, config, group):
             "diagnostic_sample": capture["diagnostic_sample"],
             "validation": "skipped",
         }
-        if rank == 0:
+        if rank == 0 and not args.accuracy_only:
             print(
                 f"[URMA PROFILE] BS={bs} cv_rows={args.cv_rows} "
                 f"round-max-mean={profile_report['rank_max_mean_us']:.3f}us "
@@ -343,19 +394,86 @@ def run(args, config, group):
                 flush=True,
             )
         if args.golden_dir:
-            from .golden import compare, contract, load
+            import numpy as np
+            from .golden import contract, load
+            from .urma_accuracy import compare_outputs
 
-            expected, _, selected = load(
+            expected, expected_counts, selected = load(
                 args.golden_dir, contract(config, world, bs, "fp8", args.routing, args.check_tokens), rank
             )
-            actual = output.float().cpu().numpy()[selected]
-            local_validation = compare(actual, expected)
+            actual = output.float().cpu().numpy()
+            if args.debug_intermediates:
+                from .urma_debug import save_snapshot
+
+                debug_raw = prepared.native.debug_snapshot()
+                for name, value in (
+                    ("x", x[0]),
+                    ("x_scale", x[1]),
+                    ("output", output),
+                    ("weights", topk_weights),
+                    ("reduce_index", prepared.routing.reduce_index),
+                    ("order", prepared.routing.order),
+                ):
+                    try:
+                        debug_raw[name] = value.view(torch.uint8).reshape(-1).cpu()
+                    except RuntimeError as error:
+                        raise RuntimeError(f"URMA diagnostic D2H failed for {name}: {error}") from error
+                # Prepared FP4 weights use internal NZ format; .cpu() is unsupported.
+                # These distinctly named prefixes describe the original CPU source only.
+                debug_raw.update(debug_weight_sources)
+                save_snapshot(
+                    debug_raw,
+                    case,
+                    bs=bs,
+                    hidden=model["hidden"],
+                    intermediate=model["intermediate_hidden"],
+                    topk=model["num_topk"],
+                    received_rows=prepared.received_rows,
+                    rank=rank,
+                )
+                del debug_raw
+            source_counts = group.all_gather(
+                prepared.routing.expert_counts.cpu().tolist(), f"URMA validation counts BS={bs}"
+            )
+            local_experts = model["num_experts"] // world
+            actual_counts = np.asarray(source_counts, dtype=np.int64).sum(axis=0)[
+                rank * local_experts : (rank + 1) * local_experts
+            ]
+            cascade_output, cascade_counts = cascade_reference.forward(
+                None, ids, topk_weights, input_kind="fp8", quantized=x
+            )
+            torch.npu.synchronize()
+            local_validation = compare_outputs(
+                actual,
+                cascade_output.float().cpu().numpy(),
+                expected,
+                actual_counts,
+                cascade_counts.cpu().numpy(),
+                expected_counts,
+                selected,
+            )
+            local_validation["received_rows_equal"] = int(actual_counts.sum()) == prepared.received_rows
+            local_validation["passed"] &= local_validation["received_rows_equal"]
+            if not local_validation["received_rows_equal"]:
+                local_validation["reason"] += "; URMA descriptor received_rows disagrees with route counts"
             local_validation["rank"] = rank
             validations = group.all_gather(local_validation, f"URMA accuracy BS={bs}")
             reports["validation"] = validations
+            (case / "accuracy.json").write_text(json.dumps(validations, indent=2, allow_nan=False), encoding="utf-8")
             if not all(value["passed"] for value in validations):
-                (case / "accuracy.json").write_text(json.dumps(validations, indent=2), encoding="utf-8")
-                raise AssertionError(f"BS={bs} URMA output differs from the CPU Golden")
+                np.savez_compressed(
+                    case / "accuracy_tensors.npz",
+                    actual=actual[selected],
+                    cascade=cascade_output.float().cpu().numpy()[selected],
+                    expected=expected,
+                    selected=selected,
+                    actual_counts=actual_counts,
+                    cascade_counts=cascade_counts.cpu().numpy(),
+                    expected_counts=expected_counts,
+                )
+                (case / "summary.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
+                raise AssertionError(f"BS={bs} URMA dual-reference accuracy failed; inspect {case / 'accuracy.json'}")
+            del cascade_output, cascade_counts
         if args.timer:
             from .urma_timer import communication_bandwidth, summarize_bandwidth
 
@@ -370,7 +488,7 @@ def run(args, config, group):
                 detailed_trace_enabled=args.trace,
             )
             (case / "timer.json").write_text(json.dumps(timer_metadata, indent=2), encoding="utf-8")
-            bandwidth = communication_bandwidth(raw_timer, rank, clock_mhz=args.timer_clock_mhz)
+            bandwidth = communication_bandwidth(raw_timer, rank, world=world, clock_mhz=args.timer_clock_mhz)
             bandwidth_records = group.all_gather(bandwidth, f"URMA bandwidth BS={bs}")
             reports["bandwidth"] = summarize_bandwidth(bandwidth_records)
             reports["bandwidth_per_rank"] = bandwidth_records
@@ -428,7 +546,11 @@ def run(args, config, group):
                 f"rank0_startup_mgroups={startup_mgroups}",
                 flush=True,
             )
-            print(f"[URMA VALIDATION] BS={bs} " + ("CPU Golden passed" if args.golden_dir else "skipped"), flush=True)
+            print(
+                f"[URMA VALIDATION] BS={bs} "
+                + ("CPU Golden + NPU cascade passed (all ranks)" if args.golden_dir else "skipped"),
+                flush=True,
+            )
         group.barrier(f"URMA case complete BS={bs}")
     if rank == 0:
         (args.output_dir / "summary.json").write_text(json.dumps(all_reports, indent=2), encoding="utf-8")

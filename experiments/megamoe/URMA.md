@@ -1,5 +1,25 @@
 # MegaMoE URMA 固定 CV 实验
 
+## 2026-10-23 上游与 SHMEM 同步
+
+`megamoe-urma-combineAdvance-v2` 已合入 `lueelu/DeepEP` 的 main `35fa7d91b321340c153b098bf166202645976a75`：更新独立 `ep_gmm_fused` 的 staging/缓冲深度/self-copy 调度，增加 EP4 配置与测试，并整理文档。此同步没有引入 `megamoe-urma-gmm2-m128n512` 的 tile 实验；advance2 的 MegaMoE 计算和提前 Combine 调度保持原设置。
+
+SHMEM gitlink、依赖锁和公开头文件校验值一起切到 PR #944 head `94794270a9af4414c11d0f1f5636bac9b1348dbe`。runtime 改用初始化属性的 shared-jetty 配置，MegaMoE 仍显式禁用共享队列、为每 peer 配置 Dispatch QP0 和 Combine QP1。需要重新构建 SHMEM SDK 和完整 wheel，旧 SDK 的 manifest 不再匹配。
+
+```bash
+git submodule update --init -- third-party/shmem third-party/catlass
+# 使用本仓子模块构建；确认没有作业使用这份 install 中的 SDK 后执行。
+unset SHMEM_ROOT SHMEM_SOURCE_PATH
+export PYTHON="$(command -v python3)"
+export DEEPEP_BUILD_MEGAMOE=ON
+export DEEPEP_MEGAMOE_TIMER=ON
+bash experiments/megamoe/scripts/build.sh --rebuild-shmem
+export SHMEM_ROOT="$PWD/third-party/shmem/install/shmem"
+export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
+```
+
+若子模块尚未获取 PR 提交，可先执行 `git -C third-party/shmem fetch origin refs/merge-requests/944/head`，再运行上述 submodule update；本地源码修改需先自行保存。本文的同步记录不代表 CANN 编译或 NPU 数值/性能验证通过。
+
 本实验是完整的 Prefill 算子：真实路由准备、本地展开、Dispatch、GMM1、SwiGLU/MXFP8 量化、GMM2、Combine PUT 和加权 Reduce。没有屏蔽计算，也没有使用预置 balanced 专用路由。
 
 本分支为 `megamoe-urma-combineAdvance-v2`，重新基于 `megamoe-urma-tailCover` 的 `60642fb`，没有合入前版 `combineAdvance` 的激活核辅助通信方案。保留原15个通信核、13个激活核和41核Reduce，在Dispatch末尾通过独立QP提前提交Combine；Dispatch后每轮从头到尾扫描本peer的通信CV，跳过未就绪项、批量提交并quiet，最后一个剩余CV单独提交。各分支须重新编译安装完整wheel，不能混用rank或Python/native版本。

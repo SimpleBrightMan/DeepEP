@@ -53,7 +53,7 @@ std::string megamoe_urma_topology_error(int rank, int world)
     }
     if (!missing.empty())
         return "MegaMoE URMA rank=" + std::to_string(rank) + " has peers without MTE mappings: " + missing +
-               "; all EP16 peers must share an MTE-accessible UB domain for completion signals";
+               "; all peers must share an MTE-accessible UB domain for completion signals";
     if (!missing_udma.empty())
         return "MegaMoE URMA rank=" + std::to_string(rank) + " has peers without UDMA transport: " + missing_udma;
     return {};
@@ -69,14 +69,16 @@ bool Session::busy()
 Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
                  bool megamoe, bool mpi, bool combine_only, bool use_1g_huge_pages, bool megamoe_urma)
 {
-    if (megamoe_urma && (!megamoe || !udma || size != 16 || mpi || combine_only || use_1g_huge_pages))
-        throw std::invalid_argument("MegaMoE URMA requires its dedicated EP16 runtime");
+    if (megamoe_urma && (!megamoe || !udma || (size != 4 && size != 8 && size != 16) || mpi || combine_only || use_1g_huge_pages))
+        throw std::invalid_argument("MegaMoE URMA requires its dedicated EP4/EP8/EP16 runtime");
     if (combine_only && (!udma || megamoe)) throw std::invalid_argument("Combine-only requires UDMA");
     if (use_1g_huge_pages && (!udma || megamoe))
         throw std::invalid_argument("1 GiB huge pages require the Elastic UDMA runtime");
     use_1g_huge_pages_ = use_1g_huge_pages;
     const char* dense_env = std::getenv("DEEPEP_SHMEM_DENSE_QPS");
-    const std::string dense = dense_env == nullptr ? "0" : dense_env;
+    // The pinned PR944 SDK creates all peer/QP channels; sparse masks were
+    // removed upstream. Preserve explicit sparse requests as a checked opt-in.
+    const std::string dense = dense_env == nullptr ? "1" : dense_env;
     if (dense != "0" && dense != "1") throw std::invalid_argument("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1");
     combine_only_ = combine_only;
     constexpr uint64_t alignment = 2ULL * 1024 * 1024;
@@ -127,8 +129,8 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
         udma ? reinterpret_cast<SetPeerQpMasks>(dlsym(RTLD_DEFAULT, "aclshmemx_set_udma_peer_qp_masks")) : nullptr;
     if (udma && !megamoe_urma && dense != "1" && !set_masks) {
         throw std::runtime_error(
-            "SHMEM lacks aclshmemx_set_udma_peer_qp_masks; use the SDK pinned in dependencies.lock.json, "
-            "or explicitly select dense channels with DEEPEP_SHMEM_DENSE_QPS=1");
+            "SHMEM lacks aclshmemx_set_udma_peer_qp_masks (removed in the PR944 SDK); "
+            "unset DEEPEP_SHMEM_DENSE_QPS or set it to 1 to select dense channels");
     }
     // A failed initialization can leave SDK state behind. Keep the process
     // reserved until a new process is launched; do not finalize foreign state.
@@ -137,13 +139,12 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     bool runtime_started = false;
     try {
         if (megamoe_urma) {
-            // Each of the fifteen communication workers owns one remote PE.
+            // Each of the world-1 communication workers owns one remote PE.
             // Each owner uses QP0 for Dispatch and QP1 for Combine, allowing
             // early Combine PUTs to remain pending through Dispatch quiet.
             // Disable shared Clos SQs so different peer owners stay isolated.
             check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 2U), "aclshmemx_set_qp_num(MegaMoE URMA)");
-            check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, false),
-                  "aclshmemx_set_shared_jetty(false, MegaMoE URMA)");
+            attr.runtime_config.udma_shared_jetty = ACLSHMEM_CONFIG_DISABLED;
             if (set_masks) {
                 check(set_masks(nullptr, 0U), "aclshmemx_set_udma_peer_qp_masks(clear, MegaMoE URMA)");
             }
@@ -153,7 +154,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
             // The pinned SDK shares Clos SQs across peers; MESH routes are separate.
             check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, ascend_deepep::udma_layout::kQpCount),
                   "aclshmemx_set_qp_num");
-            check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, true), "aclshmemx_set_shared_jetty");
+            attr.runtime_config.udma_shared_jetty = ACLSHMEM_CONFIG_ENABLED;
             std::vector<uint64_t> masks;
             if (dense != "1") {
                 masks.resize(size);

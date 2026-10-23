@@ -250,7 +250,7 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
             Te::MakeCoord(static_cast<int64_t>(config2.tileM), static_cast<int64_t>(config2.tileN))});
     const uint32_t count2 = schedule2.GetTileNum();
     if constexpr (g_coreType == AIC) {
-        // The 13 independent activation workers collectively publish one
+        // The independent activation workers collectively publish one
         // contribution per original GMM1 tile after both FP8 planes drain.
         const uint64_t waitStart = timer.TraceBegin();
         WaitComputeFlag(args.activationDone, fragmentIndex, FragmentGmm1Tiles(args, fragment));
@@ -404,7 +404,7 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
                                               uint32_t fragmentIndex, uint32_t tile, UrmaActivation& epilogue,
                                               Timer& timer)
 {
-    const MegaMoeImpl::BlockJobContext job{worker, kActivationWorkers};
+    const MegaMoeImpl::BlockJobContext job{worker, ActivationWorkers(args.config.world)};
     const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
     auto addr = Gmm1Addresses(args, fragment);
     addr.activationToGmm2Flag = nullptr;
@@ -448,6 +448,8 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
 // Readiness checks never block another cursor. No dynamic task claims.
 __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Timer& timer)
 {
+    const uint32_t activationWorkers = ActivationWorkers(args.config.world);
+    const uint32_t communicationWorkers = CommunicationWorkers(args.config.world);
     UrmaActivation epilogue;
     // Match main MegaMoE's unclamped SwiGLU. The epilogue default is zero,
     // which clamps every up value to zero and makes the entire FFN zero.
@@ -473,7 +475,7 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
             const auto fragment = LoadFragment(args, nextActivation);
             const uint32_t tileCount = FragmentGmm1Tiles(args, fragment);
             if (!activationPrepared) {
-                activationTile = FirstOwnedComputeTile(fragment.gmm1TileBegin, worker, kActivationWorkers);
+                activationTile = FirstOwnedComputeTile(fragment.gmm1TileBegin, worker, activationWorkers);
                 activationPrepared = true;
             }
             if (activationTile >= tileCount) {
@@ -487,7 +489,7 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
                     idle = false;
                 }
                 RunReadyActivationTile(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
-                activationTile += kActivationWorkers;
+                activationTile += activationWorkers;
                 progress = true;
             }
             break;
@@ -500,7 +502,7 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
                     idle = false;
                 }
                 GatherInputScale(args, fragment, nextGather, timer);
-                nextGather += kActivationWorkers;
+                nextGather += activationWorkers;
                 progress = true;
             }
         }
@@ -512,7 +514,7 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
                 timer.TraceEnd(idleEvent, idleStart, idleMeta);
                 idle = false;
             }
-            PackOneRound(args, nextPackRound, worker + kCommunicationWorkers, kAic, timer);
+            PackOneRound(args, nextPackRound, worker + communicationWorkers, kAic, timer);
             ++nextPackRound;
             progress = true;
         }

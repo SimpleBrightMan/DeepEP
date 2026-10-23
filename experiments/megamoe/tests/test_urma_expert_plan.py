@@ -27,10 +27,10 @@ def expert_plan_binary(tmp_path_factory):
 #include <cassert>
 #include <iostream>
 using namespace MegaMoeUrma;
-Config Dimensions(uint32_t bs, uint32_t cv) {
+Config Dimensions(uint32_t bs, uint32_t cv, uint32_t world = 16) {
     Config c{};
     c.bs = bs; c.hidden = 3584; c.intermediate = 1280; c.topk = 8;
-    c.localExperts = 24; c.cvRows = cv; c.maxPeerChunks = (bs * 8 + cv - 1) / cv;
+    c.world = world; c.localExperts = 384 / world; c.cvRows = cv; c.maxPeerChunks = (bs * 8 + cv - 1) / cv;
     return c;
 }
 int main(int argc, char**) {
@@ -52,6 +52,8 @@ int main(int argc, char**) {
         bad = c; bad.cvRows = 129; reject(bad, 128);
         bad = c; bad.maxPeerChunks = 0; reject(bad, 128);
         bad = c; bad.maxPeerChunks = 513; reject(bad, 128);
+        bad = c; bad.world = 3; reject(bad, 128);
+        bad = c; bad.world = 0; reject(bad, 128);
         bad = c; bad.localExperts = 23; reject(bad, 128);
         bad = c; bad.gmm1AheadMGroups = 65537; reject(bad, 128);
         counts[0] = -1; reject(c, 128);
@@ -62,13 +64,13 @@ int main(int argc, char**) {
         reject(c, 16 * 257 * 8);
         return 0;
     }
-    uint32_t bs = 0, cv = 0;
-    assert(std::cin >> bs >> cv);
-    for (auto& count : counts) assert(std::cin >> count);
-    for (uint32_t rank = 0; rank < 16; ++rank) {
-        auto config = Dimensions(bs, cv);
+    uint32_t bs = 0, cv = 0, world = 0;
+    assert(std::cin >> bs >> cv >> world);
+    for (uint32_t index = 0; index < world * 384; ++index) assert(std::cin >> counts[index]);
+    for (uint32_t rank = 0; rank < world; ++rank) {
+        auto config = Dimensions(bs, cv, world);
         config.rank = rank;
-        auto p = BuildExpertPlan(counts.data(), config, uint64_t(16) * bs * 8);
+        auto p = BuildExpertPlan(counts.data(), config, uint64_t(world) * bs * 8);
         const auto& c = p.config;
         std::cout << "P " << rank << ' ' << c.receiveRows << ' ' << c.gmm1Tiles << ' ' << c.gmm2Tiles
                   << ' ' << c.selfSendRow << ' ' << c.selfRecvRow << ' ' << c.selfRows << ' '
@@ -130,11 +132,12 @@ int main(int argc, char**) {
 
 
 def read_plans(binary, ids, cv_rows):
-    routes = [plan_routes(value, 384, 16) for value in ids]
+    world = len(ids)
+    routes = [plan_routes(value, 384, world) for value in ids]
     counts = np.array([route.expert_counts for route in routes])
     result = subprocess.run(
         [str(binary)],
-        input=f"{len(ids[0])} {cv_rows}\n" + " ".join(map(str, counts.reshape(-1))),
+        input=f"{len(ids[0])} {cv_rows} {world}\n" + " ".join(map(str, counts.reshape(-1))),
         capture_output=True,
         text=True,
         timeout=30,
@@ -147,13 +150,14 @@ def read_plans(binary, ids, cv_rows):
         if label == "P":
             plans.append(defaultdict(list))
         plans[-1][label].append(values)
-    assert len(plans) == 16
+    assert len(plans) == world
     return routes, plans
 
 
 def check_plans(ids, cv_rows, routes, plans):
+    world, local_experts = len(ids), 384 // len(ids)
     counts = np.array([r.peer_counts for r in routes])
-    receive_base = np.concatenate((np.zeros((1, 16), dtype=np.int64), counts.cumsum(axis=0)), axis=0)
+    receive_base = np.concatenate((np.zeros((1, world), dtype=np.int64), counts.cumsum(axis=0)), axis=0)
     for rank, plan in enumerate(plans):
         (
             reported_rank,
@@ -173,18 +177,18 @@ def check_plans(ids, cv_rows, routes, plans):
         assert self_recv == receive_base[rank, rank] and self_rows == counts[rank, rank]
         assert groups == len(plan["F"]) and sends == len(plan["T"]) and receives == len(plan["R"])
         assert g1 == groups * 5 and g2 == groups * 14
-        assert len(plan["B"]) == 24
-        assert len(plan["A"]) == 48
-        assert [expert for stage, expert in plan["A"] if stage == 1] == list(range(24))
-        assert [expert for stage, expert in plan["A"] if stage == 2] == list(range(24))
+        assert len(plan["B"]) == local_experts
+        assert len(plan["A"]) == 2 * local_experts
+        assert [expert for stage, expert in plan["A"] if stage == 1] == list(range(local_experts))
+        assert [expert for stage, expert in plan["A"] if stage == 2] == list(range(local_experts))
         submitted = consumed = 0
         for stage, expert in plan["A"]:
             if stage == 1:
                 submitted += 1
             else:
-                assert expert == consumed and submitted >= min(24, consumed + 2)
+                assert expert == consumed and submitted >= min(local_experts, consumed + 2)
                 queued = sum(count for _, count in plan["B"][consumed:submitted])
-                assert submitted == 24 or queued >= 12
+                assert submitted == local_experts or queued >= 12
                 consumed += 1
         covered = np.zeros(rows, dtype=np.int8)
         compact = np.zeros(rows, dtype=np.int8)
@@ -192,8 +196,8 @@ def check_plans(ids, cv_rows, routes, plans):
         expected_dependencies = defaultdict(set)
         expected_reduce_dependencies = np.full(ids[rank].size, (1 << 64) - 1, dtype=np.uint64)
         expected_compact_rows = []
-        for expert in range(24):
-            global_expert = rank * 24 + expert
+        for expert in range(local_experts):
+            global_expert = rank * local_experts + expert
             expert_rows = []
             for source, route in enumerate(routes):
                 lo, hi = map(int, route.expert_offsets[global_expert : global_expert + 2])
@@ -239,7 +243,7 @@ def check_plans(ids, cv_rows, routes, plans):
 
         expected_send = []
         expected_receive = []
-        for peer in range(16):
+        for peer in range(world):
             for offset in range(0, int(counts[rank, peer]), cv_rows):
                 if peer != rank:
                     lo = int(routes[rank].peer_offsets[peer]) + offset
@@ -290,7 +294,7 @@ def check_plans(ids, cv_rows, routes, plans):
         # This is the index_select contract used by native bind on the NPU:
         # each token/top-k entry receives the dependency for its original row.
         token_dependencies = actual_reduce_dependencies[routes[rank].reduce_index]
-        destinations = ids[rank] // 24
+        destinations = ids[rank] // local_experts
         self_entries = (token_dependencies & np.uint64(1 << 63)) != 0
         np.testing.assert_array_equal(self_entries, destinations == rank)
         np.testing.assert_array_equal(token_dependencies[~self_entries] // max_chunks, destinations[~self_entries])
@@ -312,30 +316,32 @@ def test_balanced_expert_groups_preserve_original_transport(expert_plan_binary, 
     assert all(len(plan["F"]) == expected_groups for plan in plans)
 
 
+@pytest.mark.parametrize("world", [4, 8, 16])
 @pytest.mark.parametrize("pattern", ["all_self", "empty_self", "one_expert", "random", "boundary"])
 @pytest.mark.parametrize("cv_rows", [128, 256, 768])
-def test_sparse_skewed_ragged_and_empty_experts(expert_plan_binary, pattern, cv_rows):
+def test_sparse_skewed_ragged_and_empty_experts(expert_plan_binary, pattern, cv_rows, world):
+    local_experts = 384 // world
     bs = 257
     rng = np.random.default_rng(207)
     ids = []
-    for rank in range(16):
+    for rank in range(world):
         if pattern == "random":
             value = rng.integers(0, 384, (bs, 8), dtype=np.int64)
         else:
-            destination = {"all_self": rank, "empty_self": (rank + 1) % 16, "one_expert": 7, "boundary": 0}[pattern]
-            value = np.full((bs, 8), destination * 24, dtype=np.int64)
+            destination = {"all_self": rank, "empty_self": (rank + 1) % world, "one_expert": world - 1, "boundary": 0}[pattern]
+            value = np.full((bs, 8), destination * local_experts, dtype=np.int64)
             if pattern != "one_expert":
                 # Unequal source/expert lengths intersect both M256 and CV
                 # boundaries; the remainder of the 24 experts remains empty.
                 value.reshape(-1)[1 + rank * 7 : 258 + rank * 11] += 3
-                value[-1, -1] += 23
+                value[-1, -1] += local_experts - 1
         ids.append(value)
     routes, plans = read_plans(expert_plan_binary, ids, cv_rows)
     check_plans(ids, cv_rows, routes, plans)
     if pattern == "empty_self":
         assert all(plan["P"][0][6] == 0 for plan in plans)
     if pattern == "one_expert":
-        assert all(not plan["F"] for rank, plan in enumerate(plans) if rank != 7)
+        assert all(not plan["F"] for rank, plan in enumerate(plans) if rank != world - 1)
 
 
 def test_invalid_counts_and_capacities_are_rejected(expert_plan_binary):

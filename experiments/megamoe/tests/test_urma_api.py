@@ -263,7 +263,8 @@ def test_modified_prepared_routes_abort_before_epoch_or_native_submission(monkey
 
 
 @pytest.mark.parametrize("allow", [False, True])
-def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runtime(monkeypatch, allow):
+@pytest.mark.parametrize("world", [4, 8, 16])
+def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runtime(monkeypatch, allow, world):
     from deep_ep._store import StoreGroup
 
     fake_torch = SimpleNamespace(device=lambda name: name, empty=lambda *a, **k: object(), float8_e4m3fn="fp8")
@@ -282,17 +283,17 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
 
     monkeypatch.setattr(urma, "collective_check", check)
     monkeypatch.setattr(urma, "_UrmaRuntime", runtime)
-    buffer = urma.UrmaBuffer(StoreGroup(None, 0, 16, prefix="test"), allow_multi_host=allow)
+    buffer = urma.UrmaBuffer(StoreGroup(None, 0, world, prefix="test"), allow_multi_host=allow)
     assert buffer.allow_multi_host is allow
     assert created == [allow]
     assert checks[0][1][-3] is allow
-    assert checks[0][1][-2] == "combine-ready-scan-reduce41"
+    assert checks[0][1][-2] == "combine-ready-scan-reduce-world-v1"
     assert checks[0][1][-1] == "expert-m256-mgroup-lookahead-v1"
     assert buffer.gmm1_ahead_mgroups == 12
 
 
 @pytest.mark.parametrize(
-    "tail", [None, "combine-cv-flag-reduce41", "combine-finished-fast-reduce41", "combine-ready-scan-reduce41"]
+    "tail", [None, "combine-cv-flag-reduce41", "combine-finished-fast-reduce41", "combine-ready-scan-reduce-world-v1"]
 )
 def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, tail):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
@@ -302,7 +303,7 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
     urma._extension.cache_clear()
     try:
-        if tail != "combine-ready-scan-reduce41":
+        if tail != "combine-ready-scan-reduce-world-v1":
             with pytest.raises(RuntimeError, match="tailCover needs its matching native wheel"):
                 urma._extension()
         else:
@@ -315,7 +316,7 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
 def test_native_mgroup_schedule_must_match_before_runtime_creation(monkeypatch, schedule):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
     extension = SimpleNamespace(
-        urma_api_protocol=1, urma_tail_schedule="combine-ready-scan-reduce41", urma_compute_schedule=schedule
+        urma_api_protocol=1, urma_tail_schedule="combine-ready-scan-reduce-world-v1", urma_compute_schedule=schedule
     )
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
     urma._extension.cache_clear()

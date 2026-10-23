@@ -56,7 +56,8 @@ inline std::vector<ComputeBatchTask> BuildComputeTasks(const std::vector<Compute
 
 inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, uint64_t maxReceiveRows)
 {
-    if (counts == nullptr || input.rank >= kWorld || input.localExperts != 24 || input.bs == 0 || input.bs > 8192 ||
+    if (counts == nullptr || (input.world != 4U && input.world != 8U && input.world != 16U) ||
+        input.rank >= input.world || input.localExperts != 384U / input.world || input.bs == 0 || input.bs > 8192 ||
         input.topk != 8 || input.hidden != 3584 || input.intermediate != 1280 || input.cvRows < 128 ||
         input.cvRows > 4096 || input.cvRows % 128 != 0 || input.maxPeerChunks == 0 ||
         input.maxPeerChunks > kMaxPeerChunks || input.gmm1AheadMGroups > 65536U || maxReceiveRows == 0) {
@@ -66,16 +67,15 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
     plan.config = input;
     auto& config = plan.config;
     config.gmm1Tiles = config.gmm2Tiles = 0;
-    constexpr uint32_t kExperts = kWorld * 24U;
     constexpr uint32_t kRowsPerGroup = 256;
     const uint64_t expandedRows = static_cast<uint64_t>(config.bs) * config.topk;
     constexpr uint64_t kUnassignedDependency = std::numeric_limits<uint64_t>::max();
     plan.reduceDependencies.assign(expandedRows, kUnassignedDependency);
     using RankMatrix = std::array<std::array<uint64_t, kWorld>, kWorld>;
     RankMatrix peerRows{}, sendBase{}, receiveBase{};
-    for (uint32_t source = 0; source < kWorld; ++source) {
+    for (uint32_t source = 0; source < config.world; ++source) {
         uint64_t row = 0;
-        for (uint32_t destination = 0; destination < kWorld; ++destination) {
+        for (uint32_t destination = 0; destination < config.world; ++destination) {
             sendBase[source][destination] = row;
             for (uint32_t expert = 0; expert < config.localExperts; ++expert) {
                 const int64_t count = counts[source * kExperts + destination * config.localExperts + expert];
@@ -93,9 +93,9 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
             throw std::invalid_argument("URMA route count sum differs from BS*topk");
         }
     }
-    for (uint32_t destination = 0; destination < kWorld; ++destination) {
+    for (uint32_t destination = 0; destination < config.world; ++destination) {
         uint64_t row = 0;
-        for (uint32_t source = 0; source < kWorld; ++source) {
+        for (uint32_t source = 0; source < config.world; ++source) {
             receiveBase[destination][source] = row;
             row += peerRows[source][destination];
         }
@@ -110,8 +110,8 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
 
     constexpr uint32_t kNoChunk = std::numeric_limits<uint32_t>::max();
     // A ready slot uniquely identifies its original contiguous receive chunk.
-    std::vector<uint32_t> readyToChunk(static_cast<uint64_t>(kWorld) * config.maxPeerChunks, kNoChunk);
-    for (uint32_t peer = 0; peer < kWorld; ++peer) {
+    std::vector<uint32_t> readyToChunk(static_cast<uint64_t>(config.world) * config.maxPeerChunks, kNoChunk);
+    for (uint32_t peer = 0; peer < config.world; ++peer) {
         const uint64_t outgoing = peerRows[config.rank][peer];
         for (uint64_t begin = 0, cv = 0; begin < outgoing; begin += config.cvRows, ++cv) {
             plan.sendChunks.push_back({peer, static_cast<uint32_t>(cv), sendBase[config.rank][peer] + begin,
@@ -141,11 +141,11 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
     uint64_t compactRow = 0;
     for (uint32_t expert = 0; expert < config.localExperts; ++expert) {
         std::array<uint64_t, kWorld + 1U> sourceBegin{};
-        for (uint32_t source = 0; source < kWorld; ++source) {
+        for (uint32_t source = 0; source < config.world; ++source) {
             sourceBegin[source + 1U] =
                 sourceBegin[source] + counts[source * kExperts + config.rank * config.localExperts + expert];
         }
-        const uint64_t expertRows = sourceBegin[kWorld];
+        const uint64_t expertRows = sourceBegin[config.world];
         const auto firstGroup = static_cast<uint32_t>(plan.fragments.size());
         for (uint64_t begin = 0; begin < expertRows; begin += kRowsPerGroup) {
             const uint64_t end = std::min<uint64_t>(begin + kRowsPerGroup, expertRows);
@@ -157,7 +157,7 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
                            0,
                            config.gmm1Tiles,
                            config.gmm2Tiles};
-            for (uint32_t source = 0; source < kWorld; ++source) {
+            for (uint32_t source = 0; source < config.world; ++source) {
                 uint64_t lo = std::max(begin, sourceBegin[source]);
                 const uint64_t hi = std::min(end, sourceBegin[source + 1U]);
                 while (lo < hi) {
@@ -196,7 +196,7 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
         }
         plan.computeBatches.push_back({firstGroup, static_cast<uint32_t>(plan.fragments.size()) - firstGroup});
         compactRow += expertRows;
-        for (uint32_t source = 0; source < kWorld; ++source) {
+        for (uint32_t source = 0; source < config.world; ++source) {
             peerExpertBegin[source] += sourceBegin[source + 1U] - sourceBegin[source];
         }
     }
@@ -219,7 +219,7 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
     config.computeTaskCount = static_cast<uint32_t>(plan.computeTasks.size());
     config.sendChunkCount = static_cast<uint32_t>(plan.sendChunks.size());
     config.recvChunkCount = static_cast<uint32_t>(plan.recvChunks.size());
-    plan.packRounds = BuildPackRounds(plan.sendChunks, config.maxPeerChunks);
+    plan.packRounds = BuildPackRounds(plan.sendChunks, config.maxPeerChunks, config.world);
     config.packRoundCount = static_cast<uint32_t>(plan.packRounds.size());
     return plan;
 }

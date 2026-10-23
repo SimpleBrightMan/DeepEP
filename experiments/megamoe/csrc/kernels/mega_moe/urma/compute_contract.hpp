@@ -9,6 +9,7 @@ namespace MegaMoeUrma {
 // Pure host/device scheduling arithmetic. Compute groups contain at most M256
 // rows of one expert, independently of the peer/CV communication boundaries.
 constexpr uint32_t kComputeCores = kAic;
+// Minimum reducer count, used only to size UB for the largest per-core quota.
 constexpr uint32_t kReduceWorkers = kLocalWorkers - kCommunicationWorkers;
 constexpr uint32_t kComputeTileM = 256U;
 constexpr uint32_t kComputeTileN = 256U;
@@ -57,6 +58,21 @@ struct ComputeBatchRange {
 #define MEGAMOE_URMA_COMPUTE_INLINE inline
 #endif
 
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t CommunicationWorkers(uint32_t world)
+{
+    return world - 1U;
+}
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ActivationWorkers(uint32_t world)
+{
+    return kAic - CommunicationWorkers(world);
+}
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ReduceWorkers(uint32_t world)
+{
+    return kLocalWorkers - CommunicationWorkers(world);
+}
+
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t LocalWorkerIndex(uint32_t block, uint32_t subblock)
 {
     return 2U * block + subblock;
@@ -76,24 +92,29 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t LocalRowBegin(uint64_t rows, uint
     return static_cast<uint64_t>(worker) * (rows / kLocalWorkers) + (worker < remainder ? worker : remainder);
 }
 
-// The 15 peer owners never reduce. All AIV0 and the 13 activation AIV1
-// workers enter Reduce independently after releasing their compute resources.
-// Return kReduceWorkers as the sentinel for a communication worker.
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ReduceWorkerIndex(uint32_t block, uint32_t subblock)
+// Peer owners never reduce. All AIV0 and all noncommunication AIV1 workers
+// enter Reduce independently after releasing their compute resources.
+// Return ReduceWorkers(world) as the sentinel for a communication worker.
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ReduceWorkerIndex(uint32_t block, uint32_t subblock,
+                                                                 uint32_t world = kWorld)
 {
-    return subblock == 0U ? block
-                          : (block >= kCommunicationWorkers ? kAic + block - kCommunicationWorkers : kReduceWorkers);
+    const uint32_t communicationWorkers = CommunicationWorkers(world);
+    return subblock == 0U
+               ? block
+               : (block >= communicationWorkers ? kAic + block - communicationWorkers : ReduceWorkers(world));
 }
 
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ReduceOwnedRows(uint64_t rows, uint32_t worker)
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ReduceOwnedRows(uint64_t rows, uint32_t worker, uint32_t world = kWorld)
 {
-    return worker < kReduceWorkers && worker < rows ? (rows - 1U - worker) / kReduceWorkers + 1U : 0U;
+    const uint32_t workers = ReduceWorkers(world);
+    return worker < workers && worker < rows ? (rows - 1U - worker) / workers + 1U : 0U;
 }
 
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ReduceRowBegin(uint64_t rows, uint32_t worker)
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ReduceRowBegin(uint64_t rows, uint32_t worker, uint32_t world = kWorld)
 {
-    const uint64_t remainder = rows % kReduceWorkers;
-    return static_cast<uint64_t>(worker) * (rows / kReduceWorkers) + (worker < remainder ? worker : remainder);
+    const uint32_t workers = ReduceWorkers(world);
+    const uint64_t remainder = rows % workers;
+    return static_cast<uint64_t>(worker) * (rows / workers) + (worker < remainder ? worker : remainder);
 }
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr bool IsSelfExpandedRow(uint64_t row, const Config& config)
@@ -150,7 +171,7 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ComputeTileCount(uint32_t rows, u
 
 // All stage task IDs are global prefix sums. Sparse experts cannot repeatedly
 // give the same physical core their first tile. AIC and its AIV0 call this with
-// identical inputs; the independent AIV1 activation team uses workerCount=13.
+// identical inputs; the AIV1 activation team uses ActivationWorkers(world).
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t FirstOwnedComputeTile(uint64_t tileBegin, uint32_t worker,
                                                                      uint32_t workerCount)
 {

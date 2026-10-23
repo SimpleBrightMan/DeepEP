@@ -28,7 +28,7 @@ def _extension():
     extension = importlib.import_module(__package__ + "._C")
     if getattr(extension, "urma_api_protocol", None) != 1:
         raise RuntimeError("URMA Python/native versions differ; rebuild and reinstall the complete wheel")
-    if getattr(extension, "urma_tail_schedule", None) != "combine-ready-scan-reduce41":
+    if getattr(extension, "urma_tail_schedule", None) != "combine-ready-scan-reduce-world-v1":
         raise RuntimeError("URMA tailCover needs its matching native wheel; rebuild and reinstall the complete wheel")
     if getattr(extension, "urma_compute_schedule", None) != "expert-m256-mgroup-lookahead-v1":
         raise RuntimeError(
@@ -81,7 +81,7 @@ class PreparedUrmaRoutes:
 
 
 class UrmaBuffer:
-    """EP16 owner; multiple hosts require explicit opt-in on every rank."""
+    """EP4/EP8/EP16 owner; multiple hosts require explicit opt-in on every rank."""
 
     def __init__(
         self,
@@ -107,8 +107,8 @@ class UrmaBuffer:
         if max_recv_rows is None:
             max_recv_rows = 2 * num_max_tokens_per_rank * num_topk
         try:
-            if group.size() != 16:
-                raise ValueError("URMA MegaMoE currently requires EP16")
+            if group.size() not in (4, 8, 16):
+                raise ValueError("URMA MegaMoE requires EP4/EP8/EP16")
             if type(allow_multi_host) is not bool:
                 raise TypeError("allow_multi_host must be bool")
             if (hidden, intermediate_hidden, num_experts, num_topk, num_shared_experts) != (3584, 1280, 384, 8, 0):
@@ -118,7 +118,7 @@ class UrmaBuffer:
             integer("gmm1_ahead_mgroups", gmm1_ahead_mgroups, 0, 65536)
             if cv_rows % 128:
                 raise ValueError("cv_rows must be a multiple of 128")
-            integer("max_recv_rows", max_recv_rows, 1, 16 * num_max_tokens_per_rank * num_topk)
+            integer("max_recv_rows", max_recv_rows, 1, group.size() * num_max_tokens_per_rank * num_topk)
         except (TypeError, ValueError) as failure:
             error = str(failure)
         collective_check(
@@ -137,7 +137,7 @@ class UrmaBuffer:
                 max_recv_rows,
                 timeout,
                 allow_multi_host,
-                "combine-ready-scan-reduce41",
+                "combine-ready-scan-reduce-world-v1",
                 "expert-m256-mgroup-lookahead-v1",
             ),
         )

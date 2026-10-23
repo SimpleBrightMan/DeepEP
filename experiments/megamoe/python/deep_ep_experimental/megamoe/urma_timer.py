@@ -10,7 +10,7 @@ TIMER_NUMEL = 28 * 3 * 8 * 16
 TIMER_SCHEMA = 1
 
 
-def communication_bandwidth(raw, rank, *, clock_mhz=1000.0):
+def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000.0):
     """Effective aggregate payload divided by the class's first-to-last span.
 
     1000 ticks/us follows the existing MegaMoE timer protocol. It is an explicit
@@ -20,8 +20,10 @@ def communication_bandwidth(raw, rank, *, clock_mhz=1000.0):
     """
     import numpy as np
 
-    if not 0 <= rank < 16:
-        raise ValueError("rank must be in [0,16)")
+    if world not in (4, 8, 16) or not 0 <= rank < world:
+        raise ValueError("world must be 4, 8 or 16 and rank must be in [0,world)")
+    if type(group_size) is not int or group_size <= 0 or world % group_size:
+        raise ValueError("group_size must be positive and divide world")
     if clock_mhz is not None and (not math.isfinite(clock_mhz) or clock_mhz <= 0):
         raise ValueError("clock_mhz must be positive and finite, or None")
     values = np.asarray(raw)
@@ -35,6 +37,8 @@ def communication_bandwidth(raw, rank, *, clock_mhz=1000.0):
         raise ValueError("URMA timer end precedes start")
     result = dict(
         rank=rank,
+        world=world,
+        group_size=group_size,
         schema=TIMER_SCHEMA,
         clock_mhz=clock_mhz,
         clock_source="caller supplied; default 1000 follows legacy MegaMoE protocol",
@@ -47,9 +51,9 @@ def communication_bandwidth(raw, rank, *, clock_mhz=1000.0):
         phase_idx = PHASES.index(phase)
         for kind in ("INTRA", "CROSS"):
             selected = []
-            for owner in range(16):
-                peer = remote_peer_for_worker(rank, owner) if owner < 15 else rank
-                owner_kind = "INTRA" if peer // 4 == rank // 4 else "CROSS"
+            for owner in range(world):
+                peer = remote_peer_for_worker(rank, owner, world) if owner < world - 1 else rank
+                owner_kind = "INTRA" if peer // group_size == rank // group_size else "CROSS"
                 record = values[owner, 2, phase_idx]
                 if owner_kind == kind and record[3] > 0:
                     if record[4] <= 0 or record[6] != TIMER_SCHEMA:
@@ -86,8 +90,13 @@ def communication_bandwidth(raw, rank, *, clock_mhz=1000.0):
 
 def summarize_bandwidth(records):
     """Average already-local bandwidths, without mixing clocks across ranks."""
-    if len(records) != 16 or {row["rank"] for row in records} != set(range(16)):
-        raise ValueError("bandwidth summary requires exactly one report for every EP16 rank")
+    world = len(records)
+    if (
+        world not in (4, 8, 16)
+        or {row["rank"] for row in records} != set(range(world))
+        or any(row.get("world", world) != world for row in records)
+    ):
+        raise ValueError("bandwidth summary requires exactly one report for every EP4/EP8/EP16 rank")
     result = []
     for phase in ("Dispatch", "Combine"):
         for kind in ("INTRA", "CROSS"):

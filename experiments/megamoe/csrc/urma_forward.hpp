@@ -3,6 +3,8 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <map>
+#include <string>
 #include "forward.hpp"
 #include "kernels/mega_moe/urma/abi.hpp"
 
@@ -22,6 +24,8 @@ public:
                           c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> out, int64_t epoch,
                           c10::optional<torch::Tensor> trace = c10::nullopt);
     int64_t workspace_bytes() const;
+    // Explicit diagnostic only: synchronize before copying owned intermediates.
+    std::map<std::string, torch::Tensor> debug_snapshot() const;
     int64_t gmm1_startup_mgroups() const
     {
         return gmm1_startup_mgroups_;
