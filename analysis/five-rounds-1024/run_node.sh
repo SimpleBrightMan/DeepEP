@@ -21,6 +21,14 @@ unset HCCL_IF_IP PYTHONPATH PYTHONHOME ASCEND_LAUNCH_BLOCKING
 export OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export RES_OPTIONS='attempts:1 timeout:1' ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export DEEPEP_SHMEM_ENDPOINT="tcp://$master:$port"
+# 临时端口可能被出站连接随机占用；在READY前拒绝冲突，不修改系统端口配置。
+read -r ephemeral_first ephemeral_last < /proc/sys/net/ipv4/ip_local_port_range
+if (( port <= ephemeral_last && port+3 >= ephemeral_first )); then
+    echo 'Experiment ports overlap host ephemeral range'; exit 3
+fi
+if [[ -n $(ss -Htan "( sport = :$port or sport = :$((port+1)) or sport = :$((port+3)) )") ]]; then
+    echo 'Experiment ports already in use'; exit 3
+fi
 source "$root/cohort_gate.sh" "$runtime/launch.lock"
 cd /tmp
 args=("$root/benchmark.py" "$method" --bs "$bs" --label "$label" --ep-size "$ep" --package-root "$root")
