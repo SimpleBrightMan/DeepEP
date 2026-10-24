@@ -371,12 +371,13 @@ static void CheckRoles(const std::vector<uint32_t>& counts, uint32_t bs, uint32_
     Check<AIC, 0, true>(counts, bs, groups);
 }
 template <int Core>
-static void CheckEp32Lag(const std::vector<uint32_t>& counts, uint32_t bs, uint32_t groups) {
-    WaveHarness<Core, 0, true> current(counts, bs, groups, 0), expected(counts, 4096U, groups, 0);
-    current.commonConfig_.worldSize = 32U;
+static void CheckLagPolicy(const std::vector<uint32_t>& counts, uint32_t bs, uint32_t groups,
+                           uint32_t world, bool lag) {
+    WaveHarness<Core, 0, true> current(counts, bs, groups, 0), expected(counts, lag ? 4096U : 96U, groups, 0);
+    current.commonConfig_.worldSize = world;
     int32_t ready = 0, expectedReady = 0;
     current.ProcessGmmWaves(ready);
-    // 冻结实现以4096强制lag；它不依赖bs做其他决策，用于核对顺序、范围与owner。
+    // 冻结实现以4096/96分别选择lag/立即消费；核对实际生产函数的顺序、范围与owner。
     expected.LegacyProcessGmmWaves(expectedReady);
     assert(current.events == expected.events);
     assert(current.loops.value == expected.loops.value);
@@ -384,12 +385,16 @@ static void CheckEp32Lag(const std::vector<uint32_t>& counts, uint32_t bs, uint3
     assert(ready == expectedReady);
 }
 int main() {
-    for (uint32_t bs : {32U, 96U, 256U, 512U, 1024U, 2048U, 4096U}) {
-        for (const auto& counts : {std::vector<uint32_t>{}, std::vector<uint32_t>{0,0},
-                                  std::vector<uint32_t>{1}, std::vector<uint32_t>{0,128,256,0,257,2048}}) {
-            for (uint32_t groups : {3U,6U}) {
-                CheckEp32Lag<AIC>(counts, bs, groups);
-                CheckEp32Lag<AIV>(counts, bs, groups);
+    for (uint32_t world : {8U,32U,64U,128U}) {
+        for (uint32_t bs : {32U,96U,256U,511U,512U,513U,1024U,2048U,4095U,4096U,4097U,8192U}) {
+            const bool lag = world == 32U ? bs >= 512U : bs >= 4096U;
+            for (const auto& counts : {std::vector<uint32_t>{}, std::vector<uint32_t>{0,0},
+                                      std::vector<uint32_t>{1}, std::vector<uint32_t>{0,128,256,0,257,2048},
+                                      std::vector<uint32_t>(384U/world, bs*world*6U/384U)}) {
+                for (uint32_t groups : {3U,6U}) {
+                    CheckLagPolicy<AIC>(counts, bs, groups, world, lag);
+                    CheckLagPolicy<AIV>(counts, bs, groups, world, lag);
+                }
             }
         }
     }

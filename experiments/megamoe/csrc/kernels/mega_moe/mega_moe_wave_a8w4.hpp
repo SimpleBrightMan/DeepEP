@@ -424,7 +424,7 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     uint32_t rows = static_cast<uint32_t>(cursor.slice.end.globalTokenIndex - begin.globalTokenIndex);
     // 只轮换当前 AIV1 的通信任务，不修改成员中的物理核编号。
     // 输入是 Combine 自己的逻辑 wave（cursor.wave），不是当前 Dispatch/GMM1 的进度；
-    // BS>=4096 时 GMM2 滞后一轮，使用其他阶段的 wave 会把同一批输出分给错误的 owner。
+    // GMM2 滞后一轮时，使用其他阶段的 wave 会把同一批输出分给错误的 owner。
     // GMM2计算核方向与通信owner轮换都不改变slice身份和实际生产核数量。
     auto combineJob = waveCombineJob_;
     if (combineJob.totalJobs != 0U && combineJob.jobIndex < combineJob.totalJobs) {
@@ -700,7 +700,7 @@ __aicore__ inline ExpertWaveRange MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFun
 }
 
 // AIC/AIV0 同序推进 GMM1/Prologue、GMM2/Prologue；数据就绪仍由各 stage 内部的 flag 保证。
-// EP32实验统一滞后一波；其他EP保留BS>=4096门限，最后补齐G2。
+// EP32在BS>=512时滞后一波；其他EP保留BS>=4096门限，最后补齐G2。
 template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessGmmWaves(int32_t& gmm1TileReadySequence)
 {
@@ -718,8 +718,8 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     uint32_t gmm1StartBlockIdx = 0U;
     uint32_t gmm2StartBlockIdx = 0U;
 
-    // 只改变EP32提交顺序，保留原Wave预算、真实ready/FIX依赖和末波收尾。
-    const bool gmm2LagActive = commonConfig_.worldSize == 32U || commonConfig_.tokenNum >= 4096U;
+    // EP32小BS保留较早的下游启动；阈值按本卡实际BS，不按容量或专家接收行数判断。
+    const bool gmm2LagActive = commonConfig_.tokenNum >= (commonConfig_.worldSize == 32U ? 512U : 4096U);
     ExpertWaveRange pendingWave{{}, {}, commonConfig_.moeExpertPerRank};
 
     // cursor 总是指向下一待规划位置；本次计算使用 TakeNextExpertSliceInWave 返回的固定 slice。
