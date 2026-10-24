@@ -19,6 +19,7 @@ def main():
     p.add_argument('--host-keys',required=True)
     p.add_argument('--dependencies',required=True)
     p.add_argument('--packages',type=Path,required=True)
+    p.add_argument('--package-cache-root',help='Existing per-node archive cache; SHA verified before copying')
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--rack',choices=('01','05','06','07'),required=True)
     p.add_argument('--nodes',required=True)
@@ -35,6 +36,8 @@ def main():
         raise ValueError('Invalid port base')
     if not re.fullmatch('/home/codex-deepep/[a-zA-Z0-9_-]+',a.remote_root):
         raise ValueError('Invalid isolated remote root')
+    if a.package_cache_root and (not re.fullmatch('/home/codex-deepep/[a-zA-Z0-9_-]+',a.package_cache_root) or a.package_cache_root==a.remote_root):
+        raise ValueError('Invalid distinct package cache root')
     sys.path.insert(0,a.dependencies)
     import openpyxl
     import paramiko
@@ -57,6 +60,7 @@ def main():
         scope='full communication kernel Duration; timer-off; last10/20; mean per-round rank-min',
         timer='separate rank0 full passive pass on a repeats only' if a.trace else 'off; screening only',
         timer_requested=a.trace,port_base=a.port_base,
+        package_cache_root=a.package_cache_root,
         harness_hashes={f.name:hashlib.sha256(f.read_bytes()).hexdigest() for f in source.iterdir() if f.is_file()})
     lock=threading.Lock()
     def state(stage,**fields):
@@ -109,7 +113,14 @@ def main():
         with connect(i) as c,c.open_sftp() as s:
             for n in ('benchmark.py','coordinator.py','cohort_gate.sh','export_native_trace.py','probe.py','run_node.sh'):
                 s.put(str(source/n),a.remote_root+'/'+n)
-            s.put(str(a.packages),a.remote_root+'/packages.tar.gz')
+            if not a.package_cache_root:
+                s.put(str(a.packages),a.remote_root+'/packages.tar.gz')
+        if a.package_cache_root:
+            # 缓存只减少上传；每次仍新建独立目录、验证原归档与展开后的native身份。
+            cached=a.package_cache_root+'/packages.tar.gz'
+            copy=(f'test $(sha256sum {cached} | cut -d" " -f1) = {manifest["package_archive_sha256"]} '
+                  f'&& cp -- {cached} {a.remote_root}/packages.tar.gz')
+            if command(i,copy,'cache'):raise RuntimeError('Package cache identity mismatch')
         check="import pathlib,json,hashlib;p=pathlib.Path('.');rs=json.loads((p/'packages.json').read_text());assert all(hashlib.sha256((p/'packages'/m/n).read_bytes()).hexdigest()==h for m,r in rs.items() for n,h in r['native'].items())"
         # 先确认每台节点的运行时依赖，避免到全组READY时才发现缺少共享锁目录/SHMEM。
         cmd=(f'cd {a.remote_root} && test -f /home/codex-deepep/ep32-r31-ds-1021/shmem/lib/libshmem.so '
