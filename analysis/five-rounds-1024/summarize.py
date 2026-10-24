@@ -50,8 +50,11 @@ def main():
     for tag,(title,branch) in ROUNDS.items():
         result['experiments'].append(dict(id=tag,title=title,branch=branch,
             cases=[v for k,v in sorted(cases.items()) if k[0]==tag]))
+    result['status']='screening_complete' if len(cases)==20 else 'partial'
+    result['coverage_note']='EP8: BS512/1024/4096；EP32: BS4096。不是全BS/全EP验收。'
     lines=['# 五轮优化实验（10月24日）','',
         '冻结对照为当前两轮wave＋AIV1完成等待 `904131c`。每轮独立对照，不把不同机器或不同分支的最小值拼成一个版本。',
+        '',result['coverage_note'],
         '',result['scope']+'；无共享专家，balanced seed20260922，H7168/I3072/E384/topk6。用户要求跳过独立Golden，输出指纹相等不等于精度验收。',
         '', '|轮次|EP|BS/卡|本轮基线 μs|候选 μs|降耗|rank-max 基线→候选 μs|',
         '|---|---:|---:|---:|---:|---:|---:|']
@@ -64,7 +67,7 @@ def main():
     for e in result['experiments']:
         eps=sorted({c['ep'] for c in e['cases']})
         lines.append(f'- {e["id"].upper()}：`{e["branch"]}`；已审计EP：{eps or "无"}。')
-    lines+=['','EP32/EP128未完整采齐的条目保持待测；端口占用、SHMEM初始化失败、外部作业入场均不计为优化失败或有效性能。',
+    lines+=['','EP32其余BS及EP128仍待测；端口占用、SHMEM初始化失败、外部作业入场均不计为优化失败或有效性能。',
         '不终止其他用户程序，不修改正式master或冻结基线。已完成尝试及资源扫描详见同目录 `five-rounds.json`。','']
     (a.root/'five-rounds.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
     (a.root/'RESULTS.md').write_text('\n'.join(lines),encoding='utf-8')
