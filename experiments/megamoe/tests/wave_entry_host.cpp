@@ -5,7 +5,7 @@
 constexpr int AIC = 0, AIV = 1;
 namespace MegaMoeImpl { enum class Stage { MOE_GMM1_ACTIVATION }; }
 std::vector<int> events;
-template <bool> void PrepareMoeExpertTokenCountTable(int,int,int,int) { events.push_back(2); }
+template <bool, class Params> void PrepareMoeExpertTokenCountTable(int,int,const Params&,int) { events.push_back(2); }
 void WaitForMoeExpertTokenCountReady(int,int,int) { events.push_back(3); }
 struct Dump { void UpdateStage(MegaMoeImpl::Stage) { events.push_back(0); } };
 template <int Core, bool Cv> struct Harness {
