@@ -31,6 +31,7 @@ struct WorkspaceInfo {
     GM_ADDR flagSendCntCalToUpdParamsPtr;
     GM_ADDR flagGmmToEpiloguePtr{nullptr};
     GM_ADDR gmm2ReadyPtr{nullptr};
+    GM_ADDR flagGmm2IssuedPtr{nullptr};
     GM_ADDR gmm2CombineSyncCounterPtr{nullptr};
     GM_ADDR cumsumInfoPtr{nullptr};
     GM_ADDR gmm1MmadResPtr{nullptr};
@@ -127,6 +128,9 @@ private:
             gmm2ReadyPtr = base + workspaceSize;
             int64_t readySlotsPerExpert = waveFlagSlotsPerExpert;
             workspaceSize += SIZE_INT_32 * moeExpertCount * readySlotsPerExpert;
+            // 每个 AIC 独占 cache line；仅为提交序号，不能替代 FIX 完成。纳入原连续 reset 区。
+            flagGmm2IssuedPtr = base + workspaceSize;
+            workspaceSize += SIZE_INT_32 * INT_CACHELINE * static_cast<int64_t>(tilingData->aicNum);
         }
 
         // Shared expert GMM2 tile counter: tile 级 flag counter, 每 shared expert 一组 slot。

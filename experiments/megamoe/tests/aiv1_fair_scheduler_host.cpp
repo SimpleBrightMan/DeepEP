@@ -12,6 +12,7 @@ enum class AivTaskKind { Activation, Combine };
 struct SharedActivationCursor { bool done = false; };
 struct ExpertTokenPosition { uint32_t expertIdx = 0; };
 struct Gmm1AsyncCompletion { static void InitConsumer() {} };
+struct Gmm2AivCompletion { static void InitConsumer() {} };
 namespace AscendC {
 enum class HardEvent { V_MTE2, MTE3_V };
 bool activationCredit = false;
@@ -49,7 +50,7 @@ struct Scheduler {
     struct Tiling { float clampLimit=0; unsigned actMode=0, actSubMode=0; float activationAlpha=1, activationBeta=1; } tiling_;
     struct { struct { int activationQuantDataPtr=0, activationQuantScalePtr=0; } workspaceInfo; Tiling* tilingData=nullptr; } params_;
     bool computeReplay_ = false;
-    bool delayActivation = false, delayCombine = false;
+    bool delayActivation = false, delayCombine = false, delayCompletion = false;
     uint32_t sharedExpertNum_ = 0, mGroupsPerWave_ = 2;
     struct { uint32_t moeExpertPerRank = 6; } commonConfig_;
     struct { struct { uint32_t totalJobs = 1; } blockJob; } gmmExecutionConfig_;
@@ -59,7 +60,7 @@ struct Scheduler {
     int tokenDispatchConfig_ = 0, tokenDispatchScratch_ = 0;
     uint32_t combineRowSequence_ = 0;
     bool activationPending_ = false;
-    uint32_t completedActivations = 0, issuedDispatches = 0;
+    uint32_t completedActivations = 0, issuedDispatches = 0, completedGmm2 = 0;
     uint32_t dispatched = 0, activated = 0, combined = 0, nextA = 0, nextC = 0;
     std::vector<char> order;
     bool NextAivSlice(AivTaskCursor& c, AivTaskKind kind) {
@@ -78,9 +79,17 @@ struct Scheduler {
         order.push_back('A');
         return true;
     }
+    bool TryReceiveGmm2Completion(ExpertTokenPosition& p, uint32_t& start, int32_t& sequence) {
+        if (p.expertIdx >= commonConfig_.moeExpertPerRank) return false;
+        if (delayCompletion && dispatched < commonConfig_.moeExpertPerRank) return false;
+        const auto end = std::min(p.expertIdx + mGroupsPerWave_, commonConfig_.moeExpertPerRank);
+        if (completedActivations < end) return false;
+        p.expertIdx = end; completedGmm2 = end; ++sequence; ++start; order.push_back('F');
+        return true;
+    }
     bool TryRunReadyCombine(AivTaskCursor& c) {
         if (delayCombine && dispatched < commonConfig_.moeExpertPerRank) return false;
-        if (completedActivations <= c.index) return false;
+        if (completedGmm2 <= c.index) return false;
         assert(c.index == combined++);
         order.push_back('C');
         return true;
@@ -124,6 +133,12 @@ int main() {
         stalled.ProcessAiv1PriorityStages(sequence);
         assert(sequence == 6 && stalled.dispatched == 6 && stalled.combined == 6);
     }
+    Scheduler delayedFix;
+    delayedFix.delayCompletion = true;
+    sequence = 0;
+    delayedFix.ProcessAiv1PriorityStages(sequence);
+    assert(sequence == 6 && delayedFix.dispatched == 6 && delayedFix.combined == 6);
+    assert(delayedFix.completedGmm2 == 6);
     Scheduler replay;
     replay.computeReplay_ = true;
     sequence = 0;

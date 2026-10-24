@@ -1,5 +1,9 @@
 # 零通信本地计算验证
 
+当前 Wave 路径已将 GMM2 的 FIX 完成等待移到配对 AIV1，协议与验证边界见
+[GMM2_AIV1_WAIT.md](GMM2_AIV1_WAIT.md)。下文为历史本地计算实验记录，
+其中逐 slice 析构/排空的描述不代表当前持久 Wave 路径；这些历史精度和性能结果也不替代本次移植验收。
+
 计算优化基线 `codex/megamoe-compute-opt` 基于 `codex/megamoe-local-compute`，
 后者基于 `codex/megamoe-compute-replay`。保持计算调度和数学运算，优化 GMM2 完成边界。
 原分支需要SHMEM初始化和一次完整forward作为priming；本分支新增local-only Plan，
