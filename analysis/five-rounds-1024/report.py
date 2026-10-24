@@ -86,12 +86,13 @@ def main():
             if inputs!=ins or outputs!=outs:raise ValueError(f'EP{ep} BS{bs}: control/candidate fingerprint mismatch')
             records.append(record)
         methods={}
-        for method in ('control','combined'):
+        for method in dict.fromkeys(job.split('-')[0] for job in manifest['schedule']):
             runs=[r for r in records if r['method']==method]
+            if len(runs)!=2:raise ValueError(f'{method}: expected two independent starts')
             methods[method]=dict(mean_us=statistics.mean(r['mean_us'] for r in runs),
                 rank_max_mean_us=statistics.mean(r['rank_max_mean_us'] for r in runs),starts=2,runs=runs)
         cases.append(dict(ep=ep,bs=bs,status='audited_complete',methods=methods,
-            reduction_pct=100*(1-methods['combined']['mean_us']/methods['control']['mean_us']),
+            reduction_pct=100*(1-methods['combined']['mean_us']/methods['control']['mean_us']) if len(methods)==2 else None,
             output_hashes_equal=True))
     complete=all(c['status']=='audited_complete' for c in cases)
     if not complete and not a.partial:raise ValueError('Matrix incomplete; use --partial without claiming completion')

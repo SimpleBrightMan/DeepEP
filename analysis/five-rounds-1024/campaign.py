@@ -26,6 +26,7 @@ def main():
     p.add_argument('--remote-root',required=True)
     p.add_argument('--bs-values',type=int,nargs='+',default=[512,1024,4096])
     p.add_argument('--trace',action='store_true',help='Separate passive timer pass for a repeats')
+    p.add_argument('--method-only',choices=('control','combined'),help='Single frozen version, two independent starts per BS')
     p.add_argument('--port-base',type=int,required=True,help='Unique bootstrap range for this campaign')
     a=p.parse_args()
     if len(set(a.bs_values))!=len(a.bs_values) or any(bs not in (32,96,256,512,1024,2048,4096) for bs in a.bs_values):
@@ -52,7 +53,7 @@ def main():
     manifest=dict(status='preparing',ep=a.ep,nodes=nodes,rack=a.rack,bs_values=a.bs_values,
         packages=packages,accuracy='not_run_user_requested',remote_root=a.remote_root,
         package_archive_sha256=hashlib.sha256(a.packages.read_bytes()).hexdigest(),
-        schedule=['control-a','combined-a','combined-b','control-b'],completed=[],finished_workers=[],
+        schedule=[a.method_only+'-a',a.method_only+'-b'] if a.method_only else ['control-a','combined-a','combined-b','control-b'],completed=[],finished_workers=[],
         scope='full communication kernel Duration; timer-off; last10/20; mean per-round rank-min',
         timer='separate rank0 full passive pass on a repeats only' if a.trace else 'off; screening only',
         timer_requested=a.trace,port_base=a.port_base,
@@ -156,7 +157,7 @@ def main():
     save('preparing')
     try:
         parallel(deploy)
-        launch('combined',32,'preflight','probe')
+        launch(a.method_only or 'combined',32,'preflight','probe')
         for bs in manifest['bs_values']:
             for job in manifest['schedule']:
                 method,repeat=job.split('-')
