@@ -13,12 +13,13 @@ def main():
     p.add_argument('--host-keys',required=True)
     p.add_argument('--dependencies',required=True)
     p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--racks',nargs='+',choices=('01','05','06','07'),default=['01','05','06','07'])
     a=p.parse_args()
     sys.path.insert(0,a.dependencies)
     import openpyxl
     import paramiko
     book=openpyxl.load_workbook(a.inventory,read_only=True,data_only=True)
-    nodes=[(s.title[-2:],*r[:4]) for s in book if s.title[-2:] in ('01','05','06','07')
+    nodes=[(s.title[-2:],*r[:4]) for s in book if s.title[-2:] in a.racks
            for r in s.iter_rows(min_row=2,values_only=True) if r[0] and r[1]]
     command=r'''date -Is
 npu-smi info | grep -c 'No running processes found in NPU'

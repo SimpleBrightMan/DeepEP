@@ -2,6 +2,7 @@
 import argparse
 import json
 from pathlib import Path
+import shutil
 
 ROUNDS = {
     'r1': ('Combine一行配额', 'codex/megamoe-r1-combine-one-row-1024'),
@@ -71,6 +72,7 @@ def main():
         '不终止其他用户程序，不修改正式master或冻结基线。已完成尝试及资源扫描详见同目录 `five-rounds.json`。','']
     (a.root/'five-rounds.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
     (a.root/'RESULTS.md').write_text('\n'.join(lines),encoding='utf-8')
+    shutil.copy2(Path(__file__).with_name('FINDINGS.md'),a.root/'FINDINGS.md')
     print('AUDITED_CASES',len(cases),'ATTEMPTS',len(result['attempts']),'SCANS',len(result['scans']))
 
 
