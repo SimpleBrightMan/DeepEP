@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -18,28 +19,39 @@ def main():
     p.add_argument('--root', type=Path, required=True)
     p.add_argument('--revision', required=True)
     p.add_argument('--archive-sha256', required=True)
+    p.add_argument('--resume-package', action='store_true', help='Only recover packaging after verified native build')
     a = p.parse_args()
     root = a.root.resolve()
     archive = root/'source.tar'
     if sha(archive) != a.archive_sha256:
         raise ValueError('Source archive mismatch')
     source = root/'source'
-    source.mkdir(exist_ok=False)
-    with tarfile.open(archive) as t:
-        t.extractall(source, filter='data')
+    if a.resume_package:
+        if (root/'packages.json').exists() or '[100%] Built target megamoe_ext' not in (root/'build.log').read_text():
+            raise ValueError('Not an import-only packaging failure')
+        with tarfile.open(archive) as t:
+            for member in t:
+                if member.isfile() and sha(source/member.name)!=hashlib.sha256(t.extractfile(member).read()).hexdigest():
+                    raise ValueError('Frozen build source changed')
+    else:
+        source.mkdir(exist_ok=False)
+        with tarfile.open(archive) as t:
+            t.extractall(source, filter='data')
     tests = source/'experiments/megamoe/tests'
     checks = ['test_paired_wave_budget_cpu.py', 'test_gmm2_aiv_completion.py',
               'test_aiv1_fair_scheduler.py', 'test_workspace_layout.py']
-    with (root/'cpu-contract.log').open('x') as log:
-        subprocess.run([sys.executable, '-B', '-m', 'pytest', '-q', *[str(tests/n) for n in checks]],
-                       stdout=log, stderr=subprocess.STDOUT, check=True, timeout=180)
+    if not a.resume_package:
+        with (root/'cpu-contract.log').open('x') as log:
+            subprocess.run([sys.executable, '-B', '-m', 'pytest', '-q', *[str(tests/n) for n in checks]],
+                           stdout=log, stderr=subprocess.STDOUT, check=True, timeout=180)
     print('CPU_CONTRACT_PASS', flush=True)
     old = Path('/home/codex-deepep/r31-two-round-build-1023')
     prior = json.loads((old/'packages.json').read_text())['paired2']
     packages = root/'packages'
-    packages.mkdir()
-    for method in ('control', 'combined'):
-        shutil.copytree(old/'packages/paired2', packages/method)
+    if not a.resume_package:
+        packages.mkdir()
+        for method in ('control', 'combined'):
+            shutil.copytree(old/'packages/paired2', packages/method)
     package = packages/'combined'
     shutil.copytree(source/'experiments/megamoe/python/deep_ep_experimental',
                     package/'deep_ep_experimental', dirs_exist_ok=True)
@@ -54,11 +66,14 @@ def main():
                '-DSHMEM_ROOT=/home/codex-deepep/20261012-d8-sdk/DeepEP/third-party/shmem/install/shmem',
                '-DCATLASS_ROOT='+str(catlass), '-DPython_EXECUTABLE='+sys.executable, '-Dpybind11_DIR='+pybind]
     (root/'configure.json').write_text(json.dumps(command, indent=2))
-    print('NATIVE_BUILD_START', flush=True)
-    with (root/'build.log').open('x') as log:
-        subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=180)
-        subprocess.run([cmake, '--build', str(build), '--target', 'megamoe_ext', '--parallel', '2'],
-                       stdout=log, stderr=subprocess.STDOUT, check=True, timeout=1200)
+    if not a.resume_package:
+        print('NATIVE_BUILD_START', flush=True)
+        with (root/'build.log').open('x') as log:
+            subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=180)
+            subprocess.run([cmake, '--build', str(build), '--target', 'megamoe_ext', '--parallel', '2'],
+                           stdout=log, stderr=subprocess.STDOUT, check=True, timeout=1200)
+    else:
+        print('REUSE_VERIFIED_NATIVE_BUILD', flush=True)
     native = package/'deep_ep_experimental/megamoe'
     for item in native.glob('_C*.so'):
         item.unlink()  # 仅覆盖本次新建的隔离包副本。
@@ -68,13 +83,15 @@ def main():
     for item in [extensions[0], build/'experiments/megamoe/libmegamoe_kernel.so']:
         shutil.copy2(item, native/item.name)
     registry = {}
+    probe_env=dict(os.environ)
+    probe_env['LD_LIBRARY_PATH']='/home/codex-deepep/ep32-r31-ds-1021/shmem/lib:'+probe_env.get('LD_LIBRARY_PATH','')
     for method in ('control', 'combined'):
         pkg = packages/method
         probe = ('import sys,json,torch,torch_npu;sys.path.insert(0,'+repr(str(pkg))+');'
                  'from deep_ep_experimental.megamoe import api;from deep_ep_experimental.megamoe.timer import protocol as p;'
                  'e=api._extension();print(json.dumps(dict(protocol=e.api_protocol,groups=p.DYNAMIC_TRACE_GROUPS,'
                  'aiv0=p.DYNAMIC_TRACE_AIV0,timer_numel=e.timer_numel,expected_numel=p.TOTAL_BUFFER_SIZE)))')
-        policy = json.loads(subprocess.check_output([sys.executable, '-I', '-B', '-c', probe], text=True))
+        policy = json.loads(subprocess.check_output([sys.executable, '-I', '-B', '-c', probe], text=True,env=probe_env))
         if policy['protocol'] != 8 or policy['groups'] != 32 or policy['aiv0'] != 1 or policy['timer_numel'] != policy['expected_numel']:
             raise ValueError('Wrong native ABI/timer contract')
         registry[method] = dict(revision=a.revision if method=='combined' else prior['revision'],
