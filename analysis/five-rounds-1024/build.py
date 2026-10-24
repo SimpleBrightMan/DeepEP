@@ -84,6 +84,7 @@ def main():
         if a.host_only:
             shutil.copy2(package/'deep_ep_experimental/megamoe/libmegamoe_kernel.so',
                          build/'experiments/megamoe/libmegamoe_kernel.so')
+            os.utime(build/'experiments/megamoe/libmegamoe_kernel.so', None)
         subprocess.run([cmake, '--build', str(build), '--target', 'megamoe_ext', '--parallel', '2'],
                        stdout=log, stderr=subprocess.STDOUT, check=True, timeout=1200)
     native = package/'deep_ep_experimental/megamoe'
