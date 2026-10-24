@@ -26,7 +26,10 @@ read -r ephemeral_first ephemeral_last < /proc/sys/net/ipv4/ip_local_port_range
 if (( port <= ephemeral_last && port+3 >= ephemeral_first )); then
     echo 'Experiment ports overlap host ephemeral range'; exit 3
 fi
-if [[ -n $(ss -Htan "( sport = :$port or sport = :$((port+1)) or sport = :$((port+3)) )") ]]; then
+if ! port_snapshot=$(ss -Htan "( sport = :$port or sport = :$((port+1)) or sport = :$((port+3)) )"); then
+    echo 'Cannot inspect experiment ports'; exit 3
+fi
+if [[ -n $port_snapshot ]]; then
     echo 'Experiment ports already in use'; exit 3
 fi
 source "$root/cohort_gate.sh" "$runtime/launch.lock"
