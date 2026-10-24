@@ -95,12 +95,16 @@ def main():
                 s.put(str(source/n),a.remote_root+'/'+n)
             s.put(str(a.packages),a.remote_root+'/packages.tar.gz')
         check="import pathlib,json,hashlib;p=pathlib.Path('.');rs=json.loads((p/'packages.json').read_text());assert all(hashlib.sha256((p/'packages'/m/n).read_bytes()).hexdigest()==h for m,r in rs.items() for n,h in r['native'].items())"
-        cmd=f'cd {a.remote_root} && test $(sha256sum packages.tar.gz | cut -d" " -f1) = {manifest["package_archive_sha256"]} && tar -xzf packages.tar.gz && /root/miniconda3/envs/zyx/bin/python -I -c {shlex.quote(check)}'
+        # 先确认每台节点的运行时依赖，避免到全组READY时才发现缺少共享锁目录/SHMEM。
+        cmd=(f'cd {a.remote_root} && test -f /home/codex-deepep/ep32-r31-ds-1021/shmem/lib/libshmem.so '
+             '&& test -f /home/pkg/b080/cann-9.2.0/set_env.sh '
+             f'&& test $(sha256sum packages.tar.gz | cut -d" " -f1) = {manifest["package_archive_sha256"]} '
+             f'&& tar -xzf packages.tar.gz && /root/miniconda3/envs/zyx/bin/python -I -c {shlex.quote(check)}')
         if command(i,cmd,'deploy'):raise RuntimeError('Deployment identity mismatch')
     def collect(i,label,probe=False):
         relative='preflight/'+label if probe else 'runs/'+label
         archive='archive-'+label+'-'+nodes[i]+'.tar.gz'
-        cmd=(f'cd {a.remote_root} && find {relative} -type f \\( -name "kernel_details*.csv" -o -name "native_sparse.npz" '
+        cmd=(f'set -o pipefail; cd {a.remote_root} && find {relative} -type f \\( -name "kernel_details*.csv" -o -name "native_sparse.npz" '
              '-o -name "timer_summary.csv" -o \\( -name "*.json" ! -path "*/profiler/*" ! -path "*/timer_profiler/*" \\) \\) '
              f'-print0 | tar --null -T - -czf {archive}')
         if command(i,cmd,'collect-'+label):raise RuntimeError('Collection failed')
