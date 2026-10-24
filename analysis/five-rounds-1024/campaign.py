@@ -1,4 +1,4 @@
-"""逐case全组空闲门禁、ABBA七BS；失败停止、保留日志，不占用他人NPU。"""
+"""默认每次启动连续跑全部BS；整套独立复测，启动前全组空闲门禁。"""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -18,20 +18,27 @@ def main():
     p.add_argument('--inventory',required=True)
     p.add_argument('--host-keys',required=True)
     p.add_argument('--dependencies',required=True)
+    p.add_argument('--jump-rack',choices=tuple(f'{n:02d}' for n in range(1,9)))
+    p.add_argument('--jump-node',default='CPU1')
+    p.add_argument('--additional-host-keys',help='Public known_hosts from an authenticated trusted host')
     p.add_argument('--packages',type=Path,required=True)
     p.add_argument('--package-cache-root',help='Existing per-node archive cache; SHA verified before copying')
     p.add_argument('--output',type=Path,required=True)
-    p.add_argument('--rack',choices=('01','05','06','07'),required=True)
+    p.add_argument('--rack',choices=tuple(f'{n:02d}' for n in range(1,9)),required=True)
     p.add_argument('--nodes',required=True)
     p.add_argument('--ep',type=int,choices=(8,32),required=True)
     p.add_argument('--remote-root',required=True)
     p.add_argument('--bs-values',type=int,nargs='+',default=[512,1024,4096])
     p.add_argument('--trace',action='store_true',help='Separate passive timer pass for a repeats')
     p.add_argument('--method-only',choices=('control','combined'),help='Single frozen version, two independent starts per BS')
+    p.add_argument('--isolated-bs',action='store_true',help='Capacity diagnostic only: restart workers per BS')
+    p.add_argument('--buffer-capacity',type=int,help='Fixed max tokens; default max(BS) in continuous mode')
     p.add_argument('--port-base',type=int,required=True,help='Unique bootstrap range for this campaign')
     a=p.parse_args()
     if len(set(a.bs_values))!=len(a.bs_values) or any(bs not in (32,96,256,512,1024,2048,4096) for bs in a.bs_values):
         raise ValueError('Invalid BS set')
+    if a.buffer_capacity is not None and not max(a.bs_values)<=a.buffer_capacity<=4096:
+        raise ValueError('Buffer capacity must cover every BS and be <=4096')
     if not 1024<=a.port_base<=60000:
         raise ValueError('Invalid port base')
     if not re.fullmatch('/home/codex-deepep/[a-zA-Z0-9_-]+',a.remote_root):
@@ -60,7 +67,10 @@ def main():
         scope='full communication kernel Duration; timer-off; last10/20; mean per-round rank-min',
         timer='separate rank0 full passive pass on a repeats only' if a.trace else 'off; screening only',
         timer_requested=a.trace,port_base=a.port_base,
+        execution_mode='isolated' if a.isolated_bs else 'continuous',
+        buffer_capacity=a.buffer_capacity or (None if a.isolated_bs else max(a.bs_values)),
         package_cache_root=a.package_cache_root,
+        jump=dict(rack=a.jump_rack,node=a.jump_node) if a.jump_rack else None,
         harness_hashes={f.name:hashlib.sha256(f.read_bytes()).hexdigest() for f in source.iterdir() if f.is_file()})
     lock=threading.Lock()
     def state(stage,**fields):
@@ -72,15 +82,35 @@ def main():
         manifest['status']=status
         (out/'experiment.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
     clients={}
+    jump_client=None
+    connection_lock=threading.Lock()
     @contextmanager
     def connect(i):
+        nonlocal jump_client
         # 每节点各阶段串行；复用一条已验证连接，减少频繁重新认证导致的启动失败。
         # 不在worker运行期间静默重连；连接失效仍停止本轮，最终统一关闭。
         if i not in clients:
             _,ip,user,password=inventory[nodes[i]]
             c=paramiko.SSHClient();c.load_host_keys(a.host_keys)
             c.set_missing_host_key_policy(paramiko.RejectPolicy())
-            c.connect(ip,username=user,password=password,timeout=15,look_for_keys=False,allow_agent=False)
+            if a.additional_host_keys:
+                extra=paramiko.HostKeys(a.additional_host_keys).lookup(ip)
+                current=c.get_host_keys().lookup(ip)
+                for kind,key in (extra or {}).items():
+                    if current and kind in current and current[kind]!=key:raise ValueError('Conflicting trusted host keys')
+                    c.get_host_keys().add(ip,kind,key)
+            tunnel=None
+            if a.jump_rack:
+                with connection_lock:
+                    if jump_client is None:
+                        js=next(s for s in book if s.title.endswith(a.jump_rack))
+                        _,jip,juser,jpassword=next(r[:4] for r in js.iter_rows(min_row=2,values_only=True) if r[0]==a.jump_node)
+                        jump_client=paramiko.SSHClient();jump_client.load_host_keys(a.host_keys)
+                        jump_client.set_missing_host_key_policy(paramiko.RejectPolicy())
+                        jump_client.connect(jip,username=juser,password=jpassword,timeout=15,look_for_keys=False,allow_agent=False)
+                        jump_client.get_transport().set_keepalive(20)
+                tunnel=jump_client.get_transport().open_channel('direct-tcpip',(ip,22),('127.0.0.1',0),timeout=15)
+            c.connect(ip,username=user,password=password,timeout=15,look_for_keys=False,allow_agent=False,sock=tunnel)
             c.get_transport().set_keepalive(20);clients[i]=c
         if not clients[i].get_transport().is_active():raise RuntimeError('Control connection lost')
         yield clients[i]
@@ -126,12 +156,21 @@ def main():
         cmd=(f'cd {a.remote_root} && test -f /home/codex-deepep/ep32-r31-ds-1021/shmem/lib/libshmem.so '
              '&& test -f /home/pkg/b080/cann-9.2.0/set_env.sh '
              f'&& test $(sha256sum packages.tar.gz | cut -d" " -f1) = {manifest["package_archive_sha256"]} '
-             f'&& tar -xzf packages.tar.gz && /root/miniconda3/envs/zyx/bin/python -I -c {shlex.quote(check)}')
-        if command(i,cmd,'deploy'):raise RuntimeError('Deployment identity mismatch')
+             f'&& tar -xzf packages.tar.gz && bash -n run_node.sh cohort_gate.sh '
+             f'&& /root/miniconda3/envs/zyx/bin/python -I -c {shlex.quote(check)}')
+        cmd+=' && source /home/pkg/b080/cann-9.2.0/set_env.sh'
+        cmd+=' && export LD_LIBRARY_PATH="/home/codex-deepep/ep32-r31-ds-1021/shmem/lib:/root/miniconda3/envs/zyx/lib:${LD_LIBRARY_PATH:-}" TORCH_DEVICE_BACKEND_AUTOLOAD=0'
+        for method in dict.fromkeys(job.split('-')[0] for job in manifest['schedule']):
+            native_check=(f"import sys,torch,torch_npu;sys.path.insert(0,'packages/{method}');"
+                "from deep_ep_experimental.megamoe.api import _extension;"
+                "assert _extension().api_protocol==8;print('NATIVE_IMPORT_READY')")
+            cmd+=' && /root/miniconda3/envs/zyx/bin/python -I -c '+shlex.quote(native_check)
+        if command(i,cmd,'deploy'):raise RuntimeError('Deployment/native dependency check failed; see node deploy log')
     def collect(i,label,probe=False):
-        relative='preflight/'+label if probe else 'runs/'+label
+        relatives=['preflight/'+label] if probe else ([f'runs/bs{bs}-{label}' for bs in a.bs_values]
+            if not a.isolated_bs else ['runs/'+label])
         archive='archive-'+label+'-'+nodes[i]+'.tar.gz'
-        cmd=(f'set -o pipefail; cd {a.remote_root} && find {relative} -type f \\( -name "kernel_details*.csv" -o -name "native_sparse.npz" '
+        cmd=(f'set -o pipefail; cd {a.remote_root} && find {" ".join(relatives)} -type f \\( -name "kernel_details*.csv" -o -name "native_sparse.npz" '
              '-o -name "timer_summary.csv" -o \\( -name "*.json" ! -path "*/profiler/*" ! -path "*/timer_profiler/*" \\) \\) '
              f'-print0 | tar --null -T - -czf {archive}')
         if command(i,cmd,'collect-'+label):raise RuntimeError('Collection failed')
@@ -145,7 +184,10 @@ def main():
         # preflight和每个独立启动不复用bootstrap/torchrun/control端口；不改变设备通信。
         launch_index=len(manifest['finished_workers'])
         port=a.port_base+launch_index*4
-        cmd=lambda i:f'bash {a.remote_root}/run_node.sh {i} {master} {a.ep} {method} {bs} {label} {trace} {port}'
+        values=[bs] if isinstance(bs,int) else bs
+        capacity=a.buffer_capacity or max(values)
+        csv_bs=','.join(map(str,values))
+        cmd=lambda i:f'bash {a.remote_root}/run_node.sh {i} {master} {a.ep} {method} {csv_bs} {label} {trace} {port} {capacity}'
         state('starting',label=label,method=method,bs=bs,ep=a.ep,shmem_port=port,master_port=port+1,control_port=port+3)
         if any(parallel(lambda i:command(i,cmd(i),label,barrier))):raise RuntimeError('Failed node; no next case')
         manifest['finished_workers'].append(dict(label=label,trace=trace))
@@ -155,24 +197,32 @@ def main():
         # 每次仍重新检查NPU空闲；失败时也归档此前已成功退出的调用，绝不重跑来掩盖失败。
         for item in manifest['finished_workers']:
             label,trace=item['label'],item['trace']
-            if label in manifest['completed']:continue
+            case_labels=[label] if trace=='probe' or a.isolated_bs else [f'bs{bs}-{label}' for bs in a.bs_values]
+            if all(case in manifest['completed'] for case in case_labels):continue
             parallel(lambda i:collect(i,label,trace=='probe'))
             if trace=='probe':
                 manifest['completed'].append(label);save('collecting');continue
-            folder=out/label;folder.mkdir()
-            for name in ['performance.json']+(['timer_on_performance.json'] if trace=='0' else []):
-                with connect(0) as c,c.open_sftp() as s:s.get(a.remote_root+'/runs/'+label+'/'+name,str(folder/name))
-            result=json.loads((folder/'performance.json').read_text())
-            state('run_complete',label=label,mean_us=result['mean_us'],rank_max_mean_us=result['rank_max_mean_us'])
-            manifest['completed'].append(label);save('collecting')
+            for case in case_labels:
+                if case in manifest['completed']:continue
+                folder=out/case;folder.mkdir()
+                for name in ['performance.json']+(['timer_on_performance.json'] if trace=='0' else []):
+                    with connect(0) as c,c.open_sftp() as s:s.get(a.remote_root+'/runs/'+case+'/'+name,str(folder/name))
+                result=json.loads((folder/'performance.json').read_text())
+                state('run_complete',label=case,worker_session=label,mean_us=result['mean_us'],rank_max_mean_us=result['rank_max_mean_us'])
+                manifest['completed'].append(case);save('collecting')
     save('preparing')
     try:
         parallel(deploy)
         launch(a.method_only or 'combined',32,'preflight','probe')
-        for bs in manifest['bs_values']:
+        if a.isolated_bs:
+            for bs in manifest['bs_values']:
+                for job in manifest['schedule']:
+                    method,repeat=job.split('-')
+                    launch(method,bs,f'bs{bs}-{job}','0' if a.trace and repeat=='a' else 'none')
+        else:
             for job in manifest['schedule']:
                 method,repeat=job.split('-')
-                launch(method,bs,f'bs{bs}-{job}','0' if a.trace and repeat=='a' else 'none')
+                launch(method,a.bs_values,job,'0' if a.trace and repeat=='a' else 'none')
         collect_finished()
         save('collected_not_yet_audited')
     except Exception as error:
@@ -185,6 +235,7 @@ def main():
         raise
     finally:
         for client in clients.values():client.close()
+        if jump_client:jump_client.close()
 
 
 if __name__=='__main__':main()

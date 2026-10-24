@@ -11,14 +11,15 @@ def load(p):
     return json.loads(p.read_text(encoding='utf-8'))
 
 
-def audit_run(root,label,ep,registry,timer_requested):
+def audit_run(root,label,ep,registry,timer_requested,execution_mode='isolated',buffer_capacity=None):
     saved=load(root/label/'performance.json')
     method=label.split('-')[1]
     bs=int(label.split('-')[0][2:])
     if (saved['ep'],saved['bs'],saved['timer'],saved['model']['num_experts'])!=(ep,bs,False,384):
         raise ValueError(f'{label}: wrong measurement domain')
     events=[json.loads(s) for s in (root/'events.jsonl').read_text().splitlines()]
-    exits=[e for e in events if e['stage']=='node_exit' and e['label']==label]
+    session=label.split('-',1)[1] if execution_mode=='continuous' else label
+    exits=[e for e in events if e['stage']=='node_exit' and e['label']==session]
     if len(exits)!=ep//8 or any(e['exit']!=0 for e in exits):
         raise ValueError(f'{label}: incomplete launch')
     traced=timer_requested and label.endswith('-a')
@@ -36,6 +37,9 @@ def audit_run(root,label,ep,registry,timer_requested):
             identity=load(folder/'identity.json')
             if identity['native']!=registry[method]['native'] or identity['rank']!=rank:
                 raise ValueError(f'{label} rank={rank}: wrong native identity')
+            if execution_mode=='continuous' and (identity.get('session_label')!=session or
+                    identity.get('buffer_capacity')!=buffer_capacity or saved.get('buffer_capacity')!=buffer_capacity):
+                raise ValueError(f'{label} rank={rank}: session/capacity mismatch')
             files=list((folder/kind).rglob('kernel_details.csv'))
             if len(files)!=1:raise ValueError(f'{label} rank={rank}: missing CSV')
             with files[0].open(encoding='utf-8-sig',newline='') as f:
@@ -81,7 +85,8 @@ def main():
             cases.append(dict(ep=ep,bs=bs,status='pending'));continue
         records=[];inputs=None;outputs=None
         for label in labels:
-            record,ins,outs=audit_run(a.root,label,ep,manifest['packages'],manifest['timer_requested'])
+            record,ins,outs=audit_run(a.root,label,ep,manifest['packages'],manifest['timer_requested'],
+                manifest.get('execution_mode','isolated'),manifest.get('buffer_capacity'))
             if inputs is None:inputs,outputs=ins,outs
             if inputs!=ins or outputs!=outs:raise ValueError(f'EP{ep} BS{bs}: control/candidate fingerprint mismatch')
             records.append(record)
@@ -98,6 +103,7 @@ def main():
     if not complete and not a.partial:raise ValueError('Matrix incomplete; use --partial without claiming completion')
     result=dict(ep=ep,status='audited_complete' if complete else 'partial',cases=cases,
         scope=manifest['scope'],accuracy=manifest['accuracy'],packages=manifest['packages'],
+        execution_mode=manifest.get('execution_mode','isolated'),buffer_capacity=manifest.get('buffer_capacity'),
         placement=dict(rack=manifest['rack'],nodes=manifest['nodes']),
         caveats=['No independent Golden.','rank-min is not global slowest-rank latency.',
                  'ISSUE is not hardware completion; timer perturbation can include measurement noise.'])

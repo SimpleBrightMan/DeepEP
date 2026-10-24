@@ -10,10 +10,12 @@ bs=$5
 label=$6
 trace=$7
 port=$8
+capacity=${9:-0}
 [[ $port =~ ^[0-9]+$ && $port -ge 1024 && $port -le 65532 ]] || exit 2
 [[ $ep == 8 || $ep == 32 ]] || exit 2
 [[ $node =~ ^[0-3]$ && $method =~ ^(control|combined)$ && $label =~ ^[a-z0-9-]+$ ]] || exit 2
-[[ $bs =~ ^(32|96|256|512|1024|2048|4096)$ && ($trace == 0 || $trace == none || $trace == probe) ]] || exit 2
+[[ $bs =~ ^(32|96|256|512|1024|2048|4096)(,(32|96|256|512|1024|2048|4096))*$ && ($trace == 0 || $trace == none || $trace == probe) ]] || exit 2
+[[ $capacity =~ ^[0-9]+$ && $capacity -le 4096 ]] || exit 2
 source /home/pkg/b080/cann-9.2.0/set_env.sh
 export LD_LIBRARY_PATH="$runtime/shmem/lib:/root/miniconda3/envs/zyx/lib:${LD_LIBRARY_PATH:-}"
 export HCCL_SOCKET_IFNAME='=enp35s0f2' HCCL_HOST_SOCKET_PORT_RANGE=auto
@@ -34,7 +36,9 @@ if [[ -n $port_snapshot ]]; then
 fi
 source "$root/cohort_gate.sh" "$runtime/launch.lock"
 cd /tmp
-args=("$root/benchmark.py" "$method" --bs "$bs" --label "$label" --ep-size "$ep" --package-root "$root")
+IFS=',' read -r -a bs_values <<< "$bs"
+args=("$root/benchmark.py" "$method" --bs-values "${bs_values[@]}" --label "$label" --ep-size "$ep" --package-root "$root")
+if [[ $capacity != 0 ]]; then args+=(--buffer-capacity "$capacity"); fi
 if [[ $trace == probe ]]; then
     args=("$root/probe.py" --label "$label" --method "$method")
 elif [[ $trace == 0 ]]; then

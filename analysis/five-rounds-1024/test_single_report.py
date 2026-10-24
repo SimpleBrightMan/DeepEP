@@ -81,5 +81,46 @@ class SingleVersionReport(unittest.TestCase):
             (root/'node0/runs/bs32-control-b/rank_7/output.json').write_text(json.dumps({'finite':True,'sha256':'different'}))
             self.assertNotEqual(self.run_report(root).returncode,0)
 
+    def make_continuous(self,root):
+        self.make_case(root)
+        manifest=json.loads((root/'experiment.json').read_text())
+        manifest.update(execution_mode='continuous',buffer_capacity=4096)
+        (root/'experiment.json').write_text(json.dumps(manifest))
+        events=[]
+        for label in manifest['completed']:
+            session=label.split('-',1)[1]
+            events.append(dict(stage='node_exit',label=session,exit=0))
+            file=root/label/'performance.json';data=json.loads(file.read_text())
+            data['buffer_capacity']=4096;file.write_text(json.dumps(data))
+            for rank in range(8):
+                file=root/f'node0/runs/{label}/rank_{rank}/identity.json'
+                data=json.loads(file.read_text());data.update(session_label=session,buffer_capacity=4096)
+                file.write_text(json.dumps(data))
+        (root/'events.jsonl').write_text('\n'.join(json.dumps(e) for e in events))
+
+    def test_continuous_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);self.make_continuous(root)
+            result=self.run_report(root);self.assertEqual(result.returncode,0,result.stderr)
+            report=json.loads((root/'summary.json').read_text())
+            self.assertEqual(report['execution_mode'],'continuous')
+            self.assertEqual(report['buffer_capacity'],4096)
+            self.assertEqual(report['cases'][0]['methods']['control']['starts'],2)
+
+    def test_wrong_continuous_capacity_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);self.make_continuous(root)
+            file=root/'node0/runs/bs32-control-a/rank_7/identity.json'
+            data=json.loads(file.read_text());data['buffer_capacity']=32;file.write_text(json.dumps(data))
+            self.assertNotEqual(self.run_report(root).returncode,0)
+
+    def test_failed_session_rejected_despite_csv(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);self.make_continuous(root)
+            events=[json.loads(x) for x in (root/'events.jsonl').read_text().splitlines()]
+            events[0]['exit']=1
+            (root/'events.jsonl').write_text('\n'.join(json.dumps(e) for e in events))
+            self.assertNotEqual(self.run_report(root).returncode,0)
+
 
 if __name__=='__main__':unittest.main()
