@@ -23,6 +23,7 @@ template <typename T> T CeilDiv(T a, T b) { return a / b + (a % b != 0); }
 struct MoeStageCommonConfig {
     uint32_t moeExpertPerRank, tokenNum;
     uint32_t gmm1OutputDim = 6144, tokenHiddenDim = 7168;
+    uint32_t worldSize = 8U;
 };
 #include "expert_context_methods.inc"
 
@@ -369,7 +370,29 @@ static void CheckRoles(const std::vector<uint32_t>& counts, uint32_t bs, uint32_
     Check<AIV, 0>(counts, bs, groups);
     Check<AIC, 0, true>(counts, bs, groups);
 }
+template <int Core>
+static void CheckEp32Lag(const std::vector<uint32_t>& counts, uint32_t bs, uint32_t groups) {
+    WaveHarness<Core, 0, true> current(counts, bs, groups, 0), expected(counts, 4096U, groups, 0);
+    current.commonConfig_.worldSize = 32U;
+    int32_t ready = 0, expectedReady = 0;
+    current.ProcessGmmWaves(ready);
+    // 冻结实现以4096强制lag；它不依赖bs做其他决策，用于核对顺序、范围与owner。
+    expected.LegacyProcessGmmWaves(expectedReady);
+    assert(current.events == expected.events);
+    assert(current.loops.value == expected.loops.value);
+    assert(current.loops.value[0] == current.loops.value[1]);
+    assert(ready == expectedReady);
+}
 int main() {
+    for (uint32_t bs : {32U, 96U, 256U, 512U, 1024U, 2048U, 4096U}) {
+        for (const auto& counts : {std::vector<uint32_t>{}, std::vector<uint32_t>{0,0},
+                                  std::vector<uint32_t>{1}, std::vector<uint32_t>{0,128,256,0,257,2048}}) {
+            for (uint32_t groups : {3U,6U}) {
+                CheckEp32Lag<AIC>(counts, bs, groups);
+                CheckEp32Lag<AIV>(counts, bs, groups);
+            }
+        }
+    }
     for (uint32_t bs : {96U, 4095U, 4096U, 8192U}) {
         CheckRoles(std::vector<uint32_t>(6, 4096), bs, 6);
         CheckRoles({0, 0, 0}, bs, 6);

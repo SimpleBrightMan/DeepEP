@@ -40,7 +40,7 @@ def main():
         with tarfile.open(archive) as tar:
             tar.extractall(source, filter='data')
     tests = source/'experiments/megamoe/tests'
-    checks = ['test_paired_wave_budget_cpu.py', 'test_gmm2_aiv_completion.py',
+    checks = ['test_device_schedule.py', 'test_paired_wave_budget_cpu.py', 'test_gmm2_aiv_completion.py',
               'test_aiv1_fair_scheduler.py', 'test_workspace_layout.py']
     if (tests/'test_combine_quota_cpu.py').exists():
         checks.append('test_combine_quota_cpu.py')

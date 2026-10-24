@@ -700,7 +700,7 @@ __aicore__ inline ExpertWaveRange MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFun
 }
 
 // AIC/AIV0 同序推进 GMM1/Prologue、GMM2/Prologue；数据就绪仍由各 stage 内部的 flag 保证。
-// BS<4096：G1(w)→G2(w)；BS>=4096：G1(w)→G2(w-1)，最后补齐 G2。
+// EP32实验统一滞后一波；其他EP保留BS>=4096门限，最后补齐G2。
 template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessGmmWaves(int32_t& gmm1TileReadySequence)
 {
@@ -718,8 +718,8 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     uint32_t gmm1StartBlockIdx = 0U;
     uint32_t gmm2StartBlockIdx = 0U;
 
-    // 按本卡输入 BS 判断，不按专家接收行数或当前 slice 行数判断。
-    const bool gmm2LagActive = commonConfig_.tokenNum >= 4096U;
+    // 只改变EP32提交顺序，保留原Wave预算、真实ready/FIX依赖和末波收尾。
+    const bool gmm2LagActive = commonConfig_.worldSize == 32U || commonConfig_.tokenNum >= 4096U;
     ExpertWaveRange pendingWave{{}, {}, commonConfig_.moeExpertPerRank};
 
     // cursor 总是指向下一待规划位置；本次计算使用 TakeNextExpertSliceInWave 返回的固定 slice。
