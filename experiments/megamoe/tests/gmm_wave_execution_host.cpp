@@ -354,7 +354,9 @@ struct WaveHarness {
 
 template <int Core, int Mode, bool Fused = false>
 static void Check(const std::vector<uint32_t>& counts, uint32_t bs, uint32_t groups, uint32_t sub = 0) {
-    WaveHarness<Core, Mode, Fused> current(counts, bs, groups, sub), legacy(counts, bs, groups, sub);
+    // 冻结编排以4096/96选择两种已知顺序；新策略统一以实际BS512为界。
+    WaveHarness<Core, Mode, Fused> current(counts, bs, groups, sub),
+        legacy(counts, bs >= 512U ? 4096U : 96U, groups, sub);
     int32_t ready = 0, oldReady = 0;
     current.ProcessGmmWaves(ready);
     legacy.LegacyProcessGmmWaves(oldReady);
@@ -387,7 +389,7 @@ static void CheckLagPolicy(const std::vector<uint32_t>& counts, uint32_t bs, uin
 int main() {
     for (uint32_t world : {8U,32U,64U,128U}) {
         for (uint32_t bs : {32U,96U,256U,511U,512U,513U,1024U,2048U,4095U,4096U,4097U,8192U}) {
-            const bool lag = world == 32U ? bs >= 512U : bs >= 4096U;
+            const bool lag = bs >= 512U;
             for (const auto& counts : {std::vector<uint32_t>{}, std::vector<uint32_t>{0,0},
                                       std::vector<uint32_t>{1}, std::vector<uint32_t>{0,128,256,0,257,2048},
                                       std::vector<uint32_t>(384U/world, bs*world*6U/384U)}) {
@@ -398,7 +400,7 @@ int main() {
             }
         }
     }
-    for (uint32_t bs : {96U, 4095U, 4096U, 8192U}) {
+    for (uint32_t bs : {96U,511U,512U,513U,4095U,4096U,8192U}) {
         CheckRoles(std::vector<uint32_t>(6, 4096), bs, 6);
         CheckRoles({0, 0, 0}, bs, 6);
         CheckRoles({0, 255, 0, 256, 257, 0, 4097, 0}, bs, 3);
