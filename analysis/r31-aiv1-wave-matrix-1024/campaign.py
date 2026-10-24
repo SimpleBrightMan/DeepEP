@@ -45,7 +45,7 @@ def main():
     manifest=dict(status='preparing',ep=a.ep,nodes=nodes,rack=a.rack,bs_values=[32,96,256,512,1024,2048,4096],
         packages=packages,accuracy='not_run_user_requested',remote_root=a.remote_root,
         package_archive_sha256=hashlib.sha256(a.packages.read_bytes()).hexdigest(),
-        schedule=['control-a','combined-a','combined-b','control-b'],completed=[],
+        schedule=['control-a','combined-a','combined-b','control-b'],completed=[],finished_workers=[],
         scope='full communication kernel Duration; timer-off; last10/20; mean per-round rank-min',
         timer='separate rank0 full passive pass on a repeats only',
         harness_hashes={f.name:hashlib.sha256(f.read_bytes()).hexdigest() for f in source.iterdir() if f.is_file()})
@@ -125,14 +125,23 @@ def main():
         cmd=lambda i:f'bash {a.remote_root}/run_node.sh {i} {master} {a.ep} {method} {bs} {label} {trace}'
         state('starting',label=label,method=method,bs=bs,ep=a.ep)
         if any(parallel(lambda i:command(i,cmd(i),label,barrier))):raise RuntimeError('Failed node; no next case')
-        parallel(lambda i:collect(i,label,trace=='probe'))
-        if trace!='probe':
+        manifest['finished_workers'].append(dict(label=label,trace=trace))
+        save('running')
+    def collect_finished():
+        # 不在两个原生进程之间下载文件；避免几秒至十几秒空档吸引另一任务入卡。
+        # 每次仍重新检查NPU空闲；失败时也归档此前已成功退出的调用，绝不重跑来掩盖失败。
+        for item in manifest['finished_workers']:
+            label,trace=item['label'],item['trace']
+            if label in manifest['completed']:continue
+            parallel(lambda i:collect(i,label,trace=='probe'))
+            if trace=='probe':
+                manifest['completed'].append(label);save('collecting');continue
             folder=out/label;folder.mkdir()
             for name in ['performance.json']+(['timer_on_performance.json'] if trace=='0' else []):
                 with connect(0) as c,c.open_sftp() as s:s.get(a.remote_root+'/runs/'+label+'/'+name,str(folder/name))
             result=json.loads((folder/'performance.json').read_text())
             state('run_complete',label=label,mean_us=result['mean_us'],rank_max_mean_us=result['rank_max_mean_us'])
-        manifest['completed'].append(label);save('running')
+            manifest['completed'].append(label);save('collecting')
     save('preparing')
     try:
         parallel(deploy)
@@ -141,9 +150,15 @@ def main():
             for job in manifest['schedule']:
                 method,repeat=job.split('-')
                 launch(method,bs,f'bs{bs}-{job}','0' if repeat=='a' else 'none')
+        collect_finished()
         save('collected_not_yet_audited')
     except Exception as error:
         save('failed');state('phase_failed',error_type=type(error).__name__)
+        try:
+            collect_finished()
+        except Exception as collect_error:
+            state('evidence_collect_failed',error_type=type(collect_error).__name__)
+        save('failed')
         raise
     finally:
         for client in clients.values():client.close()
