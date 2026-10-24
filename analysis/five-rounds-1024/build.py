@@ -21,21 +21,30 @@ def main():
     p.add_argument('--revision', required=True)
     p.add_argument('--source-sha256', required=True)
     p.add_argument('--host-only', action='store_true')
+    p.add_argument('--resume-build', action='store_true', help='Preserve failed log; verify source before build-only retry')
     a = p.parse_args()
     root, deps = a.root.resolve(), a.dependencies.resolve()
     archive = root/'source.tar'
     if sha(archive) != a.source_sha256:
         raise ValueError('Source archive identity mismatch')
     source = root/'source'
-    source.mkdir(exist_ok=False)
-    with tarfile.open(archive) as tar:
-        tar.extractall(source, filter='data')
+    if a.resume_build:
+        if (root/'packages.json').exists():
+            raise ValueError('Already packaged; do not overwrite')
+        with tarfile.open(archive) as tar:
+            for member in tar:
+                if member.isfile() and sha(source/member.name) != hashlib.sha256(tar.extractfile(member).read()).hexdigest():
+                    raise ValueError('Frozen source changed: '+member.name)
+    else:
+        source.mkdir(exist_ok=False)
+        with tarfile.open(archive) as tar:
+            tar.extractall(source, filter='data')
     tests = source/'experiments/megamoe/tests'
     checks = ['test_paired_wave_budget_cpu.py', 'test_gmm2_aiv_completion.py',
               'test_aiv1_fair_scheduler.py', 'test_workspace_layout.py']
     if (tests/'test_combine_quota_cpu.py').exists():
         checks.append('test_combine_quota_cpu.py')
-    with (root/'cpu-contract.log').open('x') as log:
+    with (root/('cpu-contract-resume.log' if a.resume_build else 'cpu-contract.log')).open('x') as log:
         subprocess.run([sys.executable, '-B', '-m', 'pytest', '-q', *[str(tests/n) for n in checks]],
                        stdout=log, stderr=subprocess.STDOUT, check=True, timeout=240)
     print('CPU_CONTRACT_PASS', flush=True)
@@ -45,9 +54,10 @@ def main():
         '9c8f7a913d0b61584acda6900db24698f5d9af40a3033797415c402631c7cacb'):
         raise ValueError('Not the frozen current merged baseline')
     packages = root/'packages'
-    packages.mkdir()
-    for method in ('control', 'combined'):
-        shutil.copytree(baseline/'packages/combined', packages/method)
+    if not a.resume_build:
+        packages.mkdir()
+        for method in ('control', 'combined'):
+            shutil.copytree(baseline/'packages/combined', packages/method)
     package = packages/'combined'
     shutil.copytree(source/'experiments/megamoe/python/deep_ep_experimental',
                     package/'deep_ep_experimental', dirs_exist_ok=True)
@@ -69,7 +79,7 @@ def main():
                '-Dpybind11_DIR='+pybind]
     (root/'configure.json').write_text(json.dumps(command, indent=2))
     print('NATIVE_BUILD_START', flush=True)
-    with (root/'build.log').open('x') as log:
+    with (root/('build-resume.log' if a.resume_build else 'build.log')).open('x') as log:
         subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=180)
         if a.host_only:
             shutil.copy2(package/'deep_ep_experimental/megamoe/libmegamoe_kernel.so',
