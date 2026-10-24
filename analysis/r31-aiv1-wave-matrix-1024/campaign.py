@@ -1,6 +1,7 @@
 """逐case全组空闲门禁、ABBA七BS；失败停止、保留日志，不占用他人NPU。"""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -57,13 +58,19 @@ def main():
     def save(status):
         manifest['status']=status
         (out/'experiment.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+    clients={}
+    @contextmanager
     def connect(i):
-        _,ip,user,password=inventory[nodes[i]]
-        c=paramiko.SSHClient();c.load_host_keys(a.host_keys)
-        c.set_missing_host_key_policy(paramiko.RejectPolicy())
-        c.connect(ip,username=user,password=password,timeout=15,look_for_keys=False,allow_agent=False)
-        c.get_transport().set_keepalive(20)
-        return c
+        # 每节点各阶段串行；复用一条已验证连接，减少频繁重新认证导致的启动失败。
+        # 不在worker运行期间静默重连；连接失效仍停止本轮，最终统一关闭。
+        if i not in clients:
+            _,ip,user,password=inventory[nodes[i]]
+            c=paramiko.SSHClient();c.load_host_keys(a.host_keys)
+            c.set_missing_host_key_policy(paramiko.RejectPolicy())
+            c.connect(ip,username=user,password=password,timeout=15,look_for_keys=False,allow_agent=False)
+            c.get_transport().set_keepalive(20);clients[i]=c
+        if not clients[i].get_transport().is_active():raise RuntimeError('Control connection lost')
+        yield clients[i]
     def command(i,cmd,label,barrier=None):
         with connect(i) as c:
             ch=c.get_transport().open_session(timeout=15);ch.set_combine_stderr(True);ch.settimeout(960);ch.exec_command(cmd)
@@ -138,6 +145,8 @@ def main():
     except Exception as error:
         save('failed');state('phase_failed',error_type=type(error).__name__)
         raise
+    finally:
+        for client in clients.values():client.close()
 
 
 if __name__=='__main__':main()
