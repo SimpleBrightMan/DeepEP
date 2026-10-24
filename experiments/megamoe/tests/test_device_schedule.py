@@ -92,3 +92,12 @@ def test_production_gmm_wave_order_matches_frozen_scheduler(tmp_path):
     context += cpp_body(utils, "UpdateExpertContext(")
     (tmp_path / "expert_context_methods.inc").write_text(context, encoding="utf-8")
     compile_and_run(Path(__file__).with_name("gmm_wave_execution_host.cpp"), tmp_path)
+
+
+def test_cv_and_gm_share_production_wave_entry(tmp_path):
+    source = (ROOT / "experiments/megamoe/csrc/kernels/mega_moe/mega_moe_wave_a8w4.hpp").read_text(encoding="utf-8")
+    (tmp_path / "wave_entry.inc").write_text(
+        "void ProcessMoeExpertStages(int32_t& gmm1TileReadySequence)" + cpp_body(source, "::ProcessMoeExpertStages("),
+        encoding="utf-8",
+    )
+    compile_and_run(Path(__file__).with_name("wave_entry_host.cpp"), tmp_path)

@@ -11,7 +11,6 @@
 
 #include "common/mega_moe_utils.hpp"
 #include "common/gmm2_aiv_completion.hpp"
-#include "common/small_linear_task_schedule.hpp"
 #include "mega_moe_arch35.hpp"
 
 namespace MegaMoeImpl {
@@ -128,11 +127,6 @@ private:
                                                       GMMAddrInfo& gmm2AddrInfo, uint32_t& startBlockIdx);
     __aicore__ inline void ProcessMoeExpertStages(int32_t& gmm1TileReadySequence);
     __aicore__ inline void ProcessGmmWaves(int32_t& gmm1TileReadySequence);
-    __aicore__ inline uint32_t SmallLinearBlockCount();
-    __aicore__ inline void AdvanceSmallLinearExpert(ExpertContext& expert, uint32_t block,
-                                                     uint32_t& blockEnd, uint32_t& nextExpert);
-    __aicore__ inline void ProcessSmallLinearTasks(uint32_t blocks, int32_t& readySequence);
-    __aicore__ inline void ProcessSmallLinearAiv1(uint32_t blocks, int32_t& readySequence);
 
     __aicore__ inline void RunNextGmm1Slice(ExpertWaveRange& wave, uint32_t& usedMGroups,
                                             ExpertContext& gmm1ExpertContext, GMMAddrInfo& gmm1AddrInfo,
@@ -639,19 +633,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
             WaitForMoeExpertTokenCountReady(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr, countWorkspace_, 0U);
         }
     }
-    if constexpr (UseCv) {
-        const uint32_t blocks = SmallLinearBlockCount();
-        if (blocks != static_cast<uint32_t>(-1)) {
-            if constexpr (g_coreType == AIV) {
-                if (GetSubBlockIdx() == 1U) {
-                    ProcessSmallLinearAiv1(blocks,gmm1TileReadySequence);
-                    return;
-                }
-            }
-            ProcessSmallLinearTasks(blocks,gmm1TileReadySequence);
-            return;
-        }
-    }
+    // 调度统一走Wave；CV只决定GMM1结果通路，不再选择另一套任务序列。
     if constexpr (g_coreType == AIV) {
         if (GetSubBlockIdx() == 1U) {
             ProcessAiv1PriorityStages(gmm1TileReadySequence);
@@ -751,199 +733,6 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         gmm1CatlassContext_.End();
         if constexpr (g_coreType == AIC) Gmm1AsyncCompletion::DrainProducer();
     }
-    timer_.SetWave(AscendTimer::NO_WAVE);
-}
-
-// 只迁移当前闭合的单M块协议：偏斜产生大专家时保留原Wave，不能用期望M冒充实际容量。
-template <TemplateMegaMoeA8W4WaveTypeClass>
-__aicore__ inline uint32_t MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::SmallLinearBlockCount()
-{
-    if (computeReplay_ || sharedExpertNum_ != 0U ||
-        Ops::Base::CeilDiv(commonConfig_.tokenHiddenDim,uint32_t(L1_TILE_N)) > gmmExecutionConfig_.blockJob.totalJobs)
-        return static_cast<uint32_t>(-1);
-    uint32_t blocks = 0U;
-    for (uint32_t expert=0; expert<commonConfig_.moeExpertPerRank; ++expert) {
-        const uint32_t rows = GetExpertTokenCountFromWorkspace(params_.workspaceInfo.expertRevTokenNumsPtr,
-            countWorkspace_, commonConfig_.moeExpertPerRank, expert);
-        if (rows > Gmm1CvPlan::Rows) return static_cast<uint32_t>(-1);
-        blocks += rows != 0U;
-    }
-    return blocks;
-}
-
-template <TemplateMegaMoeA8W4WaveTypeClass>
-__aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::AdvanceSmallLinearExpert(
-    ExpertContext& expert, uint32_t block, uint32_t& blockEnd, uint32_t& nextExpert)
-{
-    while (block >= blockEnd) {
-        this->PrepareGmmExpertContext(expert, nextExpert++);
-        if (Get<M_VALUE>(expert.problemShape) != 0U) ++blockEnd;
-    }
-}
-
-// 计算侧两层共享issued序列与两份epilogue credit，AIV1按同一task流消费真实FIX完成。
-// GMM2不再在phase边界Scalar排空；唯一收尾仍确认所有最终credit已归还。
-template <TemplateMegaMoeA8W4WaveTypeClass>
-__aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessSmallLinearTasks(
-    uint32_t blocks, int32_t& readySequence)
-{
-    const auto& job = gmmExecutionConfig_.blockJob;
-    const uint32_t n1 = Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF,uint32_t(GMM1_TASK_N));
-    const uint32_t n2 = Ops::Base::CeilDiv(commonConfig_.tokenHiddenDim,uint32_t(L1_TILE_N));
-    SmallLinearTaskSchedule schedule{blocks,n1,n2,job.totalJobs};
-    auto first = CreateExpertContext(commonConfig_), second = CreateExpertContext(commonConfig_);
-    uint32_t firstEnd=0U, firstNext=0U, secondEnd=0U, secondNext=0U;
-    SmallLinearTask task{};
-    while (schedule.Next(job.jobIndex,task)) {
-        timer_.SetWave(task.index / job.totalJobs);
-        GMMAddrInfo addr{};
-        if (task.gmm1) {
-            gmm2WaveContext_.HandoffTo(gmm1CatlassContext_);
-            AdvanceSmallLinearExpert(first,task.index/n1,firstEnd,firstNext);
-            const auto config = Gmm1Config::BuildGmm1ProblemConfig(first.problemShape,job,GMM1_TILE_M);
-            const uint32_t rows = static_cast<uint32_t>(Get<M_VALUE>(first.problemShape));
-            const uint32_t column = task.index%n1 * GMM1_TASK_N;
-            const uint32_t columns = Min(uint32_t(GMM1_TASK_N),uint32_t(config.outputN)-column);
-            UpdateMoeExpertGmm1GlobalBuffer<ActivationType,Weight1Type,ActivationQuantOutType,QuantScaleOutType,
-                A_ELEMS_PER_BYTE,true>(gmmExecutionConfig_,syncWorkspaceLayout_,params_.workspaceInfo,
-                moeWeightTensorListAddrs_,epilogueOp_,addr,first,0U,n1);
-            addr.timer = timer_.Enabled() ? &timer_ : nullptr;
-            gmm1CatlassContext_.UpdateProblem(config,addr);
-            gmm1CatlassContext_.Begin();
-            timer_.SetSlice(first.expertIdx,0U,rows);
-            if constexpr (g_coreType == AIC) {
-                AscendTimerTileScope event(addr.timer,AscendTimer::AIC_GMM1_ISSUE,0U,column,rows,columns);
-                auto inputReady=[&]() __aicore__ {WaitForGmm1InputReady<false>(addr,config,0U);};
-                gmm1CatlassContext_.ComputeCv(0U,column,rows,columns,uint32_t(readySequence),addr.gmmToEpilogueFlag,inputReady);
-                readySequence += Gmm1CvPlan::ChunkCount(rows);
-            } else {
-                AscendTimerSpanScope event(addr.timer,AscendTimer::AIV_GMM1_PROLOGUE);
-                gmm1CatlassContext_.Dequantize(column,rows,columns);
-            }
-        } else {
-            gmm1CatlassContext_.HandoffTo(gmm2WaveContext_);
-            AdvanceSmallLinearExpert(second,task.index/n2,secondEnd,secondNext);
-            const auto config = Gmm2Config::BuildGmm2ProblemConfig(second.problemShape,job,GMM1_TILE_M);
-            const uint32_t rows = static_cast<uint32_t>(Get<M_VALUE>(second.problemShape));
-            const uint32_t column = task.index%n2 * L1_TILE_N;
-            const uint32_t columns = Min(uint32_t(L1_TILE_N),uint32_t(config.outputN)-column);
-            UpdateMoeExpertGmm2GlobalBuffer<Weight1Type,ActivationQuantOutType,QuantScaleOutType>(
-                gmmExecutionConfig_,syncWorkspaceLayout_,params_.workspaceInfo,moeWeightTensorListAddrs_,addr,second);
-            addr.timer = timer_.Enabled() ? &timer_ : nullptr;
-            gmm2WaveContext_.UpdateProblem(config,addr);
-            gmm2WaveContext_.Begin();
-            timer_.SetSlice(second.expertIdx,0U,rows);
-            if constexpr (g_coreType == AIC) {
-                AscendTimerTileScope event(addr.timer,AscendTimer::AIC_GMM2_ISSUE,0U,column,rows,columns);
-                auto inputReady=[&]() __aicore__ {
-                    WaitForGmm2InputReady<false>(addr,config,0U);
-                    Gmm1AsyncCompletion::AcquireProducer(uint32_t(readySequence));
-                };
-                gmm2WaveContext_.Compute(0U,column,rows,columns,inputReady);
-                Gmm1AsyncCompletion::PublishCompleted(uint32_t(readySequence));
-                auto issued = reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagGmmToEpiloguePtr) +
-                    static_cast<uint64_t>(job.jobIndex)*INT_CACHELINE;
-                AscendC::WriteGmByPassDCache(issued,++readySequence);
-            } else {
-                AscendTimerSpanScope event(addr.timer,AscendTimer::AIV_GMM2_PROLOGUE);
-                gmm2WaveContext_.Dequantize(column,rows,columns);
-            }
-        }
-        timer_.ClearSlice();
-    }
-    gmm2WaveContext_.HandoffTo(gmm1CatlassContext_);
-    gmm1CatlassContext_.End();
-    if constexpr (g_coreType == AIC) Gmm1AsyncCompletion::DrainProducer();
-    timer_.SetWave(AscendTimer::NO_WAVE);
-}
-
-// AIV1 epilogue必须与AIC重放相同的两层task流；独立只消费GMM1会在共享FIX credit上形成环。
-template <TemplateMegaMoeA8W4WaveTypeClass>
-__aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessSmallLinearAiv1(
-    uint32_t blocks, int32_t& readySequence)
-{
-    const auto& job = gmmExecutionConfig_.blockJob;
-    const uint32_t n1 = Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim/ACTIVATION_N_HALF,uint32_t(GMM1_TASK_N));
-    const uint32_t n2 = Ops::Base::CeilDiv(commonConfig_.tokenHiddenDim,uint32_t(L1_TILE_N));
-    SmallLinearTaskSchedule schedule{blocks,n1,n2,job.totalJobs};
-    auto first = CreateExpertContext(commonConfig_), second = CreateExpertContext(commonConfig_);
-    uint32_t firstEnd=0U, firstNext=0U, secondEnd=0U, secondNext=0U;
-    SmallLinearTask task{};
-    AivTaskCursor activation{},combine{};
-    bool hasTask=false, submitted=false;
-    auto next = [&]() __aicore__ {
-        hasTask=schedule.Next(job.jobIndex,task);
-        submitted=false;
-        if (!hasTask || !task.gmm1) return;
-        AdvanceSmallLinearExpert(first,task.index/n1,firstEnd,firstNext);
-        const uint32_t rows=static_cast<uint32_t>(Get<M_VALUE>(first.problemShape));
-        const uint64_t globalStart=static_cast<uint64_t>(first.globalTokenStartIndex);
-        activation.slice={{first.expertIdx,0U,globalStart},{first.expertIdx,rows,globalStart+rows}};
-        activation.nextTile=task.index%n1;
-        activation.nextRow=0U;
-        activation.wave=task.index/job.totalJobs;
-    };
-    Gmm1AsyncCompletion::InitConsumer();
-    const auto* t=params_.tilingData;
-    cvActivationOp_.Init({.yGmAddr=params_.workspaceInfo.activationQuantDataPtr,
-        .yScaleGmAddr=params_.workspaceInfo.activationQuantScalePtr,.clampLimit=t->clampLimit,
-        .actMode=t->actMode,.actSubMode=t->actSubMode,.activationAlpha=t->activationAlpha,
-        .activationBeta=t->activationBeta,.ubBaseBytes=Gmm1CvPlan::ScratchBase});
-    next();
-    bool hasCombine=NextAivSlice(combine,AivTaskKind::Combine),preferCombine=false;
-    ExpertTokenPosition dispatch{};
-    uint32_t dispatchGroups=0U;
-    uint64_t dispatchWave=0U;
-    const auto issued=reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagGmmToEpiloguePtr) +
-        static_cast<uint64_t>(job.jobIndex)*INT_CACHELINE;
-    while (hasTask || activationPending_ || hasCombine || dispatchAsync_.pending ||
-           dispatch.expertIdx<commonConfig_.moeExpertPerRank) {
-        bool progressed=RetireActivation();
-        if (submitted && !activationPending_) next();
-        if (hasTask && !submitted) {
-            if (task.gmm1) {
-                if (TryRunCvActivation(activation,readySequence)) {
-                    submitted=activation.nextRow==0U;
-                    progressed=true;
-                }
-            } else if (AscendC::ReadGmByPassDCache(issued)>=readySequence+1) {
-                AdvanceSmallLinearExpert(second,task.index/n2,secondEnd,secondNext);
-                {
-                    AscendTimerWaitScope wait(timer_.Enabled()?&timer_:nullptr,AscendTimer::AIV_COMBINE_WAIT);
-                    Gmm1AsyncCompletion::WaitScalarConsumer(uint32_t(readySequence));
-                }
-                // 真正FIX完成后发布该N tile的贡献；小M且N tile<=核数保证每核每专家至多一次。
-                asc_sync_data_barrier(DSB_DDR);
-                AscendC::AtomicAdd(GetTokenCombineReadyCounter(params_,second.expertIdx,0U),1);
-                Gmm1AsyncCompletion::ReleaseScalarConsumer(uint32_t(readySequence));
-                ++readySequence;
-                next();
-                progressed=true;
-            }
-        }
-        const bool hasDispatch=dispatchAsync_.pending || dispatch.expertIdx<commonConfig_.moeExpertPerRank;
-        if (hasCombine && (preferCombine || !hasDispatch) && TryRunReadyCombine(combine)) {
-            hasCombine=NextAivSlice(combine,AivTaskKind::Combine);
-            preferCombine=false;
-            progressed=true;
-        } else if (hasDispatch) {
-            if (!dispatchAsync_.pending && dispatchGroups>=mGroupsPerWave_) {
-                dispatchGroups=0U;
-                ++dispatchWave;
-            }
-            DispatchNextExpertSlice(dispatch,dispatchGroups,dispatchWave,true);
-            preferCombine=true;
-            progressed=true;
-        }
-        if (!progressed) {
-            const int64_t start=AscendC::GetSystemCycle();
-            while (AscendC::GetSystemCycle()-start<GM_FLAG_POLL_BACKOFF_CYCLES) {}
-        }
-    }
-    DrainDispatchCopyBuffers<ActivationType,QuantScaleOutType,false>(
-        tokenDispatchConfig_,params_,tokenDispatchScratch_,dispatchAsync_.progress);
-    DrainCombineRowBuffers(combineRowSequence_,waveCombineBuffers_.rowBufferCount,waveCombineBuffers_.eventBase);
-    timer_.ClearSlice();
     timer_.SetWave(AscendTimer::NO_WAVE);
 }
 

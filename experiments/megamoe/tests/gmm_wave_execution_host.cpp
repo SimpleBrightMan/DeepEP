@@ -75,8 +75,6 @@ struct WaveHarness {
     static constexpr bool ASYNC_GMM1 = CombineQuantMode == COMBINE_NO_QUANT;
     static constexpr bool UseCv = false;
     static constexpr bool GMM2_REVERSE_BLOCKS = false;
-    uint32_t SmallLinearBlockCount() { return uint32_t(-1); }
-    void ProcessSmallLinearTasks(uint32_t, int32_t&) { assert(false); }
     int32_t gmm2IssuedSequence_ = 0;
     PipelineStub gmm1CatlassContext_, gmm2WaveContext_;
     struct { struct { uint32_t jobIndex = 0, totalJobs = 32; } blockJob; } gmmExecutionConfig_;

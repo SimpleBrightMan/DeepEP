@@ -137,7 +137,7 @@ Slice 不跨专家，Wave 可包含多个 slice。`ExpertWaveRange` 将起点、
 当前Wave路径中，所有EP统一按每卡实际BS≥512开启GMM2滞后一波，BS<512关闭。
 关闭时顺序为 `G1(W0), G2(W0), G1(W1), G2(W1)...`；开启时为
 `G1(W0), G1(W1), G2(W0), G1(W2), G2(W1)...`，末尾补齐最后一个 GMM2。
-只调整提交顺序，不改变Wave预算或数据ready/FIX依赖；Linear路径不受此条件影响。
+不改变Wave预算或数据ready/FIX依赖；已删除Linear调度，CV/GM结果通路仍按原条件选择。
 GMM1/GMM2各自保留跨专家分核游标，本分支两者同向。AIV1的进度不由这些调用顺序代替。
 
 ### 专家状态、当前 slice、下一位置
