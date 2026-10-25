@@ -84,7 +84,7 @@ def main():
     faulthandler.dump_traceback_later(90,repeat=True)
     stage('device_init')
     torch.npu.set_device(local)
-    # StoreGroup仍是生产API；只隔离启动器Store，真正Dispatch/Combine仍走SHMEM/MTE。
+    # 测试主机控制使用CPU Gloo，真正Dispatch/Combine仍走SHMEM/MTE，不引入HCCL。
     stage('host_store_init')
     group=open_control_group(api,rank,world,a.label)
     stage('symm_buffer_init')
@@ -132,7 +132,7 @@ def main():
             native=identity['native'],model=model,seed=SEED,routing='balanced',timer=False,
             accuracy='not_run_user_requested',torch=torch.__version__,torch_npu=torch_npu.__version__,
             benchmark_sha256=sha(Path(__file__)),coordinator_sha256=sha(ROOT/'coordinator.py'),
-            host_coordination='standalone_tcpstore',host_store_backend='legacy',device_communication='shmem_mte',
+            host_coordination='cpu_gloo',device_communication='shmem_mte',
             diagnostic_equivalent_expert_m=diagnostic,session_label=a.label,session_bs_values=batches,**resources))
         del x,data,scale,ids,weights
         for _ in range(10):call()
@@ -150,7 +150,7 @@ def main():
             report=summarize_rounds(rows,8)
             report.update(ep=world,bs=bs,method=a.method,measurement='full_moe',timer=False,model=model,
                 accuracy='not_run_user_requested',native=identity['native'],seed=SEED,routing='balanced',
-                host_coordination='standalone_tcpstore',host_store_backend='legacy',device_communication='shmem_mte',
+                host_coordination='cpu_gloo',device_communication='shmem_mte',
                 diagnostic_equivalent_expert_m=diagnostic,session_label=a.label,session_bs_values=batches,
                 expected_tokens_per_expert=world*bs*model['num_topk']//model['num_experts'],**resources)
             write(out/'performance.json',report)

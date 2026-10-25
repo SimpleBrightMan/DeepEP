@@ -10,7 +10,7 @@ import sys
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--label', required=True)
 parser.add_argument('--method', choices=('control','combined'), default='combined')
-parser.add_argument('--coordination', choices=('hccl','tcpstore'), default='tcpstore')
+parser.add_argument('--coordination', choices=('hccl','gloo'), default='gloo')
 args = parser.parse_args()
 if Path(args.label).name != args.label or args.label in ('.','..'):
     raise ValueError('Unsafe probe label')
@@ -46,6 +46,7 @@ buffer = api.SymmBuffer(group, num_experts=384,
     num_max_tokens_per_rank=32, num_topk=6, hidden=7168, intermediate_hidden=3072,
     num_shared_experts=0, ranks_per_node=8)
 print(f'BUFFER_READY rank={rank}', flush=True)
+if args.coordination=='gloo':group.barrier('probe_all_buffers_ready')
 buffer.destroy()
 if args.coordination=='hccl':
     dist.barrier()
@@ -59,7 +60,7 @@ with (folder/f'probe-rank{rank}.json').open('x') as output:
     output.write(json.dumps(dict(
     rank=rank, local_rank=local, world=world, control_sum=control_sum, buffer_destroyed=True,
     allreduce=control_sum if args.coordination=='hccl' else None,coordination=args.coordination,
-    host_coordination='standalone_tcpstore' if args.coordination=='tcpstore' else 'hccl',
+    host_coordination='cpu_gloo' if args.coordination=='gloo' else 'hccl',
     torch=torch.__version__, torch_npu=torch_npu.__version__, protocol=api._extension().api_protocol,
     method=args.method)))
 print(f'PROBE_PASS rank={rank}', flush=True)
