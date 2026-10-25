@@ -34,13 +34,12 @@ MEGAMOE_UB_PLAN_INLINE uint64_t AlignResidentUb(uint64_t n)
     return (n + 31U) / 32U * 32U;
 }
 
-// CV两槽各128行：均衡期望M<=128时可保留两完整tile；大M保留GM解耦。
-// 先只推广到已验证EP8。偏斜路由可能超过期望M，此规则不是所有路由的最优保证。
+// Wave+GM 消融：host预算、device UB绑定和kernel派发共用此单一来源。
+// 只禁用CV，复用现有GM完成/消费协议；不改配对、Wave预算或lag。
 MEGAMOE_UB_PLAN_INLINE bool UseGmm1CvForLaunch(uint32_t bs, uint32_t topk, uint32_t world,
                                               uint32_t expertsPerRank, uint32_t pairedMaxTokens)
 {
-    return world == 8U && bs <= pairedMaxTokens && topk != 0U && expertsPerRank != 0U &&
-        uint64_t(bs) * topk <= uint64_t(expertsPerRank) * Gmm1CvPlan::Rows;
+    return false;
 }
 
 // 与DispatchBuffInit逐项相同；不能只预算token ring而漏掉index、prefix和metadata。

@@ -18,6 +18,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--root', type=Path, required=True)
     p.add_argument('--dependencies', type=Path, required=True)
+    p.add_argument('--baseline', type=Path, required=True, help='Frozen 4a0de857 build root; read-only')
     p.add_argument('--revision', required=True)
     p.add_argument('--source-sha256', required=True)
     p.add_argument('--host-only', action='store_true')
@@ -41,17 +42,18 @@ def main():
             tar.extractall(source, filter='data')
     tests = source/'experiments/megamoe/tests'
     checks = ['test_device_schedule.py', 'test_paired_wave_budget_cpu.py', 'test_gmm2_aiv_completion.py',
-              'test_aiv1_fair_scheduler.py', 'test_workspace_layout.py']
+              'test_aiv1_fair_scheduler.py', 'test_workspace_layout.py', 'test_wave_gm_policy.py',
+              'test_aiv1_resident_ub.py', 'test_gmm1_cv_plan.py']
     if (tests/'test_combine_quota_cpu.py').exists():
         checks.append('test_combine_quota_cpu.py')
     with (root/('cpu-contract-resume.log' if a.resume_build else 'cpu-contract.log')).open('x') as log:
         subprocess.run([sys.executable, '-B', '-m', 'pytest', '-q', *[str(tests/n) for n in checks]],
                        stdout=log, stderr=subprocess.STDOUT, check=True, timeout=240)
     print('CPU_CONTRACT_PASS', flush=True)
-    baseline = deps/'baseline'
+    baseline = a.baseline.resolve()
     prior = json.loads((baseline/'packages.json').read_text())['combined']
     if prior['native']['deep_ep_experimental/megamoe/libmegamoe_kernel.so'] != (
-        '9c8f7a913d0b61584acda6900db24698f5d9af40a3033797415c402631c7cacb'):
+        '9525043992ad15a446840bdca3b3ca333a9de2c76b31b41623fe6f8f0199ce94'):
         raise ValueError('Not the frozen current merged baseline')
     packages = root/'packages'
     if not a.resume_build:
