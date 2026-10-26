@@ -160,6 +160,9 @@ public:
         return true;
     }
     bool Done() const { return Test::reorderRemaining == 0U; }
+    // This older whole-peer harness supplies one aggregate producer release.
+    // test_urma_reorder_lookahead.py exercises the real bounded wait/cursor.
+    void DrainThroughFragment(uint32_t) { DrainReady(); }
 private:
     Timer& timer_;
 };

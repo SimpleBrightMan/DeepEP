@@ -87,6 +87,45 @@ Combine quiet → 发布这一批 CV 完成
 重排时，先结束当前 wait 记录，重排后再开始新的 wait，保持同一引擎的 trace 不重叠。
 没有任务就绪的轮询不会新增逐轮 wait 记录。
 
+## Combine quiet 前提前准备一轮
+
+在28核一一对应重排的基础上，每次 **Combine quiet** 前增加下一CV的本核重排保证。
+原来只执行 `DrainReady()`，若本核下一个 GMM2 tile 尚未发布就立即进入 quiet；
+quiet 等待期间该 tile 即使就绪，本核也无法重排，可能阻碍下一轮 Combine 提交。
+
+现在按以下顺序执行：
+
+```text
+当前一批 Combine PUT 已提交
+找到本 peer 按 CV 顺序的第一个尚未提交的 CV（跳过已提交的洞）
+从该 CV 的计算组依赖中，找出本 AIC 真正拥有 tile 的最晚一个组
+推进本核的重排游标，直到该组的本核 tile 全部完成：
+    已就绪 → 重排
+    尚未就绪 → 等待本 AIC 的 matmulDone，并显式退避200 cycle
+继续重排本核其它当前已就绪的 tile
+Combine quiet → 发布当前批次的完成 flag
+重新扫描 CV，提交已就绪的数据
+```
+
+这个保证只针对下一CV中**归本核负责的重排**；其它 AIV1 的贡献仍由它们独立推进。
+不在此处等待整组 `gmm2Done`，不增加跨核/跨卡同步、不转移 tile 所有权。
+该路径只在本卡 Dispatch/Pack 完成后执行，因此不会扣住尚未发布的 Dispatch 数据。
+生产调度 `BuildComputeTasks` 按专家和 fragment 递增提交 GMM2，允许用最晚依赖组界定
+本核的重排前缀；不是根据绝对均衡路由推导依赖。
+
+下一CV没有本核任务、当前没有待 quiet 的 PUT，或所有CV已提交时，不增加生产者等待。
+最后一个实际未发送CV仍单独 PUT/quiet；最终 quiet 不等待无关的未来重排。
+Dispatch quiet 前继续保持 Pack 优先、只做当前就绪重排的原逻辑。
+`WaitGmm2Reorder` 与 `Gmm2Reorder` 分开计时，二者都位于 `CombineQuiet` 计时范围外；
+轮询失败不逐次打点，没有新增 `PIPE_ALL`。
+
+这会把对下一批生产者的部分等待移到当前 quiet 之前，当前已提交 PUT 可在此期间推进；
+也可能延迟当前批次完成 flag 的发布，最终收益需上板对比，不能仅据 quiet 条缩短判断。
+
+本次393项相关CPU回归通过，包含21项直接执行生产 lookahead / OwnedReorder / quiet
+逻辑的新检查：晚到生产者、非连续依赖、乱序已提交CV、无本核任务、最终quiet、空批次、
+目标边界以及Wait/Reorder计时不重叠。未进行 CANN 编译或 NPU 验证。
+
 ## 诊断与测试
 
 命令行与基线一致，切分支后必须重新编译安装完整 wheel。先用同一机器、相同 routing / BS /
@@ -113,6 +152,7 @@ python3 -m pytest \
   experiments/megamoe/tests/test_urma_reorder_device.py \
   experiments/megamoe/tests/test_urma_reorder_progress.py \
   experiments/megamoe/tests/test_urma_reorder_comm.py \
+  experiments/megamoe/tests/test_urma_reorder_lookahead.py \
   experiments/megamoe/tests/test_urma_tail_protocol.py \
   experiments/megamoe/tests/test_urma_transport.py \
   experiments/megamoe/tests/test_urma_trace.py \
