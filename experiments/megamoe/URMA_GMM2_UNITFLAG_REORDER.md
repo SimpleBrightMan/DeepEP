@@ -38,8 +38,9 @@ M256×N256 放得下两块 FP32 L0C。
 - 全部28个 AIV1 参与重排，严格沿用 GMM2 的全局 tile ID 模28分工：AIC block b
   计算的 tile 只由同 block 的 AIV1 重排。EP16/8/4 的通信核仍分别为15/7/3个，
   激活、scale gather、Pack 的静态分工不变，不增加队列共享或任务争抢。
-- 通信核先完成本轮 Pack 配额，再于每次 Dispatch/Combine quiet 前处理本核当前
-  已就绪的全部重排 tile；没有就绪 tile 就继续通信，不等待其 AIC。无可发送 Combine、
+- 通信核先完成本轮 Pack 配额，再于每次 Dispatch quiet 前处理本核当前
+  已就绪的全部重排 tile；Combine 扫描及非最终 PUT 后也推进这些 tile，普通扫描不做 quiet。
+  没有就绪 tile 就继续通信，不等待其 AIC。无可发送 Combine、
   空 peer 和发送已经结束的路径也继续推进重排，直到本核任务完成，不能提前退出。
 - 非通信辅助核仍优先执行就绪 SwiGLU；Pack 优先于重排。重排完成仍以最终 GM
   写出为准，不能仅依据计算临时区就绪放行通信。
@@ -74,9 +75,12 @@ Dispatch PUT(X, scale)
 重排对应 AIC 当前已发布的全部 tile（遇到未就绪立即返回）
 Dispatch quiet → 发布 CV 完成
 
-扫描并提交已就绪的 Combine CV
-重排对应 AIC 当前已发布的全部 tile
-Combine quiet → 发布这一批 CV 完成
+扫描未发送的 Combine CV，跳过未就绪 CV
+每个非最终 CV：PUT → 重排对应 AIC 当前已发布的全部 tile
+没有就绪 CV：推进重排，观察入站完成，显式退避，继续扫描
+最后一个实际未发送 CV 就绪后：
+    quiet 前序全部 PUT → 发布前序 CV 完成 flag
+    最后一个 CV PUT → quiet → 发布最后一个 CV 完成 flag
 
 没有可发送的 CV：仍推进本核重排，不能只等 Combine 就绪
 发送结束：先发布 peer finished，再持续重排并观察入站完成
@@ -87,44 +91,33 @@ Combine quiet → 发布这一批 CV 完成
 重排时，先结束当前 wait 记录，重排后再开始新的 wait，保持同一引擎的 trace 不重叠。
 没有任务就绪的轮询不会新增逐轮 wait 记录。
 
-## Combine quiet 前提前准备一轮
+## Combine 只在尾部 quiet
 
-在28核一一对应重排的基础上，每次 **Combine quiet** 前增加下一CV的本核重排保证。
-原来只执行 `DrainReady()`，若本核下一个 GMM2 tile 尚未发布就立即进入 quiet；
-quiet 等待期间该 tile 即使就绪，本核也无法重排，可能阻碍下一轮 Combine 提交。
+每个 peer 的独立 QP1 连续积累 PUT，不再对 Dispatch 末尾提前提交的 Combine
+单独 quiet，也不在每轮扫描结束时 quiet。该核可继续重排，直到这个 peer 只剩
+最后一个实际未发送的 CV。最后一个由就绪顺序决定，不必是编号最大的 CV。
 
-现在按以下顺序执行：
+只有最后 CV 的完整 `gmm2Done` 已满足，才执行前序批次的 quiet。成功后为前序
+每个 CV 发布原有 MTE 完成信号，再提交最后 CV，单独 quiet 并发布它的完成信号。
+两个 quiet 之间不插入重排，也不在 quiet 前等待无关的 GMM2 生产者。
+已提交 CV 的源数据保持不变；后续重排只写其它未完成 tile，不复用它们的存储。
 
-```text
-当前一批 Combine PUT 已提交
-找到本 peer 按 CV 顺序的第一个尚未提交的 CV（跳过已提交的洞）
-从该 CV 的计算组依赖中，找出本 AIC 真正拥有 tile 的最晚一个组
-推进本核的重排游标，直到该组的本核 tile 全部完成：
-    已就绪 → 重排
-    尚未就绪 → 等待本 AIC 的 matmulDone，并显式退避200 cycle
-继续重排本核其它当前已就绪的 tile
-Combine quiet → 发布当前批次的完成 flag
-重新扫描 CV，提交已就绪的数据
-```
+因此每个 peer 有至少2个 CV 时恰好调用2次 Combine quiet；只有1个时调用1次；
+0个时不调用。空 peer 仍发布 finished，并继续推进本核重排与入站观察，不能提前退出。
+这只改变 QP1 完成等待和信号发布时间；Dispatch 的 QP0 quiet/发布节奏保持原样。
+最多512个 CV 的 pending 元数据已由原有 UB 容量覆盖；SDK 内部的队列信用管理保留。
 
-这个保证只针对下一CV中**归本核负责的重排**；其它 AIV1 的贡献仍由它们独立推进。
-不在此处等待整组 `gmm2Done`，不增加跨核/跨卡同步、不转移 tile 所有权。
-该路径只在本卡 Dispatch/Pack 完成后执行，因此不会扣住尚未发布的 Dispatch 数据。
-生产调度 `BuildComputeTasks` 按专家和 fragment 递增提交 GMM2，允许用最晚依赖组界定
-本核的重排前缀；不是根据绝对均衡路由推导依赖。
+扫描无新提交时，即使已有在途 PUT，也继续执行入站观察与200 cycle退避。重排就绪
+检查仍为非阻塞，保留28核一一对应分工，不引入全卡同步或动态领任务。
 
-下一CV没有本核任务、当前没有待 quiet 的 PUT，或所有CV已提交时，不增加生产者等待。
-最后一个实际未发送CV仍单独 PUT/quiet；最终 quiet 不等待无关的未来重排。
-Dispatch quiet 前继续保持 Pack 优先、只做当前就绪重排的原逻辑。
-`WaitGmm2Reorder` 与 `Gmm2Reorder` 分开计时，二者都位于 `CombineQuiet` 计时范围外；
-轮询失败不逐次打点，没有新增 `PIPE_ALL`。
+前序完成信号集中到倒数第二次 quiet 后发布，接收端只对已收齐全部 TopK 的 token
+开始 Reduce，允许与末次 PUT/quiet 重叠。不同 peer、rank 的进度仍独立，因此不保证
+全 rank 的 Reduce 同时起跑。这也有意减少前序通信与 Reduce 的重叠窗口，收益需实测。
+`CombineQuiet` 只记录实际 quiet；PUT 与重排之间的生产者空隙保留，不新增 `PIPE_ALL`。
 
-这会把对下一批生产者的部分等待移到当前 quiet 之前，当前已提交 PUT 可在此期间推进；
-也可能延迟当前批次完成 flag 的发布，最终收益需上板对比，不能仅据 quiet 条缩短判断。
-
-本次393项相关CPU回归通过，包含21项直接执行生产 lookahead / OwnedReorder / quiet
-逻辑的新检查：晚到生产者、非连续依赖、乱序已提交CV、无本核任务、最终quiet、空批次、
-目标边界以及Wait/Reorder计时不重叠。未进行 CANN 编译或 NPU 验证。
+本次389项相关CPU回归通过，直接执行生产通信循环与退休逻辑，覆盖 EP4/8/16、
+提前 PUT、乱序/分批就绪、最后实际CV为0、最多512个CV、0/1/2次quiet、写完成后
+才发布信号、无关重排不阻碍quiet，以及等待/工作trace不重叠。未进行 CANN 编译或 NPU 实测。
 
 ## 诊断与测试
 
@@ -152,7 +145,7 @@ python3 -m pytest \
   experiments/megamoe/tests/test_urma_reorder_device.py \
   experiments/megamoe/tests/test_urma_reorder_progress.py \
   experiments/megamoe/tests/test_urma_reorder_comm.py \
-  experiments/megamoe/tests/test_urma_reorder_lookahead.py \
+  experiments/megamoe/tests/test_urma_reorder_retirement.py \
   experiments/megamoe/tests/test_urma_tail_protocol.py \
   experiments/megamoe/tests/test_urma_transport.py \
   experiments/megamoe/tests/test_urma_trace.py \

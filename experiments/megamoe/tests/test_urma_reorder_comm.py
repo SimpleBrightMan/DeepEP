@@ -37,7 +37,11 @@ inline uint32_t owner, peer, round, lastPackRound = UINT32_MAX;
 inline uint32_t serial, lastPackSerial, lastDrainSerial, lastQuietSerial;
 inline uint32_t drainCalls, reorderRemaining, reorderCompleted, reorderDoneMarks;
 inline uint32_t finishedPublications, dispatchQuiets, combineQuiets, cycleCalls;
+inline uint32_t earlyCombinePuts, pollingWithPending;
 inline bool deferReorderUntilFinished, enableInitialReorder, markOnFirstDrain;
+inline bool progressiveReorder;
+inline uint32_t producerBudget, producerCursor;
+inline std::vector<uint32_t> producerOrder;
 inline uint32_t readyChecks, readyThreshold;
 inline uint64_t traceClock;
 inline int32_t* unblockFlag;
@@ -79,6 +83,13 @@ template <typename T> T ReadGmByPassDCache(T* ptr) { return *ptr; }
 inline void AtomicAdd(int32_t* ptr, int32_t n) { *ptr += n; }
 inline uint64_t GetSystemCycle() {
     if (++Test::cycleCalls > 10000U) throw std::runtime_error("peer loop failed to make reorder progress");
+    // External AIC progress deliberately pauses between CVs. Already issued
+    // PUTs must remain pending while the owner backs off and does other work.
+    if (Test::progressiveReorder) {
+        if (!Test::combinePending.empty()) ++Test::pollingWithPending;
+        if (Test::cycleCalls % 6U == 0U && Test::producerBudget < Test::producerOrder.size())
+            ++Test::producerBudget;
+    }
     return Test::traceClock += 200U;
 }
 template <bool> void SyncAll() {}
@@ -133,6 +144,7 @@ public:
         Test::CompleteReorder();
     }
     bool Ready() const {
+        if (Test::progressiveReorder) return Test::producerCursor < Test::producerBudget;
         if (Test::reorderRemaining && ++Test::readyChecks < Test::readyThreshold) return false;
         return Test::reorderRemaining != 0U &&
             (!Test::deferReorderUntilFinished || Test::finishedPublications != 0U);
@@ -146,6 +158,18 @@ public:
         if (!Ready()) return false;
         const uint64_t start = timer_.TraceBegin();
         Test::traceClock += 20U;
+        if (Test::progressiveReorder) {
+            while (Test::producerCursor < Test::producerBudget) {
+                const uint32_t index = Test::producerOrder.at(Test::producerCursor++);
+                const auto& fragment = reinterpret_cast<const Fragment*>(Test::args->fragments)[index];
+                *ComputeFlag(Test::args->gmm2Done, index) = ComputeTileCount(fragment.rows, Test::args->config.hidden);
+                ++Test::reorderCompleted;
+                --Test::reorderRemaining;
+            }
+            Test::CompleteReorder();
+            timer_.TraceEnd(TraceEvent::Gmm2Reorder, start, {});
+            return true;
+        }
         if (Test::enableInitialReorder || Test::markOnFirstDrain) {
             for (uint32_t index = 0; index < Test::args->config.fragmentCount; ++index) {
                 const auto& fragment = reinterpret_cast<const Fragment*>(Test::args->fragments)[index];
@@ -160,9 +184,6 @@ public:
         return true;
     }
     bool Done() const { return Test::reorderRemaining == 0U; }
-    // This older whole-peer harness supplies one aggregate producer release.
-    // test_urma_reorder_lookahead.py exercises the real bounded wait/cursor.
-    void DrainThroughFragment(uint32_t) { DrainReady(); }
 private:
     Timer& timer_;
 };
@@ -179,24 +200,38 @@ inline void Put(uint8_t*, uint64_t offset, uint8_t*, uint32_t bytes, uint32_t pe
             found = i; break;
         }
     }
-    assert(found != UINT32_MAX && ++Test::combineSends.at(found) == 1U);
+    assert(found != UINT32_MAX);
+    const auto sent = std::count(Test::combineSends.begin(), Test::combineSends.end(), 1U);
+    if (sent + 1U == Test::combineSends.size() && sent != 0U) {
+        // All earlier flags must be published before the final actual PUT,
+        // even when the last actual CV is zero after out-of-order readiness.
+        assert(Test::combinePending.empty() && Test::combineQuiets == 1U);
+        for (uint32_t cv = 0; cv < Test::combineSends.size(); ++cv)
+            if (Test::combineSends[cv]) assert(Test::combinePublications[cv] == 1U);
+    }
+    assert(++Test::combineSends.at(found) == 1U);
+    if (Test::dispatchQuiets < Test::dispatchPublications.size()) ++Test::earlyCombinePuts;
     Test::combinePending.push_back(found);
 }
 inline void Quiet(uint32_t peer, uint32_t qp) {
     assert(peer == Test::peer);
-    assert(Test::lastDrainSerial > Test::lastQuietSerial && "every quiet must first check paired reorder");
-    Test::lastQuietSerial = ++Test::serial;
     if (qp == kDispatchQp) {
+        assert(Test::lastDrainSerial > Test::lastQuietSerial && "Dispatch quiet must first check paired reorder");
+        assert(Test::combineQuiets == 0U && "Dispatch QP quiet must not retire early Combine PUTs");
         assert(Test::lastPackRound == Test::round + kPackStartupRounds);
         assert(Test::lastDrainSerial > Test::lastPackSerial && "Pack has priority before Dispatch quiet");
         ++Test::dispatchQuiets;
     } else {
         assert(qp == kCombineQp && !Test::combinePending.empty());
+        const auto count = Test::combineSends.size();
+        const auto expected = Test::combineQuiets == 0U && count > 1U ? count - 1U : 1U;
+        assert(Test::combinePending.size() == expected && "Combine only retires pre-final and final batches");
         ++Test::combineQuiets;
         Test::combineBatches.push_back(Test::combinePending);
         for (auto index : Test::combinePending) Test::quieted.at(index) = true;
         Test::combinePending.clear();
     }
+    Test::lastQuietSerial = ++Test::serial;
 }
 inline void PublishDone(uint8_t*, uint64_t offset, uint32_t peer, uint64_t epoch,
                         LocalTensor<uint64_t> signal, uint32_t event) {
@@ -249,13 +284,25 @@ void CheckWaitAndReorder(TraceEvent event, uint32_t expectedWaits) {
     }
     assert(waits == expectedWaits && reorders == 1U);
 }
+void CheckIdleScopes() {
+    for (const auto& row : Test::traces) {
+        if (row.event != TraceEvent::WaitCombineReady && row.event != TraceEvent::WaitDispatch &&
+            row.event != TraceEvent::WaitLocalDispatch && row.event != TraceEvent::WaitStartPeer) continue;
+        for (const auto& other : Test::traces) {
+            if (other.event != TraceEvent::Gmm2Reorder && other.event != TraceEvent::CombinePut &&
+                other.event != TraceEvent::CombineQuiet && other.event != TraceEvent::CombinePublish) continue;
+            assert(row.end <= other.start || other.end <= row.start);
+        }
+    }
+}
 int main(int argc, char** argv) {
     using namespace MegaMoeUrma;
     assert(argc == 5);
     const uint32_t world = std::stoul(argv[1]), owner = std::stoul(argv[2]);
     const std::string scenario = argv[3];
     const uint32_t combineCount = std::stoul(argv[4]);
-    const uint32_t dispatchCount = scenario == "early" ? 4U : scenario == "empty-rounds" ? 3U : 0U;
+    const bool early = scenario == "early" || scenario == "early-progressive";
+    const uint32_t dispatchCount = early ? 4U : scenario == "empty-rounds" ? 3U : 0U;
     Arguments args{};
     args.config.world = world; args.config.rank = world - 1U;
     args.config.hidden = 3584U; args.config.maxPeerChunks = kMaxPeerChunks;
@@ -300,7 +347,16 @@ int main(int argc, char** argv) {
     Test::quieted.resize(combineCount); Test::dispatchPublications.resize(sends.size());
     Test::deferReorderUntilFinished = scenario == "tail" || scenario == "empty" || scenario == "empty-rounds";
     Test::enableInitialReorder = !Test::deferReorderUntilFinished;
+    Test::progressiveReorder = scenario == "progressive" || scenario == "reverse-progressive" ||
+                               scenario == "early-progressive";
     Test::reorderRemaining = scenario == "no-owned-work" ? 0U : std::max(combineCount, 3U);
+    if (Test::progressiveReorder) {
+        assert(combineCount >= 3U);
+        Test::reorderRemaining = combineCount;
+        Test::producerBudget = early ? 2U : 1U;
+        for (uint32_t cv = 0; cv < combineCount; ++cv)
+            Test::producerOrder.push_back(scenario == "reverse-progressive" ? combineCount - 1U - cv : cv);
+    }
     const auto expectedReorders = Test::reorderRemaining;
     if (scenario == "no-owned-work") {
         for (uint32_t cv = 0; cv < combineCount; ++cv)
@@ -325,6 +381,7 @@ int main(int argc, char** argv) {
     }
     if (scenario == "waiting") Test::readyThreshold = 2U;
     CommunicatePeer(args, owner, timer);
+    CheckIdleScopes();
     assert(Test::reorderCompleted == expectedReorders && Test::reorderRemaining == 0U);
     assert(Test::reorderDoneMarks == 1U && local[kLocalFlagReorderDone * 32U] == int32_t(kAic));
     assert(local[kLocalFlagIncomingDone * 32U] == (owner == 0U ? 2 : 1));
@@ -334,13 +391,22 @@ int main(int argc, char** argv) {
     for (auto count : Test::combineSends) assert(count == 1U);
     for (auto count : Test::combinePublications) assert(count == 1U);
     for (auto count : Test::dispatchPublications) assert(count == 1U);
+    assert(Test::combineQuiets == (combineCount == 0U ? 0U : combineCount == 1U ? 1U : 2U));
     if (combineCount) {
         assert(!Test::combineBatches.empty() && Test::combineBatches.back().size() == 1U);
-        assert(Test::combineBatches.back().front() == combineCount - 1U);
+        assert(Test::combineBatches.back().front() == (scenario == "reverse-progressive" ? 0U : combineCount - 1U));
     }
-    if (scenario == "early" && combineCount >= 5U) {
-        assert(Test::combineBatches.size() == 3U);
-        assert((Test::combineBatches.front() == std::vector<uint32_t>{0U, 1U}));
+    if (early && combineCount >= 5U) {
+        assert(Test::earlyCombinePuts == 2U && Test::combineBatches.size() == 2U);
+        assert(Test::combineBatches.front().size() == combineCount - 1U);
+        assert(Test::combineBatches.front()[0] == 0U && Test::combineBatches.front()[1] == 1U);
+    }
+    if (Test::progressiveReorder) {
+        assert(Test::cycleCalls >= (combineCount - (early ? 2U : 1U)) * 6U);
+        assert(Test::pollingWithPending != 0U && Test::producerCursor == combineCount);
+        // No early readiness flags during producer gaps: the first quiet
+        // retires every earlier PUT together, then the last one separately.
+        assert(Test::combineBatches.front().size() == combineCount - 1U);
     }
     if (scenario == "unready") assert(Test::drainCalls != 0U && Test::reorderCompleted != 0U);
     if (scenario == "waiting") {
@@ -386,7 +452,20 @@ def reorder_comm_binary(tmp_path_factory):
 @pytest.mark.parametrize("last_owner", [False, True])
 @pytest.mark.parametrize(
     ("scenario", "combine_count"),
-    [("early", 5), ("unready", 5), ("tail", 1), ("empty", 0), ("empty-rounds", 0), ("no-owned-work", 5)],
+    [
+        ("early", 5),
+        ("unready", 5),
+        ("tail", 1),
+        ("tail", 2),
+        ("empty", 0),
+        ("empty-rounds", 0),
+        ("no-owned-work", 5),
+        ("early", 1),
+        ("early", 2),
+        ("progressive", 5),
+        ("reverse-progressive", 5),
+        ("early-progressive", 5),
+    ],
 )
 def test_actual_peer_loop_progress_publications_and_ub_isolation(
     reorder_comm_binary, world, last_owner, scenario, combine_count
@@ -400,9 +479,10 @@ def test_actual_peer_loop_progress_publications_and_ub_isolation(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_actual_peer_loop_full_capacity_pending_metadata_survives_reorder(reorder_comm_binary):
+@pytest.mark.parametrize("scenario", ["early", "progressive", "reverse-progressive", "early-progressive"])
+def test_actual_peer_loop_full_capacity_pending_metadata_survives_reorder(reorder_comm_binary, scenario):
     result = subprocess.run(
-        [str(reorder_comm_binary), "16", "0", "early", "512"],
+        [str(reorder_comm_binary), "16", "0", scenario, "512"],
         capture_output=True,
         text=True,
         timeout=15,

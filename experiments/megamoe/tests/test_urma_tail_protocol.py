@@ -948,7 +948,7 @@ def test_finished_observation_and_aic_publication_integration():
     combine = source[source.index("while (remaining != 0U)") : source.index("__aicore__ inline void Process")]
     assert (
         combine.index("Put(symmetric,")
-        < combine.index("if (pendingCount != 0U)")
+        < combine.index("if (remaining == 0U) {")
         < combine.index("timer.End(Phase::Combine, combineBytes)")
         < combine.index("FinishCombinePeer(args, owner, signal, peerCounted, selfCounted, reorder);")
     )

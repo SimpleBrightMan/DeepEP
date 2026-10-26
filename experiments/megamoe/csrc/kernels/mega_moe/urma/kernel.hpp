@@ -131,45 +131,14 @@ __aicore__ inline bool IsChunkComputed(const Arguments& args, const Chunk& chunk
     return true;
 }
 
-// The next sweep starts at the first still-unsent CV, including holes left
-// by out-of-order submission. Prepare ONLY this AIC/AIV1 pair's contribution
-// to that CV. No work stealing, whole-CV ready wait, or cross-owner join.
-// Once all CVs are submitted, final quiet must not wait for unrelated tiles.
-__aicore__ inline void PrepareNextCombine(const Arguments& args, uint32_t owner, uint32_t combineBegin,
-                                          uint32_t combineCount, LocalTensor<uint32_t>& submitted,
-                                          OwnedReorder& reorder)
-{
-    for (uint32_t i = 0U; i < combineCount; ++i) {
-        if (submitted.GetValue(i) != 0U) continue;
-        const Chunk next = LoadChunk(args.recvChunks, combineBegin + i);
-        bool hasOwnedDependency = false;
-        uint32_t lastRequired = 0U;
-        for (uint32_t j = 0U; j < next.fragmentCount; ++j) {
-            const uint32_t index =
-                reinterpret_cast<const __gm__ uint32_t*>(args.chunkGroupIndices)[next.fragmentBegin + j];
-            const auto* fragment = reinterpret_cast<const __gm__ Fragment*>(args.fragments) + index;
-            if (FirstOwnedComputeTile(fragment->gmm2TileBegin, owner, kAic) >=
-                ComputeTileCount(fragment->rows, args.config.hidden)) {
-                continue;
-            }
-            if (!hasOwnedDependency || index > lastRequired) lastRequired = index;
-            hasOwnedDependency = true;
-        }
-        if (hasOwnedDependency) reorder.DrainThroughFragment(lastRequired);
-        break;
-    }
-    // Keep the original opportunistic progress for other peers/self too.
-    reorder.DrainReady();
-}
-
 // Retire exactly the submitted CVs, which need not form a contiguous prefix.
-// Their disjoint remote rows and independent ready slots permit out-of-order
-// submission. Only the original owner touches this peer's QP1 and flags.
+// Called only before the final actual CV and after its standalone PUT. Earlier
+// sweeps (including speculative Dispatch-time PUTs) leave QP1 in flight so this
+// owner can keep reordering. Only this owner touches the peer's QP1 and flags.
 __aicore__ inline void RetireCombineBatch(const Arguments& args, uint32_t owner, uint32_t combineBegin,
-                                          uint32_t combineCount, LocalTensor<uint32_t>& submitted,
                                           LocalTensor<uint32_t>& pending, uint32_t& pendingCount, uint64_t& pendingRows,
                                           LocalTensor<uint64_t>& signal, Timer& timer, bool& peerCounted,
-                                          bool& selfCounted, OwnedReorder& reorder)
+                                          bool& selfCounted)
 {
     if (pendingCount == 0U) return;
     const uint32_t peer = PeerForOwner(args.config.rank, owner);
@@ -180,10 +149,8 @@ __aicore__ inline void RetireCombineBatch(const Arguments& args, uint32_t owner,
     if (pendingCount == 1U) meta = ChunkTraceMeta(LoadChunk(args.recvChunks, combineBegin + pending.GetValue(0U)));
     // Multiple CVs may have holes: retain unknown CV/row, and sum actual rows.
     // Local Dispatch and Pack have finished before any caller reaches here.
-    // Wait for/reorder the next CV's local contribution while current PUTs
-    // progress; do not let quiet strand that work behind its completion.
-    // Reorder and its producer wait stay outside the CombineQuiet event.
-    PrepareNextCombine(args, owner, combineBegin, combineCount, submitted, reorder);
+    // The caller has already confirmed the final CV's complete reorder before
+    // the pre-final flush. Neither flush waits for unrelated producer work.
     ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);
     uint64_t start = timer.TraceBegin();
     Quiet(peer, kCombineQp);
@@ -322,9 +289,9 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             pendingRows += LoadChunk(args.recvChunks, combineBegin + i).rows;
         }
     }
-    // Retire the early prefix before scanning any new producers.
-    RetireCombineBatch(args, owner, combineBegin, combineCount, submitted, pending, pendingCount, pendingRows, signal,
-                       timer, peerCounted, selfCounted, reorder);
+    // Keep speculative PUTs on QP1 pending with the steady-state submissions.
+    // There is no early-prefix or per-sweep quiet: producer gaps are available
+    // for paired reorder until only the last actual unsent CV remains.
     uint32_t remaining = combineCount - earlyCount;
     bool waiting = false;
     uint64_t waitStart = 0U;
@@ -340,6 +307,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         }
         // Always scan this peer's CVs from beginning to end. Already submitted
         // or unready CVs are skipped; readiness does not imply a ready prefix.
+        const uint32_t remainingBeforeScan = remaining;
         const uint64_t scanStart = timer.TraceBegin();
         for (uint32_t i = 0U; i < combineCount; ++i) {
             if (submitted.GetValue(i) != 0U) continue;
@@ -353,8 +321,8 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             if (remaining == 1U) {
                 // Last ACTUAL unsent CV, not necessarily the highest index.
                 // Publish all earlier results before submitting it alone.
-                RetireCombineBatch(args, owner, combineBegin, combineCount, submitted, pending, pendingCount,
-                                   pendingRows, signal, timer, peerCounted, selfCounted, reorder);
+                RetireCombineBatch(args, owner, combineBegin, pending, pendingCount, pendingRows, signal, timer,
+                                   peerCounted, selfCounted);
             }
             if (!combineStarted) {
                 timer.Begin(Phase::Combine);
@@ -373,13 +341,19 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             pendingRows += chunk.rows;
             --remaining;
             if (remaining == 0U) break;
+            // QP1 progresses independently of the paired MTE reorder work.
+            // Sources already submitted are immutable, disjoint final-layout
+            // rows; later reorder only produces not-yet-ready tiles.
+            reorder.DrainReady();
         }
-        if (pendingCount != 0U) {
-            // One quiet for everything found ready this sweep. A final CV is
-            // the only pending entry here after the preceding batch flush.
-            RetireCombineBatch(args, owner, combineBegin, combineCount, submitted, pending, pendingCount, pendingRows,
-                               signal, timer, peerCounted, selfCounted, reorder);
-        } else if (remaining != 0U) {
+        if (remaining == 0U) {
+            // The pre-final flush published all earlier CVs. Only the last
+            // actual CV is pending, allowing Reduce to overlap this quiet.
+            RetireCombineBatch(args, owner, combineBegin, pending, pendingCount, pendingRows, signal, timer,
+                               peerCounted, selfCounted);
+        } else if (remaining == remainingBeforeScan) {
+            // Pending PUTs persist across producer gaps; their presence must
+            // not suppress backoff or incoming-completion observation.
             if (!waiting) {
                 waitStart = scanStart;
                 waiting = true;
@@ -390,9 +364,9 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             }
         }
     }
-    // Every CV now has its own completion flag, so the source can reduce
-    // completed tokens while other peers are still computing/returning rows.
-    // The aggregate envelope includes producer gaps between CVs.
+    // Every CV now has its own completion flag. The earlier CVs were published
+    // together before the final PUT; the final CV was published after its own
+    // quiet. The aggregate envelope includes producer gaps between CVs.
     if (combineStarted) timer.End(Phase::Combine, combineBytes);
     // Publish finished promptly, then keep reordering the paired AIC's tiles
     // while observing inbound completion. Empty peer edges also take this path;

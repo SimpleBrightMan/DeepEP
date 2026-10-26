@@ -454,37 +454,6 @@ public:
     {
         return progress_.DrainReady();
     }
-    // BuildComputeTasks emits GMM2 batches in increasing fragment order.
-    // Finish this owner's prefix through the next Combine CV's last owned
-    // dependency BEFORE entering quiet. Only the paired AIC's matmul flags
-    // are polled here; waiting on a whole group's gmm2Done would also wait
-    // for other AIV1 owners, which may themselves be in communication.
-    __aicore__ inline void DrainThroughFragment(uint32_t lastRequired)
-    {
-        bool waiting = false;
-        uint64_t start = 0U;
-        TraceMeta meta;
-        while (!progress_.Done() && progress_.FragmentIndex() <= lastRequired) {
-            if (progress_.Ready()) {
-                if (waiting) {
-                    backend_.timer.TraceEnd(TraceEvent::WaitGmm2Reorder, start, meta);
-                    waiting = false;
-                }
-                progress_.RunOneReady();
-            } else {
-                if (!waiting) {
-                    const uint32_t index = progress_.FragmentIndex();
-                    meta = FragmentTraceMeta(LoadFragment(backend_.args, index), index);
-                    start = backend_.timer.TraceBegin();
-                    waiting = true;
-                }
-                const uint64_t backoff = GetSystemCycle();
-                while (GetSystemCycle() - backoff < 200U) {
-                }
-            }
-        }
-        if (waiting) backend_.timer.TraceEnd(TraceEvent::WaitGmm2Reorder, start, meta);
-    }
     __aicore__ inline bool Done() const
     {
         return progress_.Done();
