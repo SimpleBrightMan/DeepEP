@@ -450,7 +450,7 @@ def mega_moe(
 
     x: BF16 [B,H], or (FP8 E4M3 [B,H], E8M0 [B,H/32]).
     FP8 is copied into the original communication record, never dequantized/requantized.
-    Routed work uses the prefill scheduler; W4 shared strategy switches at B=256.
+    Routed A8W4 uses Wave+GM; its current launcher does not support shared experts.
     No backward or graph guarantee yet.
     """
     return _run(

@@ -42,7 +42,7 @@ private:
     // 一个逻辑任务对应一对 gate/up；生产、SwiGLU 和 GMM2 ready 必须使用同一粒度。
     static constexpr uint32_t GMM1_TASK_N = FuseGateUp ? GMM1_FUSED_TILE_N : L1_TILE_N;
     static constexpr bool ASYNC_GMM1 = true;
-    // 本消融对齐DS两层同向分核；执行、空任务判断与完成通知必须共用这个方向。
+    // 两层同向分核；执行、空任务判断与完成通知必须共用这个方向。
     static constexpr bool GMM2_REVERSE_BLOCKS = false;
     static_assert(!UseCv || FuseGateUp, "CV requires paired weights");
 
@@ -682,7 +682,7 @@ __aicore__ inline ExpertWaveRange MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFun
 }
 
 // AIC/AIV0 同序推进 GMM1/Prologue、GMM2/Prologue；数据就绪仍由各 stage 内部的 flag 保证。
-// 所有EP在BS>=512时滞后一波，最后补齐G2；Linear路径不经过此调度器。
+// 所有EP在BS>=512时滞后一波，最后补齐G2。
 template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessGmmWaves(int32_t& gmm1TileReadySequence)
 {

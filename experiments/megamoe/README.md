@@ -5,6 +5,9 @@ Modified by Joyce_An 2026
 
 # MegaMoE Prefill Beta
 
+当前有效入口、支持范围、BS/M作用域与策略表见 [ACTIVE_POLICY.md](ACTIVE_POLICY.md)。
+当前routed A8W4仅支持无共享专家；下方历史共享专家回归不代表当前launcher仍允许该配置。
+
 工程设计、文件/函数职责及同步维护约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。当前仅保留
 MTE + 非量化 Combine；W4A8 与 A8W8 都继续支持。URMA、量化 Combine、top-k weight prefetch
 的不可达执行分支已清理，A8W8 MX 计算独立在 `stage/mega_moe_gmm{1,2}_a8w8.hpp`。
@@ -53,8 +56,9 @@ ProcessGmmWaves                     决定 GMM1/GMM2 的 Wave 顺序
 CATLASS 是物理缓冲/引擎边界，因此保留；不把所有工作塞成大函数，也不继续增加纯转发层。
 现役非量化 AIV1 走独立优先级调度器，而非这里的兼容 epilogue。维护约定见本目录 `AGENTS.md`。
 
-异步 routed GMM1/GMM2 用 `HandoffTo` 转移唯一资源 owner；GMM2 在发布 Combine ready 前
-`DrainOutput` 等真正 FIX 完成，**不是每个 Wave 都销毁/重建流水**。最终 owner 在 routed 阶段结束时统一 End。
+异步 routed GMM1/GMM2 用 `HandoffTo` 转移唯一资源 owner；GMM2的Wave完成事件排入FIX，
+AIV1等待真实FIX完成后重放并发布slice-ready。AIC不在每个Wave末主动Scalar排空FIX；
+最终回收最后credit，由当前owner统一End。**不是每个Wave都销毁/重建流水。**
 
 ### 2026-10-16 整合验收
 

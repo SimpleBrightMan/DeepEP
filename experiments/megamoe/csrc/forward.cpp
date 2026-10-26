@@ -243,13 +243,13 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     t.actSubMode = static_cast<uint8_t>(MegaMoeImpl::MegaMoeActSubMode::DEFAULT);
     t.activationAlpha = 1.0F;
     t.activationBeta = 1.0F;
-    // 按本次每卡 BS 选择，不用预分配容量；小 batch 缩短 wave，较早释放 GMM2。
+    // 使用本次每卡BS，不用预分配容量；小BS的连续提交预算用于摊薄阶段边界。
     if (is_a8w4 && t.bs <= MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS) {
         const uint64_t gmm1_tasks_per_m_group =
             CeilDiv<uint64_t>(t.hiddenDim / MegaMoeImpl::ACTIVATION_N_HALF, MegaMoeImpl::GMM1_FUSED_TILE_N);
         t.mGroupsPerWave =
             static_cast<uint32_t>(CeilDiv<uint64_t>(static_cast<uint64_t>(p.aic) * 2U, gmm1_tasks_per_m_group));
-        // 实验：只改变同类任务的连续提交预算，保持资源归还边界。
+        // 扩大同类任务的连续提交预算，保持资源归还边界。
         t.mGroupsPerWave *= 2U;
     } else if (is_a8w4) {
         // 配对按逻辑N128任务预算两轮AIC，避免沿用四轮预算放大激活/Combine尾段。

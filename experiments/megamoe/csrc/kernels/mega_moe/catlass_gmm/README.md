@@ -20,7 +20,7 @@
 - `UpdateProblem` 更新形状、地址和权重 layout，不重新分配存储。
 - `Begin` 幂等启动；`End` 排空并归还事件，且恢复相关 MM layout。
 - 异步 routed GMM1/GMM2 用 `HandoffTo` 转移缓冲游标与 credit，任一时刻只有一个对象 active。
-- GMM2 Wave 结束先 `DrainOutput` 等 FIX 完成，才能发布各 slice 的 Combine ready；随后 handoff 回 GMM1。
+- GMM2 Wave末将完成事件排入FIX并通知issued，随后handoff回GMM1；AIV1等真实FIX完成后重放该Wave、发布各slice的Combine ready。
 - routed 阶段最终由当前 owner End；共享专家、量化与其他兼容路径保留既有局部生命周期。
 - GMM1 的 GM 序号只表示 issued；AIV1 的 MTE2 等 FIX full 后读取，消费后通过 MTE3 返回 empty。
   不能用 Scalar 发出指令的时间替代真实完成，也不能为 timer 额外排空。
@@ -67,6 +67,5 @@ CPU 模型不能证明设备可见性。验收需覆盖尾 K/N/M、空/偏斜专
 
 Linear专用task流、入口和重放代码已删除；AIC/AIV0统一走`ProcessGmmWaves`，AIV1走
 `ProcessAiv1PriorityStages`。所有EP按每卡实际BS≥512开启GMM2滞后一波。
-CV只决定GMM1结果通路，不再决定另一套调度；FIX完成、epilogue credit、输入ready及资源归还协议保留。
-CV输出仍在已消费输入前缀内压缩，stage末尾统一写出，scale槽独立。
+当前routed A8W4统一使用GM结果通路；FIX完成、epilogue credit、输入ready及资源归还协议保留。
 旧Linear消融代码及实测结果保存在Git历史和各独立实验分支中，不作为当前版本的新实测。

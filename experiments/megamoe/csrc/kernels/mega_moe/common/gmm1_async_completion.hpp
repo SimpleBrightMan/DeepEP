@@ -4,7 +4,7 @@
 #include <c_api/asc_simd.h>
 
 namespace MegaMoeImpl {
-// AIC<->AIV1专用两槽完成通道，不与AIV0权重通道(6..9)共享。
+// AIC<->AIV1专用两槽完成通道，不与AIV0权重通道(4..11)共享。
 // GM输出仍按专家/tile独立寻址；credit保护完成事件槽的复用，不改变输出布局。
 struct Gmm1AsyncCompletion {
     static constexpr unsigned STAGES = 2;
