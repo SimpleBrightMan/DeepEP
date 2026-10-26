@@ -707,6 +707,7 @@ int main(int argc, char** argv) {
         args.localFlags = reinterpret_cast<uint64_t>(local.data());
         auto* incoming = LocalCompletionFlag(args, kLocalFlagIncomingDone);
         auto* aic = LocalCompletionFlag(args, kLocalFlagAicDone);
+        auto* reorder = LocalCompletionFlag(args, kLocalFlagReorderDone);
         auto flag = [&](unsigned owner) {
             return reinterpret_cast<uint64_t*>(args.symmetric +
                 PeerPhaseSlot(args, 1, PeerForOwner(args.config.rank, owner)));
@@ -725,7 +726,13 @@ int main(int argc, char** argv) {
         assert(!ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
         assert(polls == peerReads && *incoming == 1);
         MarkCubeComplete(args);
-        assert(*aic == 28 && ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
+        assert(*aic == 28 && !ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
+        assert(*incoming == 1); // AIC scratch ready is not self return ready.
+        for (unsigned i = 1; i < ActivationWorkers(world); ++i) MarkReorderComplete(args);
+        assert(!ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
+        assert(*incoming == 1);
+        MarkReorderComplete(args);
+        assert(ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
         assert(*incoming == 2);
         const auto selfReads = selfPolls;
         assert(ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
@@ -739,6 +746,7 @@ int main(int argc, char** argv) {
         assert(!ObserveIncomingCompletion(args, 0, peerSeen[0], selfSeen[0]));
         assert(*incoming == 0);
         for (unsigned i = 0; i < 28; ++i) MarkCubeComplete(args);
+        for (unsigned i = 0; i < ActivationWorkers(world); ++i) MarkReorderComplete(args);
         for (unsigned owner = 0; owner < world - 1; ++owner) {
             *flag(owner) = 9;
             assert(ObserveIncomingCompletion(args, owner, peerSeen[owner], selfSeen[owner]));
@@ -760,12 +768,13 @@ int main(int argc, char** argv) {
             return polls == 1 ? 10ULL : 11ULL;
         };
         readSelf = [&](int32_t* address) {
-            assert(publications == 1 && address == aic);
+            assert(publications == 1 && (address == aic || address == reorder));
+            if (address == reorder) return static_cast<int32_t>(ActivationWorkers(world));
             return selfPolls < 3 ? 27 : 28;
         };
         LocalTensor<uint64_t> signal;
         FinishCombinePeer(args, 0, signal, peerCounted, selfCounted);
-        assert(publications == 1 && polls == 2 && selfPolls == 3 && backoffs > 0);
+        assert(publications == 1 && polls == 2 && selfPolls == 4 && backoffs > 0);
         assert(*incoming == 2 && peerCounted && selfCounted);
         auto* published = reinterpret_cast<uint64_t*>(args.symmetric +
             PeerPhaseSlot(args, 1, args.config.rank));

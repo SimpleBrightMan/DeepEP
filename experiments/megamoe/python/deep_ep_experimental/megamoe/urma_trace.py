@@ -48,6 +48,15 @@ EVENTS = (
     "CombinePublish",
     "WaitReduceReady",
     "ReduceDrain",
+    None,  # 33..39 remain reserved for historical JSON-only GMM envelopes.
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    "Gmm2Reorder",
+    "WaitGmm2Reorder",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
 SYNC_STAGES = {0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
@@ -147,7 +156,7 @@ def decode_trace(raw, *, rank, clock_mhz):
             offset = HEADER_WORDS + ordinal * RECORD_WORDS
             row = tuple(map(int, data[offset : offset + RECORD_WORDS]))
             start, end, event_id = row[:3]
-            if event_id >= len(EVENTS):
+            if event_id >= len(EVENTS) or EVENTS[event_id] is None:
                 raise ValueError(f"engine={engine} record={ordinal}: unknown event id={event_id}")
             if end < start or start == UNKNOWN or end == UNKNOWN:
                 raise ValueError(f"engine={engine} record={ordinal}: invalid ticks start={start} end={end}")

@@ -77,6 +77,8 @@ def test_filter_keeps_final_global_sync_and_never_compresses_time():
 def test_default_export_filters_but_optional_full_export_preserves_all_ids(tmp_path):
     raw = trace_buffer(1)
     for index, name in enumerate(EVENTS):
+        if name is None:
+            continue
         add_record(raw, engine=index, event=name)
     default, full = tmp_path / "default.json", tmp_path / "full.json"
     export_trace(raw, default, rank=0, clock_mhz=1000)
@@ -84,7 +86,7 @@ def test_default_export_filters_but_optional_full_export_preserves_all_ids(tmp_p
     filtered = json.loads(default.read_text())
     assert all(not row["name"].startswith("Wait") for row in events(filtered))
     assert any(row["name"] == "RankBarrier" for row in events(filtered))
-    assert len(events(json.loads(full.read_text()))) == len(EVENTS)
+    assert len(events(json.loads(full.read_text()))) == sum(name is not None for name in EVENTS)
 
 
 def test_merge_all_16_ranks_preserves_identity_clocks_and_raw_metadata(tmp_path):

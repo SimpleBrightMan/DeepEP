@@ -145,6 +145,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     activation_ = allocate(config.receiveRows * intermediate);
     activation_scale_ = allocate(config.receiveRows * (intermediate / 32));
     gmm2_ = allocate(config.receiveRows * config.hidden * 2);
+    gmm2_contiguous_ = allocate(config.receiveRows * config.hidden * 2);
     fragments_ = Upload(plan.fragments, options);
     segments_ = Upload(plan.segments, options);
     compute_batches_ = Upload(plan.computeBatches, options);
@@ -166,6 +167,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     input_scale_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
     activation_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
     gmm2_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
+    gmm2_matmul_done_ = allocate(config.gmm2Tiles * MegaMoeUrma::kFlagBytes);
     local_flags_ = allocate(16 * MegaMoeUrma::kFlagBytes);
     system_workspace_ = allocate(platform_.system_workspace + (2ULL << 20));
 
@@ -176,6 +178,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     args_.activation = Address(activation_);
     args_.activationScale = Address(activation_scale_);
     args_.gmm2Output = Address(gmm2_);
+    args_.gmm2Contiguous = Address(gmm2_contiguous_);
     args_.fragments = Address(fragments_);
     args_.segments = Address(segments_);
     args_.computeBatches = Address(compute_batches_);
@@ -189,6 +192,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     args_.inputScaleDone = Address(input_scale_done_);
     args_.activationDone = Address(activation_done_);
     args_.gmm2Done = Address(gmm2_done_);
+    args_.gmm2MatmulDone = Address(gmm2_matmul_done_);
     args_.localFlags = Address(local_flags_);
     args_.systemWorkspace = Address(system_workspace_);
 }
@@ -291,8 +295,8 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     CheckTensor(output, 2, "out", device);
     TORCH_CHECK(output.scalar_type() == torch::kBFloat16 && output.sizes() == x.sizes(), "out must be BF16 [BS,H]");
     auto stream = c10_npu::getCurrentNPUStream();
-    for (auto* tensor :
-         {&gmm1_done_, &input_scale_done_, &activation_done_, &gmm2_done_, &local_flags_, &pack_ready_}) {
+    for (auto* tensor : {&gmm1_done_, &input_scale_done_, &activation_done_, &gmm2_done_, &gmm2_matmul_done_,
+                         &local_flags_, &pack_ready_}) {
         ASCEND_DEEPEP_CHECK_ACL(
             aclrtMemsetAsync(tensor->data_ptr(), tensor->numel(), 0, tensor->numel(), stream.stream()));
     }
@@ -337,6 +341,8 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
                                &activation_,
                                &activation_scale_,
                                &gmm2_,
+                               &gmm2_contiguous_,
+                               &gmm2_matmul_done_,
                                &fragments_,
                                &segments_,
                                &compute_batches_,
@@ -389,6 +395,7 @@ std::map<std::string, torch::Tensor> UrmaPlan::debug_snapshot() const
     copy("gmm1", Address(gmm1_), c.receiveRows * c.intermediate * 4);
     copy("activation", Address(activation_), c.receiveRows * c.intermediate);
     copy("activation_scale", Address(activation_scale_), c.receiveRows * (c.intermediate / 32));
+    copy("gmm2_contiguous", Address(gmm2_contiguous_), c.receiveRows * c.hidden * 2);
     copy("gmm2_remote", Address(gmm2_), c.receiveRows * c.hidden * 2);
     copy("returned", args_.symmetric + c.returnYOffset, expanded * c.hidden * 2);
     for (auto item :
@@ -396,7 +403,8 @@ std::map<std::string, torch::Tensor> UrmaPlan::debug_snapshot() const
           std::make_pair("compute_tasks", &compute_tasks_), std::make_pair("send_chunks", &send_chunks_),
           std::make_pair("recv_chunks", &recv_chunks_), std::make_pair("gmm1_done", &gmm1_done_),
           std::make_pair("input_scale_done", &input_scale_done_), std::make_pair("activation_done", &activation_done_),
-          std::make_pair("gmm2_done", &gmm2_done_), std::make_pair("local_flags", &local_flags_)}) {
+          std::make_pair("gmm2_matmul_done", &gmm2_matmul_done_), std::make_pair("gmm2_done", &gmm2_done_),
+          std::make_pair("local_flags", &local_flags_)}) {
         copy(item.first, Address(*item.second), item.second->nbytes());
     }
     return result;
@@ -412,6 +420,8 @@ int64_t UrmaPlan::workspace_bytes() const
                                &activation_,
                                &activation_scale_,
                                &gmm2_,
+                               &gmm2_contiguous_,
+                               &gmm2_matmul_done_,
                                &fragments_,
                                &segments_,
                                &compute_batches_,

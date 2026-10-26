@@ -271,6 +271,8 @@ def save_snapshot(raw, directory, *, bs, hidden, intermediate, topk, received_ro
         "reduce_index": ("int64", (bs, topk)),
         "order": ("int64", (bs * topk,)),
     }
+    if "gmm2_contiguous" in byte_arrays:
+        shapes["gmm2_contiguous"] = ("bf16", (received_rows, hidden))
     for name in (
         "weight1_prefix",
         "weight2_prefix",
@@ -306,7 +308,7 @@ def save_snapshot(raw, directory, *, bs, hidden, intermediate, topk, received_ro
         except (ValueError, FloatingPointError) as error:
             report["errors"].append(f"cpu_activation_from_gmm1: {error}")
 
-    for name in ("gmm1_done", "input_scale_done", "activation_done", "gmm2_done", "local_flags"):
+    for name in ("gmm1_done", "input_scale_done", "activation_done", "gmm2_done", "gmm2_matmul_done", "local_flags"):
         if name not in byte_arrays:
             continue
         data = byte_arrays[name]
@@ -319,6 +321,8 @@ def save_snapshot(raw, directory, *, bs, hidden, intermediate, topk, received_ro
     if "local_flags" in report["flags"]:
         values = report["flags"]["local_flags"]["first_values"]
         report["flags"]["local_named"] = dict(zip(("dispatch_done", "aic_done", "incoming_done"), values[:3]))
+        if "gmm2_matmul_done" in byte_arrays and len(values) >= 5:
+            report["flags"]["local_named"].update(pack_done=values[3], reorder_done=values[4])
 
     if "order" in arrays:
         order = arrays["order"]

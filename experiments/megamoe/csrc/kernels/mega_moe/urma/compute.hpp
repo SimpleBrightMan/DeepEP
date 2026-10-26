@@ -6,6 +6,9 @@
 
 #include "abi.hpp"
 #include "compute_contract.hpp"
+#include "continuous_matmul.hpp"
+#include "deferred_output.hpp"
+#include "reorder.hpp"
 #include "pack_round.hpp"
 #include "transport.hpp"
 #include "timer.hpp"
@@ -82,9 +85,8 @@ __aicore__ inline MegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& args, 
     addr.aScaleGlobal = reinterpret_cast<GM_ADDR>(args.activationScale + fragment.rowBegin * scaleI);
     addr.bGlobal = reinterpret_cast<GM_ADDR>(args.weight2 + expert * i * h / 2U);
     addr.bScaleGlobal = reinterpret_cast<GM_ADDR>(args.weightScale2 + expert * scaleI * h);
-    // Segmented row IO scatters remote rows into this original source-major
-    // output plane and self rows directly into their final symmetric return.
-    addr.gmm2OutGlobal = reinterpret_cast<GM_ADDR>(args.gmm2Output);
+    // The helper team scatters this expert-major output only after matmulDone.
+    addr.gmm2OutGlobal = reinterpret_cast<GM_ADDR>(args.gmm2Contiguous + fragment.rowBegin * h * sizeof(bfloat16_t));
     return addr;
 }
 
@@ -170,137 +172,86 @@ __aicore__ inline void CompleteComputeContext()
     }
 }
 
-using UrmaGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig, false, UrmaInputRows>;
-using UrmaGmm2 = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows>;
+// Completion fences are distinct from the CATLASS FIX_S0 context teardown.
+struct ComputeOutputBackend {
+    const Arguments& args;
+    Timer& timer;
+    __aicore__ inline void Arm()
+    {
+        SetFlag<HardEvent::FIX_S>(EVENT_ID1);
+    }
+    __aicore__ inline void Complete(bool gmm1, uint64_t tile, const TraceMeta& meta)
+    {
+        const uint64_t start = timer.TraceBegin();
+        WaitFlag<HardEvent::FIX_S>(EVENT_ID1);
+        timer.TraceEnd(gmm1 ? TraceEvent::Gmm1TileDrain : TraceEvent::Gmm2Drain, start, meta);
+        WriteGmByPassDCache(ComputeFlag(gmm1 ? args.gmm1Done : args.gmm2MatmulDone, tile), 1);
+    }
+};
 
-__aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
-                                       uint32_t firstTile, UrmaGmm1& gmm1, bool endContext, Timer& timer)
+using UrmaContinuousGmm = ContinuousMatmul<UrmaProblemConfig>;
+
+__aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
+                                          uint32_t firstTile, bool gmm1, UrmaContinuousGmm& pipeline,
+                                          DeferredOutput<ComputeOutputBackend>& pending, Timer& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
     const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
     const auto shape = FragmentShape(args, fragment);
-    auto config1 = UrmaGmmConfig::BuildGmm1ProblemConfig(shape, job, kComputeTileM);
-    MegaMoeImpl::GmmKernel::BlockScheduler schedule1(
-        {config1.m, config1.schedulerN, config1.k},
+    auto config = gmm1 ? UrmaGmmConfig::BuildGmm1ProblemConfig(shape, job, kComputeTileM)
+                       : UrmaGmmConfig::BuildGmm2ProblemConfig(shape, job, kComputeTileM);
+    MegaMoeImpl::GmmKernel::BlockScheduler schedule(
+        {config.m, config.schedulerN, config.k},
         MegaMoeImpl::GmmKernel::BlockScheduler::Params{
-            Te::MakeCoord(static_cast<int64_t>(config1.tileM), static_cast<int64_t>(config1.tileN))});
-    const uint32_t count1 = schedule1.GetTileNum();
+            Te::MakeCoord(static_cast<int64_t>(config.tileM), static_cast<int64_t>(config.tileN))});
     if constexpr (g_coreType == AIC) {
-        // The AIV1 gather owner checks every segment's current dispatch epoch,
-        // then drains the compact scale stores before publishing this flag.
-        // It therefore covers both X arrival and scale readiness; rereading
-        // every segment here only repeats that fan-in on each owning AIC.
-        // Forward clears inputScaleDone on the launch stream every invocation.
-        const uint64_t scaleWait = timer.TraceBegin();
-        WaitComputeFlag(args.inputScaleDone, fragmentIndex, 1U);
-        timer.TraceEnd(TraceEvent::WaitInputScale, scaleWait, fragmentMeta);
+        const uint64_t flags = gmm1 ? args.inputScaleDone : args.activationDone;
+        const uint32_t expected = gmm1 ? 1U : FragmentGmm1Tiles(args, fragment);
+        const bool ready = ReadGmByPassDCache(ComputeFlag(flags, fragmentIndex)) >= static_cast<int32_t>(expected);
+        // In particular, never retain the last GMM1 flag while blocking on
+        // its activation: that would prevent the helper from making progress.
+        pending.BeforeDependency(ready);
+        const uint64_t wait = timer.TraceBegin();
+        if (!ready) WaitComputeFlag(flags, fragmentIndex, expected);
+        timer.TraceEnd(gmm1 ? TraceEvent::WaitInputScale : TraceEvent::WaitActivation, wait, fragmentMeta);
     }
-    timer.Begin(Phase::Gmm1);
-    const auto addr = Gmm1Addresses(args, fragment);
-    gmm1.UpdateProblem(config1, addr);
-    gmm1.SetRowIO(FragmentRowIO<UrmaInputRows>(args, fragment));
-    gmm1.Begin();
-    for (uint32_t tile = firstTile; tile < count1; tile += kAic) {
-        const auto coord = schedule1.GetBlockCoord(tile);
-        const auto tileShape = schedule1.GetBlockShape(coord);
+    const Phase phase = gmm1 ? Phase::Gmm1 : Phase::Gmm2;
+    timer.Begin(phase);
+    const auto addresses = gmm1 ? Gmm1Addresses(args, fragment) : Gmm2Addresses(args, fragment);
+    pipeline.UpdateProblem(config, addresses, gmm1);
+    ContinuousComputeRows rowIO;
+    static_cast<UrmaInputRows&>(rowIO) = FragmentRowIO<UrmaInputRows>(args, fragment);
+    rowIO.gather = gmm1;
+    if (!gmm1) {
+        rowIO.inputX = addresses.aGlobal;
+        rowIO.inputStride = args.config.intermediate;
+    }
+    pipeline.SetRowIO(rowIO);
+    pipeline.Begin();  // Idempotent; only the invocation's first owned tile opens events.
+    const uint32_t count = schedule.GetTileNum();
+    for (uint32_t tile = firstTile; tile < count; tile += kAic) {
+        const auto coord = schedule.GetBlockCoord(tile);
+        const auto tileShape = schedule.GetBlockShape(coord);
         const uint32_t m = Get<MegaMoeImpl::M_VALUE>(coord);
         const uint32_t n = Get<MegaMoeImpl::N_VALUE>(coord);
         const uint32_t rows = Get<MegaMoeImpl::M_VALUE>(tileShape);
         const uint32_t columns = Get<MegaMoeImpl::N_VALUE>(tileShape);
         const auto tileMeta = ComputeTileTraceMeta(fragmentMeta, m, n, rows, columns);
         if constexpr (g_coreType == AIC) {
-            // Compute submits asynchronous work and may wait on its
-            // existing internal dependencies; it is not a FIX drain.
-            const uint64_t computeStart = timer.TraceBegin();
-            gmm1.Compute(m, n, rows, columns);
-            timer.TraceEnd(TraceEvent::Gmm1Tile, computeStart, tileMeta);
-            const uint64_t drainStart = timer.TraceBegin();
-            SetFlag<HardEvent::FIX_S>(EVENT_ID0);
-            WaitFlag<HardEvent::FIX_S>(EVENT_ID0);
-            timer.TraceEnd(TraceEvent::Gmm1TileDrain, drainStart, tileMeta);
-            WriteGmByPassDCache(ComputeFlag(args.gmm1Done, fragment.gmm1TileBegin + tile), 1);
+            const uint64_t start = timer.TraceBegin();
+            pipeline.Compute(m, n, rows, columns);
+            timer.TraceEnd(gmm1 ? TraceEvent::Gmm1Tile : TraceEvent::Gmm2Tile, start, tileMeta);
+            // Old fence was captured BEFORE this submission. Publishing it
+            // here cannot wait for this new tile or release its output early.
+            pending.AfterSubmit(gmm1, (gmm1 ? fragment.gmm1TileBegin : fragment.gmm2TileBegin) + tile, tileMeta);
         } else {
-            const uint64_t dequantStart = timer.TraceBegin();
-            gmm1.Dequantize(n, rows, columns);
-            timer.TraceEnd(TraceEvent::Gmm1Dequant, dequantStart, tileMeta);
+            const uint64_t start = timer.TraceBegin();
+            pipeline.Dequantize(n, rows, columns);
+            timer.TraceEnd(gmm1 ? TraceEvent::Gmm1Dequant : TraceEvent::Gmm2Dequant, start, tileMeta);
         }
     }
-    if (endContext) {
-        const uint64_t endStart = timer.TraceBegin();
-        gmm1.End(g_coreType == AIC);
-        CompleteComputeContext();
-        timer.TraceEnd(TraceEvent::Gmm1Drain, endStart, fragmentMeta);
-    }
-    timer.End(Phase::Gmm1);
-}
-
-__aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
-                                       uint32_t firstTile, UrmaGmm2& gmm2, uint32_t batchBegin, bool endContext,
-                                       Timer& timer)
-{
-    const MegaMoeImpl::BlockJobContext job{block, kAic};
-    const Fragment fragment = LoadFragment(args, fragmentIndex);
-    const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
-    const auto shape = FragmentShape(args, fragment);
-    auto config2 = UrmaGmmConfig::BuildGmm2ProblemConfig(shape, job, kComputeTileM);
-    MegaMoeImpl::GmmKernel::BlockScheduler schedule2(
-        {config2.m, config2.schedulerN, config2.k},
-        MegaMoeImpl::GmmKernel::BlockScheduler::Params{
-            Te::MakeCoord(static_cast<int64_t>(config2.tileM), static_cast<int64_t>(config2.tileN))});
-    const uint32_t count2 = schedule2.GetTileNum();
-    if constexpr (g_coreType == AIC) {
-        // The independent activation workers collectively publish one
-        // contribution per original GMM1 tile after both FP8 planes drain.
-        const uint64_t waitStart = timer.TraceBegin();
-        WaitComputeFlag(args.activationDone, fragmentIndex, FragmentGmm1Tiles(args, fragment));
-        timer.TraceEnd(TraceEvent::WaitActivation, waitStart, fragmentMeta);
-    }
-    timer.Begin(Phase::Gmm2);
-    const auto addr = Gmm2Addresses(args, fragment);
-    gmm2.UpdateProblem(config2, addr);
-    gmm2.SetRowIO(FragmentRowIO<UrmaOutputRows>(args, fragment));
-    gmm2.Begin();
-    for (uint32_t tile = firstTile; tile < count2; tile += kAic) {
-        const auto coord = schedule2.GetBlockCoord(tile);
-        const auto tileShape = schedule2.GetBlockShape(coord);
-        const uint32_t m = Get<MegaMoeImpl::M_VALUE>(coord);
-        const uint32_t n = Get<MegaMoeImpl::N_VALUE>(coord);
-        const uint32_t rows = Get<MegaMoeImpl::M_VALUE>(tileShape);
-        const uint32_t columns = Get<MegaMoeImpl::N_VALUE>(tileShape);
-        const auto tileMeta = ComputeTileTraceMeta(fragmentMeta, m, n, rows, columns);
-        if constexpr (g_coreType == AIC) {
-            const uint64_t computeStart = timer.TraceBegin();
-            gmm2.Compute(m, n, rows, columns);
-            timer.TraceEnd(TraceEvent::Gmm2Tile, computeStart, tileMeta);
-        } else {
-            const uint64_t dequantStart = timer.TraceBegin();
-            gmm2.Dequantize(n, rows, columns);
-            timer.TraceEnd(TraceEvent::Gmm2Dequant, dequantStart, tileMeta);
-        }
-    }
-    if (endContext) {
-        const uint64_t drainStart = timer.TraceBegin();
-        // One FIX drain per expert batch. Intermediate M256 groups keep
-        // submitting; the block's FIX_M events still protect each L0C slot.
-        gmm2.End();
-        CompleteComputeContext();
-        timer.TraceEnd(TraceEvent::Gmm2Drain, drainStart, fragmentMeta);
-        if constexpr (g_coreType == AIC) {
-            // Every group (including a short M tail) has the same N tile
-            // count. Recover each group's contribution without rereading GM
-            // descriptors. Publish only after ALL this core's stores drain.
-            const uint64_t batchTileBegin =
-                fragment.gmm2TileBegin - static_cast<uint64_t>(fragmentIndex - batchBegin) * count2;
-            const uint64_t tileLimit = static_cast<uint64_t>(fragmentIndex - batchBegin + 1U) * count2;
-            for (uint64_t tile = FirstOwnedComputeTile(batchTileBegin, block, kAic); tile < tileLimit;) {
-                const auto owned = OwnedComputeGroupAt(tile, count2, kAic);
-                AtomicAdd(ComputeFlag(args.gmm2Done, batchBegin + owned.group), static_cast<int32_t>(owned.tileCount));
-                tile += static_cast<uint64_t>(owned.tileCount) * kAic;
-            }
-        }
-    }
-    timer.End(Phase::Gmm2);
+    timer.End(phase);
 }
 
 __aicore__ inline ComputeBatchRange LoadComputeBatch(const Arguments& args, uint32_t index)
@@ -321,10 +272,10 @@ __aicore__ inline ComputeBatchTask LoadComputeTask(const Arguments& args, uint32
 // independent; the GMM1 M-group window covers earlier activation latency.
 __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, Timer& timer)
 {
-    // Only one stage owns the shared L1/L0/prologue buffers at a time. The
-    // objects keep their views; each expert batch acquires/releases events.
-    UrmaGmm1 gmm1;
-    UrmaGmm2 gmm2;
+    UrmaContinuousGmm pipeline;
+    ComputeOutputBackend backend{args, timer};
+    DeferredOutput<ComputeOutputBackend> pending(backend);
+    bool hasWork = false;
     for (uint32_t step = 0U; step < args.config.computeTaskCount; ++step) {
         const auto task = LoadComputeTask(args, step);
         const auto range = LoadComputeBatch(args, task.batchIndex);
@@ -341,14 +292,15 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
             const auto owned = OwnedComputeGroupAt(tile, tilesPerGroup, kAic);
             const uint64_t nextTile = tile + static_cast<uint64_t>(owned.tileCount) * kAic;
             const uint32_t fragmentIndex = range.begin + owned.group;
-            const bool endContext = nextTile >= tileLimit;
-            if (isGmm1) {
-                RunGmm1Fragment(args, block, fragmentIndex, owned.firstTile, gmm1, endContext, timer);
-            } else {
-                RunGmm2Fragment(args, block, fragmentIndex, owned.firstTile, gmm2, range.begin, endContext, timer);
-            }
+            RunComputeFragment(args, block, fragmentIndex, owned.firstTile, isGmm1, pipeline, pending, timer);
+            hasWork = true;
             tile = nextTile;
         }
+    }
+    if constexpr (g_coreType == AIC) pending.Flush();
+    if (hasWork) {
+        pipeline.End(g_coreType == AIC);
+        CompleteComputeContext();
     }
 }
 
@@ -442,10 +394,10 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
     timer.End(Phase::Activation);
 }
 
-// Each helper owns independent cursors for activation, input-scale groups and
-// its fixed Pack quota. A ready activation always wins; otherwise gather one
-// ready scale group or pack one quota. Recheck activation after each task.
-// Readiness checks never block another cursor. No dynamic task claims.
+// Each helper owns static activation/reorder tiles, scale groups and Pack
+// quotas. Activation always wins. Scale gather, Pack and reorder round-robin
+// at task boundaries, so neither input supply nor Combine output can starve.
+// All tasks close UB events before returning. No dynamic task claims.
 __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Timer& timer)
 {
     const uint32_t activationWorkers = ActivationWorkers(args.config.world);
@@ -460,6 +412,10 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
     uint32_t nextActivation = 0U;
     uint32_t activationTile = 0U;
     uint32_t nextPackRound = kPackStartupRounds;
+    uint32_t nextReorder = 0U;
+    uint32_t reorderTile = 0U;
+    uint32_t fallbackTurn = 0U;
+    bool reorderPrepared = false;
     bool packFinished = false;
     bool activationPrepared = false;
     bool idle = false;
@@ -467,7 +423,7 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
     TraceEvent idleEvent = TraceEvent::WaitGmm1;
     TraceMeta idleMeta;
     while (nextGather < args.config.fragmentCount || nextActivation < args.config.fragmentCount ||
-           nextPackRound < args.config.packRoundCount) {
+           nextPackRound < args.config.packRoundCount || nextReorder < args.config.fragmentCount) {
         bool progress = false;
         // Skip groups without this worker's activation tile, but never skip a
         // scale gather merely because its owner has no activation in that group.
@@ -494,41 +450,70 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
             }
             break;
         }
-        if (!progress && nextGather < args.config.fragmentCount) {
-            const auto fragment = LoadFragment(args, nextGather);
-            if (AreGroupInputsReady(args, fragment)) {
+        for (uint32_t attempt = 0U; !progress && attempt < 3U; ++attempt) {
+            const uint32_t kind = (fallbackTurn + attempt) % 3U;
+            if (kind == 0U && nextGather < args.config.fragmentCount) {
+                const auto fragment = LoadFragment(args, nextGather);
+                if (AreGroupInputsReady(args, fragment)) {
+                    if (idle) {
+                        timer.TraceEnd(idleEvent, idleStart, idleMeta);
+                        idle = false;
+                    }
+                    GatherInputScale(args, fragment, nextGather, timer);
+                    nextGather += activationWorkers;
+                    progress = true;
+                }
+            } else if (kind == 1U && nextPackRound < args.config.packRoundCount) {
                 if (idle) {
                     timer.TraceEnd(idleEvent, idleStart, idleMeta);
                     idle = false;
                 }
-                GatherInputScale(args, fragment, nextGather, timer);
-                nextGather += activationWorkers;
+                PackOneRound(args, nextPackRound, worker + communicationWorkers, kAic, timer);
+                ++nextPackRound;
                 progress = true;
+            } else if (kind == 2U) {
+                while (nextReorder < args.config.fragmentCount) {
+                    const auto fragment = LoadFragment(args, nextReorder);
+                    const uint32_t count = FragmentGmm2Tiles(args, fragment);
+                    if (!reorderPrepared) {
+                        reorderTile = FirstOwnedComputeTile(fragment.gmm2TileBegin, worker, activationWorkers);
+                        reorderPrepared = true;
+                    }
+                    if (reorderTile >= count) {
+                        ++nextReorder;
+                        reorderPrepared = false;
+                        continue;
+                    }
+                    if (ReadGmByPassDCache(ComputeFlag(args.gmm2MatmulDone, fragment.gmm2TileBegin + reorderTile)) !=
+                        0) {
+                        if (idle) {
+                            timer.TraceEnd(idleEvent, idleStart, idleMeta);
+                            idle = false;
+                        }
+                        ReorderGmm2Tile(args, fragment, nextReorder, reorderTile, timer);
+                        reorderTile += activationWorkers;
+                        progress = true;
+                    }
+                    break;
+                }
             }
-        }
-        // Only fall back to Pack when neither activation nor a scale gather
-        // ran. Keep the same fixed quota and close its events before returning
-        // to the activation check; never gate activation on another peer.
-        if (!progress && nextPackRound < args.config.packRoundCount) {
-            if (idle) {
-                timer.TraceEnd(idleEvent, idleStart, idleMeta);
-                idle = false;
-            }
-            PackOneRound(args, nextPackRound, worker + communicationWorkers, kAic, timer);
-            ++nextPackRound;
-            progress = true;
+            if (progress) fallbackTurn = (kind + 1U) % 3U;
         }
         if (!packFinished && nextPackRound >= args.config.packRoundCount) {
             MarkPackWorkerComplete(args);
             packFinished = true;
         }
-        if (!progress && (nextGather < args.config.fragmentCount || nextActivation < args.config.fragmentCount)) {
+        if (!progress && (nextGather < args.config.fragmentCount || nextActivation < args.config.fragmentCount ||
+                          nextReorder < args.config.fragmentCount)) {
             if (!idle) {
                 idleStart = timer.TraceBegin();
                 idle = true;
                 const bool waitingActivation = nextActivation < args.config.fragmentCount;
-                const uint32_t index = waitingActivation ? nextActivation : nextGather;
-                idleEvent = waitingActivation ? TraceEvent::WaitGmm1 : TraceEvent::WaitDispatch;
+                const bool waitingGather = nextGather < args.config.fragmentCount;
+                const uint32_t index = waitingActivation ? nextActivation : (waitingGather ? nextGather : nextReorder);
+                idleEvent = waitingActivation
+                                ? TraceEvent::WaitGmm1
+                                : (waitingGather ? TraceEvent::WaitDispatch : TraceEvent::WaitGmm2Reorder);
                 idleMeta = FragmentTraceMeta(LoadFragment(args, index), index);
             }
             const uint64_t backoff = GetSystemCycle();

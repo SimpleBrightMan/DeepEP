@@ -36,6 +36,7 @@ private:
     MegaMoeUrma::Arguments args_{};
     torch::Tensor expanded_x_, expanded_scale_, gmm1_, activation_, activation_scale_, gmm2_;
     torch::Tensor gathered_input_scale_, input_scale_done_;
+    torch::Tensor gmm2_contiguous_, gmm2_matmul_done_;
     torch::Tensor fragments_, send_chunks_, recv_chunks_, gmm1_done_, activation_done_, gmm2_done_, local_flags_;
     torch::Tensor segments_, compute_batches_, compute_tasks_, chunk_group_indices_;
     torch::Tensor pack_rounds_, pack_ready_;

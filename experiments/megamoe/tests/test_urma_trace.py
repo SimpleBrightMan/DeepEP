@@ -67,11 +67,15 @@ def test_export_fields_thread_mapping_and_submission_semantics():
 def test_every_event_id_has_a_name_and_no_fabricated_async_events():
     raw = trace_buffer(1)
     for event_id, name in enumerate(EVENTS):
+        if name is None:
+            continue
         add_record(raw, engine=event_id, event=name)
     result = decode_trace(raw, rank=0, clock_mhz=1000)
-    assert len(events(result)) == len(EVENTS) == 33
+    assert len(events(result)) == sum(name is not None for name in EVENTS) == 35
     assert {row["ph"] for row in result["traceEvents"]} == {"M", "X"}
-    assert {row["args"]["event_id"] for row in events(result)} == set(range(len(EVENTS)))
+    assert {row["args"]["event_id"] for row in events(result)} == {
+        index for index, name in enumerate(EVENTS) if name is not None
+    }
 
 
 def test_historical_tail_cover_events_keep_completion_signal_and_hide_only_ready_wait():
@@ -86,6 +90,29 @@ def test_historical_tail_cover_events_keep_completion_signal_and_hide_only_ready
     assert [row["args"]["event_id"] for row in filtered] == [30, 25, 32]
     assert filtered[0]["cat"] == "signal.publish"
     assert filtered[1]["ts"] == 0.015
+
+
+def test_reorder_events_do_not_reuse_json_gmm_envelope_ids():
+    from deep_ep_experimental.megamoe.urma_trace import coalesce_gmm_tiles, filter_trace_waits
+
+    raw = trace_buffer(4)
+    add_record(raw, engine=0, event="Gmm2Tile", start=1000, end=1010, fragment=0, expert=0)
+    add_record(raw, engine=0, event="Gmm2Drain", start=1010, end=1020, fragment=0, expert=0)
+    add_record(raw, engine=2, event="WaitGmm2Reorder", start=1000, end=1020, fragment=0)
+    add_record(raw, engine=2, event="Gmm2Reorder", start=1020, end=1030, fragment=0)
+    decoded = coalesce_gmm_tiles(decode_trace(raw, rank=0, clock_mhz=1000))
+    ids = {event["args"]["event_id"] for event in events(decoded)}
+    assert ids == {34, 40, 41}
+    assert {event["args"]["event_id"] for event in events(filter_trace_waits(decoded))} == {34, 40}
+
+
+@pytest.mark.parametrize("reserved", range(33, 40))
+def test_json_only_event_ids_are_rejected_in_raw_device_records(reserved):
+    raw = trace_buffer(1)
+    record = add_record(raw, engine=0, event="Gmm2Tile")
+    record[2] = reserved
+    with pytest.raises(ValueError, match="unknown event id"):
+        decode_trace(raw, rank=0, clock_mhz=1000)
 
 
 def test_reduce_envelope_is_one_visible_interval_including_internal_waits():

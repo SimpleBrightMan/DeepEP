@@ -100,6 +100,20 @@ def test_valid_pack_gather_and_weighted_reduce(tmp_path):
         np.testing.assert_array_equal(samples["weight1_prefix"], [1, 1, 1, -1, 0, -0.0])
 
 
+def test_contiguous_reorder_diagnostics_are_optional_and_separate(tmp_path):
+    raw = fixture_snapshot()
+    raw["gmm2_contiguous"] = raw["returned"].copy()
+    flags = np.zeros((2, 32), dtype="<i4")
+    flags[:, 0] = 1
+    raw["gmm2_matmul_done"] = byte_view(flags)
+    raw["local_flags"].view("<i4").reshape(16, 32)[3:5, 0] = [28, 13]
+    report = save(raw, tmp_path)
+    assert not report["errors"]
+    assert report["stages"]["gmm2_contiguous"]["elements"] == 192
+    assert report["flags"]["gmm2_matmul_done"]["first_values"] == [1, 1]
+    assert report["flags"]["local_named"]["reorder_done"] == 13
+
+
 def test_nonzero_return_zero_output_points_to_reduce(tmp_path):
     raw = fixture_snapshot()
     raw["output"][:] = 0

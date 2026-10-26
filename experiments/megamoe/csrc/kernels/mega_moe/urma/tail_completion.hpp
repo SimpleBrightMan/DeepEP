@@ -3,6 +3,7 @@
 #pragma once
 
 #include "abi.hpp"
+#include "compute_contract.hpp"
 #include "transport.hpp"
 
 namespace MegaMoeUrma {
@@ -17,11 +18,16 @@ __aicore__ inline uint64_t PeerPhaseSlot(const Arguments& args, uint32_t phase, 
     return args.config.barrierOffset + (static_cast<uint64_t>(phase) * args.config.world + source) * kFlagBytes;
 }
 
-// Called once per AIC only after its final GMM2 context drained every FIX store.
-// AIV0 completion is not sufficient to certify self returnY stores.
+// AIC completion certifies contiguous scratch, not self returnY. The helper
+// team must also finish all final-layout stores before the aggregate bypass.
 __aicore__ inline void MarkCubeComplete(const Arguments& args)
 {
     AscendC::AtomicAdd(LocalCompletionFlag(args, kLocalFlagAicDone), 1);
+}
+
+__aicore__ inline void MarkReorderComplete(const Arguments& args)
+{
+    AscendC::AtomicAdd(LocalCompletionFlag(args, kLocalFlagReorderDone), 1);
 }
 
 // Nonblocking: call once before each Combine quiet, then poll at the tail.
@@ -43,10 +49,13 @@ __aicore__ inline bool ObserveIncomingCompletion(const Arguments& args, uint32_t
             peerCounted = true;
         }
     }
-    // Only owner 0 contributes self. Include idle AICs as well; every AIC
-    // reports after its compute schedule returns, so even empty routes work.
+    // Only owner 0 contributes self. Empty AIC/helper workloads still report.
+    // All remote finished flags plus AIC28 alone must NOT bypass self reads:
+    // scratch can be complete while the last helper's self scatter is pending.
     if (owner == 0U && !selfCounted &&
-        ReadGmByPassDCache(LocalCompletionFlag(args, kLocalFlagAicDone)) == static_cast<int32_t>(kAic)) {
+        ReadGmByPassDCache(LocalCompletionFlag(args, kLocalFlagAicDone)) == static_cast<int32_t>(kAic) &&
+        ReadGmByPassDCache(LocalCompletionFlag(args, kLocalFlagReorderDone)) ==
+            static_cast<int32_t>(ActivationWorkers(args.config.world))) {
         AtomicAdd(LocalCompletionFlag(args, kLocalFlagIncomingDone), 1);
         selfCounted = true;
     }

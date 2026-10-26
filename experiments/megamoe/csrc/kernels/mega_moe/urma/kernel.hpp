@@ -355,6 +355,7 @@ __aicore__ inline void Process(const Arguments& args)
         CommunicatePeer(args, block, timer);
     } else {
         RunActivation(args, block - communicationWorkers, timer);
+        MarkReorderComplete(args);
     }
     if constexpr (g_coreType == AIV) {
         // Only this engine releases its phase-private UB/events. Other

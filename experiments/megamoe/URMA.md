@@ -1,5 +1,10 @@
 # MegaMoE URMA 固定 CV 实验
 
+当前 `megamoe-urma-gmm2-unitflag-reorder` 分支的计算输出/完成协议以
+[GMM2 连续写出与重排实验](URMA_GMM2_UNITFLAG_REORDER.md) 为准：GMM1/GMM2 共用持久化
+Unit Flag 上下文，GMM2 写连续临时区，辅助 AIV1 重排后才通知 Combine/Reduce。
+下文的直接 GMM2 Scatter 和逐专家上下文收尾描述是基线行为。
+
 ## 2026-10-23 上游与 SHMEM 同步
 
 `megamoe-urma-combineAdvance-v2` 已合入 `lueelu/DeepEP` 的 main `35fa7d91b321340c153b098bf166202645976a75`：更新独立 `ep_gmm_fused` 的 staging/缓冲深度/self-copy 调度，增加 EP4 配置与测试，并整理文档。此同步没有引入 `megamoe-urma-gmm2-m128n512` 的 tile 实验；advance2 的 MegaMoE 计算和提前 Combine 调度保持原设置。

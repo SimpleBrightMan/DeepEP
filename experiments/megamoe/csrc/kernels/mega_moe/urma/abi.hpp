@@ -23,6 +23,7 @@ constexpr uint32_t kLocalFlagDispatchDone = 0U;
 constexpr uint32_t kLocalFlagAicDone = 1U;
 constexpr uint32_t kLocalFlagIncomingDone = 2U;
 constexpr uint32_t kLocalFlagPackDone = 3U;
+constexpr uint32_t kLocalFlagReorderDone = 4U;
 // Reduce dependency values are uint64 bit patterns stored in an int64 tensor.
 // Low values address a producer/CV completion flag; tagged values address a
 // local GMM2 group that writes its self return rows directly.
@@ -74,7 +75,10 @@ enum class TraceEvent : uint32_t {
     WaitInputScale,
     CombinePublish,
     WaitReduceReady,  // Reserved for historical per-token Reduce traces.
-    ReduceDrain       // Reserved: the Reduce envelope now includes its drain.
+    ReduceDrain,      // Reserved: the Reduce envelope now includes its drain.
+    // IDs 33..39 are reserved for historical JSON-only GMM envelopes.
+    Gmm2Reorder = 40U,
+    WaitGmm2Reorder
 };
 
 struct TraceMeta {
@@ -209,6 +213,7 @@ struct Arguments {
     uint64_t activation;
     uint64_t activationScale;
     uint64_t gmm2Output;
+    uint64_t gmm2Contiguous;  // Expert-major BF16 scratch; not visible to Combine.
     uint64_t fragments;
     uint64_t segments;
     uint64_t computeBatches;
@@ -222,6 +227,7 @@ struct Arguments {
     uint64_t inputScaleDone;
     uint64_t activationDone;
     uint64_t gmm2Done;
+    uint64_t gmm2MatmulDone;  // Per logical GMM2 tile; reorder consumes these flags.
     uint64_t localFlags;
     uint64_t timer;
     uint64_t trace;
