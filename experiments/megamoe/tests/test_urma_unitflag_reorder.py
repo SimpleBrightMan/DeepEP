@@ -93,7 +93,7 @@ int main() {
                 }
                 std::vector<uint32_t> seen(rows * 14U);
                 uint32_t groupDone = 0;
-                std::vector<uint32_t> workerDone(ActivationWorkers(world));
+                std::vector<uint32_t> workerDone(kAic);
                 for (uint32_t tile = 0; tile < 14U; ++tile) {
                     // Arrival into contiguous scratch alone does not increment
                     // the Combine/Reduce-visible counter.
@@ -113,7 +113,7 @@ int main() {
                         }
                     }
                     ++groupDone;
-                    ++workerDone[(uint64_t(1) << 33U | tile) % ActivationWorkers(world)];
+                    ++workerDone[(uint64_t(1) << 33U | tile) % kAic];
                 }
                 assert(groupDone == ComputeTileCount(rows, 3584U));
                 assert(std::all_of(seen.begin(), seen.end(), [](auto n) { return n == 1U; }));

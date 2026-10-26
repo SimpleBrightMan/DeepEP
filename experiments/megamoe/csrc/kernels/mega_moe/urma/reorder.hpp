@@ -9,7 +9,7 @@
 namespace MegaMoeUrma {
 static_assert(kReorderUbBytes == ActivationUbContract::inputEnd);
 
-// One helper owns a complete N tile. Two M128 slots overlap read and write
+// One paired AIV1 owns a complete N tile. Two M128 slots overlap read and write
 // without an S wait between rows/segments. Each call closes its event credits
 // and drains stores before activation/gather reuse the same low 128KiB UB.
 __aicore__ inline void ReorderGmm2Tile(const Arguments& args, const Fragment& fragment, uint32_t fragmentIndex,

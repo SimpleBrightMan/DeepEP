@@ -728,7 +728,7 @@ int main(int argc, char** argv) {
         MarkCubeComplete(args);
         assert(*aic == 28 && !ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
         assert(*incoming == 1); // AIC scratch ready is not self return ready.
-        for (unsigned i = 1; i < ActivationWorkers(world); ++i) MarkReorderComplete(args);
+        for (unsigned i = 1; i < kAic; ++i) MarkReorderComplete(args);
         assert(!ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
         assert(*incoming == 1);
         MarkReorderComplete(args);
@@ -746,7 +746,7 @@ int main(int argc, char** argv) {
         assert(!ObserveIncomingCompletion(args, 0, peerSeen[0], selfSeen[0]));
         assert(*incoming == 0);
         for (unsigned i = 0; i < 28; ++i) MarkCubeComplete(args);
-        for (unsigned i = 0; i < ActivationWorkers(world); ++i) MarkReorderComplete(args);
+        for (unsigned i = 0; i < kAic; ++i) MarkReorderComplete(args);
         for (unsigned owner = 0; owner < world - 1; ++owner) {
             *flag(owner) = 9;
             assert(ObserveIncomingCompletion(args, owner, peerSeen[owner], selfSeen[owner]));
@@ -769,11 +769,15 @@ int main(int argc, char** argv) {
         };
         readSelf = [&](int32_t* address) {
             assert(publications == 1 && (address == aic || address == reorder));
-            if (address == reorder) return static_cast<int32_t>(ActivationWorkers(world));
+            if (address == reorder) return static_cast<int32_t>(kAic);
             return selfPolls < 3 ? 27 : 28;
         };
         LocalTensor<uint64_t> signal;
-        FinishCombinePeer(args, 0, signal, peerCounted, selfCounted);
+        struct ReadyReorder {
+            bool DrainReady() { assert(AscendC::publications == 1); return false; }
+            bool Done() const { return true; }
+        } readyReorder;
+        FinishCombinePeer(args, 0, signal, peerCounted, selfCounted, readyReorder);
         assert(publications == 1 && polls == 2 && selfPolls == 4 && backoffs > 0);
         assert(*incoming == 2 && peerCounted && selfCounted);
         auto* published = reinterpret_cast<uint64_t*>(args.symmetric +
@@ -785,8 +789,25 @@ int main(int argc, char** argv) {
         publications = polls = selfPolls = 0;
         readPeer = [](uint64_t*) -> uint64_t { assert(false); return 0; };
         readSelf = [](int32_t*) -> int32_t { assert(false); return 0; };
-        FinishCombinePeer(args, 0, signal, peerCounted, selfCounted);
+        FinishCombinePeer(args, 0, signal, peerCounted, selfCounted, readyReorder);
         assert(publications == 1 && polls == 0 && selfPolls == 0 && *incoming == 2);
+
+        // Publishing this peer's finished edge must not wait for unrelated
+        // reorder work. Conversely, incoming completion must not allow this
+        // owner to stop progressing its own remaining tiles (also empty edges).
+        struct DelayedReorder {
+            unsigned attempts = 0;
+            bool DrainReady() {
+                assert(AscendC::publications == 1);
+                ++attempts;
+                return attempts == 3;
+            }
+            bool Done() const { return attempts == 3; }
+        } delayedReorder;
+        publications = polls = selfPolls = backoffs = 0;
+        FinishCombinePeer(args, 0, signal, peerCounted, selfCounted, delayedReorder);
+        assert(publications == 1 && delayedReorder.attempts == 3);
+        assert(polls == 0 && selfPolls == 0 && backoffs > 0);
         return 0;
     }
     if (std::string(argv[1]) == "flags") {
@@ -929,7 +950,7 @@ def test_finished_observation_and_aic_publication_integration():
         combine.index("Put(symmetric,")
         < combine.index("if (pendingCount != 0U)")
         < combine.index("timer.End(Phase::Combine, combineBytes)")
-        < combine.index("FinishCombinePeer(args, owner, signal, peerCounted, selfCounted);")
+        < combine.index("FinishCombinePeer(args, owner, signal, peerCounted, selfCounted, reorder);")
     )
     process = source[source.index("__aicore__ inline void Process") :]
     assert process.index("RunCubeAndPrologue(args, block, timer);") < process.index("MarkCubeComplete(args);")

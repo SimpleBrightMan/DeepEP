@@ -35,13 +35,19 @@ M256×N256 放得下两块 FP32 L0C。
 ## 重排与完成协议
 
 - 每个 GMM2 tile 的 FIX 完成后置 `gmm2MatmulDone[tile]`，只表示临时区已写好。
-- 非通信 AIV1 按全局 GMM2 tile ID 模 helper 数量静态分工，EP16/8/4 分别13/21/25核。
-  就绪激活始终最高优先；其余 scale gather、Pack、重排按任务轮换，避免任何一项长期饥饿。
+- 全部28个 AIV1 参与重排，严格沿用 GMM2 的全局 tile ID 模28分工：AIC block b
+  计算的 tile 只由同 block 的 AIV1 重排。EP16/8/4 的通信核仍分别为15/7/3个，
+  激活、scale gather、Pack 的静态分工不变，不增加队列共享或任务争抢。
+- 通信核先完成本轮 Pack 配额，再于每次 Dispatch/Combine quiet 前处理本核当前
+  已就绪的全部重排 tile；没有就绪 tile 就继续通信，不等待其 AIC。无可发送 Combine、
+  空 peer 和发送已经结束的路径也继续推进重排，直到本核任务完成，不能提前退出。
+- 非通信辅助核仍优先执行就绪 SwiGLU；Pack 优先于重排。重排完成仍以最终 GM
+  写出为准，不能仅依据计算临时区就绪放行通信。
 - 每个重排任务用两块 M128×N256 BF16 UB 槽，共128 KiB。按原 RowSegment 把远端行
   写到原 `gmm2Output` source-major 布局，本卡行直接写最终 symmetric return 区。
   只有所有该 tile 的 MTE3 写出完成后才给原 `gmm2Done[group]` 原子加一。
 - Combine 和按 token 的 Reduce 只认原 `gmm2Done`；它们不能消费 `gmm2MatmulDone`。
-  本卡入站累计完成还要求 **全部28个AIC完成且全部重排helper完成**，避免提前进入
+  本卡入站累计完成还要求 **全部28个AIC完成且全部28个AIV1重排完成**，避免提前进入
   Reduce 的“所有来源完成、免读逐token flag”路径。空任务核心也各报告一次。
 - 所有临时 flag/计数沿用 forward 启动 stream 上清零；新的张量加入 recordStream、
   workspace 统计和 debug snapshot。
@@ -49,6 +55,37 @@ M256×N256 放得下两块 FP32 L0C。
 新增临时区为 `receiveRows × H × 2` 字节，另有每 GMM2 tile 一个128字节完成槽。
 相对直接 FIX Scatter 增加约 `2 × receiveRows × H × 2` 字节逻辑 GM 读写。
 该量不等于实际 HBM流量，也不能直接当成新增串行时延；缓存和与计算通信的重叠要实测。
+
+重排仍使用原来的低128 KiB UB，并在每个 tile 末尾等待 MTE3 后发布完成。
+通信核长期保留的 signal / submitted / pending 数据移到与此缓冲不重叠的区域，
+防止在 quiet 前重排时破坏尚未发布的 Combine 批次。此次只扩大重排分工和调整调度，
+没有取消逐 tile 写出等待或改变整 M-group 的 Combine 就绪条件。
+
+每个 AIV1 的重排游标直接读取对应 AIC 使用的 `computeTasks` / `computeBatches`，
+过滤出其 GMM2 子序列。该 AIC 的完成标志按这个子序列发布，因此首个未就绪任务之后
+不会已有本核的已发布任务；无需扫描其它核的 tile，也无需重复遍历整张路由表。
+成功的 ready 检查缓存到本 tile 消费，避免为关闭等待计时再次读取同一个 GM flag。
+
+通信核调度示意：
+
+```text
+Dispatch PUT(X, scale)
+完成本核本轮向前准备的 Pack 配额
+重排对应 AIC 当前已发布的全部 tile（遇到未就绪立即返回）
+Dispatch quiet → 发布 CV 完成
+
+扫描并提交已就绪的 Combine CV
+重排对应 AIC 当前已发布的全部 tile
+Combine quiet → 发布这一批 CV 完成
+
+没有可发送的 CV：仍推进本核重排，不能只等 Combine 就绪
+发送结束：先发布 peer finished，再持续重排并观察入站完成
+本核重排全部完成且入站观察结束后退出通信循环
+```
+
+`WaitStartPeer` / `WaitDispatch` / `WaitLocalDispatch` / `WaitCombineReady` 中执行
+重排时，先结束当前 wait 记录，重排后再开始新的 wait，保持同一引擎的 trace 不重叠。
+没有任务就绪的轮询不会新增逐轮 wait 记录。
 
 ## 诊断与测试
 
@@ -60,16 +97,24 @@ trace 新增 `Gmm2Reorder` 和 `WaitGmm2Reorder`（raw ID40/41），33–39不�
 避免与历史 JSON 合成 GMM 条的ID冲突。默认展示隐藏后者 wait。GMM submit 和延迟 drain 可能不相邻，不能
 跨过其它 tile 强行合成同一条；计时不额外排空流水。
 
-273项CPU测试通过：执行真实的 deferred flag 状态机、重排地址交集计算和尾部完成协议，覆盖短M尾、
+首版273项CPU测试通过：执行真实的 deferred flag 状态机、重排地址交集计算和尾部完成协议，覆盖短M尾、
 任意来源分段、EP4/8/16、空核与自锁反例，并检查 trace/debug 导出。其中45项通过异步引擎
 模型执行生产 `ReorderGmm2Tile`，检查所有14个N tile的逐元素输出、未写区域与写出后发布顺序。
 CPU通过不代表 CANN 编译、NPU数值正确或性能收益；本次未进行 CANN/NPU验证。
+
+28核重排更新共314项相关CPU回归通过，新增直接执行生产任务游标及通信循环的检查：
+EP4/8/16 分工、随机稀疏任务、空核、空 peer、最高512个CV的持久UB状态、Pack优先、
+最后CV独立quiet、完成计数恰好一次，以及 wait/Reorder trace 区间不重叠。
+本次未进行 CANN 编译或 NPU 运行，性能收益与设备精度仍需实测。
 
 ```bash
 python3 -m pytest \
   experiments/megamoe/tests/test_urma_unitflag_reorder.py \
   experiments/megamoe/tests/test_urma_reorder_device.py \
+  experiments/megamoe/tests/test_urma_reorder_progress.py \
+  experiments/megamoe/tests/test_urma_reorder_comm.py \
   experiments/megamoe/tests/test_urma_tail_protocol.py \
+  experiments/megamoe/tests/test_urma_transport.py \
   experiments/megamoe/tests/test_urma_trace.py \
   experiments/megamoe/tests/test_urma_trace_merge.py \
   experiments/megamoe/tests/test_urma_trace_coalesce.py \

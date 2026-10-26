@@ -2,7 +2,7 @@
 
 当前 `megamoe-urma-gmm2-unitflag-reorder` 分支的计算输出/完成协议以
 [GMM2 连续写出与重排实验](URMA_GMM2_UNITFLAG_REORDER.md) 为准：GMM1/GMM2 共用持久化
-Unit Flag 上下文，GMM2 写连续临时区，辅助 AIV1 重排后才通知 Combine/Reduce。
+Unit Flag 上下文，GMM2 写连续临时区，全部28个 AIV1 按对应 AIC 的任务重排后才通知 Combine/Reduce。
 下文的直接 GMM2 Scatter 和逐专家上下文收尾描述是基线行为。
 
 ## 2026-10-23 上游与 SHMEM 同步
