@@ -73,7 +73,7 @@ __aicore__ inline bool TryReduceToken(const Arguments& args, AscendC::LocalTenso
                                       AscendC::LocalTensor<uint32_t>& selfCache, uint32_t firstRoute)
 {
     using namespace AscendC;
-    constexpr uint32_t expectedSelfTiles = (ReduceUbContract::hidden + kComputeTileN - 1U) / kComputeTileN;
+    constexpr uint32_t expectedSelfTiles = Gmm2TileCount(kComputeTileM, ReduceUbContract::hidden);
     for (uint32_t slot = 0U; slot < ReduceUbContract::topk; ++slot) {
         const uint64_t dependency = dependencies.GetValue(firstRoute + slot);
         const bool self = (dependency & kReduceSelfDependency) != 0U;

@@ -399,7 +399,9 @@ int main(int argc, char** argv) {
                     readyCandidate = local;
                 }
             }
-            if (dependency & kReduceSelfDependency) return uint64_t(complete ? 14U : 13U);
+            // 27 completed N128 tiles must not release self Reduce; only
+            // the final column tile makes the original M256 group ready.
+            if (dependency & kReduceSelfDependency) return uint64_t(complete ? 28U : 27U);
             return complete ? args.config.epoch : mode == "future" ? args.config.epoch + 1U : args.config.epoch - 1U;
         };
         beforePayload = [&](uintptr_t address) {

@@ -108,9 +108,9 @@ public:
     static constexpr uint32_t L0B_TILE_SIZE = L0_TILE_K * L0_TILE_N * SizeOfBits<ElementL0B>::value / 8;
     static constexpr uint32_t L0C_TILE_SIZE = L1_TILE_M * L1_TILE_N * sizeof(ElementAccumulator);
 
-    static_assert(L1_TILE_M == 256 && L1_TILE_N == 256 && L1_TILE_K == 256 && L1A_STAGES == 2 && L1B_STAGES == 2 &&
-                      L1_SCALE_FACTOR_K == 16 && SizeOfBits<ElementA>::value == 8 && SizeOfBits<ElementB>::value == 8 &&
-                      !HAS_BIAS,
+    static_assert(L1_TILE_M == 256 && (L1_TILE_N == 256 || L1_TILE_N == 128) && L1_TILE_K == 256 && L1A_STAGES == 2 &&
+                      L1B_STAGES == 2 && L1_SCALE_FACTOR_K == 16 && SizeOfBits<ElementA>::value == 8 &&
+                      SizeOfBits<ElementB>::value == 8 && !HAS_BIAS,
                   "Adaptive A8W4 requires two A128KiB/B64KiB/scale32KiB slots and no bias");
 
     // Check L0C_STAGES

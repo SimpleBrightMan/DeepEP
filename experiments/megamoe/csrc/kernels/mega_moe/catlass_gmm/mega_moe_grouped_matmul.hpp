@@ -27,7 +27,8 @@ struct CatlassGroupedMatmulLayouts {
 
 // Shared AIC/AIV0 pipeline mechanics; projection semantics belong to GMM1/GMM2 below.
 namespace detail {
-template <class Config, bool BypassInputL2 = false, class RowIO = ContiguousRowIO>
+template <class Config, bool BypassInputL2 = false, class RowIO = ContiguousRowIO, uint32_t PhysicalTileN = 256U,
+          uint32_t L0CStages = 1U>
 class A8W4MatmulPipeline {
     using C = typename Config::KernelConfig;
     using A = typename C::ElementAType;
@@ -42,8 +43,8 @@ class A8W4MatmulPipeline {
     using LayoutScaleA = CatlassGroupedMatmulLayouts::LayoutScaleA;
     using LayoutScaleB = CatlassGroupedMatmulLayouts::LayoutScaleB;
     using LayoutDequantizedB = CatlassGroupedMatmulLayouts::LayoutDequantizedB;
-    using L1 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<256>>;
-    using L0 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<128>>;
+    using L1 = tla::Shape<tla::Int<256>, tla::Int<PhysicalTileN>, tla::Int<256>>;
+    using L0 = tla::Shape<tla::Int<256>, tla::Int<PhysicalTileN>, tla::Int<128>>;
     using ScaleALayout = decltype(tla::MakeMxScaleLayout<SA, LayoutScaleA, false>(uint32_t{}, uint32_t{}));
     using ScaleBLayout = decltype(tla::MakeMxScaleLayout<SB, LayoutScaleB, true>(uint32_t{}, uint32_t{}));
     using TileCopy =
@@ -52,7 +53,7 @@ class A8W4MatmulPipeline {
                                                      Catlass::Gemm::Tile::ScaleGranularity::PER_TENSOR>;
     // A multi-store result needs ordinary NZ L0C and explicit FIX ownership.
     // Keep the existing transformed/unit-flag path for contiguous outputs.
-    using Policy = Catlass::Gemm::MmadA8W4Mx<Arch, !RowIO::kScatterOutput, false, 16, 1, 2, 2, 2, 2>;
+    using Policy = Catlass::Gemm::MmadA8W4Mx<Arch, !RowIO::kScatterOutput, false, 16, L0CStages, 2, 2, 2, 2>;
     using Mmad = Catlass::Gemm::Block::MegaMoeBlockMmadA8W4<Policy, L1, L0, A, A, Out, void, TileCopy>;
     using Prologue =
         Catlass::Gemm::Block::MegaMoeBlockPrologueA8W4<Arch, 2, Catlass::Gemm::GemmType<W, LayoutB>,
@@ -203,15 +204,18 @@ protected:
         auto tileSA = tla::GetTile(sa, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.scaleK));
         auto tileSB = tla::GetTile(sb, tla::MakeCoord(0, weightN), tla::MakeShape(config_.scaleK, cols));
         auto tileC = tla::GetTile(c, tla::MakeCoord(m, outputN), tla::MakeShape(rows, cols));
-        block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U,
-               Catlass::EmptyClass{}, rowIO_, m, outputN);
+        // N128 is an isolated output/L0C experiment: retain Kb256 for its
+        // short M tails too, rather than also enabling the adaptive Kb512 path.
+        block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB,
+               config_.m < 256U && PhysicalTileN == 256U, Catlass::EmptyClass{}, rowIO_, m, outputN);
     }
 
     __aicore__ inline void DequantizeWeight(uint32_t weightN, uint32_t rows, uint32_t cols)
     {
         auto b = Tensor<W>(addr_.bGlobal, block_.params.layoutPrologueB);
         auto tileB = tla::GetTile(b, tla::MakeCoord(0, weightN), tla::MakeShape(config_.k, cols));
-        block_.op(tileB, Catlass::GemmCoord{rows, cols, config_.k}, block_.params, config_.m < 256U);
+        block_.op(tileB, Catlass::GemmCoord{rows, cols, config_.k}, block_.params,
+                  config_.m < 256U && PhysicalTileN == 256U);
     }
 };
 
@@ -267,9 +271,10 @@ public:
 };
 
 // GMM2 owns the down projection and always writes row-major output.
-template <class Config, bool BypassInputL2 = false, class RowIO = ContiguousRowIO>
-class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO> {
-    using Pipeline = detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO>;
+template <class Config, bool BypassInputL2 = false, class RowIO = ContiguousRowIO, uint32_t PhysicalTileN = 256U,
+          uint32_t L0CStages = 1U>
+class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO, PhysicalTileN, L0CStages> {
+    using Pipeline = detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO, PhysicalTileN, L0CStages>;
 
 public:
     __aicore__ inline CatlassGmm2() = default;

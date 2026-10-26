@@ -176,7 +176,7 @@ def check_plans(ids, cv_rows, routes, plans):
         assert self_send == routes[rank].peer_offsets[rank]
         assert self_recv == receive_base[rank, rank] and self_rows == counts[rank, rank]
         assert groups == len(plan["F"]) and sends == len(plan["T"]) and receives == len(plan["R"])
-        assert g1 == groups * 5 and g2 == groups * 14
+        assert g1 == groups * 5 and g2 == groups * 28
         assert len(plan["B"]) == local_experts
         assert len(plan["A"]) == 2 * local_experts
         assert [expert for stage, expert in plan["A"] if stage == 1] == list(range(local_experts))
@@ -213,7 +213,7 @@ def check_plans(ids, cv_rows, routes, plans):
                 assert e == expert and 0 < group_rows <= 256
                 assert group_rows == min(256, len(expert_rows) - cursor)
                 assert row_begin == len(expected_compact_rows) + cursor
-                assert g1_begin == group_index * 5 and g2_begin == group_index * 14
+                assert g1_begin == group_index * 5 and g2_begin == group_index * 28
                 compact[row_begin : row_begin + group_rows] += 1
                 mapping = []
                 for segment_index in range(begin, begin + segment_count):
@@ -328,7 +328,9 @@ def test_sparse_skewed_ragged_and_empty_experts(expert_plan_binary, pattern, cv_
         if pattern == "random":
             value = rng.integers(0, 384, (bs, 8), dtype=np.int64)
         else:
-            destination = {"all_self": rank, "empty_self": (rank + 1) % world, "one_expert": world - 1, "boundary": 0}[pattern]
+            destination = {"all_self": rank, "empty_self": (rank + 1) % world, "one_expert": world - 1, "boundary": 0}[
+                pattern
+            ]
             value = np.full((bs, 8), destination * local_experts, dtype=np.int64)
             if pattern != "one_expert":
                 # Unequal source/expert lengths intersect both M256 and CV

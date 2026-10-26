@@ -13,6 +13,9 @@ constexpr uint32_t kComputeCores = kAic;
 constexpr uint32_t kReduceWorkers = kLocalWorkers - kCommunicationWorkers;
 constexpr uint32_t kComputeTileM = 256U;
 constexpr uint32_t kComputeTileN = 256U;
+// GMM2 halves only its output-column tile. Keep GMM1, activation and the
+// source-independent M-group contract at their original dimensions.
+constexpr uint32_t kGmm2TileN = 128U;
 // Keep matrix scheduling at M256; only the AIV1 epilogue works in M128
 // slices. The W4 AIV0 prologue remains the largest UB user at exactly 192KiB.
 constexpr uint32_t kActivationTileM = 128U;
@@ -167,6 +170,11 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr ActivationRowSlice ActivationSlice(uint32_
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ComputeTileCount(uint32_t rows, uint32_t columns)
 {
     return ((rows + kComputeTileM - 1U) / kComputeTileM) * ((columns + kComputeTileN - 1U) / kComputeTileN);
+}
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm2TileCount(uint32_t rows, uint32_t columns)
+{
+    return ((rows + kComputeTileM - 1U) / kComputeTileM) * ((columns + kGmm2TileN - 1U) / kGmm2TileN);
 }
 
 // All stage task IDs are global prefix sums. Sparse experts cannot repeatedly

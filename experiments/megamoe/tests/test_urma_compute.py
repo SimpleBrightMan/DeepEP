@@ -100,6 +100,11 @@ int main() {
     CheckUniformWindow(0, 12, 24);
     assert(BuildComputeTasks({}, 12).empty());
     static_assert(kComputeTileM == 256 && kActivationTileM == 128);
+    static_assert(kComputeTileN == 256 && kGmm2TileN == 128);
+    static_assert(ComputeTileCount(256, 1280) == 5);
+    static_assert(Gmm2TileCount(256, 3584) == 28);
+    static_assert(Gmm2TileCount(1, 3584) == 28);
+    static_assert(Gmm2TileCount(0, 3584) == 0);
     static_assert(kRequiredUbBytes == 196608);
     static_assert(ActivationUbContract::inputEnd == 131072);
     static_assert(ActivationUbContract::scratchEnd == 103424);
@@ -112,15 +117,16 @@ int main() {
     assert(ActivationSlice(512, 0, 0).rows == 0);
     assert(ActivationSlice(512, 128, 128).rows == 0);
     Config config{};
-    assert(std::cin >> config.bs >> config.rank >> config.cvRows >> config.gmm1AheadMGroups);
+    assert(std::cin >> config.bs >> config.rank >> config.cvRows >> config.gmm1AheadMGroups >> config.world);
     config.hidden = 3584;
     config.intermediate = 1280;
-    config.localExperts = 24;
+    config.localExperts = 384 / config.world;
     config.topk = 8;
     config.maxPeerChunks = (config.bs * config.topk + config.cvRows - 1) / config.cvRows;
-    std::vector<int64_t> counts(16 * 384);
+    const uint32_t activationWorkers = ActivationWorkers(config.world);
+    std::vector<int64_t> counts(config.world * 384);
     for (auto& count : counts) assert(std::cin >> count);
-    const auto plan = BuildExpertPlan(counts.data(), config, uint64_t(16) * config.bs * config.topk);
+    const auto plan = BuildExpertPlan(counts.data(), config, uint64_t(config.world) * config.bs * config.topk);
     const auto& fragments = plan.fragments;
     const auto& chunks = plan.recvChunks;
     const auto& batches = plan.computeBatches;
@@ -128,8 +134,8 @@ int main() {
     const auto chunkCount = static_cast<uint32_t>(chunks.size());
     const auto batchCount = static_cast<uint32_t>(batches.size());
     assert(batchCount == config.localExperts);
-    std::vector<uint32_t> readyToChunk(16 * config.maxPeerChunks, UINT32_MAX);
-    std::vector<std::vector<uint32_t>> fragmentChunks(fragments.size()), peerChunks(16);
+    std::vector<uint32_t> readyToChunk(config.world * config.maxPeerChunks, UINT32_MAX);
+    std::vector<std::vector<uint32_t>> fragmentChunks(fragments.size()), peerChunks(config.world);
     for (uint32_t index = 0; index < chunkCount; ++index) {
         const auto& chunk = chunks[index];
         readyToChunk[chunk.peer * config.maxPeerChunks + chunk.cv] = index;
@@ -175,13 +181,13 @@ int main() {
         assert(std::all_of(scratch.begin() + group.rows * kInputScaleUbStride, scratch.end(),
                            [](auto byte) { return byte == 0xcd; }));
     }
-    std::vector<std::vector<Task>> tasks(28 + 13);
+    std::vector<std::vector<Task>> tasks(28 + activationWorkers);
     std::vector<uint32_t> g1Owners(prefix1), g2Owners(prefix2), actOwners(prefix1);
     for (uint32_t f = 0; f < fragments.size(); ++f) {
         auto &d = fragments[f];
-        auto n1 = ComputeTileCount(d.rows, 1280), n2 = ComputeTileCount(d.rows, 3584);
+        auto n1 = ComputeTileCount(d.rows, 1280), n2 = Gmm2TileCount(d.rows, 3584);
         assert(n1 == ((d.rows + 255) / 256) * 5);
-        assert(n2 == ((d.rows + 255) / 256) * 14);
+        assert(n2 == ((d.rows + 255) / 256) * 28);
         std::vector<uint32_t> outputVisits(d.rows * 5), scaleVisits(d.rows * 40);
         uint32_t originalTileContributions = 0;
         for (uint32_t m = 0; m < d.rows; m += kComputeTileM) {
@@ -223,10 +229,11 @@ int main() {
                 assert(id % 28 == core); ++g2Owners[id];
             }
         }
-        for (uint32_t worker = 0; worker < 13; ++worker)
-            for (auto j = FirstOwnedComputeTile(d.gmm1TileBegin, worker, 13); j < n1; j += 13) {
+        for (uint32_t worker = 0; worker < activationWorkers; ++worker)
+            for (auto j = FirstOwnedComputeTile(d.gmm1TileBegin, worker, activationWorkers);
+                 j < n1; j += activationWorkers) {
                 auto id = d.gmm1TileBegin + j;
-                assert(id % 13 == worker); ++actOwners[id]; tasks[28 + worker].push_back({1, f, id});
+                assert(id % activationWorkers == worker); ++actOwners[id]; tasks[28 + worker].push_back({1, f, id});
             }
     }
     for (auto* owners : {&g1Owners, &g2Owners, &actOwners})
@@ -290,7 +297,7 @@ int main() {
             assert(fragment.expert == task.batchIndex);
             const bool first = task.stage == Stage::Gmm1;
             const auto prefix = first ? fragment.gmm1TileBegin : fragment.gmm2TileBegin;
-            const auto count = ComputeTileCount(fragment.rows, first ? 1280 : 3584);
+            const auto count = first ? ComputeTileCount(fragment.rows, 1280) : Gmm2TileCount(fragment.rows, 3584);
             for (uint32_t core = 0; core < 28; ++core)
                 for (uint32_t tile = FirstOwnedComputeTile(prefix, core, 28); tile < count; tile += 28) {
                     const auto id = prefix + tile;
@@ -304,7 +311,8 @@ int main() {
         const bool firstStage = task.stage == Stage::Gmm1;
         const auto& firstFragment = fragments[range.begin];
         const uint64_t prefix = firstStage ? firstFragment.gmm1TileBegin : firstFragment.gmm2TileBegin;
-        const auto width = ComputeTileCount(firstFragment.rows, firstStage ? 1280 : 3584);
+        const auto width = firstStage ? ComputeTileCount(firstFragment.rows, 1280)
+                                      : Gmm2TileCount(firstFragment.rows, 3584);
         const uint64_t limit = uint64_t(batch.fragmentCount) * width;
         for (uint32_t core = 0; core < 28; ++core) {
             size_t cursor = 0;
@@ -312,7 +320,8 @@ int main() {
                 const auto owned = OwnedComputeGroupAt(tile, width, 28);
                 const auto f = range.begin + owned.group;
                 const auto& fragment = fragments[f];
-                assert(ComputeTileCount(fragment.rows, firstStage ? 1280 : 3584) == width);
+                assert((firstStage ? ComputeTileCount(fragment.rows, 1280)
+                                   : Gmm2TileCount(fragment.rows, 3584)) == width);
                 const uint64_t fragmentPrefix = firstStage ? fragment.gmm1TileBegin : fragment.gmm2TileBegin;
                 assert(fragmentPrefix == prefix + uint64_t(owned.group) * width);
                 uint32_t completed = 0;
@@ -346,7 +355,7 @@ int main() {
         std::vector<size_t> cursor(tasks.size());
         std::vector<uint32_t> g1Done(prefix1), actDone(fragments.size()), g2Done(fragments.size()),
             scaleDone(fragments.size());
-        std::vector<uint32_t> nextGather(13);
+        std::vector<uint32_t> nextGather(activationWorkers);
         std::iota(nextGather.begin(), nextGather.end(), 0U);
         std::vector<uint32_t> actors(tasks.size());
         std::iota(actors.begin(), actors.end(), 0);
@@ -356,10 +365,10 @@ int main() {
         std::vector<uint32_t> readyAt(chunkCount);
         for (uint32_t index = 0; index < chunkCount; ++index)
             readyAt[index] = chunks[index].peer == config.rank ? 0 : 1 + random() % 80;
-        uint32_t activationStart[13]{};
+        std::vector<uint32_t> activationStart(activationWorkers);
         activationStart[0] = 95;  // Stress an independently delayed activation worker.
         const uint32_t dispatchCompleteAt = 140;
-        std::vector<uint32_t> outputWrites(plan.config.receiveRows * 14), nextPeerChunk(16), sent(chunkCount);
+        std::vector<uint32_t> outputWrites(plan.config.receiveRows * 28), nextPeerChunk(config.world), sent(chunkCount);
         uint32_t remainingChunks = 0;
         for (uint32_t index = 0; index < chunkCount; ++index) {
             if (chunks[index].peer == config.rank) sent[index] = 1;
@@ -383,7 +392,7 @@ int main() {
                         std::all_of(fragmentChunks[group].begin(), fragmentChunks[group].end(),
                                     [&](auto chunk) { return tick >= readyAt[chunk]; })) {
                         assert(++scaleDone[group] == 1);
-                        group += 13;
+                        group += activationWorkers;
                         --left; ++progress;
                     }
                 }
@@ -405,13 +414,13 @@ int main() {
                 else {
                     const auto& group = fragments[t.fragment];
                     const uint32_t n = t.tile - group.gmm2TileBegin;
-                    assert(n < 14);
+                    assert(n < 28);
                     // This models the actual completion boundary: scatter
                     // every span of this N tile before incrementing gmm2Done.
                     for (uint32_t j = 0; j < group.segmentCount; ++j) {
                         const auto& segment = plan.segments[group.segmentBegin + j];
                         for (uint32_t row = 0; row < segment.rows; ++row)
-                            assert(++outputWrites[(segment.receiveRow + row) * 14 + n] == 1);
+                            assert(++outputWrites[(segment.receiveRow + row) * 28 + n] == 1);
                     }
                     ++g2Done[t.fragment];
                 }
@@ -419,19 +428,19 @@ int main() {
             }
             // One owner per remote peer, preserving CV order. Producers may
             // complete before local Dispatch; no return PUT is then permitted.
-            for (uint32_t peer = 0; peer < 16; ++peer) {
+            for (uint32_t peer = 0; peer < config.world; ++peer) {
                 if (peer == config.rank || nextPeerChunk[peer] == peerChunks[peer].size()) continue;
                 const auto index = peerChunks[peer][nextPeerChunk[peer]];
                 const auto& chunk = chunks[index];
                 bool ready = true;
                 for (uint32_t j = 0; j < chunk.fragmentCount; ++j) {
                     const auto group = plan.chunkGroupIndices[chunk.fragmentBegin + j];
-                    if (g2Done[group] != ComputeTileCount(fragments[group].rows, 3584)) ready = false;
+                    if (g2Done[group] != Gmm2TileCount(fragments[group].rows, 3584)) ready = false;
                 }
                 if (!ready || tick < dispatchCompleteAt) continue;
                 for (uint32_t row = 0; row < chunk.rows; ++row)
-                    for (uint32_t n = 0; n < 14; ++n)
-                        assert(outputWrites[(chunk.localRow + row) * 14 + n] == 1);
+                    for (uint32_t n = 0; n < 28; ++n)
+                        assert(outputWrites[(chunk.localRow + row) * 28 + n] == 1);
                 assert(++sent[index] == 1);
                 ++nextPeerChunk[peer]; --remainingChunks; ++progress;
             }
@@ -444,7 +453,7 @@ int main() {
         for (uint32_t f = 0; f < fragments.size(); ++f) {
             assert(scaleDone[f] == 1);
             assert(actDone[f] == ComputeTileCount(fragments[f].rows, 1280));
-            assert(g2Done[f] == ComputeTileCount(fragments[f].rows, 3584));
+            assert(g2Done[f] == Gmm2TileCount(fragments[f].rows, 3584));
         }
         assert(std::all_of(sent.begin(), sent.end(), [](auto n) { return n == 1; }));
         assert(std::all_of(outputWrites.begin(), outputWrites.end(), [](auto n) { return n == 1; }));
@@ -475,9 +484,10 @@ int main() {
 def run_scheduler(scheduler_binary, counts, bs, rank=7, cv_rows=256, ahead_mgroups=12):
     """Build the production host plan, then execute its real device schedule."""
     counts = np.asarray(counts, dtype=np.int64)
-    assert counts.shape == (16, 384)
+    world = counts.shape[0]
+    assert world in (4, 8, 16) and counts.shape == (world, 384)
     assert np.all(counts.sum(axis=1) == bs * 8)
-    lines = [f"{bs} {rank} {cv_rows} {ahead_mgroups}", " ".join(map(str, counts.reshape(-1)))]
+    lines = [f"{bs} {rank} {cv_rows} {ahead_mgroups} {world}", " ".join(map(str, counts.reshape(-1)))]
     result = subprocess.run(
         [str(scheduler_binary)],
         input="\n".join(lines),
@@ -554,3 +564,34 @@ def test_same_cv_ids_on_different_sources_keep_independent_ready_dependencies(sc
         counts[source, 7 * 24] = rows
         counts[source, 0] -= rows
     run_scheduler(scheduler_binary, counts, 64)
+
+
+@pytest.mark.parametrize("world", [4, 8, 16])
+@pytest.mark.parametrize("bs", [2048, 4096, 8192])
+def test_gmm2_n128_full_and_partial_groups_all_ep_sizes(scheduler_binary, world, bs):
+    """N128 ownership/completion covers every output column for ragged groups.
+
+    Keep the communication-CV and M-group boundaries deliberately different;
+    the simulator may release Combine only after all 28 N tiles have written
+    every covered source span. GMM1/activation still contribute five tiles.
+    """
+    local_experts = 384 // world
+    counts = np.zeros((world, 384), dtype=np.int64)
+    counts[:, 0] = bs * 8
+    target = world - 1
+    for expert, rows in enumerate((1, 127, 128, 129, 255, 256, 257, 511, 512, 513)):
+        source = expert % world
+        counts[source, target * local_experts + expert] += rows
+        counts[source, 0] -= rows
+    run_scheduler(scheduler_binary, counts, bs, rank=target, cv_rows=128)
+
+
+@pytest.mark.parametrize("world", [4, 8, 16])
+@pytest.mark.parametrize("seed", [17, 83])
+def test_gmm2_n128_random_routes_keep_full_combine_dependency(scheduler_binary, world, seed):
+    rng = np.random.default_rng(seed)
+    bs = 1031
+    counts = [
+        plan_routes(rng.integers(0, 384, (bs, 8), dtype=np.int64), 384, world).expert_counts for _ in range(world)
+    ]
+    run_scheduler(scheduler_binary, counts, bs, rank=world - 1, cv_rows=256)

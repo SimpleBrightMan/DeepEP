@@ -5,6 +5,7 @@
 // Host-only routing planner. Keep it independent of torch/CANN so the exact
 // descriptors consumed by the kernel can be exercised in CPU regression tests.
 #include "abi.hpp"
+#include "compute_contract.hpp"
 #include "pack_plan.hpp"
 
 #include <algorithm>
@@ -191,8 +192,8 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
             }
             group.segmentCount = static_cast<uint32_t>(plan.segments.size()) - group.segmentBegin;
             plan.fragments.push_back(group);
-            config.gmm1Tiles += (config.intermediate + 255U) / 256U;
-            config.gmm2Tiles += (config.hidden + 255U) / 256U;
+            config.gmm1Tiles += ComputeTileCount(group.rows, config.intermediate);
+            config.gmm2Tiles += Gmm2TileCount(group.rows, config.hidden);
         }
         plan.computeBatches.push_back({firstGroup, static_cast<uint32_t>(plan.fragments.size()) - firstGroup});
         compactRow += expertRows;

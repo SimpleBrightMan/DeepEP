@@ -93,7 +93,7 @@ __aicore__ inline bool IsChunkComputed(const Arguments& args, const Chunk& chunk
         const uint32_t index = reinterpret_cast<__gm__ uint32_t*>(args.chunkGroupIndices)[chunk.fragmentBegin + j];
         const uint32_t rows = reinterpret_cast<__gm__ Fragment*>(args.fragments)[index].rows;
         if (ReadGmByPassDCache(ComputeFlag(args.gmm2Done, index)) <
-            static_cast<int32_t>(ComputeTileCount(rows, args.config.hidden))) {
+            static_cast<int32_t>(Gmm2TileCount(rows, args.config.hidden))) {
             return false;
         }
     }
