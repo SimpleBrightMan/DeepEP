@@ -337,30 +337,29 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::DispatchBuffInit()
 
     const bool cv = ENABLE_A8W4 && UseGmm1CvForLaunch(commonConfig_.tokenNum, params_.tilingData->topK,
         commonConfig_.worldSize, commonConfig_.moeExpertPerRank, W4A8_PAIRED_GATE_UP_MAX_TOKENS);
-    uint32_t cumsumInfoTensorAddr = cv ? Aiv1ResidentUbLayout::ActivationBytes : Aiv1ResidentUbLayout::GmActivationBytes;
-    scratch.cumsumInfoTensor =
-        LocalTensor<int32_t>(TPosition::VECCALC, cumsumInfoTensorAddr, cumsumInfoTensorSize / sizeof(int32_t));
-    // compact route 已消除 mask 扫描，只保留一份接收 index batch。
-    uint32_t validTopkIndexTensorAddr = cumsumInfoTensorAddr + cumsumInfoTensorSize;
-    uint32_t validTopkIndexTensorSize = Ops::Base::CeilAlign(
-        static_cast<int64_t>(bufferConfig.routeItemsPerBatch * sizeof(int32_t)), static_cast<int64_t>(ALIGN_32));
-    scratch.validTopkIndexTensor =
-        LocalTensor<int32_t>(TPosition::VECCALC, validTopkIndexTensorAddr, validTopkIndexTensorSize / sizeof(int32_t));
-    scratch.copyTmpBaseAddr = validTopkIndexTensorAddr + validTopkIndexTensorSize;
-    uint32_t copyTmpTotalSize = static_cast<uint32_t>(bufferConfig.bufferCount) * context.quantTokenScaleAlignBytes;
-    uint32_t expertTokenNumsOutTensorAddr = scratch.copyTmpBaseAddr + copyTmpTotalSize;
-    uint32_t expertTokenNumsOutTensorSize = Ops::Base::CeilAlign(
-        static_cast<int64_t>(commonConfig_.moeExpertPerRank * sizeof(int32_t)), static_cast<int64_t>(ALIGN_32));
-    scratch.expertTokenNumsOutTensor = LocalTensor<int32_t>(TPosition::VECCALC, expertTokenNumsOutTensorAddr,
-                                                            expertTokenNumsOutTensorSize / sizeof(int32_t));
-    uint32_t metaInfoTensorAddr = expertTokenNumsOutTensorAddr + expertTokenNumsOutTensorSize;
-    uint32_t metaInfoTensorSize = static_cast<uint32_t>(bufferConfig.bufferCount) * INT32_PER_256B * sizeof(int32_t);
-    scratch.metaInfoTensor =
-        LocalTensor<int32_t>(TPosition::VECCALC, metaInfoTensorAddr, metaInfoTensorSize / sizeof(int32_t));
     const uint32_t combineSlots = cv ? Aiv1AsyncEvents::CombineSlots : Aiv1AsyncEvents::GmCombineSlots;
     const auto resident = MakeAiv1ResidentUbLayout(
         commonConfig_.tokenHiddenDim, commonConfig_.worldSize, commonConfig_.moeExpertPerRank,
         bufferConfig.routeItemsPerBatch, bufferConfig.bufferCount, context.quantTokenScaleAlignBytes, combineSlots, cv);
+    uint32_t cumsumInfoTensorAddr = static_cast<uint32_t>(resident.dispatchBase);
+    scratch.cumsumInfoTensor =
+        LocalTensor<int32_t>(TPosition::VECCALC, cumsumInfoTensorAddr, cumsumInfoTensorSize / sizeof(int32_t));
+    // compact route 已消除 mask 扫描，只保留一份接收 index batch。
+    uint32_t validTopkIndexTensorAddr = static_cast<uint32_t>(resident.routeIndicesBase);
+    uint32_t validTopkIndexTensorSize = Ops::Base::CeilAlign(
+        static_cast<int64_t>(bufferConfig.routeItemsPerBatch * sizeof(int32_t)), static_cast<int64_t>(ALIGN_32));
+    scratch.validTopkIndexTensor =
+        LocalTensor<int32_t>(TPosition::VECCALC, validTopkIndexTensorAddr, validTopkIndexTensorSize / sizeof(int32_t));
+    scratch.copyTmpBaseAddr = static_cast<uint32_t>(resident.dispatchCopyBase);
+    uint32_t expertTokenNumsOutTensorAddr = static_cast<uint32_t>(resident.expertCountsBase);
+    uint32_t expertTokenNumsOutTensorSize = Ops::Base::CeilAlign(
+        static_cast<int64_t>(commonConfig_.moeExpertPerRank * sizeof(int32_t)), static_cast<int64_t>(ALIGN_32));
+    scratch.expertTokenNumsOutTensor = LocalTensor<int32_t>(TPosition::VECCALC, expertTokenNumsOutTensorAddr,
+                                                            expertTokenNumsOutTensorSize / sizeof(int32_t));
+    uint32_t metaInfoTensorAddr = static_cast<uint32_t>(resident.dispatchMetaBase);
+    uint32_t metaInfoTensorSize = static_cast<uint32_t>(bufferConfig.bufferCount) * INT32_PER_256B * sizeof(int32_t);
+    scratch.metaInfoTensor =
+        LocalTensor<int32_t>(TPosition::VECCALC, metaInfoTensorAddr, metaInfoTensorSize / sizeof(int32_t));
     // launcher先检查容量；此处只绑定一次。三阶段仍保留原生完成等待，不靠别的阶段覆盖UB。
     waveCombineBuffers_ = cv ? InitWaveCombineBuffers<false, Aiv1AsyncEvents::CombineSlots>(
         commonConfig_, waveCombineScratch_, resident.combineRowsBase, resident.combineMetaBase)

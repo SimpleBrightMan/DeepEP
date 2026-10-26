@@ -15,6 +15,10 @@ struct Aiv1ResidentUbLayout {
     static constexpr uint32_t CombineMetaRows = 384U;
     static constexpr uint32_t MetaWords = 8U;
     uint64_t dispatchBase;
+    uint64_t routeIndicesBase;
+    uint64_t dispatchCopyBase;
+    uint64_t expertCountsBase;
+    uint64_t dispatchMetaBase;
     uint64_t dispatchEnd;
     uint64_t combineRowsBase;
     uint64_t combineMetaBase;
@@ -48,13 +52,14 @@ MEGAMOE_UB_PLAN_INLINE Aiv1ResidentUbLayout MakeAiv1ResidentUbLayout(
     uint32_t dispatchSlots, uint32_t tokenScaleBytes, uint32_t combineSlots, bool cv = true)
 {
     const uint64_t activationBytes = cv ? Aiv1ResidentUbLayout::ActivationBytes : Aiv1ResidentUbLayout::GmActivationBytes;
-    const uint64_t dispatchEnd = activationBytes +
-        AlignResidentUb(uint64_t(world) * experts * 4U) + AlignResidentUb(uint64_t(routeItems) * 4U) +
-        uint64_t(dispatchSlots) * tokenScaleBytes + AlignResidentUb(uint64_t(experts) * 4U) +
-        uint64_t(dispatchSlots) * Aiv1ResidentUbLayout::MetaWords * 4U;
+    const uint64_t routeBase = activationBytes + AlignResidentUb(uint64_t(world) * experts * 4U);
+    const uint64_t copyBase = routeBase + AlignResidentUb(uint64_t(routeItems) * 4U);
+    const uint64_t expertBase = copyBase + uint64_t(dispatchSlots) * tokenScaleBytes;
+    const uint64_t meta = expertBase + AlignResidentUb(uint64_t(experts) * 4U);
+    const uint64_t dispatchEnd = meta + uint64_t(dispatchSlots) * Aiv1ResidentUbLayout::MetaWords * 4U;
     const uint64_t rowsBase = AlignResidentUb(dispatchEnd);
     const uint64_t metaBase = rowsBase + uint64_t(combineSlots) * AlignResidentUb(uint64_t(hidden) * 2U);
-    return {activationBytes, dispatchEnd, rowsBase, metaBase,
+    return {activationBytes, routeBase, copyBase, expertBase, meta, dispatchEnd, rowsBase, metaBase,
             metaBase + uint64_t(Aiv1ResidentUbLayout::CombineMetaRows) * Aiv1ResidentUbLayout::MetaWords * 4U,
             combineSlots, hidden != 0U && world != 0U && experts != 0U && routeItems != 0U &&
             dispatchSlots >= 1U && dispatchSlots <= 6U && combineSlots >= 1U && combineSlots <= 6U &&

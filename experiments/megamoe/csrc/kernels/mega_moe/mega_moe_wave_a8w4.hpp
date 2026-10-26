@@ -10,6 +10,7 @@
 #define MEGA_MOE_WAVE_A8W4_H
 
 #include "common/mega_moe_utils.hpp"
+#include "common/mega_moe_schedule_policy.hpp"
 #include "common/gmm2_aiv_completion.hpp"
 #include "mega_moe_arch35.hpp"
 
@@ -701,7 +702,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     uint32_t gmm2StartBlockIdx = 0U;
 
     // 小BS保留较早的下游启动；阈值按本卡实际BS，不按容量或专家接收行数判断。
-    const bool gmm2LagActive = commonConfig_.tokenNum >= 512U;
+    const bool gmm2LagActive = UseGmm2WaveLag(commonConfig_.tokenNum);
     ExpertWaveRange pendingWave{{}, {}, commonConfig_.moeExpertPerRank};
 
     // cursor 总是指向下一待规划位置；本次计算使用 TakeNextExpertSliceInWave 返回的固定 slice。

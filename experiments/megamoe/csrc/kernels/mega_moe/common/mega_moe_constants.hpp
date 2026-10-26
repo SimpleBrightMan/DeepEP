@@ -92,7 +92,8 @@ constexpr uint32_t ACTIVATION_N_HALF = 2U;
 // 路由 W4A8 GMM1：逻辑 gate/up 各 128 列，物理 GEMM 仍为 N256。
 constexpr uint32_t GMM1_FUSED_TILE_N = L1_TILE_N / ACTIVATION_N_HALF;
 // W4A8 的 host wave 预算和 device Dispatch 共用同一实际每卡 BS 边界。
-constexpr uint32_t W4A8_SMALL_BATCH_MAX_TOKENS = 256U;
+constexpr uint32_t W4A8_SMALL_BATCH_MAX_TOKENS = SHARED_DECODE_MAX_BS;
+constexpr uint32_t W4A8_GMM2_LAG_MIN_TOKENS = 512U;
 // 覆盖接口允许的全部BS；保留导出名供Python/本地计算选权重，不再以4096切换planar。
 // 这是输入上限，不替代各shape的GM/SHMEM/UB容量检查。
 constexpr uint32_t W4A8_PAIRED_GATE_UP_MAX_TOKENS = 65536U;

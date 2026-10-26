@@ -13,27 +13,30 @@ class PairedWaveBudgetTests(unittest.TestCase):
         compiler = shutil.which('g++') or shutil.which('clang++')
         if compiler is None:
             self.skipTest('Requires host C++ compiler; execute on build host')
-        source = (ROOT / 'experiments/megamoe/csrc/forward.cpp').read_text(encoding='utf-8')
-        start = source.index('    if (is_a8w4 && t.bs <= MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS)')
-        end = source.index('    t.isPerExpertWeightTensor', start)
-        constants = (ROOT / 'experiments/megamoe/csrc/kernels/mega_moe/common/mega_moe_constants.hpp').read_text(encoding='utf-8')
-        first = constants.index('constexpr uint32_t L1_TILE_M_256')
-        last = constants.index('}  // namespace MegaMoeImpl', first)
         program = r'''
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include "common/mega_moe_schedule_policy.hpp"
 template<class T> T CeilDiv(T n,T d) { return (n+d-1)/d; }
-namespace MegaMoeImpl {
-''' + constants[first:last] + r'''
-}
 uint32_t groups(uint32_t bs,uint32_t intermediate,uint32_t hidden,uint32_t aic,bool is_a8w4) {
-    struct { uint32_t bs,hiddenDim,h,mGroupsPerWave; } t{bs,intermediate*2,hidden,0};
-    struct { uint32_t aic; } p{aic};
-''' + source[start:end] + r'''
-    return t.mGroupsPerWave;
+    return MegaMoeImpl::CalcWaveMGroupsPerWave(is_a8w4,bs,intermediate*2,hidden,aic);
+}
+// 冻结decf4bb的预算公式作参考，执行被测生产helper而非检查其文本。
+uint32_t frozen(uint32_t bs,uint32_t intermediate,uint32_t hidden,uint32_t aic,bool w4) {
+    const uint64_t g1=(intermediate+127U)/128U;
+    if(w4 && bs<=256U) return CeilDiv<uint64_t>(uint64_t(aic)*2U,g1)*2U;
+    if(w4) return std::max(CeilDiv<uint64_t>(uint64_t(aic)*2U,g1),CeilDiv<uint64_t>(aic,(hidden+255U)/256U));
+    return std::max(CeilDiv<uint64_t>(uint64_t(aic)*4U,(intermediate*2U+255U)/256U),CeilDiv<uint64_t>(aic,(hidden+255U)/256U));
 }
 int main() {
+    for(unsigned bs : {1U,256U,257U,511U,512U,4096U,4097U,65536U}) {
+      assert(MegaMoeImpl::UseGmm2WaveLag(bs)==(bs>=512U));
+      for(unsigned i : {128U,256U,3008U,3072U,4096U})
+       for(unsigned h : {256U,1024U,7168U,8192U})
+        for(unsigned c : {1U,24U,32U,64U})
+         for(bool w4 : {false,true}) assert(groups(bs,i,h,c,w4)==frozen(bs,i,h,c,w4));
+    }
     // EP32/BS4096：12专家×8个M256块=96组；每组24个配对任务，3组/波，共32波。
     for(unsigned bs : {257U,512U,1024U,2048U,4096U,4097U,8192U,16384U,65536U})
         assert(groups(bs,3072,7168,32,true)==3);
@@ -55,7 +58,7 @@ int main() {
             path = Path(folder)
             (path / 'check.cpp').write_text(program, encoding='utf-8')
             binary = path / 'check'
-            subprocess.run([compiler, '-std=c++17', '-O2', str(path / 'check.cpp'), '-o', str(binary)], check=True)
+            subprocess.run([compiler, '-std=c++17', '-O2', '-I', str(ROOT / 'experiments/megamoe/csrc/kernels/mega_moe'), str(path / 'check.cpp'), '-o', str(binary)], check=True)
             subprocess.run([str(binary)], check=True, timeout=15)
 
 

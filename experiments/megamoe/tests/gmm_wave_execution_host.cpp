@@ -1,6 +1,7 @@
 // Execute production Wave orchestration on CPU; GEMM/communication leaves only record calls.
 // LegacyProcessGmmWaves is frozen from c1c4633 to detect order/range/rolling-owner regressions.
 #include "common/mega_moe_wave_schedule.hpp"
+#include "common/mega_moe_schedule_policy.hpp"
 #include <array>
 #include <cassert>
 #include <cstdint>
@@ -8,14 +9,10 @@
 #include <utility>
 #include <vector>
 #define __gm__
-constexpr uint32_t INT_CACHELINE = 16;
 
 using namespace MegaMoeImpl;
 using ProblemShape = std::array<int64_t, 4>;
-constexpr uint32_t M_VALUE = 0, N_VALUE = 1, K_VALUE = 2;
-constexpr int AIC = 0, AIV = 1, COMBINE_NO_QUANT = 0;
-constexpr uint32_t ACTIVATION_N_HALF = 2;
-constexpr uint32_t L1_TILE_N = 256;
+constexpr int AIC = 0, AIV = 1;
 template <std::size_t I, typename T> auto& Get(T& value) { return std::get<I>(value); }
 namespace Ops::Base {
 template <typename T> T CeilDiv(T a, T b) { return a / b + (a % b != 0); }
@@ -47,7 +44,6 @@ void UpdateGmmLoopCount(GmmLoopCount* c, LoopCountIndex i, uint64_t value) {
 }
 namespace AscendTimer { constexpr int64_t NO_WAVE = -1; constexpr int AIV_COMBINE = 1; }
 enum class HardEvent { MTE3_MTE2 };
-constexpr int SYNC_EVENT_ID0 = 0;
 struct Timer {
     int64_t wave = -1;
     void SetWave(int64_t value) { wave = value; }

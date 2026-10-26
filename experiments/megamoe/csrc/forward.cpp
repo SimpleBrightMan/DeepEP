@@ -18,6 +18,7 @@
 #include "check.hpp"
 #include "kernels/mega_moe/common/ascend_timer_v2.hpp"
 #include "kernels/mega_moe/common/mega_moe_constants.hpp"
+#include "kernels/mega_moe/common/mega_moe_schedule_policy.hpp"
 #include "kernels/mega_moe/common/aiv1_async_events.hpp"
 #include "kernels/mega_moe/common/mega_moe_aiv1_ub_layout.hpp"
 #include "kernels/mega_moe/common/mega_moe_workspace.hpp"
@@ -244,29 +245,7 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     t.activationAlpha = 1.0F;
     t.activationBeta = 1.0F;
     // 使用本次每卡BS，不用预分配容量；小BS的连续提交预算用于摊薄阶段边界。
-    if (is_a8w4 && t.bs <= MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS) {
-        const uint64_t gmm1_tasks_per_m_group =
-            CeilDiv<uint64_t>(t.hiddenDim / MegaMoeImpl::ACTIVATION_N_HALF, MegaMoeImpl::GMM1_FUSED_TILE_N);
-        t.mGroupsPerWave =
-            static_cast<uint32_t>(CeilDiv<uint64_t>(static_cast<uint64_t>(p.aic) * 2U, gmm1_tasks_per_m_group));
-        // 扩大同类任务的连续提交预算，保持资源归还边界。
-        t.mGroupsPerWave *= 2U;
-    } else if (is_a8w4) {
-        // 配对按逻辑N128任务预算两轮AIC，避免沿用四轮预算放大激活/Combine尾段。
-        // 保留GMM2至少一轮；不改配对、GMM2滞后、credit或各stage的就绪协议。
-        const uint64_t gmm1_tasks = CeilDiv<uint64_t>(
-            t.hiddenDim / MegaMoeImpl::ACTIVATION_N_HALF, MegaMoeImpl::GMM1_FUSED_TILE_N);
-        const uint64_t gmm2_tiles = CeilDiv<uint64_t>(t.h, MegaMoeImpl::L1_TILE_N);
-        t.mGroupsPerWave = static_cast<uint32_t>(std::max(
-            CeilDiv<uint64_t>(static_cast<uint64_t>(p.aic) * 2U, gmm1_tasks),
-            CeilDiv<uint64_t>(p.aic, gmm2_tiles)));
-    } else {
-        // A8W8沿用原非配对预算；A8W4不再在BS>4096时切换到此处。
-        const uint64_t gmm1_tiles = CeilDiv<uint64_t>(t.hiddenDim, 256U);
-        const uint64_t gmm2_tiles = CeilDiv<uint64_t>(t.h, 256U);
-        t.mGroupsPerWave = static_cast<uint32_t>(std::max(
-            CeilDiv<uint64_t>(static_cast<uint64_t>(p.aic) * 4U, gmm1_tiles), CeilDiv<uint64_t>(p.aic, gmm2_tiles)));
-    }
+    t.mGroupsPerWave = MegaMoeImpl::CalcWaveMGroupsPerWave(is_a8w4, t.bs, t.hiddenDim, t.h, p.aic);
     t.isPerExpertWeightTensor = false;
     t.dispatchBufferConfig = DispatchConfig(t, p.ub);
     SetSendMaskConfigs(t, p.ub);
