@@ -93,13 +93,9 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
             context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
             shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
             workspace, timer, tiling, ffts_addr, compute_replay);
-    } else if (is_a8w4 && tiling.bs <= MegaMoeImpl::W4A8_PAIRED_GATE_UP_MAX_TOKENS) {
-        mega_moe_kernel<true, true><<<block_dim, ub_bytes, stream>>>(
-            context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
-            shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
-            workspace, timer, tiling, ffts_addr, compute_replay);
     } else if (is_a8w4) {
-        mega_moe_kernel<true, false><<<block_dim, ub_bytes, stream>>>(
+        // 所有合法BS均使用配对权重；与host两轮Wave预算、Python权重选择一致。
+        mega_moe_kernel<true, true><<<block_dim, ub_bytes, stream>>>(
             context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
             shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
             workspace, timer, tiling, ffts_addr, compute_replay);

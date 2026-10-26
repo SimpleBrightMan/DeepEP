@@ -174,7 +174,7 @@ def backend(monkeypatch):
         timer_enabled=True,
         timer_numel=64,
         small_batch_max_tokens=256,
-        paired_gate_up_max_tokens=4096,
+        paired_gate_up_max_tokens=65536,
     )
     monkeypatch.setattr(api, "_extension", lambda: ext)
     buffer = api.SymmBuffer(Group(), 4, 17, 2, 1024, 256)
@@ -362,9 +362,9 @@ def test_weight_scale_block_mapping_rejects_incomplete_n(backend):
 
 
 @pytest.mark.parametrize("bf16", [False, True])
-def test_routed_layout_switches_with_actual_bs_without_hot_path_cast(backend, bf16):
+def test_routed_layout_stays_paired_above_4096_without_hot_path_cast(backend, bf16):
     b = backend.buffer
-    capacity = backend.ext.paired_gate_up_max_tokens + 1
+    capacity = 8192
     b.num_max_tokens_per_rank = capacity
     b.x = Tensor(np.zeros((capacity, 1024)), "float8_e4m3fn")
     b.x_sf = Tensor(np.zeros((capacity, 32)), "float8_e8m0fnu")
@@ -378,12 +378,12 @@ def test_routed_layout_switches_with_actual_bs_without_hot_path_cast(backend, bf
     # Preparing weights must not share writable storage with the caller's raw scales.
     assert w1.select(False)[1].untyped_storage().data_ptr() != raw[0][1].untyped_storage().data_ptr()
     casts = sum(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events)
-    for bs in (96, 256, 257, 1024, 1025, capacity - 1, capacity, 96):
+    for bs in (96, 256, 257, 1024, 4096, 4097, capacity, 96):
         output = Tensor(np.zeros((bs, 1024)), "bfloat16")
         x = Tensor(np.ones((bs, 1024)), "bfloat16") if bf16 else None
         api.fp8_fp4_mega_moe(output, w1, w2, b, x=x)
         launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
-        selected = w1.select(bs <= backend.ext.paired_gate_up_max_tokens)
+        selected = w1.select(True)
         assert launch[4] is selected[0] and launch[6] is selected[1]
         assert b._plan.bs == bs  # actual BS, not max capacity or per-expert M
     assert sum(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events) == casts

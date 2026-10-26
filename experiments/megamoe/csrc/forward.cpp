@@ -251,7 +251,7 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
             static_cast<uint32_t>(CeilDiv<uint64_t>(static_cast<uint64_t>(p.aic) * 2U, gmm1_tasks_per_m_group));
         // 实验：只改变同类任务的连续提交预算，保持资源归还边界。
         t.mGroupsPerWave *= 2U;
-    } else if (is_a8w4 && t.bs <= MegaMoeImpl::W4A8_PAIRED_GATE_UP_MAX_TOKENS) {
+    } else if (is_a8w4) {
         // 配对按逻辑N128任务预算两轮AIC，避免沿用四轮预算放大激活/Combine尾段。
         // 保留GMM2至少一轮；不改配对、GMM2滞后、credit或各stage的就绪协议。
         const uint64_t gmm1_tasks = CeilDiv<uint64_t>(
@@ -261,7 +261,7 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
             CeilDiv<uint64_t>(static_cast<uint64_t>(p.aic) * 2U, gmm1_tasks),
             CeilDiv<uint64_t>(p.aic, gmm2_tiles)));
     } else {
-        // 大 batch 和 A8W8 的预算包括 GMM2 的最低任务量约束。
+        // A8W8沿用原非配对预算；A8W4不再在BS>4096时切换到此处。
         const uint64_t gmm1_tiles = CeilDiv<uint64_t>(t.hiddenDim, 256U);
         const uint64_t gmm2_tiles = CeilDiv<uint64_t>(t.h, 256U);
         t.mGroupsPerWave = static_cast<uint32_t>(std::max(

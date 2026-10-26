@@ -35,10 +35,12 @@ uint32_t groups(uint32_t bs,uint32_t intermediate,uint32_t hidden,uint32_t aic,b
 }
 int main() {
     // EP32/BS4096：12专家×8个M256块=96组；每组24个配对任务，3组/波，共32波。
-    for(unsigned bs : {257U,512U,1024U,2048U,4096U}) assert(groups(bs,3072,7168,32,true)==3);
+    for(unsigned bs : {257U,512U,1024U,2048U,4096U,4097U,8192U,16384U,65536U})
+        assert(groups(bs,3072,7168,32,true)==3);
     assert(groups(256,3072,7168,32,true)==6);
-    assert(groups(4097,3072,7168,32,true)==6);
+    assert(MegaMoeImpl::W4A8_PAIRED_GATE_UP_MAX_TOKENS==65536U);
     assert(groups(4096,3072,7168,32,false)==6);
+    assert(groups(8192,3072,7168,32,false)==6);
     assert(groups(4096,3008,7168,32,true)==3);
     assert(groups(4096,3072,256,32,true)==32);
     assert(groups(4096,128,7168,32,true)==64);

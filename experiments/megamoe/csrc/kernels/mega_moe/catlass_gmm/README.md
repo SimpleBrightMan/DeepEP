@@ -49,8 +49,11 @@ GMM1 完成通道：AIC/AIV1 使用 full12/13、empty14/15 与 AIV1 目标编码
 
 `CatlassGmm1` 管 gate/up 投影及输出偏移；`CatlassGmm2` 管 down 投影及行主序输出。
 routed 权重的配对布局由 Python 离线准备，Host/JIT 和消费者必须选择同一 `FuseGateUp` 特化。
-当前配对阈值是 `W4A8_PAIRED_GATE_UP_MAX_TOKENS=4096`，不是旧版的256；
-它与共享专家的小 BS tile 策略阈值256是不同概念。
+当前routed A8W4在全部合法BS（1～65536）下使用配对，不再以4096切换planar；
+兼容导出 `paired_gate_up_max_tokens` 为65536，仅反映接口输入上限，不保证所有shape均满足容量约束。
+BS≤256保留原小BS Wave预算；其余A8W4使用与原BS4096相同的两轮AIC预算。
+输入协议的256阈值、BS≥512的lag、实际tile M的供数计划和容量校验均不变。
+Python仍准备legacy planar副本以保留返回对象兼容性，本次不删除该准备流程。
 共享专家保持自己的 planar 布局与完成通知，不借用 routed ready 序号。
 
 GMM1 stage 入口直接选择计算或兼容向量后处理，不再经过 `Gmm1ExecA8W4` 包装；

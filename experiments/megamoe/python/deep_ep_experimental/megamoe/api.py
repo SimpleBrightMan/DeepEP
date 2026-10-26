@@ -362,9 +362,10 @@ def transform_weights_for_mega_moe(
 
     Prepared weights from earlier branches must be regenerated: FP4 GMM2 and paired
     GMM1 now use N256-block SF pair-major storage, without changing external tensor shapes.
-    Planar GMM1 retains its original SF layout. Raw inputs use [gate | up]. Routed FP4 GMM1 prepares both planar Prefill and
-    [gate128, up128] Decode layouts. Keep the returned l1 pair intact and immutable;
-    the API selects its layout by actual BS without a timed conversion. Pass shared=True for
+    Raw inputs use [gate | up]. Routed FP4 GMM1 uses [gate128, up128] for every
+    supported BS (1..65536), with no layout switch above 4096. The legacy planar
+    copy is still prepared for tuple compatibility, not selected by routed launches.
+    Keep the returned l1 pair intact and immutable. Pass shared=True for
     shared experts, whose GMM1 remains planar. Routed FP4 data uses tile-pack v1,
     not ordinary NZ; regenerate old prepared weights. FP8/shared preparation is unchanged.
     This is not the CUDA UTCCP transform. Old prepared FP4 routed weights must
