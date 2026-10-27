@@ -98,6 +98,13 @@ def event_style(event):
             "thread_state_iowait",
             "final outbound-peer quiet; end confirms all submitted Combine PUTs to this peer completed",
         )
+    if event == "Gmm2Reorder":
+        return (
+            event,
+            "compute.copy",
+            "rail_animation",
+            "ready-span batch with local store completion; rows/bytes cover only this batch, not the whole CV",
+        )
     if event.endswith("Drain"):
         return event + " [drain]", "compute.drain", "thread_state_iowait", "explicit pipeline drain scope"
     if event.startswith("Wait") or event in ("RankBarrier", "LocalSync", "FinalPeerHandshake"):

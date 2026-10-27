@@ -9,7 +9,8 @@
 
 初版相关 CPU 回归分组执行共700项通过，覆盖实际通信循环、异步 RO/SO 模型、完整行 DMA、
 路由/Reduce 容量和 timer 解析。未进行 CANN 编译或 NPU 运行，尚无设备精度及性能结论。
-本次 self Reorder 前移与 Dispatch 每 CV quiet 修改按要求未编译、未运行测试；
+后续 self Reorder 前移、Dispatch 每 CV quiet 和片段级提前 Reorder 修改
+按要求未编译、未运行测试；
 上述初版回归结果不代表本次修改已验证。
 
 ## 执行顺序
@@ -30,14 +31,16 @@ Host stream: 清本次接收 CV / finished flags → kernel
     本地确认所有 Dispatch 已完成 quiet、所有 Pack 配额已完成
 
     while 本 peer 还有未发送的 Combine CV，或本核还有 self CV:
-        从头扫描未提交 CV，跳过未完成的计算组
-        如果 CV 涉及的 M256 组全部完成其 N tiles:
-            按 peer/CV 的行映射，用两块64KiB UB重排完整H行
-            等本地 MTE3 写完本 CV
+        从头扫描未提交 CV，再扫描该 CV 尚未搬运的行片段
+        对应 M256 组的全部 N tiles 已完成，就提前重排该片段的完整H行
+        未完成的片段直接跳过，不挡住后面的就绪片段
+        同一 CV 本轮所有就绪片段共用双64KiB槽，最后统一等待本批写出
+        记录已搬片段；如果该 CV 全部片段已搬完:
             RO PUT(返回数据) → SO atomic_add(CV ready, epoch)
         本 peer 所有 Combine 提交完后，仅执行一次:
             SO atomic_add(finished, epoch)
-        同样处理本核静态分配的 self CV，直接写 returnY → 本地 ready
+        同样提前处理本核静态分配的 self CV 片段，直接写 returnY
+        self CV 全部片段写完后才发布本地 ready
         未就绪的 self CV 留待下一轮扫描，不进入最终 quiet
         finished 已提交且本核所有 self CV 已重排后，仅执行一次:
             quiet(QP0)
@@ -71,6 +74,15 @@ SHMEM 的队列信用不足时仍可能内部等待 CQ，不能把 NBI 理解为
   在最终 quiet 之前不复用；复用的是 UB 槽，不是在途 PUT 的 GM 源地址。
 - `gmm2Done[group]` 改为全部 N tile 的 FIX 完成计数，只代表连续计算临时区完成。
   CPU 预计算 peer/CV→完整行区间表，通信核不再遍历全部专家/来源寻找地址。
+- 提前 Reorder 沿用该区间表，不修改路由、计算 M-group 或 CV 的 PUT 粒度。
+  每个 owner 的 remote/self 各用一个8KiB UB位图，CV保存已搬片段数，
+  搬过的片段直接跳过。位图只在本核访问，不增加 GM 进度表或原子操作。
+  Pack 结束后复用其 UB，位图与双64KiB DMA槽、CV计数互不重叠；
+  仍满足192KiB UB要求，不依赖均衡路由。Host检查每peer最多65536个片段，
+  该上限覆盖BS8192/TopK8每个来源的全部展开行。
+- 每轮只对实际就绪片段启动DMA，一批片段共用槽位和事件；批末等MTE3完成。
+  不对每个片段单独排空。CV部分完成时只更新本核位图/计数，
+  只有所有片段完成写出后才下发一次完整CV PUT或self ready。
 - 自卡结果按 `self_cv % (world-1)` 静态分给通信核；直接重排到最终 returnY，
   不发网络 PUT。Reduce 的自卡依赖也改为 self CV ready，不能仅看 GMM2 完成。
 - 空 peer 仍完成 Pack 配额、发送 finished 并最终 quiet，也参与自卡任务与入站观察。
@@ -95,6 +107,9 @@ word0..4 保留提交统计，Dispatch 的 Pack/quiet 不混入提交耗时。
   不应把该条缩短直接解释为网络变快。
 - 接收端仍按 CV flag 执行计算/Reduce，Reduce 泳道不添加完成采样或细粒度打点。
 - 不同 rank 时钟不直接相减，包络包含内部等待和重排间隙。
+- `Gmm2Reorder` 每条代表某个CV在本轮扫描中实际搬运的一批就绪片段；
+  同一CV可能有多条，rows/bytes只统计该批实际搬运量，累计不重复。
+  批次可能包含不连续目标行，因此不填连续row起点；只有单一计算组时填写fragment。
 
 `urma_trace_to_text.py` 输出 `[COMPLETION]` 汇总；各 peer 的完成时刻也保留在详细事件中。
 旧网页若只按 PUT 条宽统计带宽会低估完成时间；请先按新完成条审阅，不沿用旧提交口径。

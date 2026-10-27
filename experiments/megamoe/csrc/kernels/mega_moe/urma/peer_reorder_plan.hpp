@@ -87,11 +87,17 @@ inline PeerReorderPlan BuildPeerReorderPlan(const Config& config, const std::vec
     }
 
     uint32_t nextSpan = 0U;
+    std::vector<uint32_t> peerSpanCounts(config.world, 0U);
     for (uint32_t index = 0U; index < recvChunks.size(); ++index) {
         if (chunkRows[index] != recvChunks[index].rows) {
             throw std::invalid_argument("Incomplete URMA peer-reorder receive CV");
         }
         auto& range = plan.ranges[index];
+        auto& peerSpans = peerSpanCounts[recvChunks[index].peer];
+        if (range.spanCount > kMaxPeerReorderSpans - peerSpans) {
+            throw std::invalid_argument("URMA peer-reorder span bitmap capacity exceeded");
+        }
+        peerSpans += range.spanCount;
         range.spanBegin = nextSpan;
         nextSpan += range.spanCount;
     }

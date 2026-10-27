@@ -6,7 +6,7 @@
 #include "compute.hpp"
 #include "pack_reduce.hpp"
 #include "pack_round.hpp"
-#include "peer_reorder.hpp"
+#include "peer_reorder_progress.hpp"
 #include "tail_completion.hpp"
 #include "timer.hpp"
 #include "transport.hpp"
@@ -22,6 +22,11 @@ constexpr uint32_t kCommunicationSubmittedOffset = kCommunicationSignalOffset + 
 constexpr uint32_t kCommunicationPendingOffset = kCommunicationSubmittedOffset + kMaxPeerChunks * sizeof(uint32_t);
 static_assert(kCommunicationSignalOffset % 32U == 0U);
 static_assert(kCommunicationPendingOffset + kMaxPeerChunks * sizeof(uint32_t) <= kRequiredUbBytes);
+// After the local Dispatch join, this owner's Pack UB is dead. Reuse 16KiB
+// of it for remote/self span bits, away from both DMA slots and CV counters.
+constexpr uint32_t kRemoteReorderBitmapOffset = kPackUbBase;
+constexpr uint32_t kSelfReorderBitmapOffset = kRemoteReorderBitmapOffset + kPeerReorderBitmapBytes;
+static_assert(kSelfReorderBitmapOffset + kPeerReorderBitmapBytes <= kCommunicationSignalOffset);
 
 template <typename T>
 __aicore__ inline void WaitProgressFlag(__gm__ T* flag, T expected, Timer& timer, TraceEvent event,
@@ -107,22 +112,6 @@ __aicore__ inline void PublishPeerStart(const Arguments& args, uint32_t owner, T
     timer.End(Phase::Barrier);
 }
 
-// A full scan never waits on an unready CV.
-// Each dependency covers the complete GMM2 N direction and all FIX stores.
-// Inspect once and return at the first incomplete compute group.
-__aicore__ inline bool IsChunkComputed(const Arguments& args, const Chunk& chunk)
-{
-    for (uint32_t j = 0U; j < chunk.fragmentCount; ++j) {
-        const uint32_t index = reinterpret_cast<__gm__ uint32_t*>(args.chunkGroupIndices)[chunk.fragmentBegin + j];
-        const uint32_t rows = reinterpret_cast<__gm__ Fragment*>(args.fragments)[index].rows;
-        if (ReadGmByPassDCache(ComputeFlag(args.gmm2Done, index)) <
-            static_cast<int32_t>(ComputeTileCount(rows, args.config.hidden))) {
-            return false;
-        }
-    }
-    return true;
-}
-
 // One owner, one QP. Data and SO notifications remain in flight while this
 // worker prepares other disjoint GM rows. No Combine is submitted in Dispatch.
 __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Timer& timer)
@@ -195,10 +184,16 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     const uint32_t end = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer + 1U);
     const uint32_t selfBegin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, args.config.rank);
     const uint32_t selfEnd = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, args.config.rank + 1U);
-    // Scalar metadata is above Pack and Reorder UB. Disjoint output GM rows
-    // are never reused before final quiet, so ring-buffer credits are unneeded.
+    // Each CV holds a completed-span count, then the submitted sentinel.
+    // Each row is written once, with no GM reuse before final quiet.
     LocalTensor<uint32_t> submitted(TPosition::VECCALC, kCommunicationSubmittedOffset, kMaxPeerChunks);
     LocalTensor<uint32_t> selfCopied(TPosition::VECCALC, kCommunicationPendingOffset, kMaxPeerChunks);
+    LocalTensor<uint32_t> remoteSpanCopied(TPosition::VECCALC, kRemoteReorderBitmapOffset, kPeerReorderBitmapWords);
+    LocalTensor<uint32_t> selfSpanCopied(TPosition::VECCALC, kSelfReorderBitmapOffset, kPeerReorderBitmapWords);
+    const auto remoteSpans = PeerReorderSpanRange(args, begin, end);
+    const auto selfSpans = PeerReorderSpanRange(args, selfBegin, selfEnd);
+    ClearReorderBitmap(remoteSpanCopied, remoteSpans.spanCount);
+    ClearReorderBitmap(selfSpanCopied, selfSpans.spanCount);
     uint32_t remaining = end - begin;
     uint32_t selfRemaining = 0U;
     for (uint32_t j = 0U; j < remaining; ++j) submitted.SetValue(j, 0U);
@@ -216,15 +211,17 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     while (!sentComplete || !selfComplete) {
         bool progress = false;
         for (uint32_t j = 0U; j < end - begin; ++j) {
-            if (submitted.GetValue(j) != 0U) continue;
+            const uint32_t copied = submitted.GetValue(j);
+            if (copied == kReorderCvSubmitted) continue;
             const Chunk chunk = LoadChunk(args.recvChunks, begin + j);
-            if (!IsChunkComputed(args, chunk)) continue;
-            if (waiting) {
-                timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
-                waiting = false;
-            }
-            // The group counter covers ALL N tiles, so copy whole rows once.
-            ReorderPeerChunk(args, begin + j, chunk, timer);
+            const auto range = LoadPeerReorderRange(args, begin + j);
+            const uint32_t advanced = ReorderReadyPeerSpans(args, range, chunk, remoteSpans.spanBegin,
+                                                           remoteSpanCopied, timer, waiting, waitStart, peerMeta);
+            if (advanced == 0U) continue;
+            progress = true;
+            submitted.SetValue(j, copied + advanced);
+            if (copied + advanced != range.spanCount) continue;
+            // Only a complete, locally drained CV may be submitted to URMA.
             auto meta = ChunkTraceMeta(chunk);
             meta.bytes = chunk.rows * rowBytes;
             timer.Begin(Phase::Combine);
@@ -240,7 +237,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             PublishOrdered(symmetric, args.config.combineReadyOffset + ready * kFlagBytes, peer, args.config.epoch);
             timer.TraceEnd(TraceEvent::CombinePublish, start, meta);
             timer.End(Phase::Combine, bytes, true);
-            submitted.SetValue(j, 1U);
+            submitted.SetValue(j, kReorderCvSubmitted);
             --remaining;
             progress = true;
         }
@@ -258,20 +255,22 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             progress = true;
         }
         for (uint32_t j = owner; j < selfEnd - selfBegin; j += workers) {
-            if (selfCopied.GetValue(j) != 0U) continue;
+            const uint32_t copied = selfCopied.GetValue(j);
+            if (copied == kReorderCvSubmitted) continue;
             const Chunk chunk = LoadChunk(args.recvChunks, selfBegin + j);
-            if (!IsChunkComputed(args, chunk)) continue;
-            if (waiting) {
-                timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
-                waiting = false;
-            }
-            ReorderPeerChunk(args, selfBegin + j, chunk, timer);
+            const auto range = LoadPeerReorderRange(args, selfBegin + j);
+            const uint32_t advanced = ReorderReadyPeerSpans(args, range, chunk, selfSpans.spanBegin,
+                                                           selfSpanCopied, timer, waiting, waitStart, peerMeta);
+            if (advanced == 0U) continue;
+            progress = true;
+            selfCopied.SetValue(j, copied + advanced);
+            if (copied + advanced != range.spanCount) continue;
             const uint64_t ready = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + chunk.cv;
             // Reorder drained local stores. Self requires no URMA operation.
             WriteGmByPassDCache(
                 reinterpret_cast<__gm__ uint64_t*>(symmetric + args.config.combineReadyOffset + ready * kFlagBytes),
                 args.config.epoch);
-            selfCopied.SetValue(j, 1U);
+            selfCopied.SetValue(j, kReorderCvSubmitted);
             --selfRemaining;
             progress = true;
         }

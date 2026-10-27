@@ -36,9 +36,11 @@ struct Operation {
 struct State {
     const Arguments* args = nullptr;
     uint32_t owner = 0, peer = 0, ticks = 0, quiets = 0, markers = 0, quietTick = 0;
+    uint32_t dispatchQuiets = 0, dispatchMarkers = 0;
     uint32_t serial = 0, finishSerial = 0, quietSerial = 0, markerSerial = 0, selfSerial = 0;
     uint32_t incomingSerial = 0, dispatchCount = 0, remoteCount = 0, selfCount = 0, producer = 0;
     bool lateSelf = false;
+    bool partialSeen = false;
     std::array<uint8_t, kRequiredUbBytes> ub{};
     std::vector<uint32_t> dispatchPuts, dispatchFlags, combinePuts, combineFlags;
     std::vector<uint32_t> copyCounts, selfFlags, sendOrder, packRounds, production;
@@ -57,7 +59,7 @@ inline uint64_t* Incoming() {
 inline void Advance() {
     auto& s = state;
     if (++s.ticks > 100000U) throw std::runtime_error("communication loop made no progress");
-    if ((!s.lateSelf || s.quiets != 0U) && s.ticks % 4U == 0U && s.producer < s.production.size()) {
+    if ((!s.lateSelf || s.finishSerial != 0U) && s.ticks % 4U == 0U && s.producer < s.production.size()) {
         const auto index = s.production[s.producer++];
         *Flag(s.args->gmm2Done, index) = 14;
     }
@@ -101,7 +103,10 @@ inline void WriteGmByPassDCache(uint64_t* pointer, uint64_t value) {
     const auto* chunks = reinterpret_cast<const MegaMoeUrma::Chunk*>(s.args->recvChunks);
     bool found = false;
     for (uint32_t i = 0; i < c.recvChunkCount; ++i)
-        if (chunks[i].peer == c.rank && chunks[i].cv == cv) { assert(s.copyCounts[i] == 1U); found = true; }
+        if (chunks[i].peer == c.rank && chunks[i].cv == cv) {
+            const auto range = reinterpret_cast<const MegaMoeUrma::PeerReorderRange*>(s.args->peerReorderRanges)[i];
+            assert(s.copyCounts[i] == range.spanCount); found = true;
+        }
     assert(found); *pointer = value;
 }
 inline void AtomicAdd(int32_t* pointer, int32_t value) { *pointer += value; }
@@ -122,6 +127,9 @@ struct Timer {
     void TraceEnd(TraceEvent, uint64_t, const TraceMeta&) { ++Test::state.serial; }
     void MarkSendComplete(Phase phase) {
         auto& s = Test::state;
+        if (phase == Phase::Dispatch) {
+            assert(++s.dispatchMarkers == s.dispatchQuiets && !s.finishSerial); return;
+        }
         assert(phase == Phase::Combine && s.quiets == 1U && s.finishSerial < s.quietSerial);
         assert(*Test::Incoming() == 0U && ++s.markers == 1U);
         s.markerSerial = ++s.serial;
@@ -167,24 +175,37 @@ inline void VerifyChunk(const Chunk& chunk, const uint8_t* source) {
     }
     assert(row == chunk.rows);
 }
-inline void ReorderPeerChunk(const Arguments& a, uint32_t index, const Chunk& chunk, Timer&) {
-    auto& s = Test::state;
-    assert(*ComputeFlag(a.localFlags, kLocalFlagDispatchDone) == int32_t(a.config.world));
-    assert(chunk.peer == s.peer || (chunk.peer == a.config.rank && chunk.cv % (a.config.world - 1U) == s.owner));
-    assert(++s.copyCounts[index] == 1U);
-    const auto range = reinterpret_cast<const PeerReorderRange*>(a.peerReorderRanges)[index];
-    const auto* spans = reinterpret_cast<const PeerReorderSpan*>(a.peerReorderSpans);
-    std::memset(s.ub.data(), 0xD3, kPackUbBase);
-    for (uint32_t j = 0; j < range.spanCount; ++j) {
-        const auto& span = spans[range.spanBegin + j];
+// Model only DMA here; execute the real readiness/bitmap scanner below.
+struct PeerReorderPipeline {
+    const Arguments* args;
+    Chunk chunk;
+    uint32_t index;
+    void Init(const Arguments& a, const Chunk& c) {
+        auto& s = Test::state; args = &a; chunk = c;
+        assert(*ComputeFlag(a.localFlags, kLocalFlagDispatchDone) == int32_t(a.config.world));
+        assert(c.peer == s.peer || (c.peer == a.config.rank && c.cv % (a.config.world - 1U) == s.owner));
+        const auto* chunks = reinterpret_cast<const Chunk*>(a.recvChunks);
+        index = 0U;
+        while (index < a.config.recvChunkCount && (chunks[index].peer != c.peer || chunks[index].cv != c.cv)) ++index;
+        assert(index < a.config.recvChunkCount);
+    }
+    void Copy(const PeerReorderSpan& span) {
+        const auto& a = *args; auto& s = Test::state;
         assert(*ComputeFlag(a.gmm2Done, span.fragmentIndex) == 14 && "whole M-group N direction must be ready");
+        const auto range = reinterpret_cast<const PeerReorderRange*>(a.peerReorderRanges)[index];
+        const auto* spans = reinterpret_cast<const PeerReorderSpan*>(a.peerReorderSpans);
+        for (uint32_t j = 0U; j < range.spanCount; ++j)
+            if (*ComputeFlag(a.gmm2Done, spans[range.spanBegin + j].fragmentIndex) < 14) s.partialSeen = true;
+        std::memset(s.ub.data(), 0xD3, kPackUbBase);
         const uint64_t destination = chunk.peer == a.config.rank ? a.symmetric + a.config.returnYOffset : a.gmm2Output;
         std::memcpy(reinterpret_cast<void*>(destination + span.destinationRow * a.config.hidden * 2U),
                     reinterpret_cast<const void*>(a.gmm2Contiguous + span.sourceRow * a.config.hidden * 2U),
                     uint64_t(span.rows) * a.config.hidden * 2U);
+        ++s.copyCounts[index];
+        if (chunk.peer == a.config.rank && !s.selfSerial) s.selfSerial = ++s.serial;
     }
-    if (chunk.peer == a.config.rank && !s.selfSerial) s.selfSerial = ++s.serial;
-}
+    void Finish() {}
+};
 inline void Put(uint8_t*, uint64_t offset, uint8_t* source, uint32_t bytes, uint32_t peer) {
     auto& s = Test::state; const auto& a = *s.args; const auto& c = a.config;
     assert(peer == s.peer && bytes && !s.finishSerial && s.quiets == 0U);
@@ -234,18 +255,27 @@ inline void PublishOrdered(uint8_t*, uint64_t offset, uint32_t peer, uint64_t ep
 }
 inline void Quiet(uint32_t peer) {
     auto& s = Test::state;
-    assert(peer == s.peer && ++s.quiets == 1U && s.finishSerial && s.queue.back().kind == 4U);
+    assert(peer == s.peer && !s.queue.empty());
+    const bool final = s.finishSerial != 0U;
+    if (final) {
+        assert(++s.quiets == 1U && s.queue.back().kind == 4U);
+        for (uint32_t cv = s.owner; cv < s.selfCount; cv += s.args->config.world - 1U)
+            assert(s.selfFlags[cv] == 1U && "self must finish before final quiet");
+    } else {
+        assert(s.queue.size() == 3U && s.queue.back().kind == 2U);
+        assert(s.queue.back().cv == s.dispatchQuiets++);
+    }
     std::vector<uint32_t> dispatchDelivered(s.dispatchCount), combineDelivered(s.remoteCount);
     for (const auto& op : s.queue) {
         if (op.kind <= 1U) {
-            // Consume at final quiet, catching later DMA that overwrites any
-            // source submitted earlier on the still-pending queue.
+            // Consume at the relevant quiet, catching source overwrites.
             assert(std::memcmp(op.source, op.data.data(), op.data.size()) == 0);
             ++(op.kind ? combineDelivered : dispatchDelivered)[op.cv];
         } else if (op.kind == 2U) assert(dispatchDelivered[op.cv] == 2U);
         else if (op.kind == 3U) assert(combineDelivered[op.cv] == 1U);
     }
-    s.quietSerial = ++s.serial; s.quietTick = s.ticks;
+    s.queue.clear();
+    if (final) { s.quietSerial = ++s.serial; s.quietTick = s.ticks; }
 }
 } // namespace MegaMoeUrma
 """
@@ -311,11 +341,11 @@ void Run(uint32_t world, uint32_t owner, const std::string& scenario, bool timer
     }
     const bool reverse = scenario == "reverse" || scenario == "capacity";
     // Two independent producer groups per CV, each missing its final N tile.
-    // Releasing only one group cannot make that CV eligible for a full-row copy.
+    // Releasing one group allows partial reorder, but not the CV's PUT.
     if (reverse) {
         for (auto it = chunks.rbegin(); it != chunks.rend(); ++it) {
             if (it->peer != s.peer) continue;
-            for (uint32_t j = 0; j < it->fragmentCount; ++j) {
+            for (uint32_t j = it->fragmentCount; j-- > 0U;) {
                 const auto group = indices[it->fragmentBegin + j];
                 compute[group * 32U] = 13; s.production.push_back(group);
             }
@@ -348,9 +378,11 @@ void Run(uint32_t world, uint32_t owner, const std::string& scenario, bool timer
     Timer timer;
     CommunicatePeer(a, owner, timer);
     assert(s.quiets == 1U && s.finishSerial && s.finishSerial < s.quietSerial);
+    assert(s.dispatchQuiets == s.dispatchCount && s.dispatchMarkers == s.dispatchCount);
+    if (reverse) assert(s.partialSeen && "ready later spans must not wait for the first span");
     assert(s.markers == (s.remoteCount != 0U) && s.incomingSerial > s.quietSerial);
     if (s.remoteCount) assert(s.quietSerial < s.markerSerial && s.markerSerial < s.incomingSerial);
-    if (s.lateSelf && s.selfSerial && s.remoteCount) assert(s.markerSerial < s.selfSerial);
+    if (s.selfSerial) assert(s.selfSerial < s.quietSerial);
     assert(local[kLocalFlagReorderDone * 32U] == int32_t(world - 1U));
     assert(local[kLocalFlagIncomingDone * 32U] == int32_t(world));
     assert(s.packRounds.size() == c.packRoundCount);
@@ -366,7 +398,7 @@ void Run(uint32_t world, uint32_t owner, const std::string& scenario, bool timer
     for (uint32_t i = 0; i < chunks.size(); ++i) {
         const auto& chunk = chunks[i];
         const bool own = chunk.peer == s.peer || (chunk.peer == c.rank && chunk.cv % (world - 1U) == owner);
-        assert(s.copyCounts[i] == uint32_t(own));
+        assert(s.copyCounts[i] == (own ? ranges[i].spanCount : 0U));
         if (chunk.peer == c.rank && own)
             VerifyChunk(chunk, reinterpret_cast<const uint8_t*>(a.symmetric + c.returnYOffset +
                                                                chunk.remoteRow * c.hidden * 2U));
@@ -392,11 +424,13 @@ def so_peer_binary(tmp_path_factory):
     headers = Path(__file__).resolve().parents[1] / "csrc/kernels/mega_moe/urma"
     tail = (headers / "tail_completion.hpp").read_text(encoding="utf-8")
     tail = tail[tail.index("namespace MegaMoeUrma {") :]
+    progress = (headers / "peer_reorder_progress.hpp").read_text(encoding="utf-8")
+    progress = progress[progress.index("namespace MegaMoeUrma {") :]
     kernel = (headers / "kernel.hpp").read_text(encoding="utf-8")
     kernel = kernel[kernel.index("namespace MegaMoeUrma {") : kernel.index("__aicore__ inline void Process(")]
     temporary = tmp_path_factory.mktemp("urma_so_comm")
     source = temporary / "so_comm.cpp"
-    source.write_text(BACKEND + "\n" + tail + "\n" + kernel + "\n}\n" + DRIVER, encoding="utf-8")
+    source.write_text(BACKEND + "\n" + progress + "\n" + tail + "\n" + kernel + "\n}\n" + DRIVER, encoding="utf-8")
     binary = temporary / ("so_comm.exe" if os.name == "nt" else "so_comm")
     result = subprocess.run(
         [*command, "-std=c++17", "-O1", "-UNDEBUG", "-I" + str(headers), str(source), "-o", str(binary)],
