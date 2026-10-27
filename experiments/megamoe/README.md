@@ -8,6 +8,10 @@ Modified by Joyce_An 2026
 当前有效入口、支持范围、BS/M作用域与策略表见 [ACTIVE_POLICY.md](ACTIVE_POLICY.md)。
 当前routed A8W4仅支持无共享专家；下方历史共享专家回归不代表当前launcher仍允许该配置。
 
+2026-10-27基线：统一Wave＋GM、可读性整理及slice级GMM2完成通知。routed A8W4已通过
+EP8/EP32七个BS及随机/偏斜路由的全量独立Golden，见[验收结果](../../analysis/gm-readable-1026/golden/RESULTS.md)。
+该结论不外推EP64/128、BS>4096、其他模型维度、A8W8或共享专家。测试约定见[TESTING.md](TESTING.md)。
+
 工程设计、文件/函数职责及同步维护约束见 [ARCHITECTURE.md](ARCHITECTURE.md)。当前仅保留
 MTE + 非量化 Combine；W4A8 与 A8W8 都继续支持。URMA、量化 Combine、top-k weight prefetch
 的不可达执行分支已清理，A8W8 MX 计算独立在 `stage/mega_moe_gmm{1,2}_a8w8.hpp`。

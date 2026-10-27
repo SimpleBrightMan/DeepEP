@@ -2,6 +2,8 @@
 
 2026-10-27。已合入`codex/megamoe-gm-readable-1026`，设备源码冻结提交`8118a7647f43db5e1fe86116a1d473514bcb6134`；main未替换。
 
+后续进展：本文记录的是最初单轮性能筛选；之后已补齐EP8/EP32全量独立Golden，见[Golden结果与main提升依据](golden/RESULTS.md)。不要将后补精度的控制面改动混入本性能窗口。
+
 ## 改了什么
 
 迁入`codex/megamoe-slice-combine-1026`的`44a39b2`和`5f3e191`机制，不恢复已删除的CV代码。
