@@ -64,7 +64,6 @@ struct GMMAddrInfo {
     AscendTimerDevice* timer = nullptr;
     // 仅非量化、非prefetch的routed Wave启用；GM计数此时表示issued而非completed。
     bool gmm1AsyncCompletion = false;
-    bool gmm1CvOutput = false;
     // 完整专家行数，不是当前wave/slice的M；0表示未知，缓存策略保持默认。
     uint32_t expertTokenCount = 0U;
 };

@@ -9,7 +9,6 @@
 #include "catlass/gemm/gemm_type.hpp"
 #include "block_mmad_a8w4.hpp"
 #include "block_prologue_a8w4.hpp"
-#include "copy_scaled_cv_output.hpp"
 #include <c_api/asc_simd.h>
 
 namespace MegaMoeImpl::GmmKernel {
@@ -31,7 +30,7 @@ struct CatlassGroupedMatmulLayouts {
 // Shared AIC/AIV0 pipeline mechanics; projection semantics belong to GMM1/GMM2 below.
 namespace detail {
 // B070 的 L2CacheAlter 没有 LAST 分支；直接编码3510高4位读取提示，保留低60位地址。
-// 激活和激活尺度跨输出列块复用，使用与 DS 一致的 NORMAL_LAST_VICTIM。
+// 激活和激活尺度跨输出列块复用，使用 NORMAL_LAST_VICTIM 提示。
 __aicore__ inline constexpr uint64_t ReusedActivationReadAddress(uint64_t address)
 {
     constexpr uint64_t shift = 60U;
@@ -61,10 +60,9 @@ class A8W4MatmulPipeline {
     using L0 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<128>>;
     using ScaleALayout = decltype(tla::MakeMxScaleLayout<SA, LayoutScaleA, false>(uint32_t{}, uint32_t{}));
     using ScaleBLayout = decltype(tla::MakeMxScaleLayout<SB, LayoutScaleB, true>(uint32_t{}, uint32_t{}));
-    using TileCopy = ScaledCvOutputCopy<
-        Catlass::Gemm::Tile::PackedMxA8W4TileCopyTla<Arch, A, LayoutA, W, LayoutB, A, LayoutDequantizedB, SA,
+    using TileCopy = Catlass::Gemm::Tile::PackedMxA8W4TileCopyTla<Arch, A, LayoutA, W, LayoutB, A, LayoutDequantizedB, SA,
                                                      ScaleALayout, SB, ScaleBLayout, Out, LayoutC, void, false,
-                                                     Catlass::Gemm::Tile::ScaleGranularity::PER_TENSOR>>;
+                                                     Catlass::Gemm::Tile::ScaleGranularity::PER_TENSOR>;
     using Policy = Catlass::Gemm::MmadA8W4Mx<Arch, true, false, 8, 1,
                                            Buffers::AStages, Buffers::BStages, 2, 2>;
     using Mmad = Catlass::Gemm::Block::MegaMoeBlockMmadA8W4<Policy, L1, L0, A, A, Out, void, TileCopy>;
@@ -271,8 +269,7 @@ protected:
 
     template<class InputReady=Catlass::EmptyClass>
     __aicore__ inline void ComputeProjection(uint32_t m, uint32_t weightN, uint32_t rows, uint32_t cols,
-                                             uint32_t outputN, __gm__ int32_t* outputIssued = nullptr,
-                                             uint32_t outputSequence = 0U,InputReady inputReady = {})
+                                             uint32_t outputN, InputReady inputReady = {})
     {
         auto aAddress = reinterpret_cast<GM_ADDR>(ReusedActivationReadAddress(reinterpret_cast<uint64_t>(addr_.aGlobal)));
         auto saAddress = reinterpret_cast<GM_ADDR>(ReusedActivationReadAddress(reinterpret_cast<uint64_t>(addr_.aScaleGlobal)));
@@ -285,17 +282,9 @@ protected:
         auto tileA = tla::GetTile(a, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.k));
         auto tileSA = tla::GetTile(sa, tla::MakeCoord(m, 0), tla::MakeShape(rows, config_.scaleK));
         auto compute = [&](auto& tileSB) __aicore__ {
-          if (outputIssued != nullptr) {
-            AscendC::LocalTensor<Out> ub(AscendC::TPosition::VECCALC, 0U,
-                Gmm1CvPlan::SlotBytes / sizeof(Out));
-            auto cv = tla::MakeTensor(ub, tla::MakeLayout<Out, LayoutC>(rows, cols), Catlass::Arch::PositionUB{});
-            block_(tileA, cv, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U,
-                   Catlass::EmptyClass{}, outputSequence, outputIssued,inputReady);
-          } else {
             auto tileC = tla::GetTile(c, tla::MakeCoord(m, outputN), tla::MakeShape(rows, cols));
             block_(tileA, tileC, Catlass::GemmCoord{rows, cols, config_.k}, tileSA, tileSB, config_.m < 256U,
-                   Catlass::EmptyClass{},0U,nullptr,inputReady);
-          }
+                   Catlass::EmptyClass{}, inputReady);
         };
         if (blockedWeightScales_) {
             // 所有blocked调用均为N256任务；planar GMM1仍允许原N192策略。
@@ -364,13 +353,6 @@ public:
             }
         }
     }
-    template<class InputReady=Catlass::EmptyClass>
-    __aicore__ inline void ComputeCv(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols,
-                                      uint32_t sequence, __gm__ int32_t* issued,InputReady inputReady = {})
-    {
-        // 只由配对routed入口调用：logical N128 -> physical gate/up N256。
-        Pipeline::ComputeProjection(m, n * 2U, rows, cols * 2U, n * 2U, issued, sequence,inputReady);
-    }
     __aicore__ inline void Dequantize(uint32_t n, uint32_t rows, uint32_t cols)
     {
         if (fused_) {
@@ -409,7 +391,7 @@ public:
     template<class InputReady=Catlass::EmptyClass>
     __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols,InputReady inputReady = {})
     {
-        Pipeline::ComputeProjection(m, n, rows, cols, n,nullptr,0U,inputReady);
+        Pipeline::ComputeProjection(m, n, rows, cols, n, inputReady);
     }
     __aicore__ inline void Dequantize(uint32_t n, uint32_t rows, uint32_t cols)
     {

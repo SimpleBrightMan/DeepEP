@@ -1,17 +1,15 @@
 // Copyright (c) 2026, Lu Lu
-// AIV1 resident scratch experiment: host/device share one byte-accurate plan.
+// AIV1 GM resident scratch: host/device share one byte-accurate plan.
 #ifndef MEGA_MOE_AIV1_UB_LAYOUT_HPP
 #define MEGA_MOE_AIV1_UB_LAYOUT_HPP
 
 #include <cstdint>
-#include "gmm1_cv_plan.hpp"
 
 namespace MegaMoeImpl {
 struct Aiv1ResidentUbLayout {
-    static constexpr uint32_t ActivationRows = Gmm1CvPlan::StepRows;
+    static constexpr uint32_t ActivationRows = 64U;
     static constexpr uint32_t ActivationColumns = 256U;
-    static constexpr uint32_t ActivationBytes = Gmm1CvPlan::End;
-    static constexpr uint32_t GmActivationBytes = 64U * 256U * 2U * 2U;
+    static constexpr uint32_t ActivationBytes = ActivationRows * ActivationColumns * 2U * 2U;
     static constexpr uint32_t CombineMetaRows = 384U;
     static constexpr uint32_t MetaWords = 8U;
     uint64_t dispatchBase;
@@ -38,20 +36,12 @@ MEGAMOE_UB_PLAN_INLINE uint64_t AlignResidentUb(uint64_t n)
     return (n + 31U) / 32U * 32U;
 }
 
-// Wave+GM 消融：host预算、device UB绑定和kernel派发共用此单一来源。
-// 只禁用CV，复用现有GM完成/消费协议；不改配对、Wave预算或lag。
-MEGAMOE_UB_PLAN_INLINE bool UseGmm1CvForLaunch(uint32_t bs, uint32_t topk, uint32_t world,
-                                              uint32_t expertsPerRank, uint32_t pairedMaxTokens)
-{
-    return false;
-}
-
 // 与DispatchBuffInit逐项相同；不能只预算token ring而漏掉index、prefix和metadata。
 MEGAMOE_UB_PLAN_INLINE Aiv1ResidentUbLayout MakeAiv1ResidentUbLayout(
     uint32_t hidden, uint32_t world, uint32_t experts, uint32_t routeItems,
-    uint32_t dispatchSlots, uint32_t tokenScaleBytes, uint32_t combineSlots, bool cv = true)
+    uint32_t dispatchSlots, uint32_t tokenScaleBytes, uint32_t combineSlots)
 {
-    const uint64_t activationBytes = cv ? Aiv1ResidentUbLayout::ActivationBytes : Aiv1ResidentUbLayout::GmActivationBytes;
+    const uint64_t activationBytes = Aiv1ResidentUbLayout::ActivationBytes;
     const uint64_t routeBase = activationBytes + AlignResidentUb(uint64_t(world) * experts * 4U);
     const uint64_t copyBase = routeBase + AlignResidentUb(uint64_t(routeItems) * 4U);
     const uint64_t expertBase = copyBase + uint64_t(dispatchSlots) * tokenScaleBytes;

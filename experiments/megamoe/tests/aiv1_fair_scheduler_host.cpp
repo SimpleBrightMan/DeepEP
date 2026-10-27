@@ -7,7 +7,7 @@
 #include "common/aiv1_async_events.hpp"
 using MegaMoeImpl::Aiv1AsyncEvents;
 using TEventID = unsigned;
-struct AivTaskCursor { uint32_t nextTile = 0, tileCount = 1, index = 0, nextRow = 0; };
+struct AivTaskCursor { uint32_t nextTile = 0, tileCount = 1, index = 0; };
 enum class AivTaskKind { Activation, Combine };
 struct SharedActivationCursor { bool done = false; };
 struct ExpertTokenPosition { uint32_t expertIdx = 0; };
@@ -26,27 +26,18 @@ int64_t GetSystemCycle() {
 }
 #define __aicore__
 #include "common/aiv1_activation_ub.hpp"
-#include "common/gmm1_cv_plan.hpp"
 using MegaMoeImpl::Aiv1ActivationUb;
-using MegaMoeImpl::Gmm1CvPlan;
 namespace AscendTimer { constexpr int NO_WAVE = -1; }
 constexpr int GM_FLAG_POLL_BACKOFF_CYCLES = 1;
 template <typename A, typename S, bool P, class... T> void DrainDispatchCopyBuffers(T...) {}
-void DrainCombineRowBuffers(uint32_t& n, uint32_t count, uint32_t base) { assert(count==4 && base==2); n=0; }
+void DrainCombineRowBuffers(uint32_t& n, uint32_t count, uint32_t base) {
+    assert(count==Aiv1AsyncEvents::CombineSlots && base==Aiv1AsyncEvents::CombineBase); n=0;
+}
 struct Scheduler {
     using ActivationType = uint8_t;
     using QuantScaleOutType = uint8_t;
     static constexpr bool ASYNC_GMM1 = true;
     static constexpr bool FuseGateUp = false;
-    static constexpr bool UseCv = false;
-    struct CvParams {
-        int yGmAddr, yScaleGmAddr;
-        float clampLimit;
-        unsigned actMode, actSubMode;
-        float activationAlpha, activationBeta;
-        unsigned ubBaseBytes;
-    };
-    struct { void Init(CvParams) { assert(false); } } cvActivationOp_;
     struct Tiling { float clampLimit=0; unsigned actMode=0, actSubMode=0; float activationAlpha=1, activationBeta=1; } tiling_;
     struct { struct { int activationQuantDataPtr=0, activationQuantScalePtr=0; } workspaceInfo; Tiling* tilingData=nullptr; } params_;
     bool computeReplay_ = false;
@@ -56,7 +47,7 @@ struct Scheduler {
     struct { struct { uint32_t totalJobs = 1; } blockJob; } gmmExecutionConfig_;
     struct { void ClearSlice() {} void SetWave(int) {} } timer_;
     struct { bool pending = false; int progress = 0; } dispatchAsync_;
-    struct { uint32_t rowBufferCount = 4, eventBase = 2; } waveCombineBuffers_;
+    struct { uint32_t rowBufferCount = Aiv1AsyncEvents::CombineSlots, eventBase = Aiv1AsyncEvents::CombineBase; } waveCombineBuffers_;
     int tokenDispatchConfig_ = 0, tokenDispatchScratch_ = 0;
     uint32_t combineRowSequence_ = 0;
     bool activationPending_ = false;

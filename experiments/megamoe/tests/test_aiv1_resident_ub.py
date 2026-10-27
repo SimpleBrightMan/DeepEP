@@ -19,8 +19,8 @@ def test_production_resident_plan_and_guard_regions(tmp_path):
 #include "mega_moe_aiv1_ub_layout.hpp"
 int main() {
   using namespace MegaMoeImpl;
-  constexpr auto bs512 = MakeAiv1ResidentUbLayout(7168,8,48,512,2,7392,4);
-  static_assert(bs512.valid && bs512.end == 235712 && bs512.dispatchBase == Gmm1CvPlan::End);
+  constexpr auto bs512 = MakeAiv1ResidentUbLayout(7168,8,48,512,6,7392,2);
+  static_assert(bs512.valid && bs512.end == 154816 && bs512.dispatchBase == 65536);
   static_assert(!MakeAiv1ResidentUbLayout(7168,8,48,512,7,7392,2).valid);
   for(unsigned ep : {8,32,64,128})
     for(unsigned h : {1024,7168,8192})
@@ -29,14 +29,14 @@ int main() {
           for(unsigned cs : {2,6}) {
             const auto token = (h+255)/256*256 + ((h+31)/32+31)/32*32;
             const auto p=MakeAiv1ResidentUbLayout(h,ep,384/ep,items,ds,token,cs);
-            assert(p.valid && p.dispatchBase==Gmm1CvPlan::End && p.dispatchEnd<=p.combineRowsBase);
+            assert(p.valid && p.dispatchBase==Aiv1ResidentUbLayout::ActivationBytes && p.dispatchEnd<=p.combineRowsBase);
             assert(p.combineRowsBase<=p.combineMetaBase && p.combineMetaBase<p.end);
             assert(p.end-p.combineMetaBase==Aiv1ResidentUbLayout::CombineMetaRows*8*4 && p.end%32==0);
             if(p.end>256*1024) continue; // launcher rejects capacity before NPU launch
             std::vector<unsigned char> ub(p.end+32, 0xa5);
             std::fill(ub.begin()+p.dispatchBase,ub.begin()+p.dispatchEnd,0x31);
             for(unsigned turn=0;turn<8;++turn) {
-              std::fill(ub.begin(),ub.begin()+Gmm1CvPlan::End,0x42);
+              std::fill(ub.begin(),ub.begin()+Aiv1ResidentUbLayout::ActivationBytes,0x42);
               std::fill(ub.begin()+p.combineRowsBase,ub.begin()+p.end,0x53);
               assert(std::all_of(ub.begin()+p.dispatchBase,ub.begin()+p.dispatchEnd,[](auto x){return x==0x31;}));
               assert(std::all_of(ub.begin()+p.end,ub.end(),[](auto x){return x==0xa5;}));

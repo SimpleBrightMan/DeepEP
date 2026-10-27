@@ -23,13 +23,8 @@ int main() {
     for(unsigned sequence=0;sequence<101;++sequence) {
         Channel::AcquireProducer(sequence);assert(lastWait==PIPE_FIX);
         Channel::PublishCompleted(sequence);assert(lastArrive==PIPE_FIX);
-        if(sequence%3==0) {
-            Channel::WaitScalarConsumer(sequence);assert(lastWait==PIPE_S);
-            Channel::ReleaseScalarConsumer(sequence);assert(lastArrive==PIPE_S);
-        } else {
-            Channel::WaitVectorConsumer(sequence);assert(lastWait==PIPE_V);
-            Channel::ReleaseConsumer(sequence);assert(lastArrive==PIPE_MTE3);
-        }
+        Channel::WaitConsumer(sequence);assert(lastWait==PIPE_MTE2);
+        Channel::ReleaseConsumer(sequence);assert(lastArrive==PIPE_MTE3);
     }
     Channel::DrainProducer();
     for(bool flag:flags) assert(!flag);

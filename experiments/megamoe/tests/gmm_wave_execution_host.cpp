@@ -69,7 +69,6 @@ struct WaveHarness {
     static constexpr uint32_t GMM1_TASK_N = FuseGateUp ? 128 : 256;
     static constexpr bool ENABLE_A8W4 = true;
     static constexpr bool ASYNC_GMM1 = CombineQuantMode == COMBINE_NO_QUANT;
-    static constexpr bool UseCv = false;
     static constexpr bool GMM2_REVERSE_BLOCKS = false;
     int32_t gmm2IssuedSequence_ = 0;
     PipelineStub gmm1CatlassContext_, gmm2WaveContext_;

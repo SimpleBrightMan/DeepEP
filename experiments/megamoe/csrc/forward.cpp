@@ -65,11 +65,7 @@ MegaMoeDispatchBufferConfig DispatchConfig(const MegaMoeTilingData& t, uint32_t 
     const uint32_t route = static_cast<uint32_t>(c.routeItemsPerBatch);
     const uint32_t without_slots = fixed + route * sizeof(int32_t);
     const uint32_t budget = ub > without_slots ? ub - without_slots : 0U;
-    const bool cv = t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 &&
-        MegaMoeImpl::UseGmm1CvForLaunch(t.bs, t.topK, t.epWorldSize, t.moeExpertPerRank,
-            MegaMoeImpl::W4A8_PAIRED_GATE_UP_MAX_TOKENS);
-    const int32_t maxSlots = cv ? static_cast<int32_t>(MegaMoeImpl::Aiv1AsyncEvents::DispatchSlots)
-                               : MAX_DISPATCH_BUFFER_COUNT;
+    const int32_t maxSlots = MAX_DISPATCH_BUFFER_COUNT;
     c.bufferCount = std::clamp(static_cast<int32_t>(budget / (c.copyBufferBytes + 32U)), MIN_DISPATCH_BUFFER_COUNT,
                                maxSlots);
     if (static_cast<uint64_t>(c.routeItemsPerBatch) < total) {

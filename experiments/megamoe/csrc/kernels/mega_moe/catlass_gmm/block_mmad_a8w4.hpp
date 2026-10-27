@@ -15,7 +15,6 @@
 
 #include "resource.hpp"
 #include "a8w4_k_plan.hpp"
-#include "../common/gmm1_cv_plan.hpp"
 #include "../common/gmm1_async_completion.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/coord.hpp"
@@ -346,7 +345,6 @@ public:
     CATLASS_DEVICE void operator()(TensorA& tensorA, TensorC& tensorC, GemmCoord const& actualShape,
                                    TensorMxScaleA const& tensorMxScaleA = {}, TensorMxScaleB const& tensorMxScaleB = {},
                                    bool allowDynamicB = false, TensorBias const& tensorBias = {},
-                                   uint32_t outputSequence = 0U, __gm__ int32_t* outputIssued = nullptr,
                                    InputReady inputReady = {})
     {
         // Check L1TileShape
@@ -395,39 +393,14 @@ public:
         const uint32_t ka = kPlan.ka;
         const uint32_t kb = kPlan.kb;
         const uint32_t kL1Loop = CeilDiv(kBlockActual, kb);
-        // DS式最后K衔接：一个N半块完成累加就发FIX，不等另一半的MMAD提交。
+        // 最后K衔接：一个N半块完成累加就发FIX，不等另一半的MMAD提交。
         // 回调只负责输出；保持scale=64、父L0C stride和每半块的unit flag。
         auto emitHalf = [&](const auto& accumulator, uint32_t column, uint32_t columns) __aicore__ {
-            if constexpr (TensorC::position == AscendC::TPosition::VECCALC) {
-                using Plan = MegaMoeImpl::Gmm1CvPlan;
-                if (column == 0U) {
-                    // 允许消费者排入V等待；数据仍必须等两半FIX后的真实FULL。
-                    AscendC::WriteGmByPassDCache(outputIssued,
-                        static_cast<int32_t>(outputSequence + Plan::ChunkCount(mBlockActual)));
-                }
-                for (uint32_t row = 0U; row < mBlockActual; row += Plan::Rows) {
-                    const uint32_t rows = Min(Plan::Rows, mBlockActual - row);
-                    const uint32_t sequence = outputSequence + row / Plan::Rows;
-                    if (column == 0U) MegaMoeImpl::Gmm1AsyncCompletion::AcquireProducer(sequence);
-                    AscendC::LocalTensor<ElementC> ub(AscendC::TPosition::VECCALC,
-                        Plan::SlotOffset(sequence), Plan::SlotBytes / sizeof(ElementC));
-                    auto full = tla::MakeTensor(ub,
-                        tla::MakeLayout<ElementC, Catlass::layout::RowMajor>(rows, nBlockActual), Arch::PositionUB{});
-                    auto destination = GetTile(full, tla::MakeCoord(0U, column), tla::MakeShape(rows, columns));
-                    auto source = GetTile(accumulator, tla::MakeCoord(row, 0U), tla::MakeShape(rows, columns));
-                    typename TileCopy::template CopyL0CToDst<decltype(destination)> copy;
-                    copy.params.scale = 64;
-                    copy(destination, source, 0b11);
-                    if (column + columns == nBlockActual)
-                        MegaMoeImpl::Gmm1AsyncCompletion::PublishCompleted(sequence);
-                }
-            } else {
-                auto destination = GetTile(tensorC, tla::MakeCoord(0U, column),
-                                           tla::MakeShape(mBlockActual, columns));
-                typename TileCopy::template CopyL0CToDst<decltype(destination)> copy;
-                copy.params.scale = 64;
-                copy(destination, accumulator, 0b11);
-            }
+            auto destination = GetTile(tensorC, tla::MakeCoord(0U, column),
+                                       tla::MakeShape(mBlockActual, columns));
+            typename TileCopy::template CopyL0CToDst<decltype(destination)> copy;
+            copy.params.scale = 64;
+            copy(destination, accumulator, 0b11);
         };
         for (uint32_t kL1Idx = 0; kL1Idx < kL1Loop; ++kL1Idx) {
             const uint32_t kOffset = kL1Idx * kb;
@@ -639,25 +612,6 @@ public:
         }
         // copy block out
         copyL0CToDst.params.scale = 64;
-        if constexpr (TensorC::position == AscendC::TPosition::VECCALC) {
-            using Plan = MegaMoeImpl::Gmm1CvPlan;
-            // issued必须在MMAD提交后、任何FIX EMPTY等待之前发布，不能形成等issued/empty的环。
-            AscendC::WriteGmByPassDCache(outputIssued,
-                static_cast<int32_t>(outputSequence + Plan::ChunkCount(mBlockActual)));
-            for (uint32_t row = 0U; row < mBlockActual; row += Plan::Rows) {
-                const uint32_t rows = Min(Plan::Rows, mBlockActual - row);
-                const uint32_t seq = outputSequence + row / Plan::Rows;
-                auto source = GetTile(tensorL0C, tla::MakeCoord(row, 0U), tla::MakeShape(rows, nBlockActual));
-                MegaMoeImpl::Gmm1AsyncCompletion::AcquireProducer(seq);
-                AscendC::LocalTensor<ElementC> ub(AscendC::TPosition::VECCALC,
-                    Plan::SlotOffset(seq), Plan::SlotBytes / sizeof(ElementC));
-                auto destination = tla::MakeTensor(ub,
-                    tla::MakeLayout<ElementC,Catlass::layout::RowMajor>(rows, nBlockActual), Arch::PositionUB{});
-                copyL0CToDst(destination, source, 0b11);
-                MegaMoeImpl::Gmm1AsyncCompletion::PublishCompleted(seq);
-            }
-            return;
-        }
         if constexpr (!ENABLE_UNIT_FLAG) {
             AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);
             AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);
@@ -703,7 +657,7 @@ protected:
                                    tla::MakeShape(CeilDiv<MX_SCALE_GROUP_NUM>(kk), nn));
                 // GetTile 只记录逻辑 coord，而 TileMmad 直接使用 data()。
                 // L0C 必须显式偏移，否则第二半会覆盖第一半。
-                // unit-flag路径每半块独立FIX；采用DS固定64KiB间距，不把M64补算成M128。
+                // unit-flag路径每半块独立FIX；保持64KiB槽间距，不把M64补算成M128。
                 // 非unit-flag路径仍需后续整块copy，保留原父layout，不能只改写入地址。
                 const auto cOffset = ENABLE_UNIT_FLAG ? no / 128U * Buffers::SmallL0CHalfElements
                                                      : c.layout()(tla::MakeCoord(0, no));

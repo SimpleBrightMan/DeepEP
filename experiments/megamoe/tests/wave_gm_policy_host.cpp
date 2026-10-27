@@ -10,7 +10,7 @@ int main()
        for(unsigned slots : {1U,2U,6U}) {
         auto align=[](uint64_t n){return (n+31U)/32U*32U;};
         const unsigned e=384U/ep, bytes=(h+255U)/256U*256U+align((h+31U)/32U);
-        const auto p=MakeAiv1ResidentUbLayout(h,ep,e,route,slots,bytes,2U,false);
+        const auto p=MakeAiv1ResidentUbLayout(h,ep,e,route,slots,bytes,2U);
         const uint64_t base=64U*256U*2U*2U;
         assert(p.dispatchBase==base);
         assert(p.routeIndicesBase==base+align(uint64_t(ep)*e*4U));
@@ -23,11 +23,9 @@ int main()
        }
     for (unsigned ep : {8,32,64,128})
         for (unsigned bs : {1,32,96,256,512,1024,2048,4096,65536}) {
-            assert(!UseGmm1CvForLaunch(bs,6,ep,384/ep,4096));
-            const auto gm = MakeAiv1ResidentUbLayout(7168,ep,384/ep,4096,6,7392,2,false);
-            assert(gm.valid && gm.dispatchBase==Aiv1ResidentUbLayout::GmActivationBytes);
+            const auto gm = MakeAiv1ResidentUbLayout(7168,ep,384/ep,4096,6,7392,2);
+            assert(gm.valid && gm.dispatchBase==Aiv1ResidentUbLayout::ActivationBytes);
             assert(gm.dispatchEnd<=gm.combineRowsBase && gm.combineRowsBase<=gm.combineMetaBase);
             assert(gm.end<=256*1024 && gm.combineRowCount==2);
         }
-    assert(!UseGmm1CvForLaunch(0,0,0,0,0));
 }

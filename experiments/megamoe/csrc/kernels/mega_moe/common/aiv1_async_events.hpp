@@ -5,13 +5,10 @@
 namespace MegaMoeImpl {
 struct Aiv1AsyncEvents {
     static constexpr unsigned LocalEventCount = 8;
-    // DS式通信环：pull 0..1、push 2..5；6..7不占用，便于最终归约独立使用。
-    static constexpr unsigned DispatchSlots = 2;
+    // GM常驻通信环：Dispatch占0..5，Combine占6..7；不同HardEvent域独立编号。
+    static constexpr unsigned DispatchSlots = 6;
     static constexpr unsigned CombineBase = DispatchSlots;
-    static constexpr unsigned CombineSlots = 4;
-    static constexpr unsigned GmDispatchSlots = 6;
-    static constexpr unsigned GmCombineBase = GmDispatchSlots;
-    static constexpr unsigned GmCombineSlots = LocalEventCount - GmCombineBase;
+    static constexpr unsigned CombineSlots = LocalEventCount - CombineBase;
     // MTE3->S：0..5归Dispatch metadata；两种完成发布各有独立ID。
     static constexpr unsigned ActivationDone = 6;
     static constexpr unsigned DispatchDone = 7;

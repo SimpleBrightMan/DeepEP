@@ -8,7 +8,7 @@ def test_routed_a8w4_keeps_paired_gm_for_all_supported_bs(tmp_path):
     root = Path(__file__).resolve().parents[3]
     source = (root / 'experiments/megamoe/csrc/kernels/mega_moe/mega_moe.cpp').read_text(encoding='utf-8')
     body = cpp_body(source, 'void mega_moe_kernel_do(')
-    dispatch = body[body.index('    // 按本次实际 BS'): -1]
+    dispatch = body[body.rindex('    if (is_a8w4) {'): -1]
     # 编译执行原分支和实参；CPU记录模板身份，不提交设备kernel。
     dispatch = dispatch.replace('<<<block_dim, ub_bytes, stream>>>', '')
     (tmp_path / 'paired_launch.inc').write_text(dispatch, encoding='utf-8')
@@ -19,8 +19,8 @@ def test_routed_a8w4_keeps_paired_gm_for_all_supported_bs(tmp_path):
 #include "common/mega_moe_constants.hpp"
 #include "common/mega_moe_aiv1_ub_layout.hpp"
 int selected = 0;
-template<bool A8W4, bool Paired=false, bool Cv=false, class... Args>
-void mega_moe_kernel(Args...) { selected=(A8W4 ? 400 : 800)+(Paired ? 10 : 0)+(Cv ? 1 : 0); }
+template<bool A8W4, bool Paired=false, class... Args>
+void mega_moe_kernel(Args...) { selected=(A8W4 ? 400 : 800)+(Paired ? 10 : 0); }
 void Launch(unsigned bs, unsigned ep, bool is_a8w4) {
     struct { unsigned bs,topK,epWorldSize,moeExpertPerRank; } tiling{bs,6,ep,384/ep};
     int context=0,x=0,x_scales=0,topk_ids=0,topk_weights=0,weight1=0,weight2=0;

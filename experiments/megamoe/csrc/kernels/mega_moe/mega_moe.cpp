@@ -23,7 +23,7 @@ using namespace AscendC;
 // Explicit types replace asc_opc dtype/format/tiling-key specialisation.
 // A8W4's existing matmul prologue continues to interpret weights as NZ/C0_32.
 // Batch scheduling preserves the old ACL schemMode=1 cross-core contract.
-template <bool IsA8W4, bool FuseGateUp = false, bool UseCv = false>
+template <bool IsA8W4, bool FuseGateUp = false>
 __schedmode__(1) __global__
     __mix__(1, 2) void mega_moe_kernel(GM_ADDR context, GM_ADDR x, GM_ADDR x_scales, GM_ADDR topk_ids,
                                        GM_ADDR topk_weights, GM_ADDR weight1, GM_ADDR weight2, GM_ADDR weight_scales1,
@@ -37,7 +37,7 @@ __schedmode__(1) __global__
     util_set_ffts_config(ffts_addr);
     constexpr int32_t kDispatchE4M3 = 4;
     if constexpr (IsA8W4) {
-        MegaMoeImpl::MegaMoeA8W4Wave<bfloat16_t, bfloat16_t, float, fp4x2_e2m1_t, kDispatchE4M3, FuseGateUp, UseCv>
+        MegaMoeImpl::MegaMoeA8W4Wave<bfloat16_t, bfloat16_t, float, fp4x2_e2m1_t, kDispatchE4M3, FuseGateUp>
             op;
         op.Init(context, x, topk_ids, topk_weights, weight1, weight2, nullptr, weight_scales1, weight_scales2, x_scales,
                 shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
@@ -68,16 +68,14 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
         using MegaMoeImpl::Aiv1ResidentUbLayout;
         static_assert(Aiv1ResidentUbLayout::MetaWords == MegaMoeImpl::META_INFO_SIZE &&
                       Aiv1ResidentUbLayout::MetaWords == MegaMoeImpl::INT32_PER_256B);
-        const bool cv = MegaMoeImpl::UseGmm1CvForLaunch(tiling.bs, tiling.topK, tiling.epWorldSize,
-            tiling.moeExpertPerRank, MegaMoeImpl::W4A8_PAIRED_GATE_UP_MAX_TOKENS);
-        const uint32_t slots = cv ? MegaMoeImpl::Aiv1AsyncEvents::CombineSlots : MegaMoeImpl::Aiv1AsyncEvents::GmCombineSlots;
+        const uint32_t slots = MegaMoeImpl::Aiv1AsyncEvents::CombineSlots;
         const auto& config = tiling.dispatchBufferConfig;
         const auto resident = MegaMoeImpl::MakeAiv1ResidentUbLayout(
             tiling.h, tiling.epWorldSize, tiling.moeExpertPerRank, config.routeItemsPerBatch,
-            config.bufferCount, config.copyBufferBytes, slots, cv);
-        // 实验分支不让未适配的共享激活覆盖常驻数据；容量错误在发射NPU前报告。
+            config.bufferCount, config.copyBufferBytes, slots);
+        // 当前入口不支持共享激活；容量错误在发射NPU前报告。
         if (tiling.sharedExpertNum != 0U || !resident.valid ||
-            config.bufferCount > (cv ? MegaMoeImpl::Aiv1AsyncEvents::DispatchSlots : MegaMoeImpl::Aiv1AsyncEvents::GmDispatchSlots) ||
+            config.bufferCount > MegaMoeImpl::Aiv1AsyncEvents::DispatchSlots ||
             resident.end > ub_bytes || resident.end > 256U * 1024U) {
             throw std::invalid_argument("AIV1 resident UB unsupported: BS=" + std::to_string(tiling.bs) +
                 " H=" + std::to_string(tiling.h) + " EP=" + std::to_string(tiling.epWorldSize) +
@@ -86,14 +84,8 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
                 " available=" + std::to_string(ub_bytes));
         }
     }
-    // 按本次实际 BS 编译期特化；不改变 wave 预算、Dispatch/Combine 或共享专家策略。
-    if (is_a8w4 && MegaMoeImpl::UseGmm1CvForLaunch(tiling.bs, tiling.topK, tiling.epWorldSize,
-        tiling.moeExpertPerRank, MegaMoeImpl::W4A8_PAIRED_GATE_UP_MAX_TOKENS)) {
-        mega_moe_kernel<true, true, true><<<block_dim, ub_bytes, stream>>>(
-            context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,
-            shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
-            workspace, timer, tiling, ffts_addr, compute_replay);
-    } else if (is_a8w4) {
+    // 只按权重类型派发；A8W4的BS差异由公共Wave策略处理。
+    if (is_a8w4) {
         // 所有合法BS均使用配对权重；与host两轮Wave预算、Python权重选择一致。
         mega_moe_kernel<true, true><<<block_dim, ub_bytes, stream>>>(
             context, x, x_scales, topk_ids, topk_weights, weight1, weight2, weight_scales1, weight_scales2,

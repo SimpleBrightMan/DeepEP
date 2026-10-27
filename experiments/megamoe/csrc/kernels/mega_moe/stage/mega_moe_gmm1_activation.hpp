@@ -90,14 +90,6 @@ __aicore__ inline void Gmm1AicMmadA8W4(BlockMmad& blockMmad, Scheduler& schedule
             lastWaveWaited = waveIdx;
         }
 
-        if constexpr (Config::FUSED_GATE_UP) {
-            if (gmmAddrInfo.gmm1CvOutput) {
-                blockMmad.ComputeCv(mLoc, nLoc, Get<M_VALUE>(actualShape), Get<N_VALUE>(actualShape),
-                                     static_cast<uint32_t>(gmm1TileReadySequence), gmmAddrInfo.gmmToEpilogueFlag);
-                gmm1TileReadySequence += Gmm1CvPlan::ChunkCount(Get<M_VALUE>(actualShape));
-                continue;
-            }
-        }
         if (gmmAddrInfo.gmm1AsyncCompletion) {
             Gmm1AsyncCompletion::AcquireProducer(gmm1TileReadySequence);
         }

@@ -38,6 +38,10 @@
 4. `stage/mega_moe_gmm1_activation.hpp`与`stage/mega_moe_gmm2_combine.hpp`：地址、slice和阶段依赖。
 5. `catlass_gmm/`：UB/L1/L0、权重转换、MMAD/FIX及owner交接。
 
+纯策略集中在`common/mega_moe_schedule_policy.hpp`：Wave预算、lag使用本次实际BS。
+`common/mega_moe_aiv1_ub_layout.hpp`逐项计算激活、prefix、route index、搬运环、metadata及Combine地址；
+host检查容量，device按同一结果建立视图，不各抄一份偏移公式。
+
 GMM1：Scalar issued → AIV1可进入等待 → **FIX full** → GM读入/SwiGLU/量化 → 释放epilogue credit。
 
 GMM2：AIC将Wave完成事件排入FIX并发布issued → AIV1等待**真实FIX完成** → 重放该Wave并发布原slice-ready → Combine。不是每波由AIC Scalar主动排空FIX；最终退出仍回收最后credit。
