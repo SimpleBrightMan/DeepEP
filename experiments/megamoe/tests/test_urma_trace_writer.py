@@ -85,6 +85,38 @@ int main() {
     disabled.TraceEnd(TraceEvent::Pack, 0);
     disabled.FinishTrace();
     assert(AscendC::cycles == cycles && AscendC::flushes == flushes);
+
+    // Aggregate submission accounting is immutable when the peer's final
+    // quiet completes. Word 7 carries completion separately from word 1.
+    static_assert(static_cast<uint32_t>(TraceEvent::CombineSendComplete) == 42);
+    std::vector<uint64_t> aggregate(kTimerElements, 0);
+    Timer submission;
+    submission.Init(reinterpret_cast<uint64_t>(aggregate.data()));
+    submission.Begin(Dispatch);
+    submission.End(Dispatch, 128, true);
+    submission.Begin(Combine);
+    submission.End(Combine, 256, true);
+    submission.Begin(Combine);
+    submission.End(Combine, 512, true);
+    const auto beforeCompletion = aggregate;
+    const auto completionTick = AscendC::cycles;
+    submission.MarkSendComplete(Combine);
+#ifdef DEEPEP_MEGAMOE_TIMER
+    const auto dispatchOffset = (core * kTimerPhases + Dispatch) * kTimerRecordElements;
+    const auto combineOffset = (core * kTimerPhases + Combine) * kTimerRecordElements;
+    auto* dispatch = aggregate.data() + dispatchOffset;
+    auto* combine = aggregate.data() + combineOffset;
+    assert(dispatch[2] == 1 && dispatch[3] == 128 && dispatch[4] == 1);
+    assert(dispatch[5] == 1 && dispatch[6] == kProtocol && dispatch[7] == 0);
+    assert(combine[2] == 2 && combine[3] == 768 && combine[4] == 2);
+    assert(combine[5] == 1 && combine[6] == kProtocol);
+    assert(combine[7] == completionTick && combine[7] > combine[1]);
+    for (size_t i = 0; i < aggregate.size(); ++i)
+        if (i != combineOffset + 7) assert(aggregate[i] == beforeCompletion[i]);
+#else
+    assert(AscendC::cycles == completionTick && AscendC::flushes == flushes);
+    for (auto value : aggregate) assert(value == 0);
+#endif
 }
 """,
         encoding="utf-8",

@@ -39,6 +39,7 @@ private:
     torch::Tensor gmm2_contiguous_, gmm2_matmul_done_;
     torch::Tensor fragments_, send_chunks_, recv_chunks_, gmm1_done_, activation_done_, gmm2_done_, local_flags_;
     torch::Tensor segments_, compute_batches_, compute_tasks_, chunk_group_indices_;
+    torch::Tensor peer_reorder_ranges_, peer_reorder_spans_;
     torch::Tensor pack_rounds_, pack_ready_;
     torch::Tensor expanded_reduce_dependencies_, reduce_dependencies_, bound_reduce_index_;
     torch::Tensor system_workspace_;

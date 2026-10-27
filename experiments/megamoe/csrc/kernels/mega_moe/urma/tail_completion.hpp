@@ -18,8 +18,8 @@ __aicore__ inline uint64_t PeerPhaseSlot(const Arguments& args, uint32_t phase, 
     return args.config.barrierOffset + (static_cast<uint64_t>(phase) * args.config.world + source) * kFlagBytes;
 }
 
-// AIC completion certifies contiguous scratch, not self returnY. Every paired
-// AIV1 must also finish its final-layout stores before the aggregate bypass.
+// AIC completion certifies contiguous scratch, not self returnY. Communication
+// owners must also finish their self-CV stores before the aggregate bypass.
 __aicore__ inline void MarkCubeComplete(const Arguments& args)
 {
     AscendC::AtomicAdd(LocalCompletionFlag(args, kLocalFlagAicDone), 1);
@@ -54,32 +54,20 @@ __aicore__ inline bool ObserveIncomingCompletion(const Arguments& args, uint32_t
     // scratch can be complete while the last AIV1's self scatter is pending.
     if (owner == 0U && !selfCounted &&
         ReadGmByPassDCache(LocalCompletionFlag(args, kLocalFlagAicDone)) == static_cast<int32_t>(kAic) &&
-        ReadGmByPassDCache(LocalCompletionFlag(args, kLocalFlagReorderDone)) == static_cast<int32_t>(kAic)) {
+        ReadGmByPassDCache(LocalCompletionFlag(args, kLocalFlagReorderDone)) ==
+            static_cast<int32_t>(CommunicationWorkers(args.config.world))) {
         AtomicAdd(LocalCompletionFlag(args, kLocalFlagIncomingDone), 1);
         selfCounted = true;
     }
     return peerCounted && (owner != 0U || selfCounted);
 }
 
-// All outbound CVs have already completed quiet and their per-CV publication.
-// Empty edges also publish once. Publish BEFORE waiting for the corresponding
-// incoming notification, so peers cannot deadlock while waiting on each other.
-// Phase 1 has separate source-owned slots, with monotonically increasing epochs.
-// Reorder may still owe tiles used by self or another peer, even on an empty
-// outbound edge. Keep advancing it until both local work and observations end.
-template <class Reorder>
-__aicore__ inline void FinishCombinePeer(const Arguments& args, uint32_t owner, AscendC::LocalTensor<uint64_t> signal,
-                                         bool& peerCounted, bool& selfCounted, Reorder& reorder)
+// The caller has already submitted SO finished and completed its final quiet.
+// Only incoming observations remain; Reduce gets no additional timer/poll work.
+__aicore__ inline void FinishCombinePeer(const Arguments& args, uint32_t owner, bool& peerCounted, bool& selfCounted)
 {
     using namespace AscendC;
-    const uint32_t peer = PeerForOwner(args.config.rank, owner);
-    PublishDone(reinterpret_cast<__gm__ uint8_t*>(args.symmetric), PeerPhaseSlot(args, 1U, args.config.rank), peer,
-                args.config.epoch, signal, EVENT_ID0);
-    while (true) {
-        const bool progressed = reorder.DrainReady();
-        const bool incomingComplete = ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);
-        if (reorder.Done() && incomingComplete) break;
-        if (progressed) continue;
+    while (!ObserveIncomingCompletion(args, owner, peerCounted, selfCounted)) {
         const uint64_t start = GetSystemCycle();
         while (GetSystemCycle() - start < 200U) {
         }

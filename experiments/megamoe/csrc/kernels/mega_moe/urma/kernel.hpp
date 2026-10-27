@@ -6,6 +6,7 @@
 #include "compute.hpp"
 #include "pack_reduce.hpp"
 #include "pack_round.hpp"
+#include "peer_reorder.hpp"
 #include "tail_completion.hpp"
 #include "timer.hpp"
 #include "transport.hpp"
@@ -22,23 +23,14 @@ constexpr uint32_t kCommunicationPendingOffset = kCommunicationSubmittedOffset +
 static_assert(kCommunicationSignalOffset % 32U == 0U);
 static_assert(kCommunicationPendingOffset + kMaxPeerChunks * sizeof(uint32_t) <= kRequiredUbBytes);
 
-// Waiting for a peer/local phase cannot stop the paired AIC's reorder work.
-// Split a wait trace only when actual work is available, so exported waits
-// never overlap Gmm2Reorder records and empty polling creates no extra rows.
 template <typename T>
-__aicore__ inline void WaitWithReorder(__gm__ T* flag, T expected, OwnedReorder& reorder, Timer& timer,
-                                       TraceEvent event, const TraceMeta& meta)
+__aicore__ inline void WaitProgressFlag(__gm__ T* flag, T expected, Timer& timer, TraceEvent event,
+                                        const TraceMeta& meta)
 {
-    uint64_t start = timer.TraceBegin();
+    const uint64_t start = timer.TraceBegin();
     while (ReadGmByPassDCache(flag) < expected) {
-        if (reorder.Ready()) {
-            timer.TraceEnd(event, start, meta);
-            reorder.DrainReady();
-            start = timer.TraceBegin();
-        } else {
-            const uint64_t backoff = GetSystemCycle();
-            while (GetSystemCycle() - backoff < 64U) {
-            }
+        const uint64_t backoff = GetSystemCycle();
+        while (GetSystemCycle() - backoff < 64U) {
         }
     }
     timer.TraceEnd(event, start, meta);
@@ -115,7 +107,7 @@ __aicore__ inline void PublishPeerStart(const Arguments& args, uint32_t owner, T
     timer.End(Phase::Barrier);
 }
 
-// Neither speculative Combine nor a full scan waits on an unready CV.
+// A full scan never waits on an unready CV.
 // Each dependency covers the complete GMM2 N direction and all FIX stores.
 // Inspect once and return at the first incomplete compute group.
 __aicore__ inline bool IsChunkComputed(const Arguments& args, const Chunk& chunk)
@@ -131,247 +123,169 @@ __aicore__ inline bool IsChunkComputed(const Arguments& args, const Chunk& chunk
     return true;
 }
 
-// Retire exactly the submitted CVs, which need not form a contiguous prefix.
-// Called only before the final actual CV and after its standalone PUT. Earlier
-// sweeps (including speculative Dispatch-time PUTs) leave QP1 in flight so this
-// owner can keep reordering. Only this owner touches the peer's QP1 and flags.
-__aicore__ inline void RetireCombineBatch(const Arguments& args, uint32_t owner, uint32_t combineBegin,
-                                          LocalTensor<uint32_t>& pending, uint32_t& pendingCount, uint64_t& pendingRows,
-                                          LocalTensor<uint64_t>& signal, Timer& timer, bool& peerCounted,
-                                          bool& selfCounted)
-{
-    if (pendingCount == 0U) return;
-    const uint32_t peer = PeerForOwner(args.config.rank, owner);
-    auto* symmetric = reinterpret_cast<__gm__ uint8_t*>(args.symmetric);
-    TraceMeta meta;
-    meta.peer = peer;
-    meta.rows = pendingRows;
-    if (pendingCount == 1U) meta = ChunkTraceMeta(LoadChunk(args.recvChunks, combineBegin + pending.GetValue(0U)));
-    // Multiple CVs may have holes: retain unknown CV/row, and sum actual rows.
-    // Local Dispatch and Pack have finished before any caller reaches here.
-    // The caller has already confirmed the final CV's complete reorder before
-    // the pre-final flush. Neither flush waits for unrelated producer work.
-    ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);
-    uint64_t start = timer.TraceBegin();
-    Quiet(peer, kCombineQp);
-    timer.TraceEnd(TraceEvent::CombineQuiet, start, meta);
-    for (uint32_t i = 0U; i < pendingCount; ++i) {
-        const Chunk completed = LoadChunk(args.recvChunks, combineBegin + pending.GetValue(i));
-        meta = ChunkTraceMeta(completed);
-        const uint64_t readyIndex = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + completed.cv;
-        start = timer.TraceBegin();
-        PublishDone(symmetric, args.config.combineReadyOffset + readyIndex * kFlagBytes, peer, args.config.epoch,
-                    signal, EVENT_ID0);
-        timer.TraceEnd(TraceEvent::CombinePublish, start, meta);
-    }
-    pendingCount = 0U;
-    pendingRows = 0U;
-}
-
-// One and only one AIV1 owns all PUT/quiet operations for this peer for the
-// entire invocation. Dispatch uses QP0 and Combine uses QP1, so a Dispatch
-// quiet cannot drain early Combine. Both queues retain the same single owner.
+// One owner, one QP. Data and SO notifications remain in flight while this
+// worker prepares other disjoint GM rows. No Combine is submitted in Dispatch.
 __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Timer& timer)
 {
     const uint32_t peer = PeerForOwner(args.config.rank, owner);
+    const uint32_t workers = CommunicationWorkers(args.config.world);
     auto* symmetric = reinterpret_cast<__gm__ uint8_t*>(args.symmetric);
-    LocalTensor<uint64_t> signal(TPosition::VECCALC, kCommunicationSignalOffset, 4U);
-    OwnedReorder reorder(args, owner, timer);
     TraceMeta peerMeta;
     peerMeta.peer = peer;
     timer.Begin(Phase::Barrier);
-    // Start was published before the startup Pack. Wait only now, immediately
-    // before this owner's first possible payload write to the peer.
     auto* startFlag = reinterpret_cast<__gm__ uint64_t*>(symmetric + PeerPhaseSlot(args, 0U, peer));
-    WaitWithReorder(startFlag, args.config.epoch, reorder, timer, TraceEvent::WaitStartPeer, peerMeta);
+    WaitProgressFlag(startFlag, args.config.epoch, timer, TraceEvent::WaitStartPeer, peerMeta);
     timer.End(Phase::Barrier);
 
     const uint64_t h = args.config.hidden;
     const uint64_t scales = h / 32U;
     const uint64_t rowBytes = h * sizeof(bfloat16_t);
-    const uint32_t dispatchCvs = PeerDispatchCvCount(args, peer);
-    const uint32_t combineBegin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer);
-    const uint32_t combineEnd = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer + 1U);
-    uint32_t nextCombine = combineBegin;
-    uint64_t combineBytes = 0U;
-    uint64_t start = 0U;
-    bool combineStarted = false;
     for (uint32_t round = 0U; round < args.config.packRoundCount; ++round) {
         const Chunk chunk = LoadPackChunk(args, round, peer);
-        // An empty peer must still produce its fixed share of every Pack
-        // round, including data for other peers and self. Never exit early.
-        if (chunk.rows == 0U) {
-            PackOneRound(args, round + kPackStartupRounds, owner, kAic, timer);
-            reorder.DrainReady();
-            continue;
+        if (chunk.rows != 0U) {
+            auto meta = ChunkTraceMeta(chunk);
+            WaitProgressFlag(PackReadyFlag(args, peer, round), static_cast<int32_t>(chunk.rows), timer,
+                             TraceEvent::WaitDispatch, meta);
+            timer.Begin(Phase::Dispatch);
+            meta.bytes = chunk.rows * h;
+            uint64_t start = timer.TraceBegin();
+            Put(symmetric, args.config.receiveXOffset + chunk.remoteRow * h,
+                reinterpret_cast<__gm__ uint8_t*>(args.expandedX + chunk.localRow * h),
+                static_cast<uint32_t>(meta.bytes), peer);
+            timer.TraceEnd(TraceEvent::DispatchPutX, start, meta);
+            meta.bytes = chunk.rows * scales;
+            start = timer.TraceBegin();
+            Put(symmetric, args.config.receiveScaleOffset + chunk.remoteRow * scales,
+                reinterpret_cast<__gm__ uint8_t*>(args.expandedScale + chunk.localRow * scales),
+                static_cast<uint32_t>(meta.bytes), peer);
+            timer.TraceEnd(TraceEvent::DispatchPutScale, start, meta);
+            meta.bytes = 0U;
+            start = timer.TraceBegin();
+            const uint64_t ready = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + chunk.cv;
+            PublishOrdered(symmetric, args.config.dispatchReadyOffset + ready * kFlagBytes, peer, args.config.epoch);
+            timer.TraceEnd(TraceEvent::DispatchPublish, start, meta);
+            timer.End(Phase::Dispatch, chunk.rows * (h + scales), true);
         }
-        TraceMeta meta = ChunkTraceMeta(chunk);
-        WaitWithReorder(PackReadyFlag(args, peer, round), static_cast<int32_t>(chunk.rows), reorder, timer,
-                        TraceEvent::WaitDispatch, meta);
-        meta.bytes = chunk.rows * h;
-        timer.Begin(Phase::Dispatch);
-        start = timer.TraceBegin();
-        Put(symmetric, args.config.receiveXOffset + chunk.remoteRow * h,
-            reinterpret_cast<__gm__ uint8_t*>(args.expandedX + chunk.localRow * h),
-            static_cast<uint32_t>(chunk.rows * h), peer);
-        timer.TraceEnd(TraceEvent::DispatchPutX, start, meta);
-        meta.bytes = chunk.rows * scales;
-        start = timer.TraceBegin();
-        Put(symmetric, args.config.receiveScaleOffset + chunk.remoteRow * scales,
-            reinterpret_cast<__gm__ uint8_t*>(args.expandedScale + chunk.localRow * scales),
-            static_cast<uint32_t>(chunk.rows * scales), peer);
-        timer.TraceEnd(TraceEvent::DispatchPutScale, start, meta);
-        // The current URMA write progresses while MTE prepares this worker's
-        // fixed quota two CVs ahead. No claims, extra work stealing or phase join.
+        // Even an empty peer keeps its static quota for other peers/self.
+        // Pack's GM writes are complete before it increments packReady.
         PackOneRound(args, round + kPackStartupRounds, owner, kAic, timer);
-        // Pack retains priority. Only after its assigned quota is complete
-        // does this AIV1 reorder ready GMM2 tiles from its paired AIC.
-        reorder.DrainReady();
-        // Only the last two actual outgoing CVs may submit one ready Combine
-        // each. A shorter peer must not use the rank-wide Pack round count.
-        // Reserve one CV for the final standalone post-Dispatch submission.
-        // No Combine quiet or ready publication occurs during Dispatch.
-        if (chunk.cv + 2U >= dispatchCvs && nextCombine + 1U < combineEnd) {
-            const Chunk early = LoadChunk(args.recvChunks, nextCombine);
-            if (IsChunkComputed(args, early)) {
-                if (!combineStarted) {
-                    timer.Begin(Phase::Combine);
-                    combineStarted = true;
-                }
-                auto earlyMeta = ChunkTraceMeta(early);
-                earlyMeta.bytes = early.rows * rowBytes;
-                const uint64_t earlyStart = timer.TraceBegin();
-                Put(symmetric, args.config.returnYOffset + early.remoteRow * rowBytes,
-                    reinterpret_cast<__gm__ uint8_t*>(args.gmm2Output + early.localRow * rowBytes),
-                    static_cast<uint32_t>(earlyMeta.bytes), peer, kCombineQp);
-                timer.TraceEnd(TraceEvent::CombinePut, earlyStart, earlyMeta);
-                combineBytes += earlyMeta.bytes;
-                ++nextCombine;
-            }
-        }
-        meta.bytes = 0U;
-        start = timer.TraceBegin();
-        Quiet(peer, kDispatchQp);
-        timer.TraceEnd(TraceEvent::DispatchQuiet, start, meta);
-        const uint64_t readyIndex = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + chunk.cv;
-        start = timer.TraceBegin();
-        PublishDone(symmetric, args.config.dispatchReadyOffset + readyIndex * kFlagBytes, peer, args.config.epoch,
-                    signal, EVENT_ID0);
-        timer.TraceEnd(TraceEvent::DispatchPublish, start, meta);
-        timer.End(Phase::Dispatch, chunk.rows * (h + scales));
     }
     MarkPackWorkerComplete(args);
-    // Empty peers must still join the local dispatch phase. Owner 0 accounts
-    // self only when every steady Pack worker has finished, including helpers.
-    AtomicAdd(ComputeFlag(args.localFlags, kLocalFlagDispatchDone), 1);
+    AtomicAdd(LocalCompletionFlag(args, kLocalFlagDispatchDone), 1);
     if (owner == 0U) {
-        WaitWithReorder(ComputeFlag(args.localFlags, kLocalFlagPackDone), static_cast<int32_t>(kAic), reorder, timer,
-                        TraceEvent::WaitLocalDispatch, peerMeta);
-        AtomicAdd(ComputeFlag(args.localFlags, kLocalFlagDispatchDone), 1);
+        WaitProgressFlag(LocalCompletionFlag(args, kLocalFlagPackDone), static_cast<int32_t>(kAic), timer,
+                         TraceEvent::WaitLocalDispatch, peerMeta);
+        AtomicAdd(LocalCompletionFlag(args, kLocalFlagDispatchDone), 1);
     }
-    WaitWithReorder(ComputeFlag(args.localFlags, kLocalFlagDispatchDone), static_cast<int32_t>(args.config.world),
-                    reorder, timer, TraceEvent::WaitLocalDispatch, peerMeta);
+    // This is a local submission-phase join, not a network completion quiet.
+    WaitProgressFlag(LocalCompletionFlag(args, kLocalFlagDispatchDone), static_cast<int32_t>(args.config.world), timer,
+                     TraceEvent::WaitLocalDispatch, peerMeta);
 
+    const uint32_t begin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer);
+    const uint32_t end = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer + 1U);
+    const uint32_t selfBegin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, args.config.rank);
+    const uint32_t selfEnd = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, args.config.rank + 1U);
+    // Scalar metadata is above Pack and Reorder UB. Disjoint output GM rows
+    // are never reused before final quiet, so ring-buffer credits are unneeded.
+    LocalTensor<uint32_t> submitted(TPosition::VECCALC, kCommunicationSubmittedOffset, kMaxPeerChunks);
+    LocalTensor<uint32_t> selfCopied(TPosition::VECCALC, kCommunicationPendingOffset, kMaxPeerChunks);
+    uint32_t remaining = end - begin;
+    uint32_t selfRemaining = 0U;
+    for (uint32_t j = 0U; j < remaining; ++j) submitted.SetValue(j, 0U);
+    for (uint32_t j = owner; j < selfEnd - selfBegin; j += workers) {
+        selfCopied.SetValue(j, 0U);
+        ++selfRemaining;
+    }
+    bool sentComplete = false;
+    bool selfComplete = false;
     bool peerCounted = false;
     bool selfCounted = false;
-    // Scalar-only owner-private metadata must survive every Reorder call.
-    // The host planner enforces the same kMaxPeerChunks bound.
-    LocalTensor<uint32_t> submitted(TPosition::VECCALC, kCommunicationSubmittedOffset, kMaxPeerChunks);
-    LocalTensor<uint32_t> pending(TPosition::VECCALC, kCommunicationPendingOffset, kMaxPeerChunks);
-    const uint32_t combineCount = combineEnd - combineBegin;
-    const uint32_t earlyCount = nextCombine - combineBegin;
-    uint32_t pendingCount = 0U;
-    uint64_t pendingRows = 0U;
-    for (uint32_t i = 0U; i < combineCount; ++i) {
-        submitted.SetValue(i, i < earlyCount ? 1U : 0U);
-        if (i < earlyCount) {
-            pending.SetValue(pendingCount++, i);
-            pendingRows += LoadChunk(args.recvChunks, combineBegin + i).rows;
-        }
-    }
-    // Keep speculative PUTs on QP1 pending with the steady-state submissions.
-    // There is no early-prefix or per-sweep quiet: producer gaps are available
-    // for paired reorder until only the last actual unsent CV remains.
-    uint32_t remaining = combineCount - earlyCount;
     bool waiting = false;
     uint64_t waitStart = 0U;
-    while (remaining != 0U) {
-        // Readiness may depend on THIS communication owner's reorder tiles.
-        // Progress even when no CV can be submitted and hence no quiet occurs.
-        if (reorder.Ready()) {
-            if (waiting) {
-                timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
-                waiting = false;
-            }
-            reorder.DrainReady();
-        }
-        // Always scan this peer's CVs from beginning to end. Already submitted
-        // or unready CVs are skipped; readiness does not imply a ready prefix.
-        const uint32_t remainingBeforeScan = remaining;
-        const uint64_t scanStart = timer.TraceBegin();
-        for (uint32_t i = 0U; i < combineCount; ++i) {
-            if (submitted.GetValue(i) != 0U) continue;
-            const Chunk chunk = LoadChunk(args.recvChunks, combineBegin + i);
+    while (!sentComplete || !selfComplete) {
+        bool progress = false;
+        for (uint32_t j = 0U; j < end - begin; ++j) {
+            if (submitted.GetValue(j) != 0U) continue;
+            const Chunk chunk = LoadChunk(args.recvChunks, begin + j);
             if (!IsChunkComputed(args, chunk)) continue;
             if (waiting) {
-                // Close idle scope BEFORE emitting any PUT/quiet/flag trace.
                 timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
                 waiting = false;
             }
-            if (remaining == 1U) {
-                // Last ACTUAL unsent CV, not necessarily the highest index.
-                // Publish all earlier results before submitting it alone.
-                RetireCombineBatch(args, owner, combineBegin, pending, pendingCount, pendingRows, signal, timer,
-                                   peerCounted, selfCounted);
-            }
-            if (!combineStarted) {
-                timer.Begin(Phase::Combine);
-                combineStarted = true;
-            }
-            TraceMeta meta = ChunkTraceMeta(chunk);
+            // The group counter covers ALL N tiles, so copy whole rows once.
+            ReorderPeerChunk(args, begin + j, chunk, timer);
+            auto meta = ChunkTraceMeta(chunk);
             meta.bytes = chunk.rows * rowBytes;
-            start = timer.TraceBegin();
+            timer.Begin(Phase::Combine);
+            uint64_t start = timer.TraceBegin();
             Put(symmetric, args.config.returnYOffset + chunk.remoteRow * rowBytes,
                 reinterpret_cast<__gm__ uint8_t*>(args.gmm2Output + chunk.localRow * rowBytes),
-                static_cast<uint32_t>(meta.bytes), peer, kCombineQp);
+                static_cast<uint32_t>(meta.bytes), peer);
             timer.TraceEnd(TraceEvent::CombinePut, start, meta);
-            combineBytes += meta.bytes;
-            submitted.SetValue(i, 1U);
-            pending.SetValue(pendingCount++, i);
-            pendingRows += chunk.rows;
+            const uint64_t bytes = meta.bytes;
+            meta.bytes = 0U;
+            start = timer.TraceBegin();
+            const uint64_t ready = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + chunk.cv;
+            PublishOrdered(symmetric, args.config.combineReadyOffset + ready * kFlagBytes, peer, args.config.epoch);
+            timer.TraceEnd(TraceEvent::CombinePublish, start, meta);
+            timer.End(Phase::Combine, bytes, true);
+            submitted.SetValue(j, 1U);
             --remaining;
-            if (remaining == 0U) break;
-            // QP1 progresses independently of the paired MTE reorder work.
-            // Sources already submitted are immutable, disjoint final-layout
-            // rows; later reorder only produces not-yet-ready tiles.
-            reorder.DrainReady();
+            progress = true;
         }
-        if (remaining == 0U) {
-            // The pre-final flush published all earlier CVs. Only the last
-            // actual CV is pending, allowing Reduce to overlap this quiet.
-            RetireCombineBatch(args, owner, combineBegin, pending, pendingCount, pendingRows, signal, timer,
-                               peerCounted, selfCounted);
-        } else if (remaining == remainingBeforeScan) {
-            // Pending PUTs persist across producer gaps; their presence must
-            // not suppress backoff or incoming-completion observation.
+        if (remaining == 0U && !sentComplete) {
+            if (waiting) {
+                timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
+                waiting = false;
+            }
+            // SO finished follows every CV on the same QP, including empty
+            // edges. A final quiet is needed even when timer is disabled.
+            const uint64_t publishStart = timer.TraceBegin();
+            PublishOrdered(symmetric, PeerPhaseSlot(args, 1U, args.config.rank), peer, args.config.epoch);
+            timer.TraceEnd(TraceEvent::CombinePublish, publishStart, peerMeta);
+            const uint64_t completeStart = timer.TraceBegin();
+            Quiet(peer);
+            timer.TraceEnd(TraceEvent::CombineSendComplete, completeStart, peerMeta);
+            if (end != begin) timer.MarkSendComplete(Phase::Combine);
+            sentComplete = true;
+            progress = true;
+        }
+        for (uint32_t j = owner; j < selfEnd - selfBegin; j += workers) {
+            if (selfCopied.GetValue(j) != 0U) continue;
+            const Chunk chunk = LoadChunk(args.recvChunks, selfBegin + j);
+            if (!IsChunkComputed(args, chunk)) continue;
+            if (waiting) {
+                timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
+                waiting = false;
+            }
+            ReorderPeerChunk(args, selfBegin + j, chunk, timer);
+            const uint64_t ready = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + chunk.cv;
+            // Reorder drained local stores. Self requires no URMA operation.
+            WriteGmByPassDCache(
+                reinterpret_cast<__gm__ uint64_t*>(symmetric + args.config.combineReadyOffset + ready * kFlagBytes),
+                args.config.epoch);
+            selfCopied.SetValue(j, 1U);
+            --selfRemaining;
+            progress = true;
+        }
+        if (selfRemaining == 0U && !selfComplete) {
+            MarkReorderComplete(args);
+            selfComplete = true;
+            progress = true;
+        }
+        ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);
+        if (!progress) {
             if (!waiting) {
-                waitStart = scanStart;
+                waitStart = timer.TraceBegin();
                 waiting = true;
             }
-            ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);
-            const uint64_t backoff = GetSystemCycle();
-            while (GetSystemCycle() - backoff < 200U) {
+            const uint64_t start = GetSystemCycle();
+            while (GetSystemCycle() - start < 200U) {
             }
         }
     }
-    // Every CV now has its own completion flag. The earlier CVs were published
-    // together before the final PUT; the final CV was published after its own
-    // quiet. The aggregate envelope includes producer gaps between CVs.
-    if (combineStarted) timer.End(Phase::Combine, combineBytes);
-    // Publish finished promptly, then keep reordering the paired AIC's tiles
-    // while observing inbound completion. Empty peer edges also take this path;
-    // stopping at outbound completion could strand another peer's Combine.
-    FinishCombinePeer(args, owner, signal, peerCounted, selfCounted, reorder);
+    if (waiting) timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
+    FinishCombinePeer(args, owner, peerCounted, selfCounted);
 }
 
 __aicore__ inline void Process(const Arguments& args)

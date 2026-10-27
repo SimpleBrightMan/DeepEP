@@ -144,6 +144,66 @@ def read_events(document):
     return metadata, events, definitions, completeness
 
 
+def completion_envelopes(events, *, source_complete):
+    """Pair each outbound lane's PUTs with its final quiet, never inbound waits."""
+    submissions, completions = defaultdict(list), defaultdict(list)
+    for event in events:
+        lane = (event["tid"], event["args"].get("peer"))
+        if event["name"] in ("DispatchPutX", "DispatchPutScale", "CombinePut"):
+            submissions[lane].append(event)
+        elif event["name"] == "CombineSendComplete":
+            completions[lane].append(event)
+    result = []
+    for phase, start_names in (
+        ("Combine", ("CombinePut",)),
+        ("Communication", ("DispatchPutX", "DispatchPutScale")),
+    ):
+        starts = [event for rows in submissions.values() for event in rows if event["name"] in start_names]
+        if not starts:
+            continue
+        # Communication spans every active outgoing peer, including peers whose
+        # first activity is a Combine PUT. Combine spans only its payload peers.
+        lanes = (
+            set(submissions)
+            if phase == "Communication"
+            else {lane for lane, rows in submissions.items() if any(row["name"] == "CombinePut" for row in rows)}
+        )
+        confirmed, missing = [], []
+        for lane in sorted(lanes, key=lambda value: (value[0], -1 if value[1] is None else value[1])):
+            markers = completions[lane]
+            last_submit = max(event["ts"] + event["dur"] for event in submissions[lane])
+            quiet_follows_puts = bool(markers) and markers[0]["ts"] >= last_submit
+            if (
+                markers
+                and "start_tick" in markers[0]["args"]
+                and all("end_tick" in row["args"] for row in submissions[lane])
+            ):
+                quiet_follows_puts = int(markers[0]["args"]["start_tick"]) >= max(
+                    int(row["args"]["end_tick"]) for row in submissions[lane]
+                )
+            if lane[0] % 3 != 2 or lane[1] is None or len(markers) != 1 or not quiet_follows_puts:
+                missing.append(f"{engine_label(lane[0])}:p{lane[1]}")
+            else:
+                confirmed.append(markers[0]["ts"] + markers[0]["dur"])
+        first = min(event["ts"] for event in starts)
+        last = max(confirmed) if confirmed and not missing and source_complete else None
+        result.append(
+            dict(
+                phase=phase,
+                status="source_incomplete"
+                if not source_complete
+                else "not_recorded"
+                if missing
+                else "outbound_complete",
+                first=first,
+                last=last,
+                span=last - first if last is not None else None,
+                missing=missing,
+            )
+        )
+    return result
+
+
 def render_report(document, *, source="trace.json", cores=None, engines=None, detail=False, include_waits=False, top=8):
     metadata, original, definitions, completeness = read_events(document)
     if type(top) is not int or top < 0:
@@ -211,9 +271,20 @@ def render_report(document, *, source="trace.json", cores=None, engines=None, de
         for name in ("DispatchPutX", "DispatchPutScale", "CombinePut"):
             matching = [row for row in rows if row["name"] == name]
             parts.extend((str(len(matching)), str(sum(row["args"].get("bytes", 0) or 0 for row in matching))))
-        for name in ("DispatchQuiet", "CombineQuiet"):
-            parts.append(f"{math.fsum(row['dur'] for row in rows if row['name'] == name):.3f}")
+        for names in (("DispatchQuiet",), ("CombineQuiet", "CombineSendComplete")):
+            parts.append(f"{math.fsum(row['dur'] for row in rows if row['name'] in names):.3f}")
         lines.append(" ".join(parts))
+    lines.append(
+        "[COMPLETION] selected outbound peers; Combine=first Combine PUT to final quiet end; "
+        "Communication=first Dispatch PUT to final Combine quiet end, including intervening compute/readiness waits"
+    )
+    for row in completion_envelopes(events, source_complete=completeness not in ("INCOMPLETE", "UNVERIFIED")):
+        last = f"{row['last']:.3f}" if row["last"] is not None else "NA"
+        span = f"{row['span']:.3f}" if row["span"] is not None else "NA"
+        lines.append(
+            f"{row['phase']} status={row['status']} first_us={row['first']:.3f} completion_us={last} "
+            f"span_us={span} missing={','.join(row['missing']) or 'none'}"
+        )
     lines.append(
         "[FIELDS] p=peer c=CV f=fragment e=local_expert r=row l=rows m=tile_m n=tile_n "
         "w=columns s=sync_stage b=bytes; unknown/zero-byte fields omitted"

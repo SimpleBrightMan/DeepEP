@@ -3,6 +3,7 @@
 #include "urma_forward.hpp"
 #include "kernels/mega_moe/urma/compute_contract.hpp"
 #include "kernels/mega_moe/urma/expert_plan.hpp"
+#include "kernels/mega_moe/urma/peer_reorder_plan.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -155,6 +156,9 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
         gmm1_startup_mgroups_ += plan.computeBatches[task.batchIndex].fragmentCount;
     }
     chunk_group_indices_ = Upload(plan.chunkGroupIndices, options);
+    const auto reorder = MegaMoeUrma::BuildPeerReorderPlan(config, plan.fragments, plan.segments, plan.recvChunks);
+    peer_reorder_ranges_ = Upload(reorder.ranges, options);
+    peer_reorder_spans_ = Upload(reorder.spans, options);
     auto dependency_cpu = torch::empty({static_cast<int64_t>(expanded_rows)},
                                        torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64));
     std::memcpy(dependency_cpu.data_ptr(), plan.reduceDependencies.data(), expanded_rows * sizeof(uint64_t));
@@ -184,6 +188,8 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     args_.computeBatches = Address(compute_batches_);
     args_.computeTasks = Address(compute_tasks_);
     args_.chunkGroupIndices = Address(chunk_group_indices_);
+    args_.peerReorderRanges = Address(peer_reorder_ranges_);
+    args_.peerReorderSpans = Address(peer_reorder_spans_);
     args_.sendChunks = Address(send_chunks_);
     args_.recvChunks = Address(recv_chunks_);
     args_.packRounds = Address(pack_rounds_);
@@ -206,8 +212,8 @@ void UrmaPlan::bind_reduce_dependencies(torch::Tensor reduce_index)
                     reduce_index.sizes() == torch::IntArrayRef({config.bs, config.topk}),
                 "reduce_index must be int64 [BS,topk]");
     // One NPU gather per route preparation avoids a second per-route GM lookup
-    // in the Reduce loop. Values are opaque int64 bit patterns: the high bit
-    // distinguishes direct-self GMM2 completion from remote producer/CV flags.
+    // in the Reduce loop. Both self and remote routes now address producer/CV
+    // flags; self is published only after the communication owner scatters it.
     reduce_dependencies_ =
         expanded_reduce_dependencies_.index_select(0, reduce_index.reshape({-1})).reshape({config.bs, config.topk});
     bound_reduce_index_ = reduce_index;
@@ -295,6 +301,20 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     CheckTensor(output, 2, "out", device);
     TORCH_CHECK(output.scalar_type() == torch::kBFloat16 && output.sizes() == x.sizes(), "out must be BF16 [BS,H]");
     auto stream = c10_npu::getCurrentNPUStream();
+    // The previous invocation has joined its reducers and all final QP quiets.
+    // New remote writes cannot arrive before PublishStart in the kernel below.
+    // Reset per-CV/finished slots so SO add(epoch) remains correct when a CV
+    // was absent in older routes or callers skipped epoch values. Start slots
+    // themselves stay monotonic and are never cleared here.
+    const uint64_t cv_flag_bytes = static_cast<uint64_t>(c.world) * c.maxPeerChunks * MegaMoeUrma::kFlagBytes;
+    for (uint64_t offset : {c.dispatchReadyOffset, c.combineReadyOffset}) {
+        ASCEND_DEEPEP_CHECK_ACL(aclrtMemsetAsync(reinterpret_cast<void*>(args_.symmetric + offset), cv_flag_bytes, 0,
+                                                 cv_flag_bytes, stream.stream()));
+    }
+    const uint64_t finished_bytes = static_cast<uint64_t>(c.world) * MegaMoeUrma::kFlagBytes;
+    ASCEND_DEEPEP_CHECK_ACL(
+        aclrtMemsetAsync(reinterpret_cast<void*>(args_.symmetric + c.barrierOffset + finished_bytes), finished_bytes, 0,
+                         finished_bytes, stream.stream()));
     for (auto* tensor : {&gmm1_done_, &input_scale_done_, &activation_done_, &gmm2_done_, &gmm2_matmul_done_,
                          &local_flags_, &pack_ready_}) {
         ASCEND_DEEPEP_CHECK_ACL(
@@ -348,6 +368,8 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
                                &compute_batches_,
                                &compute_tasks_,
                                &chunk_group_indices_,
+                               &peer_reorder_ranges_,
+                               &peer_reorder_spans_,
                                &expanded_reduce_dependencies_,
                                &reduce_dependencies_,
                                &bound_reduce_index_,
@@ -427,6 +449,8 @@ int64_t UrmaPlan::workspace_bytes() const
                                &compute_batches_,
                                &compute_tasks_,
                                &chunk_group_indices_,
+                               &peer_reorder_ranges_,
+                               &peer_reorder_spans_,
                                &expanded_reduce_dependencies_,
                                &reduce_dependencies_,
                                &send_chunks_,

@@ -1,5 +1,8 @@
 # GMM2 连续写出与辅助核重排实验
 
+> 当前 `megamoe-urma-unitflag-so` 分支的执行协议已更新，请以
+> [单 QP 与 SO 通知说明](URMA_UNITFLAG_SO.md) 为准。下文保留基线方案2的实验记录。
+
 分支：`megamoe-urma-gmm2-unitflag-reorder`，基于 `megamoe-urma` 的 `10d6a04`。
 
 本实验保留 M256 group / GMM2 256×256 tile、现有专家顺序和全局 tile 分核。

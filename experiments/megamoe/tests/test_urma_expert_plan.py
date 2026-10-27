@@ -232,9 +232,6 @@ def check_plans(ids, cv_rows, routes, plans):
                     if source == rank:
                         assert return_row - self_send == receive_row - self_recv
                 assert mapping == expert_rows[cursor : cursor + group_rows]
-                for source, _, return_row in expert_rows[cursor : cursor + group_rows]:
-                    if source == rank:
-                        expected_reduce_dependencies[return_row] = (1 << 63) | group_index
                 cursor += group_rows
             assert cursor == len(expert_rows)
             expected_compact_rows.extend(expert_rows)
@@ -245,10 +242,9 @@ def check_plans(ids, cv_rows, routes, plans):
         expected_receive = []
         for peer in range(world):
             for offset in range(0, int(counts[rank, peer]), cv_rows):
-                if peer != rank:
-                    lo = int(routes[rank].peer_offsets[peer]) + offset
-                    hi = lo + min(cv_rows, int(counts[rank, peer]) - offset)
-                    expected_reduce_dependencies[lo:hi] = peer * max_chunks + offset // cv_rows
+                lo = int(routes[rank].peer_offsets[peer]) + offset
+                hi = lo + min(cv_rows, int(counts[rank, peer]) - offset)
+                expected_reduce_dependencies[lo:hi] = peer * max_chunks + offset // cv_rows
                 expected_send.append(
                     [
                         peer,
@@ -295,10 +291,9 @@ def check_plans(ids, cv_rows, routes, plans):
         # each token/top-k entry receives the dependency for its original row.
         token_dependencies = actual_reduce_dependencies[routes[rank].reduce_index]
         destinations = ids[rank] // local_experts
-        self_entries = (token_dependencies & np.uint64(1 << 63)) != 0
-        np.testing.assert_array_equal(self_entries, destinations == rank)
-        np.testing.assert_array_equal(token_dependencies[~self_entries] // max_chunks, destinations[~self_entries])
-        assert np.all((token_dependencies[self_entries] & np.uint64((1 << 63) - 1)) < groups)
+        # Self rows now depend on full-width local CV scatter, not GMM2 scratch.
+        assert not np.any(token_dependencies & np.uint64(1 << 63))
+        np.testing.assert_array_equal(token_dependencies // max_chunks, destinations)
         # The transport workload is unchanged, regardless of compute grouping.
         assert sum(c[4] for c in plan["T"] if c[0] != rank) == counts[rank].sum() - self_rows
         assert sum(c[4] for c in plan["R"] if c[0] != rank) == counts[:, rank].sum() - self_rows

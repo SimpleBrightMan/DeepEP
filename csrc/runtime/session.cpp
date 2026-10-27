@@ -69,7 +69,8 @@ bool Session::busy()
 Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
                  bool megamoe, bool mpi, bool combine_only, bool use_1g_huge_pages, bool megamoe_urma)
 {
-    if (megamoe_urma && (!megamoe || !udma || (size != 4 && size != 8 && size != 16) || mpi || combine_only || use_1g_huge_pages))
+    if (megamoe_urma &&
+        (!megamoe || !udma || (size != 4 && size != 8 && size != 16) || mpi || combine_only || use_1g_huge_pages))
         throw std::invalid_argument("MegaMoE URMA requires its dedicated EP4/EP8/EP16 runtime");
     if (combine_only && (!udma || megamoe)) throw std::invalid_argument("Combine-only requires UDMA");
     if (use_1g_huge_pages && (!udma || megamoe))
@@ -140,10 +141,10 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     try {
         if (megamoe_urma) {
             // Each of the world-1 communication workers owns one remote PE.
-            // Each owner uses QP0 for Dispatch and QP1 for Combine, allowing
-            // early Combine PUTs to remain pending through Dispatch quiet.
+            // RO payload writes and SO completion atomics share QP0. Dispatch
+            // submissions finish before Combine; no second QP is required.
             // Disable shared Clos SQs so different peer owners stay isolated.
-            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 2U), "aclshmemx_set_qp_num(MegaMoE URMA)");
+            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 1U), "aclshmemx_set_qp_num(MegaMoE URMA)");
             attr.runtime_config.udma_shared_jetty = ACLSHMEM_CONFIG_DISABLED;
             if (set_masks) {
                 check(set_masks(nullptr, 0U), "aclshmemx_set_udma_peer_qp_masks(clear, MegaMoE URMA)");

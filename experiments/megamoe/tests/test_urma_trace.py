@@ -71,7 +71,7 @@ def test_every_event_id_has_a_name_and_no_fabricated_async_events():
             continue
         add_record(raw, engine=event_id, event=name)
     result = decode_trace(raw, rank=0, clock_mhz=1000)
-    assert len(events(result)) == sum(name is not None for name in EVENTS) == 35
+    assert len(events(result)) == sum(name is not None for name in EVENTS) == 36
     assert {row["ph"] for row in result["traceEvents"]} == {"M", "X"}
     assert {row["args"]["event_id"] for row in events(result)} == {
         index for index, name in enumerate(EVENTS) if name is not None
@@ -104,6 +104,20 @@ def test_reorder_events_do_not_reuse_json_gmm_envelope_ids():
     ids = {event["args"]["event_id"] for event in events(decoded)}
     assert ids == {34, 40, 41}
     assert {event["args"]["event_id"] for event in events(filter_trace_waits(decoded))} == {34, 40}
+
+
+def test_outbound_completion_keeps_its_peer_and_remains_visible_when_waits_are_hidden():
+    from deep_ep_experimental.megamoe.urma_trace import filter_trace_waits
+
+    raw = trace_buffer(3)
+    add_record(raw, event="CombinePut", start=1000, end=1010, peer=7, cv=1, bytes=4096)
+    add_record(raw, event="CombineSendComplete", start=1020, end=2010, peer=7)
+    rows = events(filter_trace_waits(decode_trace(raw, rank=0, clock_mhz=1000)))
+    assert rows[0]["dur"] == 0.01
+    assert rows[1]["args"]["event_id"] == 42
+    assert rows[1]["args"]["peer"] == 7 and rows[1]["args"]["cv"] is None
+    assert rows[1]["args"]["end_tick"] == "2010" and rows[1]["args"]["bytes"] == 0
+    assert rows[1]["cat"] == "transport.quiet" and "outbound-peer" in rows[1]["args"]["meaning"]
 
 
 @pytest.mark.parametrize("reserved", range(33, 40))

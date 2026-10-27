@@ -57,6 +57,7 @@ EVENTS = (
     None,
     "Gmm2Reorder",
     "WaitGmm2Reorder",
+    "CombineSendComplete",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
 SYNC_STAGES = {0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
@@ -89,6 +90,13 @@ def event_style(event):
             "transport.quiet",
             "thread_state_iowait",
             "wait for prior peer PUT completion",
+        )
+    if event == "CombineSendComplete":
+        return (
+            event + " [outbound completion]",
+            "transport.quiet",
+            "thread_state_iowait",
+            "final outbound-peer quiet; end confirms all submitted Combine PUTs to this peer completed",
         )
     if event.endswith("Drain"):
         return event + " [drain]", "compute.drain", "thread_state_iowait", "explicit pipeline drain scope"

@@ -130,8 +130,8 @@ int aclrtFreePhysical(aclrtDrvMemHandle handle)
 void check_runtime_config(const aclshmemx_init_attr_t* attr)
 {
     const bool udma = (attr->option_attr.data_op_engine_type & ACLSHMEM_DATA_OP_UDMA) != 0;
-    const auto expected = udma ? (expected_shared_jetty ? ACLSHMEM_CONFIG_ENABLED : ACLSHMEM_CONFIG_DISABLED)
-                               : ACLSHMEM_CONFIG_DEFAULT;
+    const auto expected =
+        udma ? (expected_shared_jetty ? ACLSHMEM_CONFIG_ENABLED : ACLSHMEM_CONFIG_DISABLED) : ACLSHMEM_CONFIG_DEFAULT;
     assert(attr->runtime_config.udma_shared_jetty == expected && initialized == 0);
     for (auto value : attr->runtime_config.reserved) assert(value == 0);
 }
@@ -229,7 +229,7 @@ int main(int argc, char** argv)
         fault = mode.substr(13);
         setenv("DEEPEP_SHMEM_DENSE_QPS", "0", 1);
         expected_world = fault == "ep4" ? 4 : fault == "ep8" ? 8 : 16;
-        expected_qp_count = 2;
+        expected_qp_count = 1;
         expected_shared_jetty = false;
         if (fault == "large") expected_bytes = 4ULL << 30;
         auto create_urma = [&]() {
@@ -241,7 +241,7 @@ int main(int argc, char** argv)
             assert(session.megamoe_urma() && session.udma() && !session.peer_table() && !session.sparse_qp_enabled());
             assert(session.workspace_address() == reinterpret_cast<uintptr_t>(&storage));
             assert(session.megamoe_urma_topology_error().empty());
-            assert(qp_count == 2 && allocations == 1 && memsets == 1 && barriers == 0);
+            assert(qp_count == 1 && allocations == 1 && memsets == 1 && barriers == 0);
             session.close();
             assert(frees == 1 && finalized == 1 && !deepep::Session::busy());
         } else if (fault.rfind("topology-", 0) == 0) {

@@ -52,6 +52,8 @@ EVENTS = {
     "WaitGmm1": (22, "wait.sync"),
     "LocalSync": (26, "wait.sync"),
     "Gmm1Drain": (27, "compute.drain"),
+    "Reduce": (25, "compute.copy"),
+    "CombineSendComplete": (42, "transport.quiet"),
 }
 
 
@@ -266,6 +268,61 @@ def test_report_does_not_mutate_source_or_convert_submit_time_to_bandwidth(trace
     assert "DispatchPutX" in result and "CombinePut" in result
     # peer, X count/bytes, scale count/bytes, return count/bytes, D/C quiet time.
     assert section_rows(result, "PEER") == [["7", "1", "4096", "1", "128", "1", "8192", "30.000", "50.000"]]
+
+
+def test_outbound_completion_spans_use_final_quiet_and_ignore_reduce_lane(trace_text):
+    doc = document(
+        event("DispatchPutX", 10, 1, peer=7, byte_count=4096),
+        event("DispatchPutScale", 11, 1, peer=7, byte_count=128),
+        event("CombinePut", 40, 1, peer=7, byte_count=8192),
+        event("CombinePut", 60, 1, peer=7, byte_count=8192),
+        event("CombineSendComplete", 61, 39, peer=7),
+        event("Reduce", 50, 400, tid=1),
+    )
+    result = trace_text.render_report(doc)
+    assert "Combine status=outbound_complete first_us=40.000 completion_us=100.000 span_us=60.000" in result
+    assert "Communication status=outbound_complete first_us=10.000 completion_us=100.000 span_us=90.000" in result
+    assert "[COMPLETION]" in result and "intervening compute/readiness waits" in result
+    assert section_rows(result, "PEER") == [["7", "1", "4096", "1", "128", "2", "16384", "0.000", "39.000"]]
+
+
+def test_completion_requires_each_outbound_peer_and_respects_selected_engines(trace_text):
+    doc = document(
+        event("DispatchPutX", 0, 1, peer=1),
+        event("CombinePut", 10, 1, peer=1),
+        event("CombineSendComplete", 11, 9, peer=1),
+        event("DispatchPutX", 1, 1, peer=2, tid=5),
+        event("CombinePut", 12, 1, peer=2, tid=5),
+        event("WaitDispatch", 13, 100, peer=2, tid=5),
+    )
+    report = trace_text.render_report(doc)
+    assert "Combine status=not_recorded first_us=10.000 completion_us=NA span_us=NA missing=01/AIV1:p2" in report
+    assert "Communication status=not_recorded first_us=0.000 completion_us=NA span_us=NA" in report
+    selected = trace_text.render_report(doc, cores={0})
+    assert "Communication status=outbound_complete first_us=0.000 completion_us=20.000 span_us=20.000" in selected
+
+
+@pytest.mark.parametrize("completion_peer,completion_tid,completion_ts", [(2, 2, 11), (1, 5, 11), (1, 2, 9)])
+def test_wrong_peer_lane_or_early_marker_never_confirms_send_completion(
+    trace_text, completion_peer, completion_tid, completion_ts
+):
+    doc = document(
+        event("CombinePut", 10, 1, peer=1),
+        event("CombineSendComplete", completion_ts, 10, peer=completion_peer, tid=completion_tid),
+    )
+    assert "Combine status=not_recorded" in trace_text.render_report(doc)
+
+
+def test_unaccounted_lost_records_suppress_even_a_present_completion_marker(trace_text):
+    doc = document(event("CombinePut", 10, 1, peer=1), event("CombineSendComplete", 11, 10, peer=1))
+    doc["metadata"]["record_count"] += 1
+    report = trace_text.render_report(doc)
+    assert "Combine status=source_incomplete first_us=10.000 completion_us=NA span_us=NA" in report
+
+
+def test_tick_order_avoids_float_rounding_between_submit_and_quiet(trace_text):
+    doc = document(event("CombinePut", 0.1, 0.2, peer=1), event("CombineSendComplete", 0.3, 0.2, peer=1))
+    assert "Combine status=outbound_complete" in trace_text.render_report(doc)
 
 
 def test_longest_sync_quiet_and_drain_are_ranked_separately(trace_text):

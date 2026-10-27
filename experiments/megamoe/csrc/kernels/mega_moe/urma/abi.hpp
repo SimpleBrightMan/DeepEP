@@ -78,7 +78,8 @@ enum class TraceEvent : uint32_t {
     ReduceDrain,      // Reserved: the Reduce envelope now includes its drain.
     // IDs 33..39 are reserved for historical JSON-only GMM envelopes.
     Gmm2Reorder = 40U,
-    WaitGmm2Reorder
+    WaitGmm2Reorder,
+    CombineSendComplete
 };
 
 struct TraceMeta {
@@ -117,6 +118,18 @@ struct RowSegment {
     uint32_t rows;
     uint32_t inputReadyIndex;
     uint32_t reserved;
+};
+
+// Full-width row copies owned by the communication core for this peer/CV.
+struct PeerReorderSpan {
+    uint64_t sourceRow;
+    uint64_t destinationRow;
+    uint32_t fragmentIndex;
+    uint32_t rows;
+};
+struct PeerReorderRange {
+    uint32_t spanBegin;
+    uint32_t spanCount;
 };
 
 // One batch per local expert, including an empty range for an empty expert.
@@ -219,6 +232,8 @@ struct Arguments {
     uint64_t computeBatches;
     uint64_t computeTasks;
     uint64_t chunkGroupIndices;
+    uint64_t peerReorderRanges;
+    uint64_t peerReorderSpans;
     uint64_t sendChunks;
     uint64_t recvChunks;
     uint64_t packRounds;
@@ -226,8 +241,8 @@ struct Arguments {
     uint64_t gmm1Done;
     uint64_t inputScaleDone;
     uint64_t activationDone;
-    uint64_t gmm2Done;
-    uint64_t gmm2MatmulDone;  // Per logical GMM2 tile; reorder consumes these flags.
+    uint64_t gmm2Done;        // Completed N tiles per M-group, BEFORE peer row reorder.
+    uint64_t gmm2MatmulDone;  // Per logical GMM2 tile, retained for diagnostics.
     uint64_t localFlags;
     uint64_t timer;
     uint64_t trace;
@@ -237,6 +252,8 @@ struct Arguments {
 };
 static_assert(sizeof(Fragment) == 40);
 static_assert(sizeof(RowSegment) == 40);
+static_assert(sizeof(PeerReorderSpan) == 24);
+static_assert(sizeof(PeerReorderRange) == 8);
 static_assert(sizeof(ComputeBatch) == 8);
 static_assert(sizeof(ComputeBatchTask) == 8);
 static_assert(sizeof(Chunk) == 40);

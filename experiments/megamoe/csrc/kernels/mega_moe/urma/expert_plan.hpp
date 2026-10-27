@@ -118,7 +118,7 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
                                        receiveBase[peer][config.rank] + begin,
                                        static_cast<uint32_t>(std::min<uint64_t>(config.cvRows, outgoing - begin)), 0, 0,
                                        0});
-            if (peer != config.rank) {
+            {
                 const uint64_t end = sendBase[config.rank][peer] + std::min<uint64_t>(begin + config.cvRows, outgoing);
                 const uint64_t ready = static_cast<uint64_t>(peer) * config.maxPeerChunks + cv;
                 std::fill(plan.reduceDependencies.begin() + sendBase[config.rank][peer] + begin,
@@ -169,15 +169,6 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
                     plan.segments.push_back({source, cv, receiveBase[config.rank][source] + peerRow,
                                              sendBase[source][config.rank] + peerRow, static_cast<uint32_t>(lo - begin),
                                              count, ready, 0});
-                    if (source == config.rank) {
-                        const uint64_t first = sendBase[source][config.rank] + peerRow;
-                        for (uint64_t row = first; row < first + count; ++row) {
-                            if (plan.reduceDependencies[row] != kUnassignedDependency) {
-                                throw std::logic_error("URMA self Reduce dependency assigned more than once");
-                            }
-                            plan.reduceDependencies[row] = kReduceSelfDependency | groupIndex;
-                        }
-                    }
                     const uint32_t chunkIndex = readyToChunk[ready];
                     if (chunkIndex == kNoChunk) {
                         throw std::logic_error("URMA compute segment has no transport chunk");

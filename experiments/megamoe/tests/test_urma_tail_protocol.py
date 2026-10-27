@@ -674,7 +674,13 @@ template<typename T> void DataCopy(GlobalTensor<T> target, LocalTensor<T> source
         r"""
 #pragma once
 inline void aclshmemi_kernel_abort(const char*, ...) {}
-template<typename T, int> void aclshmemx_udma_qp_put_nbi(T*, T*, void*, uint32_t, uint32_t, uint32_t, uint32_t) {}
+struct aclshmemx_udma_op_config_t { uint32_t odr; };
+inline constexpr aclshmemx_udma_op_config_t ACLSHMEMX_UDMA_OP_CONFIG_RO{5};
+inline constexpr aclshmemx_udma_op_config_t ACLSHMEMX_UDMA_OP_CONFIG_SO{6};
+template<typename T, int, const aclshmemx_udma_op_config_t&>
+void aclshmemx_udma_qp_put_nbi(T*, T*, void*, uint32_t, uint32_t, uint32_t, uint32_t) {}
+template<typename T, const aclshmemx_udma_op_config_t&>
+void aclshmemx_udma_atomic_add(T*, T, int32_t) { throw std::runtime_error("unexpected tail publication"); }
 inline void aclshmemx_udma_qp_quiet(uint32_t, uint32_t) {}
 inline void* aclshmem_ptr(void* address, unsigned) { return address; }
 """
@@ -728,7 +734,7 @@ int main(int argc, char** argv) {
         MarkCubeComplete(args);
         assert(*aic == 28 && !ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
         assert(*incoming == 1); // AIC scratch ready is not self return ready.
-        for (unsigned i = 1; i < kAic; ++i) MarkReorderComplete(args);
+        for (unsigned i = 1; i < CommunicationWorkers(world); ++i) MarkReorderComplete(args);
         assert(!ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
         assert(*incoming == 1);
         MarkReorderComplete(args);
@@ -738,15 +744,15 @@ int main(int argc, char** argv) {
         assert(ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
         assert(polls == peerReads && selfPolls == selfReads && *incoming == 2);
 
-        // Reset happens before a new invocation's Start. Old finished epochs
-        // remain in symmetric slots and must not contribute after this reset.
+        // Even before the receiver clear, an old finished epoch must not
+        // contribute to this invocation's local completion counters.
         args.config.epoch = 9;
         std::fill(local.begin(), local.end(), 0);
         std::array<bool, kWorld - 1> peerSeen{}, selfSeen{};
         assert(!ObserveIncomingCompletion(args, 0, peerSeen[0], selfSeen[0]));
         assert(*incoming == 0);
         for (unsigned i = 0; i < 28; ++i) MarkCubeComplete(args);
-        for (unsigned i = 0; i < kAic; ++i) MarkReorderComplete(args);
+        for (unsigned i = 0; i < CommunicationWorkers(world); ++i) MarkReorderComplete(args);
         for (unsigned owner = 0; owner < world - 1; ++owner) {
             *flag(owner) = 9;
             assert(ObserveIncomingCompletion(args, owner, peerSeen[owner], selfSeen[owner]));
@@ -757,57 +763,32 @@ int main(int argc, char** argv) {
             assert(ObserveIncomingCompletion(args, owner, peerSeen[owner], selfSeen[owner]));
         assert(*incoming == world && polls == noMorePeerReads && selfPolls == noMoreSelfReads);
 
-        // Empty edges still publish first, even while the incoming peer and
-        // self completion are delayed. Polling cannot begin before publication.
+        // The caller has published SO finished and completed final quiet.
+        // This helper only observes delayed inbound and self completions.
         args.config.epoch = 11;
         std::fill(local.begin(), local.end(), 0);
         peerCounted = selfCounted = false;
         publications = polls = selfPolls = backoffs = 0;
         readPeer = [&](uint64_t* address) {
-            assert(publications == 1 && address == flag(0));
+            assert(publications == 0 && address == flag(0));
             return polls == 1 ? 10ULL : 11ULL;
         };
         readSelf = [&](int32_t* address) {
-            assert(publications == 1 && (address == aic || address == reorder));
-            if (address == reorder) return static_cast<int32_t>(kAic);
+            assert(publications == 0 && (address == aic || address == reorder));
+            if (address == reorder) return static_cast<int32_t>(CommunicationWorkers(world));
             return selfPolls < 3 ? 27 : 28;
         };
-        LocalTensor<uint64_t> signal;
-        struct ReadyReorder {
-            bool DrainReady() { assert(AscendC::publications == 1); return false; }
-            bool Done() const { return true; }
-        } readyReorder;
-        FinishCombinePeer(args, 0, signal, peerCounted, selfCounted, readyReorder);
-        assert(publications == 1 && polls == 2 && selfPolls == 4 && backoffs > 0);
+        FinishCombinePeer(args, 0, peerCounted, selfCounted);
+        assert(publications == 0 && polls == 2 && selfPolls == 4 && backoffs > 0);
         assert(*incoming == 2 && peerCounted && selfCounted);
-        auto* published = reinterpret_cast<uint64_t*>(args.symmetric +
-            PeerPhaseSlot(args, 1, args.config.rank));
-        assert(published[0] == 11 && published[1] == 0 && published[2] == 0 && published[3] == 0);
 
-        // Early observation before quiet does not suppress the eventual
-        // outbound finished publication, and already-counted flags are skipped.
+        // Already-counted flags are skipped; the completion-only tail never
+        // republishes or re-enters communication after the final quiet.
         publications = polls = selfPolls = 0;
         readPeer = [](uint64_t*) -> uint64_t { assert(false); return 0; };
         readSelf = [](int32_t*) -> int32_t { assert(false); return 0; };
-        FinishCombinePeer(args, 0, signal, peerCounted, selfCounted, readyReorder);
-        assert(publications == 1 && polls == 0 && selfPolls == 0 && *incoming == 2);
-
-        // Publishing this peer's finished edge must not wait for unrelated
-        // reorder work. Conversely, incoming completion must not allow this
-        // owner to stop progressing its own remaining tiles (also empty edges).
-        struct DelayedReorder {
-            unsigned attempts = 0;
-            bool DrainReady() {
-                assert(AscendC::publications == 1);
-                ++attempts;
-                return attempts == 3;
-            }
-            bool Done() const { return attempts == 3; }
-        } delayedReorder;
-        publications = polls = selfPolls = backoffs = 0;
-        FinishCombinePeer(args, 0, signal, peerCounted, selfCounted, delayedReorder);
-        assert(publications == 1 && delayedReorder.attempts == 3);
-        assert(polls == 0 && selfPolls == 0 && backoffs > 0);
+        FinishCombinePeer(args, 0, peerCounted, selfCounted);
+        assert(publications == 0 && polls == 0 && selfPolls == 0 && *incoming == 2);
         return 0;
     }
     if (std::string(argv[1]) == "flags") {
@@ -925,7 +906,7 @@ def test_actual_start_and_payload_wait_predicates(reduce_workers_binary):
 
 
 @pytest.mark.parametrize("world", [4, 8, 16])
-def test_actual_finished_helpers_count_once_publish_first_and_require_28_aic(reduce_workers_binary, world):
+def test_actual_finished_helpers_count_once_require_aic_and_self_copy_cohort(reduce_workers_binary, world):
     result = subprocess.run(
         [str(reduce_workers_binary), "completion", str(world)], capture_output=True, text=True, timeout=30
     )
@@ -935,23 +916,16 @@ def test_actual_finished_helpers_count_once_publish_first_and_require_28_aic(red
 def test_finished_observation_and_aic_publication_integration():
     root = Path(__file__).resolve().parents[3]
     source = (root / "experiments/megamoe/csrc/kernels/mega_moe/urma/kernel.hpp").read_text()
-    retire = source[
-        source.index("__aicore__ inline void RetireCombineBatch") : source.index(
-            "__aicore__ inline void CommunicatePeer"
-        )
-    ]
-    assert (
-        retire.index("ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);")
-        < retire.index("Quiet(peer, kCombineQp);")
-        < retire.index("PublishDone(symmetric,")
-    )
-    combine = source[source.index("while (remaining != 0U)") : source.index("__aicore__ inline void Process")]
+    combine = source[source.index("while (!sentComplete || !selfComplete)") : source.index("__aicore__ inline void Process")]
     assert (
         combine.index("Put(symmetric,")
-        < combine.index("if (remaining == 0U) {")
-        < combine.index("timer.End(Phase::Combine, combineBytes)")
-        < combine.index("FinishCombinePeer(args, owner, signal, peerCounted, selfCounted, reorder);")
+        < combine.index("PublishOrdered(symmetric, args.config.combineReadyOffset")
+        < combine.index("PublishOrdered(symmetric, PeerPhaseSlot(args, 1U")
+        < combine.index("Quiet(peer);")
+        < combine.index("timer.MarkSendComplete(Phase::Combine)")
+        < combine.index("FinishCombinePeer(args, owner, peerCounted, selfCounted);")
     )
+    assert combine.count("Quiet(peer);") == 1
     process = source[source.index("__aicore__ inline void Process") :]
     assert process.index("RunCubeAndPrologue(args, block, timer);") < process.index("MarkCubeComplete(args);")
     assert process.count("MarkCubeComplete(args);") == 1

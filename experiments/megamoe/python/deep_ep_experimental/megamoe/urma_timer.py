@@ -1,4 +1,4 @@
-"""Decode URMA schema 1; aggregate same-rank elapsed envelopes, never core averages."""
+"""Decode URMA schema 1; separate PUT submission from outbound completion."""
 
 import math
 import statistics
@@ -8,6 +8,8 @@ from .urma_routing import remote_peer_for_worker
 PHASES = ("Pack", "Dispatch", "Gmm1", "Activation", "Gmm2", "Combine", "Barrier", "Reduce")
 TIMER_NUMEL = 28 * 3 * 8 * 16
 TIMER_SCHEMA = 1
+LEGACY_COMPLETED_SCOPE = 0
+SUBMISSION_ONLY = 1
 
 
 def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000.0):
@@ -15,6 +17,9 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
 
     1000 ticks/us follows the existing MegaMoE timer protocol. It is an explicit
     assumption, not a device-frequency measurement. Pass None for raw ticks.
+    Record word 5 distinguishes legacy completed scopes (0) from PUT-only
+    scopes (1); word 7 is an optional confirmed outbound completion tick.
+    Missing completion never turns a submission rate into bandwidth.
     Older records may include self-copy in INTRA. Detect it from recorded
     payload; direct self Pack/GMM2 writes are not communication payload.
     """
@@ -35,6 +40,11 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
         raise ValueError("URMA timer schema is missing or incompatible")
     if np.any(values[..., 1][active] < values[..., 0][active]):
         raise ValueError("URMA timer end precedes start")
+    if np.any(~np.isin(values[..., 5][active], (LEGACY_COMPLETED_SCOPE, SUBMISSION_ONLY))):
+        raise ValueError("URMA timer has unknown timing semantics")
+    completed_submissions = active & (values[..., 5] == SUBMISSION_ONLY) & (values[..., 7] != 0)
+    if np.any(values[..., 7][completed_submissions] < values[..., 1][completed_submissions]):
+        raise ValueError("URMA timer completion precedes the last submission")
     result = dict(
         rank=rank,
         world=world,
@@ -43,7 +53,7 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
         clock_mhz=clock_mhz,
         clock_source="caller supplied; default 1000 follows legacy MegaMoE protocol",
         metric="single_direction_aggregate_effective_payload_gbps",
-        denominator="same-rank class max(last_tick) - min(first_tick)",
+        denominator="same-rank class max(outbound completion tick) - min(first PUT tick); null without completion",
         includes_self_copy_in_intra=False,
         classes=[],
     )
@@ -64,12 +74,28 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
             result["includes_self_copy_in_intra"] |= includes_self_copy
             if selected:
                 first = min(int(record[0]) for _, _, record in selected)
-                last = max(int(record[1]) for _, _, record in selected)
-                span = last - first
-                if span <= 0:
+                recorded_last = max(int(record[1]) for _, _, record in selected)
+                submission_only = all(int(record[5]) == SUBMISSION_ONLY for _, _, record in selected)
+                completion_ticks = [
+                    int(record[7] if record[5] == SUBMISSION_ONLY else record[1]) for _, _, record in selected
+                ]
+                complete = all(tick != 0 for tick in completion_ticks)
+                last = max(completion_ticks) if complete else None
+                span = last - first if complete else None
+                if span is not None and span <= 0:
                     raise ValueError("nonempty payload requires a positive timer span")
+                completion_status = (
+                    "outbound_complete"
+                    if complete and submission_only
+                    else "legacy_completed_scope"
+                    if complete
+                    else "not_recorded"
+                )
             else:
                 first = last = span = 0
+                recorded_last = 0
+                submission_only = False
+                completion_status = "empty"
             result["classes"].append(
                 dict(
                     phase=phase,
@@ -78,8 +104,16 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
                     first_tick=first,
                     last_tick=last,
                     envelope_ticks=span,
-                    envelope_us=span / clock_mhz if clock_mhz is not None else None,
+                    envelope_us=span / clock_mhz if span is not None and clock_mhz is not None else None,
                     bandwidth_gbps=payload * clock_mhz / (span * 1000) if span and clock_mhz is not None else None,
+                    completion_status=completion_status,
+                    missing_completion_peers=[
+                        peer for _, peer, record in selected if record[5] == SUBMISSION_ONLY and record[7] == 0
+                    ],
+                    submission_first_tick=first if submission_only else None,
+                    submission_last_tick=recorded_last if submission_only else None,
+                    submission_envelope_ticks=recorded_last - first if submission_only else None,
+                    submission_sum_ticks=sum(int(record[2]) for _, _, record in selected) if submission_only else None,
                     workers=[owner for owner, _, _ in selected],
                     peers=[peer for _, peer, _ in selected],
                     includes_self_copy=includes_self_copy,
@@ -113,6 +147,12 @@ def summarize_bandwidth(records):
                     rank_min_gbps=min(rates) if rates else None,
                     rank_max_gbps=max(rates) if rates else None,
                     nonempty_ranks=len(rates),
+                    payload_ranks=sum(row["payload_bytes"] > 0 for row in rows),
+                    missing_completion_ranks=[
+                        record["rank"]
+                        for record, row in zip(records, rows)
+                        if row.get("completion_status") == "not_recorded"
+                    ],
                     bytes_per_rank=[row["payload_bytes"] for row in rows],
                     includes_self_copy=any(row.get("includes_self_copy", False) for row in rows),
                 )

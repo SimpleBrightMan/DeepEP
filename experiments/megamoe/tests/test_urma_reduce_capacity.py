@@ -95,8 +95,8 @@ int main(int argc, char** argv) {
     assert(receiver.config.receiveRows == globalRoutes);
     assert(receiver.config.fragmentCount == expectedGroups);
     const uint64_t lastSelf = receiver.reduceDependencies.back();
-    assert((lastSelf & kReduceSelfDependency) != 0U);
-    assert((lastSelf & ~kReduceSelfDependency) == expectedGroups - 1U);
+    assert((lastSelf & kReduceSelfDependency) == 0U);
+    assert(lastSelf == uint64_t(kWorld) * config.maxPeerChunks - 1U);
     if (bs == 8192U && fragmented) assert(expectedGroups == 4119U);
 
     // Rank 0 has no incoming compute rows, but its final returned row depends

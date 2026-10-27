@@ -89,7 +89,7 @@ public:
         if (count_[phase] == 0U) first_[phase] = start_[phase];
     }
 
-    __aicore__ inline void End(Phase phase, uint64_t bytes = 0U)
+    __aicore__ inline void End(Phase phase, uint64_t bytes = 0U, bool submissionOnly = false)
     {
         if (address_ == 0U) return;
         const uint64_t end = AscendC::GetSystemCycle();
@@ -103,12 +103,21 @@ public:
         record[2] = total_[phase];
         record[3] = bytes_[phase];
         record[4] = count_[phase];
-        record[5] = 0;
+        record[5] = submissionOnly ? 1U : 0U;
         record[6] = kProtocol;
         AscendC::GlobalTensor<uint64_t> tensor;
         tensor.SetGlobalBuffer(record);
         AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                           AscendC::DcciDst::CACHELINE_OUT>(tensor);
+    }
+
+    __aicore__ inline void MarkSendComplete(Phase phase)
+    {
+        if (address_ == 0U) return;
+        auto* record = reinterpret_cast<__gm__ uint64_t*>(address_) +
+                       (static_cast<uint64_t>(core_) * kTimerPhases + phase) * kTimerRecordElements;
+        record[7] = AscendC::GetSystemCycle();
+        FlushTraceLine(record);
     }
 
 private:

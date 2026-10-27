@@ -14,12 +14,10 @@ constexpr uint32_t kWorldSize = 16U;
 constexpr uint32_t kSignalSlotBytes = 128U;
 constexpr uint32_t kSignalCopyBytes = 32U;
 constexpr uint32_t kMaxPutBytes = 256U * 1024U * 1024U;
-constexpr uint32_t kDispatchQp = 0U;
-constexpr uint32_t kCombineQp = 1U;
+constexpr uint32_t kCommunicationQp = 0U;
 
-// The dedicated Session creates independent Dispatch/Combine QPs for every
-// peer and disables shared jetty. Exactly one AIV1 worker owns both QPs of each
-// remote peer. Other workers must not submit or quiet either peer queue.
+// One AIV1 owns QP0 for each remote peer. Dispatch submissions precede Combine.
+// The SO atomic API uses QP0; all payloads must use that same ordered queue.
 __aicore__ inline uint32_t PeerForOwner(uint32_t rank, uint32_t owner)
 {
     return owner < rank ? owner : owner + 1U;
@@ -30,25 +28,35 @@ __aicore__ inline uint32_t PeerForOwner(uint32_t rank, uint32_t owner)
 // The caller completes local GM producers before submitting and retains src
 // unchanged until Quiet(peer, qp) returns. This transport deliberately has no GET.
 __aicore__ inline void Put(__gm__ uint8_t* symmetricBase, uint64_t dstOffset, __gm__ uint8_t* src, uint32_t bytes,
-                           uint32_t peer, uint32_t qp = kDispatchQp)
+                           uint32_t peer)
 {
     if (bytes == 0U) return;
     if (bytes > kMaxPutBytes) {
         aclshmemi_kernel_abort("MegaMoE URMA PUT exceeds 256 MiB: bytes=%u peer=%u\n", bytes, peer);
         return;
     }
-    aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_S>(symmetricBase + dstOffset, src, nullptr, bytes, peer, qp, 0U);
+    aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_S, ACLSHMEMX_UDMA_OP_CONFIG_RO>(symmetricBase + dstOffset, src, nullptr,
+                                                                            bytes, peer, kCommunicationQp, 0U);
 }
 
-// Blocking completion of only this peer/QP, not merely WQE publication. A
-// Dispatch quiet must leave speculative Combine work pending on its own QP.
-// The one-owner rule also applies here: no second worker may poll the same CQ.
-__aicore__ inline void Quiet(uint32_t peer, uint32_t qp = kDispatchQp)
+// The receiver resets this invocation's slots before publishing its start.
+// SO is ordered after every preceding RO/SO on this PE/QP. Ordinary NO PUTs
+// would not provide this guarantee. This is async and has no per-CV quiet.
+__aicore__ inline void PublishOrdered(__gm__ uint8_t* symmetricBase, uint64_t signalOffset, uint32_t peer,
+                                      uint64_t epoch)
 {
-    aclshmemx_udma_qp_quiet(peer, qp);
+    aclshmemx_udma_atomic_add<uint64_t, ACLSHMEMX_UDMA_OP_CONFIG_SO>(
+        reinterpret_cast<__gm__ uint64_t*>(symmetricBase + signalOffset), epoch, peer);
 }
 
-// Publish only AFTER Quiet(peer, phaseQp) covered every payload PUT for this chunk.
+// Blocking completion of all local submissions, including the final SO flag.
+// The one-owner rule also applies here: no second worker may poll the same CQ.
+__aicore__ inline void Quiet(uint32_t peer)
+{
+    aclshmemx_udma_qp_quiet(peer, kCommunicationQp);
+}
+
+// MTE publication is retained only for the invocation start/barrier handshake.
 // Each (source peer, CV chunk, phase) owns a separate 128B destination slot.
 // The caller supplies 32B of UB and a free event ID; no hidden TPipe/UB state
 // is introduced. MTE3_S protects both publication and immediate UB reuse.

@@ -36,6 +36,55 @@ def test_raw_ticks_work_without_a_frequency_assumption():
     assert report["classes"][0]["envelope_ticks"] == 200
 
 
+def test_submission_only_timers_require_outbound_completion_for_bandwidth():
+    raw = timer_with_records().reshape(28, 3, 8, 16)
+    raw[..., 5][raw[..., 4] > 0] = 1
+    raw[3, 2, 5, 7] = 2000
+    report = communication_bandwidth(raw, 0)
+    rows = {(row["phase"], row["communication_class"]): row for row in report["classes"]}
+    dispatch = rows["Dispatch", "CROSS"]
+    assert dispatch["bandwidth_gbps"] is None and dispatch["envelope_ticks"] is None
+    assert dispatch["last_tick"] is None and dispatch["envelope_us"] is None
+    assert dispatch["completion_status"] == "not_recorded" and dispatch["missing_completion_peers"] == [4]
+    assert dispatch["submission_envelope_ticks"] == 400 and dispatch["submission_sum_ticks"] == 200
+    combine = rows["Combine", "CROSS"]
+    assert combine["completion_status"] == "outbound_complete"
+    assert combine["first_tick"] == 600 and combine["last_tick"] == 2000
+    assert combine["envelope_ticks"] == 1400 and combine["bandwidth_gbps"] == pytest.approx(16000 / 1400)
+    assert combine["submission_envelope_ticks"] == 800 and combine["submission_sum_ticks"] == 500
+
+
+def test_a_class_requires_completion_of_every_payload_peer():
+    raw = np.zeros((28, 3, 8, 16), dtype=np.int64)
+    raw[0, 2, 5, :8] = [100, 200, 100, 1000, 1, 1, 1, 900]
+    raw[1, 2, 5, :8] = [200, 300, 100, 2000, 1, 1, 1, 0]
+    row = communication_bandwidth(raw, 0)["classes"][2]
+    assert row["payload_bytes"] == 3000 and row["bandwidth_gbps"] is None
+    assert row["missing_completion_peers"] == [2]
+    raw[1, 2, 5, 7] = 1100
+    row = communication_bandwidth(raw, 0)["classes"][2]
+    assert row["envelope_ticks"] == 1000 and row["bandwidth_gbps"] == 3
+
+
+@pytest.mark.parametrize("mode,completion,match", [(2, 900, "semantics"), (1, 199, "completion precedes")])
+def test_reject_unknown_timer_semantics_and_completion_before_submission(mode, completion, match):
+    raw = np.zeros((28, 3, 8, 16), dtype=np.int64)
+    raw[0, 2, 5, :8] = [100, 200, 100, 1000, 1, mode, 1, completion]
+    with pytest.raises(ValueError, match=match):
+        communication_bandwidth(raw, 0)
+
+
+def test_summary_identifies_ranks_with_payload_but_no_completion():
+    reports = []
+    for rank in range(4):
+        raw = np.zeros((28, 3, 8, 16), dtype=np.int64)
+        raw[0, 2, 1, :8] = [100, 200, 100, 1000, 1, 1, 1, 0]
+        reports.append(communication_bandwidth(raw, rank, world=4))
+    row = summarize_bandwidth(reports)[0]
+    assert row["mean_gbps"] is None and row["payload_ranks"] == 4
+    assert row["missing_completion_ranks"] == list(range(4))
+
+
 def test_reject_incomplete_timer_schema():
     raw = timer_with_records().reshape(28, 3, 8, 16)
     raw[3, 2, 1, 6] = 0

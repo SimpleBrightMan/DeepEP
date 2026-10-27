@@ -8,8 +8,6 @@
 #include "compute_contract.hpp"
 #include "continuous_matmul.hpp"
 #include "deferred_output.hpp"
-#include "reorder.hpp"
-#include "reorder_progress.hpp"
 #include "pack_round.hpp"
 #include "tail_completion.hpp"
 #include "transport.hpp"
@@ -87,7 +85,7 @@ __aicore__ inline MegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& args, 
     addr.aScaleGlobal = reinterpret_cast<GM_ADDR>(args.activationScale + fragment.rowBegin * scaleI);
     addr.bGlobal = reinterpret_cast<GM_ADDR>(args.weight2 + expert * i * h / 2U);
     addr.bScaleGlobal = reinterpret_cast<GM_ADDR>(args.weightScale2 + expert * scaleI * h);
-    // This AIC's paired AIV1 scatters the output only after matmulDone.
+    // The peer's communication AIV1 copies full rows after all group N tiles finish.
     addr.gmm2OutGlobal = reinterpret_cast<GM_ADDR>(args.gmm2Contiguous + fragment.rowBegin * h * sizeof(bfloat16_t));
     return addr;
 }
@@ -188,6 +186,7 @@ struct ComputeOutputBackend {
         WaitFlag<HardEvent::FIX_S>(EVENT_ID1);
         timer.TraceEnd(gmm1 ? TraceEvent::Gmm1TileDrain : TraceEvent::Gmm2Drain, start, meta);
         WriteGmByPassDCache(ComputeFlag(gmm1 ? args.gmm1Done : args.gmm2MatmulDone, tile), 1);
+        if (!gmm1) AtomicAdd(ComputeFlag(args.gmm2Done, meta.fragment), 1);
     }
 };
 
@@ -396,87 +395,8 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
     timer.End(Phase::Activation);
 }
 
-// Keep the device adapter below the compute descriptor/flag loaders. The
-// shared progress class is also exercised on the CPU using those same task
-// and batch contracts, without any dependency on Ascend hardware headers.
-struct ReorderBackend {
-    const Arguments& args;
-    Timer& timer;
-    __aicore__ inline uint32_t TaskCount() const
-    {
-        return args.config.computeTaskCount;
-    }
-    __aicore__ inline ComputeBatchTask TaskAt(uint32_t index) const
-    {
-        return LoadComputeTask(args, index);
-    }
-    __aicore__ inline ComputeBatchRange BatchAt(uint32_t index) const
-    {
-        return LoadComputeBatch(args, index);
-    }
-    __aicore__ inline Fragment FragmentAt(uint32_t index) const
-    {
-        return LoadFragment(args, index);
-    }
-    __aicore__ inline uint32_t TileCount(const Fragment& fragment) const
-    {
-        return FragmentGmm2Tiles(args, fragment);
-    }
-    __aicore__ inline bool Ready(const Fragment& fragment, uint32_t tile) const
-    {
-        return ReadGmByPassDCache(ComputeFlag(args.gmm2MatmulDone, fragment.gmm2TileBegin + tile)) != 0;
-    }
-    __aicore__ inline void Run(const Fragment& fragment, uint32_t index, uint32_t tile)
-    {
-        ReorderGmm2Tile(args, fragment, index, tile, timer);
-    }
-    __aicore__ inline void Complete()
-    {
-        MarkReorderComplete(args);
-    }
-};
-
-// Every physical AIV1 owns exactly its paired AIC's GMM2 tiles. Completion
-// is reported once, including empty owners; callers must not report it again.
-// No UB/event state survives RunOneReady(), allowing Pack/activation/URMA
-// work between calls on the same core.
-class OwnedReorder {
-public:
-    __aicore__ inline OwnedReorder(const Arguments& args, uint32_t block, Timer& timer)
-        : backend_{args, timer}, progress_(backend_, block)
-    {
-    }
-    __aicore__ inline bool RunOneReady()
-    {
-        return progress_.RunOneReady();
-    }
-    __aicore__ inline bool DrainReady()
-    {
-        return progress_.DrainReady();
-    }
-    __aicore__ inline bool Done() const
-    {
-        return progress_.Done();
-    }
-    __aicore__ inline bool Ready()
-    {
-        return progress_.Ready();
-    }
-    __aicore__ inline uint32_t FragmentIndex() const
-    {
-        return progress_.FragmentIndex();
-    }
-
-private:
-    ReorderBackend backend_;
-    OwnedReorderProgress<ReorderBackend> progress_;
-};
-
-// Helpers retain their static activation/scale/Pack partitions. Reorder uses
-// the physical block instead of the smaller helper-worker index. Activation
-// always wins; scale gather and Pack rotate ahead of Reorder. Each fallback
-// reorders at most one tile before reconsidering these higher priorities.
-// All tasks close UB events before returning. No dynamic task claims.
+// Noncommunication AIV1 workers own activation, scale gather and static Pack.
+// Reorder is exclusively performed by peer communication owners.
 __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Timer& timer)
 {
     const uint32_t activationWorkers = ActivationWorkers(args.config.world);
@@ -491,7 +411,6 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
     uint32_t nextActivation = 0U;
     uint32_t activationTile = 0U;
     uint32_t nextPackRound = kPackStartupRounds;
-    OwnedReorder reorder(args, worker + communicationWorkers, timer);
     uint32_t fallbackTurn = 0U;
     bool packFinished = false;
     bool activationPrepared = false;
@@ -500,7 +419,7 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
     TraceEvent idleEvent = TraceEvent::WaitGmm1;
     TraceMeta idleMeta;
     while (nextGather < args.config.fragmentCount || nextActivation < args.config.fragmentCount ||
-           nextPackRound < args.config.packRoundCount || !reorder.Done()) {
+           nextPackRound < args.config.packRoundCount) {
         bool progress = false;
         // Skip groups without this worker's activation tile, but never skip a
         // scale gather merely because its owner has no activation in that group.
@@ -551,31 +470,17 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
             }
             if (progress) fallbackTurn = (kind + 1U) % 2U;
         }
-        if (!progress && reorder.Ready()) {
-            // Only close an idle interval when work is ready; polling must
-            // not create a separate timer record on every failed probe.
-            if (idle) {
-                timer.TraceEnd(idleEvent, idleStart, idleMeta);
-                idle = false;
-            }
-            progress = reorder.RunOneReady();
-        }
         if (!packFinished && nextPackRound >= args.config.packRoundCount) {
             MarkPackWorkerComplete(args);
             packFinished = true;
         }
-        if (!progress &&
-            (nextGather < args.config.fragmentCount || nextActivation < args.config.fragmentCount || !reorder.Done())) {
+        if (!progress && (nextGather < args.config.fragmentCount || nextActivation < args.config.fragmentCount)) {
             if (!idle) {
                 idleStart = timer.TraceBegin();
                 idle = true;
                 const bool waitingActivation = nextActivation < args.config.fragmentCount;
-                const bool waitingGather = nextGather < args.config.fragmentCount;
-                const uint32_t index =
-                    waitingActivation ? nextActivation : (waitingGather ? nextGather : reorder.FragmentIndex());
-                idleEvent = waitingActivation
-                                ? TraceEvent::WaitGmm1
-                                : (waitingGather ? TraceEvent::WaitDispatch : TraceEvent::WaitGmm2Reorder);
+                const uint32_t index = waitingActivation ? nextActivation : nextGather;
+                idleEvent = waitingActivation ? TraceEvent::WaitGmm1 : TraceEvent::WaitDispatch;
                 idleMeta = FragmentTraceMeta(LoadFragment(args, index), index);
             }
             const uint64_t backoff = GetSystemCycle();

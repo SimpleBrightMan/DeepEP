@@ -36,7 +36,7 @@ def pack_pipeline_binary(tmp_path_factory):
 #define __aicore__
 #define __gm__
 namespace AscendC {
-enum class HardEvent { MTE3_MTE2, MTE2_MTE3, S_MTE2, MTE2_S };
+enum class HardEvent { MTE3_MTE2, MTE2_MTE3, S_MTE2, MTE2_S, MTE3_S };
 enum class TPosition { VECCALC };
 using TEventID = int;
 constexpr TEventID EVENT_ID0 = 0;
@@ -92,6 +92,7 @@ inline std::pair<Pipe, Pipe> Direction(HardEvent event) {
     case HardEvent::MTE2_MTE3: return {Mte2, Mte3};
     case HardEvent::S_MTE2: return {Scalar, Mte2};
     case HardEvent::MTE2_S: return {Mte2, Scalar};
+    case HardEvent::MTE3_S: return {Mte3, Scalar};
     }
     std::abort();
 }
@@ -246,7 +247,9 @@ int main(int argc, char** argv) {
             ResetWorker();
             Expand(args, worker); // Run the production function, not a duplicate algorithm.
             const auto batches = (count + kPackOrderRows - 1) / kPackOrderRows;
-            assert(scalarWaits == batches && indexCopies == batches && flags.empty());
+            // Each metadata batch becomes scalar-readable once; the final
+            // MTE3_S additionally certifies both GM stores, even for no rows.
+            assert(scalarWaits == batches + 1 && indexCopies == batches && flags.empty());
             if (count >= kPackPipelineSlots + 1) assert(Overlap());
             const auto begin = LocalRowBegin(totalRows, worker);
             for (uint64_t row = begin; row < begin + count; ++row) {
