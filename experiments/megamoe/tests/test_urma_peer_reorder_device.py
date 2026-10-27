@@ -29,6 +29,8 @@ inline uint32_t submittedStores,""",
 
 DRIVER = r"""
 #include "kernel_operator.h"
+// The full CANN compilation also exposes a global CacheMode type.
+enum class CacheMode { Other };
 #include "peer_reorder.hpp"
 #include <string>
 using namespace AscendC;

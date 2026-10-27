@@ -22,7 +22,7 @@ __aicore__ inline void ReorderPeerChunk(const Arguments& args, uint32_t chunkInd
     const PeerReorderRange range{rangeGm->spanBegin, rangeGm->spanCount};
     GlobalTensor<uint8_t> input, output;
     input.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.gmm2Contiguous));
-    input.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+    input.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
     output.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(
         chunk.peer == args.config.rank ? args.symmetric + args.config.returnYOffset : args.gmm2Output));
     const uint64_t start = timer.TraceBegin();
