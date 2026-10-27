@@ -107,6 +107,26 @@ def parse_args(argv=None):
     return args
 
 
+def format_profile_summary(reports, world):
+    """Display the already aggregated formal profiler results; no new measurements."""
+    headers = ("BS/rank", "EP", "Rounds", "round-max-mean(us)", "round-min-mean(us)")
+    rows = [
+        (str(report["bs"]), str(world), str(report["profile"]["rounds"]),
+         f'{report["profile"]["rank_max_mean_us"]:.3f}',
+         f'{report["profile"]["rank_min_mean_us"]:.3f}')
+        for report in reports
+    ]
+    widths = [max(len(header), *(len(row[i]) for row in rows)) for i, header in enumerate(headers)]
+    line = "+-" + "-+-".join("-" * width for width in widths) + "-+"
+    def row_text(row):
+        return "| " + " | ".join(value.rjust(width) for value, width in zip(row, widths)) + " |"
+    return "\n".join([
+        "[URMA PROFILE SUMMARY] device kernel; formal rounds only; timer/trace off",
+        "round-max/min-mean = mean of per-round cross-rank maximum/minimum (not max/min of rank means)",
+        line, row_text(headers), line, *(row_text(row) for row in rows), line,
+    ])
+
+
 def main():
     args = parse_args()
     config = load_config(args.config, args.bs_values)
@@ -558,6 +578,8 @@ def run(args, config, group):
     owner.destroy()
     launch_guard.close()
     group.close()
+    if rank == 0 and not args.accuracy_only and len(all_reports) > 1:
+        print(format_profile_summary(all_reports, world), flush=True)
 
 
 if __name__ == "__main__":
