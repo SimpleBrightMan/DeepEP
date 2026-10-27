@@ -158,8 +158,8 @@ def test_run_profiles_all_formal_rounds_and_only_instruments_final_call(
     monkeypatch.setattr(urma, "_extension", lambda: extension)
 
     class Guard:
-        def __init__(self, group, shape, repeat, timeout):
-            calls.append(("guard-create", tuple(shape), repeat, timeout))
+        def __init__(self, group, shape, repeat, timeout, *, backend="hccl"):
+            calls.append(("guard-create", tuple(shape), repeat, timeout, backend))
 
         def describe(self):
             return {"allocated_bytes_per_rank": 48}

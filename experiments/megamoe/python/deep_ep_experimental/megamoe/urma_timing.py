@@ -15,26 +15,32 @@ import statistics
 
 
 class UrmaLaunchGuard:
-    """Own a benchmark-only HCCL domain and reusable FP32 exp buffers.
+    """Benchmark-only launch alignment plus reusable FP32 exp buffers.
 
-    StoreGroup remains responsible for control/reporting. Its unique session
-    namespaces the HCCL rendezvous without creating a second TCP listener or
-    reusing another job's communication domain. This standalone benchmark must
-    not already have a torch.distributed default process group.
+    The default backend owns a dedicated HCCL domain. The ``store`` backend
+    keeps the same exp sequence but uses the host Store barrier instead, for
+    machines where the HCCL device transport cannot initialize (for example a
+    down NPU network port). StoreGroup remains responsible for control/reporting.
+    Its unique session namespaces the HCCL rendezvous without creating a second
+    TCP listener or reusing another job's communication domain. This standalone
+    benchmark must not already have a torch.distributed default process group.
     """
 
-    def __init__(self, group, shape=(100000, 20000), repeat=50, timeout=300):
+    def __init__(self, group, shape=(100000, 20000), repeat=50, timeout=300, *, backend="hccl"):
         import torch
         import torch.distributed as dist
 
         self.torch, self.dist = torch, dist
         self.group = group
+        self.backend = backend
         self.shape, self.repeat = tuple(shape), repeat
         self.bytes = math.prod(self.shape) * 4 * 2
-        self.input = self.output = self.process_group = None
+        self.input = self.output = self.store = self.process_group = None
         error = None
         try:
-            if dist.is_initialized():
+            if backend not in ("hccl", "store"):
+                raise ValueError("launch guard backend must be 'hccl' or 'store'")
+            if backend == "hccl" and dist.is_initialized():
                 raise RuntimeError("URMA standalone benchmark requires no pre-existing ProcessGroup")
             if not self.shape or any(type(n) is not int or n < 1 for n in self.shape):
                 raise ValueError("exp shape dimensions must be positive integers")
@@ -54,31 +60,39 @@ class UrmaLaunchGuard:
                 "adjust --exp-shape/--exp-repeat. "
                 + "; ".join(f"rank={rank}: {item}" for rank, item in enumerate(checks) if item)
             )
-        self.store = dist.PrefixStore(group._prefix + "urma-benchmark-hccl/", group._store)
-        dist.init_process_group(
-            backend="hccl",
-            store=self.store,
-            rank=group.rank(),
-            world_size=group.size(),
-            timeout=timedelta(seconds=timeout),
-        )
-        self.process_group = dist.group.WORLD
+        if backend == "hccl":
+            self.store = dist.PrefixStore(group._prefix + "urma-benchmark-hccl/", group._store)
+            dist.init_process_group(
+                backend="hccl",
+                store=self.store,
+                rank=group.rank(),
+                world_size=group.size(),
+                timeout=timedelta(seconds=timeout),
+            )
+            self.process_group = dist.group.WORLD
 
     def begin(self):
         """Enqueue the guard on the caller stream; never synchronize after exp.
 
-        HCCL barrier is a device collective, unlike StoreGroup.barrier. URMA's
+        The HCCL barrier is a device collective; the Store fallback is a host
+        barrier for machines where HCCL transport cannot initialize. URMA's
         _enqueue_forward subsequently inserts owner_stream.wait_stream(caller),
         so the dedicated native stream cannot overtake this exp sequence.
         """
-        self.dist.barrier(group=self.process_group)
+        if self.process_group is not None:
+            self.dist.barrier(group=self.process_group)
+        else:
+            self.group.barrier("URMA guard start")
         for _ in range(self.repeat):
             self.torch.exp(self.input, out=self.output)
 
     def end(self):
-        # forward_prepared orders caller after owner. HCCL therefore sees the
-        # completed block; neither this barrier nor synchronization is timed.
-        self.dist.barrier(group=self.process_group)
+        # forward_prepared orders caller after owner. The barrier therefore sees
+        # the completed block; neither this barrier nor synchronization is timed.
+        if self.process_group is not None:
+            self.dist.barrier(group=self.process_group)
+        else:
+            self.group.barrier("URMA guard end")
         self.torch.npu.synchronize()
 
     def close(self):
@@ -88,14 +102,26 @@ class UrmaLaunchGuard:
         self.input = self.output = None
 
     def describe(self):
+        if self.backend == "hccl":
+            method = "HCCL barrier + finite-input exp before continuous block; HCCL barrier + synchronize after"
+            limitations = (
+                "reduces host launch skew; does not equalize physical device speeds or synchronize every iteration"
+            )
+        else:
+            method = "host Store barrier + finite-input exp before continuous block; host Store barrier + synchronize after"
+            limitations = (
+                "host-side barrier used where HCCL transport cannot initialize; start skew is larger than the "
+                "HCCL device barrier, so label these numbers separately from HCCL-guard runs"
+            )
         return dict(
-            method="HCCL barrier + finite-input exp before continuous block; HCCL barrier + synchronize after",
+            method=method,
+            backend=self.backend,
             exp_shape=list(self.shape),
             exp_repeat=self.repeat,
             allocated_bytes_per_rank=self.bytes if self.repeat else 0,
             scope="one continuous profiler block: warmup + formal iterations + optional final diagnostic",
             stream_order="caller barrier/exp -> owner.wait_stream(caller) -> native -> caller.wait_stream(owner)",
-            limitations="reduces host launch skew; does not equalize physical device speeds or synchronize every iteration",
+            limitations=limitations,
         )
 
 

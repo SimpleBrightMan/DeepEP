@@ -261,6 +261,8 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib${CONDA_PREFIX:+:$CONDA_PREFIX/lib}${LD_L
 
 同一命令将列表中的各BS顺序跑完，整个进程只创建、销毁一次通信域。`--bs-values` 省略时使用同一套1024～8192步长1024的默认扫描。原来的`DEEPEP_MEGAMOE_PREFILL_OPT`、4/24核配比、XOR顺序、MTE槽位数不控制这个独立URMA接口。
 
+启动拉齐默认使用HCCL barrier（`--guard-backend hccl`）。若测试机因设备网口down无法建HCCL域（`hcclCommInitRootInfoConfig ... The network port is down`），可临时改用`--guard-backend store`，由Host Store barrier完成后拉齐；exp形状/次数、profiler计时和round-max-mean聚合都不变，但host barrier的启动偏差大于HCCL设备barrier，这类数据需单独标注，不能与HCCL口径直接混用。
+
 `cv_rows`首版接受128到4096之间128的整数倍。原始输入scale可以为`[BS,H/32]`或`[BS,H/64,2]`，Python在native调用前统一为后者，不改变scale内容。
 
 默认只测性能，明确打印`VALIDATION skipped`，不将其写成精度通过。如需数值对照，先按照现有CPU Golden流程生成FP8、相同config/seed/routing/BS/check-tokens的缓存，再增加`--golden-dir <目录> --check-tokens <同一数值>`。CPU路由单元测试不等于NPU数值验证。

@@ -43,6 +43,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--launch-timeout", type=int, default=300, help="Benchmark HCCL group timeout in seconds")
     parser.add_argument(
+        "--guard-backend",
+        choices=("hccl", "store"),
+        default="hccl",
+        help="Launch-alignment barrier: HCCL device barrier (default) or host Store barrier where HCCL cannot initialize",
+    )
+    parser.add_argument(
         "--allow-multi-host",
         action="store_true",
         help="Explicitly allow EP4/EP8/EP16 across hosts; requires cross-host SHMEM mapping and URMA connectivity",
@@ -213,6 +219,7 @@ def run(args, config, group):
             args.exp_shape,
             args.exp_repeat,
             args.launch_timeout,
+            args.guard_backend,
             args.max_recv_rows,
             args.timer,
             args.timer_clock_mhz,
@@ -270,7 +277,9 @@ def run(args, config, group):
 
         debug_weight_sources = source_weight_prefixes(raw)
     weights = transform_weights_for_mega_moe(*map(device_pair, raw))
-    launch_guard = UrmaLaunchGuard(group, args.exp_shape, args.exp_repeat, args.launch_timeout)
+    launch_guard = UrmaLaunchGuard(
+        group, args.exp_shape, args.exp_repeat, args.launch_timeout, backend=args.guard_backend
+    )
     cascade_reference = None
     if args.golden_dir:
         from .cascade import CascadeReference
@@ -334,7 +343,8 @@ def run(args, config, group):
             flush=True,
         )
         print(
-            f"[URMA LAUNCH GUARD] HCCL barrier + exp shape={tuple(args.exp_shape)} repeat={args.exp_repeat}; "
+            f"[URMA LAUNCH GUARD] {args.guard_backend} barrier + exp shape={tuple(args.exp_shape)} "
+            f"repeat={args.exp_repeat}; "
             f"buffers={manifest['launch_guard']['allocated_bytes_per_rank'] / 2**30:.2f} GiB/rank; "
             "once per continuous profile block; guard excluded from kernel timings",
             flush=True,
