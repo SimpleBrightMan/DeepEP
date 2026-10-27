@@ -243,9 +243,14 @@ __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block,
             const uint64_t start = timer.TraceBegin();
             pipeline.Compute(m, n, rows, columns);
             timer.TraceEnd(gmm1 ? TraceEvent::Gmm1Tile : TraceEvent::Gmm2Tile, start, tileMeta);
-            // Old fence was captured BEFORE this submission. Publishing it
-            // here cannot wait for this new tile or release its output early.
+            // Retire a previous GMM2 fence after submitting this tile. The
+            // old fence was captured before this submission, so it cannot
+            // release the new tile's output early.
             pending.AfterSubmit(gmm1, (gmm1 ? fragment.gmm1TileBegin : fragment.gmm2TileBegin) + tile, tileMeta);
+            // SwiGLU consumes GMM1 tile-by-tile: publish this tile as soon as
+            // its FIX writes complete, without waiting for another AIC task.
+            // This uses FIX_S1 only; keep the context open and GMM2 deferred.
+            if (gmm1) pending.Flush();
         } else {
             const uint64_t start = timer.TraceBegin();
             pipeline.Dequantize(n, rows, columns);

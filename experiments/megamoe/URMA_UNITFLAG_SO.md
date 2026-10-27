@@ -3,7 +3,12 @@
 分支 `megamoe-urma-unitflag-so`，基于方案2
 `megamoe-urma-gmm2-unitflag-reorder` 的 `0e36097`。
 
-保留 GMM1/GMM2 连续 GM 输出、UnitFlag、共用计算上下文及下一 tile 提交后发布前一 tile。
+保留 GMM1/GMM2 连续 GM 输出、UnitFlag 和共用计算上下文。
+GMM1 当前 tile 提交后立即等待其 FIX 写出完成并发布 `gmm1Done[tile]`，
+不再等下一 AIC tile 下发才发布，避免拖延 SwiGLU 就绪。
+GMM2 仍在下一 tile 提交后发布上一 tile；遇到依赖等待或收尾时补完通知。
+GMM1 使用已有 FIX_S 事件，不新增 PIPE_ALL，也不关闭或重建计算上下文。
+这会减少 GMM1 与下一 tile 的跨 tile 重叠，以换取更早的激活就绪；实际收益需实测。
 本次只改通信、完整行重排的分工和完成计时。EP4/8/16 的通信核分别为3/7/15个；
 剩余 AIV1 继续执行 SwiGLU、输入 scale gather 和静态 Pack，不再承担 Reorder。
 
