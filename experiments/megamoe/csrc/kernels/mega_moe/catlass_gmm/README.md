@@ -20,7 +20,7 @@
 - `UpdateProblem` 更新形状、地址和权重 layout，不重新分配存储。
 - `Begin` 幂等启动；`End` 排空并归还事件，且恢复相关 MM layout。
 - 异步 routed GMM1/GMM2 用 `HandoffTo` 转移缓冲游标与 credit，任一时刻只有一个对象 active。
-- GMM2 Wave末将完成事件排入FIX并通知issued，随后handoff回GMM1；AIV1等真实FIX完成后重放该Wave、发布各slice的Combine ready。
+- GMM2在每个本核实际拥有输出的slice末将完成事件排入FIX并通知issued，Wave末handoff回GMM1；AIV1先安排更早的GMM1消费，再按相同owner/slice顺序等待真实FIX完成、发布该slice的Combine ready。空生产核不消费事件，AIC Scalar不逐slice排空。
 - routed 阶段最终由当前 owner End；共享专家、量化与其他兼容路径保留既有局部生命周期。
 - GMM1 的 GM 序号只表示 issued；AIV1 的 MTE2 等 FIX full 后读取，消费后通过 MTE3 返回 empty。
   不能用 Scalar 发出指令的时间替代真实完成，也不能为 timer 额外排空。

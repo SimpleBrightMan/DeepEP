@@ -7,7 +7,7 @@
 namespace MegaMoeImpl {
 // 专供 routed W4A8 Wave：AIC FIX -> 配对 AIV1 Scalar -> 原 slice ready 计数。
 // 0/1 不与 AIV0 权重通道 4..11、AIV1 GMM1 通道 12..15 共用。
-// 一份 credit 限制未消费的完成事件；等待排在 FIX 队列，AIC Scalar 不在 Wave 末排空。
+// 一份 credit 限制未消费的 slice 完成事件；等待排在 FIX 队列，AIC Scalar 不逐 slice 排空。
 struct Gmm2AivCompletion {
     static constexpr unsigned MODE = 4U;
     static constexpr unsigned FULL = 0U;
@@ -27,7 +27,7 @@ struct Gmm2AivCompletion {
             // 只保护事件槽；此前全部 GM 写回均排在同一 FIX 队列中。
             AscendC::CrossCoreWaitFlag<MODE, PIPE_FIX>(AIV1 | EMPTY);
             AscendC::CrossCoreSetFlag<MODE, PIPE_FIX>(AIV1 | FULL);
-            // Scalar 只通知整 Wave 的写回/事件已提交；它不是数据完成标记。
+            // Scalar 只通知本核下一个有效 slice 的写回/事件已提交；它不是数据完成标记。
             AscendC::WriteGmByPassDCache(issued, sequence);
         }
     }

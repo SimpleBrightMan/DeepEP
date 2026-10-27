@@ -56,8 +56,8 @@ ProcessGmmWaves                     决定 GMM1/GMM2 的 Wave 顺序
 CATLASS 是物理缓冲/引擎边界，因此保留；不把所有工作塞成大函数，也不继续增加纯转发层。
 现役非量化 AIV1 走独立优先级调度器，而非这里的兼容 epilogue。维护约定见本目录 `AGENTS.md`。
 
-异步 routed GMM1/GMM2 用 `HandoffTo` 转移唯一资源 owner；GMM2的Wave完成事件排入FIX，
-AIV1等待真实FIX完成后重放并发布slice-ready。AIC不在每个Wave末主动Scalar排空FIX；
+异步 routed GMM1/GMM2 用 `HandoffTo` 转移唯一资源 owner；GMM2按本核拥有的slice将完成事件排入FIX，
+AIV1按相同owner顺序等待真实FIX完成后发布该slice-ready；进入等待前先安排更早的GMM1消费。AIC不逐slice主动Scalar排空FIX；
 最终回收最后credit，由当前owner统一End。**不是每个Wave都销毁/重建流水。**
 
 ### 2026-10-16 整合验收

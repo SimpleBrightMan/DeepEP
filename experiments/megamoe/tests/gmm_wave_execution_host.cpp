@@ -358,6 +358,15 @@ static void Check(const std::vector<uint32_t>& counts, uint32_t bs, uint32_t gro
     assert(ready == oldReady);
     assert(current.timer_.wave == legacy.timer_.wave);
     assert(current.loops.value[0] == current.loops.value[1]);
+    if constexpr (Core==AIC) {
+        uint32_t expected=0;
+        for(const auto& e:current.events) if(e[0]==2) {
+            const auto tiles=Ops::Base::CeilDiv(static_cast<uint32_t>(e[3]),256U)*28U;
+            if(current.GetGmmFirstOwnedTile(0,32,static_cast<uint32_t>(e[6]),false)<tiles)++expected;
+        }
+        assert(current.gmm2IssuedSequence_==static_cast<int32_t>(expected));
+        assert(current.params_.workspaceInfo.issued[0]==static_cast<int32_t>(expected));
+    }
 }
 
 static void CheckRoles(const std::vector<uint32_t>& counts, uint32_t bs, uint32_t groups) {

@@ -37,13 +37,17 @@ inline int32_t ReadGmByPassDCache(int32_t* p) { return *p; }
     compile_and_run(Path(__file__).with_name("gmm2_aiv_completion_host.cpp"), tmp_path)
 
 
-def test_aiv1_replays_wave_ranges_and_forward_owners(tmp_path):
+def test_aiv1_replays_owned_slices_and_publishes_one_ready_per_full(tmp_path):
     from test_device_schedule import cpp_body
     kernel = ROOT / "experiments/megamoe/csrc/kernels/mega_moe"
     wave = (kernel / "mega_moe_wave_a8w4.hpp").read_text()
     utils = (kernel / "common/mega_moe_utils.hpp").read_text()
     methods = function_source(utils, "PlanNextExpertTokenRangeInWave")
-    methods += "\nbool TryReceiveGmm2Completion(ExpertTokenPosition& position, uint32_t& startBlockIdx, int32_t& completedSequence)"
+    methods += "\nbool NextAivSlice(AivTaskCursor& cursor, AivTaskKind kind)"
+    methods += cpp_body(wave, "::NextAivSlice(")
+    methods += "\nbool NextGmm2CompletionSlice(AivTaskCursor& cursor)"
+    methods += cpp_body(wave, "::NextGmm2CompletionSlice(")
+    methods += "\nbool TryReceiveGmm2Completion(const AivTaskCursor& cursor, int32_t& completedSequence)"
     methods += cpp_body(wave, "::TryReceiveGmm2Completion(")
     (tmp_path / "gmm2_wave_receive.inc").write_text(methods)
     compile_and_run(Path(__file__).with_name("gmm2_wave_receive_host.cpp"), tmp_path)

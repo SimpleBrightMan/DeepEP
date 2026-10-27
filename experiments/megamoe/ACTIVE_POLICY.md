@@ -44,6 +44,8 @@ host检查容量，device按同一结果建立视图，不各抄一份偏移公�
 
 GMM1：Scalar issued → AIV1可进入等待 → **FIX full** → GM读入/SwiGLU/量化 → 释放epilogue credit。
 
-GMM2：AIC将Wave完成事件排入FIX并发布issued → AIV1等待**真实FIX完成** → 重放该Wave并发布原slice-ready → Combine。不是每波由AIC Scalar主动排空FIX；最终退出仍回收最后credit。
+GMM2：AIC在本核实际拥有输出的每个slice末，将完成事件排入FIX并发布issued → AIV1按相同owner/slice顺序等待**真实FIX完成** → 只发布该slice的ready → Combine。空生产核不发出或消费不存在的事件；不逐slice排空AIC Scalar。
+
+AIV1进入GMM2完成等待前，先安排消费同一FIX队列中更早的GMM1（lag时包括下一wave），避免等待FULL反过来阻塞GMM1 EMPTY归还。计算与消费端共用`UseGmm2WaveLag`，最终退出仍回收最后credit。
 
 Handoff只转移唯一资源owner和游标，不删除真实依赖。这里的slice-ready不是token-prefix提前归约。
