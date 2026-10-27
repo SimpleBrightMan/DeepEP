@@ -3,6 +3,8 @@
 基线：`decf4bbc1cf8cf1b0bf76ad8c6c83c7ed5a33c59`（全BS配对，继承main `7de059f`）。
 分支：`codex/megamoe-gm-readable-1026`。不直接覆盖main。
 
+本页为初版整理计划。2026-10-27用户将日常测试改为预部署后单轮B，最新约定以`experiments/megamoe/TESTING.md`为准；Slice合并与EP8/EP32单轮结果见`SLICE_RESULTS.md`。以下ABBA保留为最初协议，不作为每轮强制要求。
+
 ## 实施顺序
 
 1. P0：修正文档/注释，明确支持范围、BS/M作用域和当前完成协议；单独提交。
