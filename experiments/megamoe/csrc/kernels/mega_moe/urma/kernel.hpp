@@ -184,7 +184,8 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     const uint32_t end = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer + 1U);
     const uint32_t selfBegin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, args.config.rank);
     const uint32_t selfEnd = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, args.config.rank + 1U);
-    // Each CV holds a completed-span count, then the submitted sentinel.
+    // Remote CVs hold submitted ROW counts; self CVs hold copied SPAN counts.
+    // Both become the submitted sentinel only after the full CV ready flag.
     // Each row is written once, with no GM reuse before final quiet.
     LocalTensor<uint32_t> submitted(TPosition::VECCALC, kCommunicationSubmittedOffset, kMaxPeerChunks);
     LocalTensor<uint32_t> selfCopied(TPosition::VECCALC, kCommunicationPendingOffset, kMaxPeerChunks);
@@ -211,32 +212,45 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     while (!sentComplete || !selfComplete) {
         bool progress = false;
         for (uint32_t j = 0U; j < end - begin; ++j) {
-            const uint32_t copied = submitted.GetValue(j);
-            if (copied == kReorderCvSubmitted) continue;
+            uint32_t sentRows = submitted.GetValue(j);
+            if (sentRows == kReorderCvSubmitted) continue;
             const Chunk chunk = LoadChunk(args.recvChunks, begin + j);
             const auto range = LoadPeerReorderRange(args, begin + j);
             const uint32_t advanced = ReorderReadyPeerSpans(args, range, chunk, remoteSpans.spanBegin,
                                                            remoteSpanCopied, timer, waiting, waitStart, peerMeta);
             if (advanced == 0U) continue;
             progress = true;
-            submitted.SetValue(j, copied + advanced);
-            if (copied + advanced != range.spanCount) continue;
-            // Only a complete, locally drained CV may be submitted to URMA.
+            const uint32_t readyRows = ReorderedPeerPrefixRows(args, range, remoteSpans.spanBegin, remoteSpanCopied);
+            while (sentRows < chunk.rows) {
+                const uint32_t left = chunk.rows - sentRows;
+                const uint32_t putRows = left < kCombinePutRows ? left : kCombinePutRows;
+                if (sentRows + putRows > readyRows) break;
+                auto meta = ChunkTraceMeta(chunk);
+                meta.row = chunk.localRow + sentRows;
+                meta.rows = putRows;
+                meta.bytes = putRows * rowBytes;
+                timer.Begin(Phase::Combine);
+                const uint64_t start = timer.TraceBegin();
+                Put(symmetric, args.config.returnYOffset + (chunk.remoteRow + sentRows) * rowBytes,
+                    reinterpret_cast<__gm__ uint8_t*>(args.gmm2Output + (chunk.localRow + sentRows) * rowBytes),
+                    static_cast<uint32_t>(meta.bytes), peer);
+                timer.TraceEnd(TraceEvent::CombinePut, start, meta);
+                timer.End(Phase::Combine, meta.bytes, true);
+                sentRows += putRows;
+            }
+            submitted.SetValue(j, sentRows);
+            if (sentRows != chunk.rows) continue;
+            // Payloads may leave in 128-row pieces, but Reduce still sees one
+            // ready flag per original CV (256 rows by default). Same-QP SO
+            // orders the flag after EVERY preceding data PUT, without quiet.
             auto meta = ChunkTraceMeta(chunk);
-            meta.bytes = chunk.rows * rowBytes;
-            timer.Begin(Phase::Combine);
-            uint64_t start = timer.TraceBegin();
-            Put(symmetric, args.config.returnYOffset + chunk.remoteRow * rowBytes,
-                reinterpret_cast<__gm__ uint8_t*>(args.gmm2Output + chunk.localRow * rowBytes),
-                static_cast<uint32_t>(meta.bytes), peer);
-            timer.TraceEnd(TraceEvent::CombinePut, start, meta);
-            const uint64_t bytes = meta.bytes;
             meta.bytes = 0U;
-            start = timer.TraceBegin();
+            timer.Begin(Phase::Combine);
+            const uint64_t start = timer.TraceBegin();
             const uint64_t ready = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + chunk.cv;
             PublishOrdered(symmetric, args.config.combineReadyOffset + ready * kFlagBytes, peer, args.config.epoch);
             timer.TraceEnd(TraceEvent::CombinePublish, start, meta);
-            timer.End(Phase::Combine, bytes, true);
+            timer.End(Phase::Combine, 0U, true);
             submitted.SetValue(j, kReorderCvSubmitted);
             --remaining;
             progress = true;

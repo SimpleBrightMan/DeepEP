@@ -35,8 +35,11 @@ Host stream: 清本次接收 CV / finished flags → kernel
         对应 M256 组的全部 N tiles 已完成，就提前重排该片段的完整H行
         未完成的片段直接跳过，不挡住后面的就绪片段
         同一 CV 本轮所有就绪片段共用双64KiB槽，最后统一等待本批写出
-        记录已搬片段；如果该 CV 全部片段已搬完:
-            RO PUT(返回数据) → SO atomic_add(CV ready, epoch)
+        记录已搬片段，找出从 CV 开头连续完成写出的行数
+        从该 CV 已发送位置起，每攒够128行就 RO PUT(128行返回数据)
+        CV 最后一段不足128行时按实际行数 PUT
+        如果该 CV 全部行已提交（默认256行，即两次 PUT）:
+            SO atomic_add(CV ready, epoch)，只发布一次
         本 peer 所有 Combine 提交完后，仅执行一次:
             SO atomic_add(finished, epoch)
         同样提前处理本核静态分配的 self CV 片段，直接写 returnY
@@ -57,7 +60,7 @@ AIV0 / 非通信 AIV1: 原六槽 Reduce，就绪扫描与缓存不变
 Dispatch 每个非空 CV 都在下一 CV 提交前 quiet，保证每个发送 rank→peer 的 QP
 最多一个未完成的数据 CV；多个发送 rank 仍可能同时访问同一目标。
 本地 Dispatch join 前，各通信核已完成各自全部 Dispatch quiet。
-Combine 保持逐 CV RO/SO 提交、末尾一次 quiet；self 重排不会被该 quiet 阻塞，
+Combine 改为128行 RO 数据提交、逐 CV SO ready、末尾一次 quiet；self 重排不会被该 quiet 阻塞，
 远端 finished 通知也不依赖 self 是否已就绪。
 SHMEM 的队列信用不足时仍可能内部等待 CQ，不能把 NBI 理解为永不阻塞。
 
@@ -74,15 +77,20 @@ SHMEM 的队列信用不足时仍可能内部等待 CQ，不能把 NBI 理解为
   在最终 quiet 之前不复用；复用的是 UB 槽，不是在途 PUT 的 GM 源地址。
 - `gmm2Done[group]` 改为全部 N tile 的 FIX 完成计数，只代表连续计算临时区完成。
   CPU 预计算 peer/CV→完整行区间表，通信核不再遍历全部专家/来源寻找地址。
-- 提前 Reorder 沿用该区间表，不修改路由、计算 M-group 或 CV 的 PUT 粒度。
-  每个 owner 的 remote/self 各用一个8KiB UB位图，CV保存已搬片段数，
+- 提前 Reorder 沿用该区间表，不修改路由、计算 M-group 或接收 CV 的 flag 粒度。
+  数据 PUT 固定最多128行；`--cv-rows 256` 时每个完整 CV 两次数据 PUT、一次 ready。
+  非默认 cv-rows 仍按原 CV 发布一次 ready，不改变接收端布局；数据按128行切分。
+  每个 owner 的 remote/self 各用一个8KiB UB位图；远端 CV 保存已发送行数，self CV保存已搬片段数，
   搬过的片段直接跳过。位图只在本核访问，不增加 GM 进度表或原子操作。
   Pack 结束后复用其 UB，位图与双64KiB DMA槽、CV计数互不重叠；
   仍满足192KiB UB要求，不依赖均衡路由。Host检查每peer最多65536个片段，
   该上限覆盖BS8192/TopK8每个来源的全部展开行。
 - 每轮只对实际就绪片段启动DMA，一批片段共用槽位和事件；批末等MTE3完成。
-  不对每个片段单独排空。CV部分完成时只更新本核位图/计数，
-  只有所有片段完成写出后才下发一次完整CV PUT或self ready。
+  不对每个片段单独排空。批末从位图计算连续就绪行前缀，
+  已完成重排的128行即可发送，不等整个 CV；未就绪的空洞不能算进前缀。
+  每行只发送一次，源 GM 在最终 quiet 前不重写。多个就绪128行段可连续下发，
+  不新增 quiet。整 CV 数据全部提交后，在同一 QP 上 SO 发布一次 ready，
+  保证接收端不会读到半个 CV。self 路径仍等整个 CV 重排完成后发布本地 ready。
 - 自卡结果按 `self_cv % (world-1)` 静态分给通信核；直接重排到最终 returnY，
   不发网络 PUT。Reduce 的自卡依赖也改为 self CV ready，不能仅看 GMM2 完成。
 - 空 peer 仍完成 Pack 配额、发送 finished 并最终 quiet，也参与自卡任务与入站观察。
@@ -110,6 +118,11 @@ word0..4 保留提交统计，Dispatch 的 Pack/quiet 不混入提交耗时。
 - `Gmm2Reorder` 每条代表某个CV在本轮扫描中实际搬运的一批就绪片段；
   同一CV可能有多条，rows/bytes只统计该批实际搬运量，累计不重复。
   批次可能包含不连续目标行，因此不填连续row起点；只有单一计算组时填写fragment。
+- `CombinePut` 每条最多128行，保留原 CV 编号，row/rows/bytes 为本次提交的实际区间；
+  同 CV 的多条累计才是完整数据量，`CombinePublish` 仍每 CV 一次（另有 peer finished）。
+  最终 `CombineSendComplete` 口径不变，新网页按 PUT 字节累加无需修改。
+
+本次128行数据提交修改按要求仅编辑与静态审阅，未编译、未运行测试。
 
 `urma_trace_to_text.py` 输出 `[COMPLETION]` 汇总；各 peer 的完成时刻也保留在详细事件中。
 旧网页若只按 PUT 条宽统计带宽会低估完成时间；请先按新完成条审阅，不沿用旧提交口径。

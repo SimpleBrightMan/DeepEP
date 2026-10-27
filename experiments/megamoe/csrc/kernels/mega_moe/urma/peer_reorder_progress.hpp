@@ -9,6 +9,7 @@ namespace MegaMoeUrma {
 constexpr uint32_t kPeerReorderBitmapWords = (kMaxPeerReorderSpans + 31U) / 32U;
 constexpr uint32_t kPeerReorderBitmapBytes = kPeerReorderBitmapWords * sizeof(uint32_t);
 constexpr uint32_t kReorderCvSubmitted = UINT32_MAX;
+constexpr uint32_t kCombinePutRows = 128U;
 
 __aicore__ inline PeerReorderRange LoadPeerReorderRange(const Arguments& args, uint32_t chunkIndex)
 {
@@ -29,6 +30,24 @@ __aicore__ inline PeerReorderRange PeerReorderSpanRange(const Arguments& args, u
 __aicore__ inline void ClearReorderBitmap(AscendC::LocalTensor<uint32_t> copied, uint32_t spans)
 {
     for (uint32_t word = 0U; word < (spans + 31U) / 32U; ++word) copied.SetValue(word, 0U);
+}
+
+// The host plan partitions a CV in destination-row order. Bits are consumed
+// only after ReorderReadyPeerSpans has drained its MTE3 writes. A count of
+// ready rows is insufficient: an unready hole must never enter a payload PUT.
+__aicore__ inline uint32_t ReorderedPeerPrefixRows(
+    const Arguments& args, const PeerReorderRange& range, uint32_t peerSpanBegin,
+    AscendC::LocalTensor<uint32_t> copied)
+{
+    uint32_t rows = 0U;
+    for (uint32_t j = 0U; j < range.spanCount; ++j) {
+        const uint32_t spanIndex = range.spanBegin + j;
+        const uint32_t bitIndex = spanIndex - peerSpanBegin;
+        if ((copied.GetValue(bitIndex / 32U) & (1U << (bitIndex % 32U))) == 0U) break;
+        const auto* span = reinterpret_cast<const __gm__ PeerReorderSpan*>(args.peerReorderSpans) + spanIndex;
+        rows += span->rows;
+    }
+    return rows;
 }
 
 // Single-writer UB bits skip spans already copied in earlier scans. Unready
