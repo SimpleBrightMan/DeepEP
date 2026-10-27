@@ -81,7 +81,8 @@ __aicore__ inline void ReorderPeerChunk(const Arguments& args, uint32_t chunkInd
     meta.row = chunk.localRow;
     meta.rows = chunk.rows;
     meta.columns = args.config.hidden;
-    meta.bytes = static_cast<uint64_t>(chunk.rows) * args.config.hidden * sizeof(AscendC::bfloat16_t);
+    // Reorder copies raw BF16 storage; bfloat16_t is not in AscendC on this SDK.
+    meta.bytes = static_cast<uint64_t>(chunk.rows) * args.config.hidden * sizeof(uint16_t);
     timer.TraceEnd(TraceEvent::Gmm2Reorder, start, meta);
 }
 }  // namespace MegaMoeUrma
