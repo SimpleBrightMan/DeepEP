@@ -30,6 +30,7 @@ def fake_runtime(monkeypatch, *, peer_errors=None, initialized=False):
         rank=lambda: 3,
         size=lambda: 16,
         all_gather=lambda error, stage: peer_errors if peer_errors is not None else [error] * 16,
+        barrier=lambda stage: calls.append(("host-barrier", stage)),
     )
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "torch.distributed", dist)
@@ -87,12 +88,35 @@ def test_refuses_to_replace_an_existing_process_group(monkeypatch):
     assert not any(call[0] in ("init", "destroy", "zeros") for call in calls)
 
 
+def test_store_backend_skips_hccl_and_uses_host_barrier(monkeypatch):
+    group, calls = fake_runtime(monkeypatch)
+    guard = UrmaLaunchGuard(group, shape=(2, 3), repeat=1, backend="store")
+    guard.begin()
+    guard.end()
+    assert not any(call[0] in ("prefix", "init", "destroy") for call in calls)
+    assert [call for call in calls if call[0] == "host-barrier"] == [
+        ("host-barrier", "URMA guard start"),
+        ("host-barrier", "URMA guard end"),
+    ]
+    assert calls.count(("exp", "finite-input", "output")) == 1
+    assert calls.count(("synchronize",)) == 1
+    assert guard.describe()["backend"] == "store"
+    guard.close()
+
+
+def test_invalid_guard_backend_fails_collectively_before_allocation(monkeypatch):
+    group, _ = fake_runtime(monkeypatch)
+    with pytest.raises(RuntimeError, match="launch guard backend must be"):
+        UrmaLaunchGuard(group, backend="roce")
+
+
 def test_cli_launch_guard_and_mgroup_options(tmp_path):
     from deep_ep_experimental.megamoe.urma_benchmark import parse_args
 
     base = ["--output-dir", str(tmp_path)]
     args = parse_args(base)
     assert args.gmm1_ahead_mgroups == 12
+    assert args.guard_backend == "hccl"
     assert tuple(args.exp_shape) == (100000, 20000) and args.exp_repeat == 50
     custom = parse_args(base + ["--exp-shape", "1000", "2000", "--exp-repeat", "0", "--gmm1-ahead-mgroups", "0"])
     assert custom.exp_shape == [1000, 2000] and custom.exp_repeat == custom.gmm1_ahead_mgroups == 0
