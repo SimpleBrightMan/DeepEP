@@ -14,7 +14,11 @@ from .benchmark import inputs, load_config
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="urma")
-    parser.add_argument("--bs-values", default="2048,4096,8192")
+    parser.add_argument(
+        "--bs-values",
+        default="1024,2048,3072,4096,5120,6144,7168,8192",
+        help="Comma-separated BS/rank sweep; each BS must be in [1, num_max_tokens_per_rank] (native capacity <= 8192)",
+    )
     parser.add_argument("--routing", choices=("balanced", "random", "skewed"), default="balanced")
     parser.add_argument("--cv-rows", type=int, default=256)
     parser.add_argument(

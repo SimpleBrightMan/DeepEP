@@ -29,7 +29,7 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:${LD_LIBRARY_PATH:-}"
 
 本分支为 `megamoe-urma-combineAdvance-v2`，重新基于 `megamoe-urma-tailCover` 的 `60642fb`，没有合入前版 `combineAdvance` 的激活核辅助通信方案。保留原15个通信核、13个激活核和41核Reduce，在Dispatch末尾通过独立QP提前提交Combine；Dispatch后每轮从头到尾扫描本peer的通信CV，跳过未就绪项、批量提交并quiet，最后一个剩余CV单独提交。各分支须重新编译安装完整wheel，不能混用rank或Python/native版本。
 
-首版范围：默认单机 EP16，固定使用28个AIC / 56个AIV、每个AIV至少192 KiB UB、H=3584、I=1280、384个专家、TopK=8、无共享专家、FP8输入/FP4权重、BS=2048/4096/8192。物理核心数更多的兼容机型仍只启动这28组计算核。任意合法路由均走同一流程；超过配置接收容量的偏斜路由会在启动计算前明确报错。
+首版范围：默认单机 EP16，固定使用28个AIC / 56个AIV、每个AIV至少192 KiB UB、H=3584、I=1280、384个专家、TopK=8、无共享专家、FP8输入/FP4权重、BS=1024～8192（步长1024；接口接受不超过`num_max_tokens_per_rank`的任意正整数，容量上限8192）。物理核心数更多的兼容机型仍只启动这28组计算核。任意合法路由均走同一流程；超过配置接收容量的偏斜路由会在启动计算前明确报错。
 
 GMM按专家聚合不同来源的行，使用M256计算块，仅专家尾块不足256行；通信CV不再决定计算分块。SwiGLU在每个已就绪GMM1 tile内按最多128行处理，全部子块写出后只发布一次该tile的完成贡献。其两个BF16输入缓冲合计128 KiB，AIV0的W4解量化流水使用192 KiB，后者决定当前UB最低要求。资源不足时分别报告核心数或UB容量，并打印实际查询值。
 
@@ -254,12 +254,12 @@ export LD_LIBRARY_PATH="$SHMEM_ROOT/lib${CONDA_PREFIX:+:$CONDA_PREFIX/lib}${LD_L
   cd /tmp || exit 1
   python3 -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=16 \
     -m deep_ep_experimental.megamoe.urma_benchmark \
-    --bs-values 2048,4096,8192 --routing balanced --cv-rows 256 \
+    --bs-values 1024,2048,3072,4096,5120,6144,7168,8192 --routing balanced --cv-rows 256 \
     --warmup 2 --iters 10 --timer --output-dir "$OUT"
 )
 ```
 
-同一命令将三种BS顺序跑完，整个进程只创建、销毁一次通信域。原来的`DEEPEP_MEGAMOE_PREFILL_OPT`、4/24核配比、XOR顺序、MTE槽位数不控制这个独立URMA接口。
+同一命令将列表中的各BS顺序跑完，整个进程只创建、销毁一次通信域。`--bs-values` 省略时使用同一套1024～8192步长1024的默认扫描。原来的`DEEPEP_MEGAMOE_PREFILL_OPT`、4/24核配比、XOR顺序、MTE槽位数不控制这个独立URMA接口。
 
 `cv_rows`首版接受128到4096之间128的整数倍。原始输入scale可以为`[BS,H/32]`或`[BS,H/64,2]`，Python在native调用前统一为后者，不改变scale内容。
 

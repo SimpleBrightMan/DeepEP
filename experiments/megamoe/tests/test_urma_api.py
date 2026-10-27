@@ -262,9 +262,10 @@ def test_modified_prepared_routes_abort_before_epoch_or_native_submission(monkey
     owner._runtime.closed = True
 
 
+@pytest.mark.parametrize("capacity", [1, 1024, 2048, 8192])
 @pytest.mark.parametrize("allow", [False, True])
 @pytest.mark.parametrize("world", [4, 8, 16])
-def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runtime(monkeypatch, allow, world):
+def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runtime(monkeypatch, allow, world, capacity):
     from deep_ep._store import StoreGroup
 
     fake_torch = SimpleNamespace(device=lambda name: name, empty=lambda *a, **k: object(), float8_e4m3fn="fp8")
@@ -283,8 +284,13 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
 
     monkeypatch.setattr(urma, "collective_check", check)
     monkeypatch.setattr(urma, "_UrmaRuntime", runtime)
-    buffer = urma.UrmaBuffer(StoreGroup(None, 0, world, prefix="test"), allow_multi_host=allow)
+    buffer = urma.UrmaBuffer(
+        StoreGroup(None, 0, world, prefix="test"),
+        num_max_tokens_per_rank=capacity,
+        allow_multi_host=allow,
+    )
     assert buffer.allow_multi_host is allow
+    assert buffer.num_max_tokens_per_rank == capacity
     assert created == [allow]
     assert checks[0][1][-3] is allow
     assert checks[0][1][-2] == "combine-ready-scan-reduce-world-v1"

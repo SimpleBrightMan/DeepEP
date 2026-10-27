@@ -113,7 +113,7 @@ class UrmaBuffer:
                 raise TypeError("allow_multi_host must be bool")
             if (hidden, intermediate_hidden, num_experts, num_topk, num_shared_experts) != (3584, 1280, 384, 8, 0):
                 raise ValueError("First URMA profile supports H3584/I1280/E384/topk8/S0 only")
-            integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 2048, 8192)
+            integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 8192)
             integer("cv_rows", cv_rows, 128, 4096)
             integer("gmm1_ahead_mgroups", gmm1_ahead_mgroups, 0, 65536)
             if cv_rows % 128:
@@ -264,8 +264,11 @@ class UrmaBuffer:
                 if topk_idx.ndim != 2 or topk_idx.shape[1] != self.num_topk:
                     raise ValueError("topk_idx must have shape [BS, topk]")
                 bs = topk_idx.shape[0]
-                if bs not in (2048, 4096, 8192) or bs > self.num_max_tokens_per_rank:
-                    raise ValueError("supported BS values are 2048, 4096, 8192 within capacity")
+                if not 0 < bs <= self.num_max_tokens_per_rank:
+                    raise ValueError(
+                        f"BS={bs} must be in [1,{self.num_max_tokens_per_rank}]; "
+                        "create UrmaBuffer with num_max_tokens_per_rank >= BS"
+                    )
                 low, high = torch.stack((topk_idx.min(), topk_idx.max())).cpu().tolist()
                 if low < 0 or high >= self.num_experts:
                     raise ValueError("expert ids must be in [0, num_experts)")
