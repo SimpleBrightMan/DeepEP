@@ -7,8 +7,10 @@
 本次只改通信、完整行重排的分工和完成计时。EP4/8/16 的通信核分别为3/7/15个；
 剩余 AIV1 继续执行 SwiGLU、输入 scale gather 和静态 Pack，不再承担 Reorder。
 
-相关 CPU 回归分组执行共700项通过，覆盖实际通信循环、异步 RO/SO 模型、完整行 DMA、
+初版相关 CPU 回归分组执行共700项通过，覆盖实际通信循环、异步 RO/SO 模型、完整行 DMA、
 路由/Reduce 容量和 timer 解析。未进行 CANN 编译或 NPU 运行，尚无设备精度及性能结论。
+本次 self Reorder 前移与 Dispatch 每 CV quiet 修改按要求未编译、未运行测试；
+上述初版回归结果不代表本次修改已验证。
 
 ## 执行顺序
 
@@ -23,7 +25,9 @@ Host stream: 清本次接收 CV / finished flags → kernel
         等本地 packReady
         RO PUT(X) → RO PUT(scale) → SO atomic_add(ready, epoch)
         准备本核两轮以后的静态 Pack 配额
-    本地确认所有 Dispatch 已提交、所有 Pack 配额已完成
+        quiet(QP0)，记录 DispatchQuiet 和该 peer 最新完成时刻
+        空 CV 只做静态 Pack 配额，不调用 quiet
+    本地确认所有 Dispatch 已完成 quiet、所有 Pack 配额已完成
 
     while 本 peer 还有未发送的 Combine CV，或本核还有 self CV:
         从头扫描未提交 CV，跳过未完成的计算组
@@ -31,9 +35,12 @@ Host stream: 清本次接收 CV / finished flags → kernel
             按 peer/CV 的行映射，用两块64KiB UB重排完整H行
             等本地 MTE3 写完本 CV
             RO PUT(返回数据) → SO atomic_add(CV ready, epoch)
-        同样处理本核静态分配的 self CV，直接写 returnY → 本地 ready
         本 peer 所有 Combine 提交完后，仅执行一次:
-            SO atomic_add(finished, epoch) → quiet(QP0)
+            SO atomic_add(finished, epoch)
+        同样处理本核静态分配的 self CV，直接写 returnY → 本地 ready
+        未就绪的 self CV 留待下一轮扫描，不进入最终 quiet
+        finished 已提交且本核所有 self CV 已重排后，仅执行一次:
+            quiet(QP0)
             记录 CombineSendComplete（timer/trace开启时）
         观察入站 finished；无进展时显式退避
 
@@ -43,8 +50,12 @@ AIV0 / 非通信 AIV1: 原六槽 Reduce，就绪扫描与缓存不变
 所有本地引擎最终 join 后 kernel 返回
 ```
 
-没有 Dispatch 末尾提前 Combine，没有第二个 QP，没有逐 CV quiet，也没有新增全卡同步。
-本地 Dispatch join 只约束提交阶段；在途 Dispatch 仍可能与后续 Combine 共存于同一 QP。
+没有 Dispatch 末尾提前 Combine，没有第二个 QP，也没有新增全卡同步。
+Dispatch 每个非空 CV 都在下一 CV 提交前 quiet，保证每个发送 rank→peer 的 QP
+最多一个未完成的数据 CV；多个发送 rank 仍可能同时访问同一目标。
+本地 Dispatch join 前，各通信核已完成各自全部 Dispatch quiet。
+Combine 保持逐 CV RO/SO 提交、末尾一次 quiet；self 重排不会被该 quiet 阻塞，
+远端 finished 通知也不依赖 self 是否已就绪。
 SHMEM 的队列信用不足时仍可能内部等待 CQ，不能把 NBI 理解为永不阻塞。
 
 ## 数据与完成保证
@@ -73,12 +84,15 @@ SHMEM 的队列信用不足时仍可能内部等待 CQ，不能把 NBI 理解为
 完成时刻是 CPU/Scalar 观察到 quiet 返回的时刻，不是网络上最后一个字节的硬件时间戳。
 
 `CombinePut` / `DispatchPutX` 仍只记录提交调用。aggregate record word5=1 标记此新语义，
-word7 记录 Combine 最终发送完成时间；word0..4 保留提交统计。
+word7 记录 Dispatch 最新 CV quiet 完成时间或 Combine 最终发送完成时间；
+word0..4 保留提交统计，Dispatch 的 Pack/quiet 不混入提交耗时。
 
 - Combine 完成包络：本卡最早 Combine PUT → 最晚对应 peer 的 CombineSendComplete。
 - 整体通信包络：本卡最早 Dispatch PUT → 最晚对应 peer 的 CombineSendComplete。
-- Dispatch 未单独 quiet，无法从这些条精确求出它的发送完成时刻；带宽输出为不可用，
-  保留明确命名的提交耗时，避免用提交速度冒充有效带宽。
+- Dispatch 完成包络：本卡最早 Dispatch PUT → 最晚对应 peer 的 DispatchQuiet 结束。
+  aggregate timer 读取 word7 恢复完成包络及有效带宽，包含中间 Pack/quiet 间隙。
+- Combine 最终 quiet 在本核 self 重排完成后观察，完成时刻可能晚于实际网络完成；
+  不应把该条缩短直接解释为网络变快。
 - 接收端仍按 CV flag 执行计算/Reduce，Reduce 泳道不添加完成采样或细粒度打点。
 - 不同 rank 时钟不直接相减，包络包含内部等待和重排间隙。
 

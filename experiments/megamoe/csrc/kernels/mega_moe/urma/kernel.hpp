@@ -169,6 +169,15 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         // Even an empty peer keeps its static quota for other peers/self.
         // Pack's GM writes are complete before it increments packReady.
         PackOneRound(args, round + kPackStartupRounds, owner, kAic, timer);
+        if (chunk.rows != 0U) {
+            // Prepare future rows while this CV is in flight, but retire its
+            // X/scale/SO operations before submitting the next CV to this peer.
+            const auto meta = ChunkTraceMeta(chunk);
+            const uint64_t start = timer.TraceBegin();
+            Quiet(peer);
+            timer.TraceEnd(TraceEvent::DispatchQuiet, start, meta);
+            timer.MarkSendComplete(Phase::Dispatch);
+        }
     }
     MarkPackWorkerComplete(args);
     AtomicAdd(LocalCompletionFlag(args, kLocalFlagDispatchDone), 1);
@@ -177,7 +186,8 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
                          TraceEvent::WaitLocalDispatch, peerMeta);
         AtomicAdd(LocalCompletionFlag(args, kLocalFlagDispatchDone), 1);
     }
-    // This is a local submission-phase join, not a network completion quiet.
+    // Every nonempty CV has completed its peer quiet before this local join.
+    // This is not a global rank barrier.
     WaitProgressFlag(LocalCompletionFlag(args, kLocalFlagDispatchDone), static_cast<int32_t>(args.config.world), timer,
                      TraceEvent::WaitLocalDispatch, peerMeta);
 
@@ -197,6 +207,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         ++selfRemaining;
     }
     bool sentComplete = false;
+    bool finishedPublished = false;
     bool selfComplete = false;
     bool peerCounted = false;
     bool selfCounted = false;
@@ -233,21 +244,17 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             --remaining;
             progress = true;
         }
-        if (remaining == 0U && !sentComplete) {
+        if (remaining == 0U && !finishedPublished) {
             if (waiting) {
                 timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
                 waiting = false;
             }
-            // SO finished follows every CV on the same QP, including empty
-            // edges. A final quiet is needed even when timer is disabled.
+            // Publish remote finished promptly, including empty edges. Defer
+            // the blocking quiet until this owner's self copies are complete.
             const uint64_t publishStart = timer.TraceBegin();
             PublishOrdered(symmetric, PeerPhaseSlot(args, 1U, args.config.rank), peer, args.config.epoch);
             timer.TraceEnd(TraceEvent::CombinePublish, publishStart, peerMeta);
-            const uint64_t completeStart = timer.TraceBegin();
-            Quiet(peer);
-            timer.TraceEnd(TraceEvent::CombineSendComplete, completeStart, peerMeta);
-            if (end != begin) timer.MarkSendComplete(Phase::Combine);
-            sentComplete = true;
+            finishedPublished = true;
             progress = true;
         }
         for (uint32_t j = owner; j < selfEnd - selfBegin; j += workers) {
@@ -271,6 +278,21 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         if (selfRemaining == 0U && !selfComplete) {
             MarkReorderComplete(args);
             selfComplete = true;
+            progress = true;
+        }
+        if (finishedPublished && selfComplete && !sentComplete) {
+            if (waiting) {
+                timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
+                waiting = false;
+            }
+            // Self ready must never depend on a remote final quiet. Unready
+            // self CVs are rescanned above while remote operations progress.
+            // Final quiet is mandatory even when timer is disabled.
+            const uint64_t completeStart = timer.TraceBegin();
+            Quiet(peer);
+            timer.TraceEnd(TraceEvent::CombineSendComplete, completeStart, peerMeta);
+            if (end != begin) timer.MarkSendComplete(Phase::Combine);
+            sentComplete = true;
             progress = true;
         }
         ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);
