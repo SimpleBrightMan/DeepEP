@@ -41,12 +41,12 @@ GMM按专家聚合不同来源的行，使用M256计算块，仅专家尾块不�
 2. 通信核先发布Start，再由56个AIV共同展开前两轮通信CV的FP8 token和E8M0 scale，剩余轮次由28个AIV1静态均分Pack行数并与Dispatch重叠。远端路由写连续发送区，self路由直接写本rank接收区；不再从发送区执行一次SelfDispatch拷贝。一个token命中多个expert时复制对应多行，本版不做去重。
 3. 每个目标rank的连续行流按 `cv_rows` 截断，通过 URMA PUT 发送。token与scale使用各自连续平面。
 4. 对每个本地expert，把16个来源的行按source编号连接，按M256划分计算组；专家尾组可以不足256，不与下一个专家混算。每组的Segment记录来源、CV、接收行、组内行和返回展开行。Segment在source/CV边界切分，但这些边界不再切分矩阵计算。
-5. GMM1按Segment把X分段加载到同一L1计算块，只等待该组实际涉及的Dispatch CV及scale准备。scale由13个AIV1独立准备，每个M组只聚合一次到expert-major GM；AIC沿用连续MX scale加载。GMM1输出、SwiGLU及GMM2输入使用连续的expert-major计算行序。GMM2按同一映射将远端结果分段写回原source-major连续输出区，self结果直接写Reduce最终读取的位置。各peer的Combine CV等待所有覆盖它的M组完成全部H列，再按原连续区间PUT。
+5. GMM1按Segment把X分段加载到同一L1计算块，只等待该组实际涉及的Dispatch CV及scale准备。scale由13个AIV1独立准备，每个M组只聚合一次到expert-major GM；AIC沿用连续MX scale加载。GMM1输出、SwiGLU及GMM2输入使用连续的expert-major计算行序。GMM2按同一映射写成连续的exper-major临时区：远端行由通信核重排后PUT，self行由激活核在Reduce前重排到本卡returnY。各peer的Combine CV等待所有覆盖它的M组完成全部H列，再按原连续区间PUT。
 6. 同一个通信核用QP0发送Dispatch、QP1发送Combine。在各peer最后两次有数据的Dispatch中，quiet之前尝试提前提交一个已就绪的Combine CV，但至少保留一个CV给最后单独提交，不quiet QP1或发布Combine flag。本rank的15个远端Dispatch全部完成且self接收区已就绪后，先quiet已提交的Combine前缀并逐CV发布flag。剩余CV每轮从头到尾扫描，跳过已发送和未就绪项，已就绪立即PUT；一轮后quiet一次，再为本批实际提交的CV逐一用MTE发布epoch flag。最后一个剩余CV在此前批次quiet、发布完成后单独PUT和quiet。计算侧AIV完成自己的任务后即可按token依赖Reduce，不再等待最终全卡同步。
 
-15个通信AIV1各独占一个远端rank的两条QP。通信worker `w` 的peer为 `w < rank ? w : w+1`；剩余13个AIV1执行输入scale准备和SwiGLU，不接管Combine。28个AIV1也各自完成每轮固定的Pack行区间。self输入就绪通过本卡对应CV的Pack完成行数判断，block15不再单独发布self信号。远端两个阶段都只使用PUT，同一peer的两条队列始终由同一个核提交和quiet。
+15个通信AIV1各独占一个远端rank的两条QP。通信worker `w` 的peer为 `w < rank ? w : w+1`；剩余13个AIV1执行输入scale准备、SwiGLU，并在本地阶段结束后静态均分本卡self行的重排（本地拷贝，不占URMA队列），不接管Combine。28个AIV1也各自完成每轮固定的Pack行区间。self输入就绪通过本卡对应CV的Pack完成行数判断，block15不再单独发布self信号。远端两个阶段都只使用PUT，同一peer的两条队列始终由同一个核提交和quiet。
 
-前两轮Pack使用全部56个AIV，任务编号为`block*2+subblock`；其后的Pack使用28个AIV1，任务编号为block。Reduce只使用28个AIV0和block15～27的13个AIV1，共41核；15个通信AIV1不参与Reduce。计算侧每核结束自己的反量化或scale/SwiGLU及Pack任务后，先排空本核流水以交还UB/event，再独立进入Reduce。当前内核固定启动28组；即使物理设备有64个AIV，也只使用已启动的56个。
+前两轮Pack使用全部56个AIV，任务编号为`block*2+subblock`；其后的Pack使用28个AIV1，任务编号为block。Reduce只使用28个AIV0和block15～27的13个AIV1，共41核；15个通信AIV1不参与Reduce。计算侧每核结束自己的反量化或scale/SwiGLU及Pack任务后，block15～27的13个AIV1先按CV顺序均分并完成本卡self行重排、逐CV发布本地self ready，再排空本核流水以交还UB/event，随后独立进入Reduce。控制侧的自完成计数因此等13个激活worker，不再等15个通信worker。当前内核固定启动28组；即使物理设备有64个AIV，也只使用已启动的56个。
 
 本地阶段使用多槽流水，benchmark打印`local_pipeline=pack6-reduce6-output2 tail=combine-ready-scan-reduce41`。Pack在每轮内部按56或28核分配连续虚拟行区间，Reduce按41核分配连续token区间：
 

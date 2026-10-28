@@ -99,7 +99,7 @@ inline void WriteGmByPassDCache(uint64_t* pointer, uint64_t value) {
     const uint64_t first = s.args->symmetric + c.combineReadyOffset + c.rank * c.maxPeerChunks * kFlagBytes;
     assert(Test::Ptr(pointer) >= first && (Test::Ptr(pointer) - first) % kFlagBytes == 0U);
     const uint32_t cv = (Test::Ptr(pointer) - first) / kFlagBytes;
-    assert(cv < s.selfCount && cv % (c.world - 1U) == s.owner && ++s.selfFlags[cv] == 1U);
+    assert(cv < s.selfCount && ++s.selfFlags[cv] == 1U);
     const auto* chunks = reinterpret_cast<const MegaMoeUrma::Chunk*>(s.args->recvChunks);
     bool found = false;
     for (uint32_t i = 0; i < c.recvChunkCount; ++i)
@@ -183,7 +183,7 @@ struct PeerReorderPipeline {
     void Init(const Arguments& a, const Chunk& c) {
         auto& s = Test::state; args = &a; chunk = c;
         assert(*ComputeFlag(a.localFlags, kLocalFlagDispatchDone) == int32_t(a.config.world));
-        assert(c.peer == s.peer || (c.peer == a.config.rank && c.cv % (a.config.world - 1U) == s.owner));
+        assert(c.peer == s.peer || (c.peer == a.config.rank && c.cv % ActivationWorkers(a.config.world) == s.owner));
         const auto* chunks = reinterpret_cast<const Chunk*>(a.recvChunks);
         index = 0U;
         while (index < a.config.recvChunkCount && (chunks[index].peer != c.peer || chunks[index].cv != c.cv)) ++index;
@@ -259,8 +259,8 @@ inline void Quiet(uint32_t peer) {
     const bool final = s.finishSerial != 0U;
     if (final) {
         assert(++s.quiets == 1U && s.queue.back().kind == 4U);
-        for (uint32_t cv = s.owner; cv < s.selfCount; cv += s.args->config.world - 1U)
-            assert(s.selfFlags[cv] == 1U && "self must finish before final quiet");
+        // Self copies belong to the activation workers now, so this owner must
+        // retire its QP without waiting for them.
     } else {
         assert(s.queue.size() == 3U && s.queue.back().kind == 2U);
         assert(s.queue.back().cv == s.dispatchQuiets++);
@@ -283,8 +283,7 @@ inline void Quiet(uint32_t peer) {
 
 DRIVER = r"""
 using namespace MegaMoeUrma;
-void Run(uint32_t world, uint32_t owner, const std::string& scenario, bool timerEnabled,
-         std::vector<uint32_t>& selfCoverage) {
+void Run(uint32_t world, uint32_t owner, const std::string& scenario, bool timerEnabled) {
     Test::state = Test::State{};
     auto& s = Test::state;
     Arguments a{}; auto& c = a.config;
@@ -373,7 +372,9 @@ void Run(uint32_t world, uint32_t owner, const std::string& scenario, bool timer
     local[kLocalFlagPackDone * 32U] = kAic - 1U;
     local[kLocalFlagDispatchDone * 32U] = world - (owner == 0U ? 2U : 1U);
     local[kLocalFlagAicDone * 32U] = kAic;
-    local[kLocalFlagReorderDone * 32U] = world - 2U;
+    // The activation workers own self copies, so their aggregate is complete
+    // before this owner reaches the tail; the peer loop must not touch it.
+    local[kLocalFlagReorderDone * 32U] = int32_t(ActivationWorkers(world));
     local[kLocalFlagIncomingDone * 32U] = world - (owner == 0U ? 2U : 1U);
     Timer timer;
     CommunicatePeer(a, owner, timer);
@@ -382,8 +383,10 @@ void Run(uint32_t world, uint32_t owner, const std::string& scenario, bool timer
     if (reverse) assert(s.partialSeen && "ready later spans must not wait for the first span");
     assert(s.markers == (s.remoteCount != 0U) && s.incomingSerial > s.quietSerial);
     if (s.remoteCount) assert(s.quietSerial < s.markerSerial && s.markerSerial < s.incomingSerial);
-    if (s.selfSerial) assert(s.selfSerial < s.quietSerial);
-    assert(local[kLocalFlagReorderDone * 32U] == int32_t(world - 1U));
+    // Self copies are the activation workers' duty: this loop must leave them
+    // untouched and must not report the aggregate reorder completion.
+    assert(s.selfSerial == 0U);
+    assert(local[kLocalFlagReorderDone * 32U] == int32_t(ActivationWorkers(world)));
     assert(local[kLocalFlagIncomingDone * 32U] == int32_t(world));
     assert(s.packRounds.size() == c.packRoundCount);
     for (uint32_t j = 0; j < c.packRoundCount; ++j) assert(s.packRounds[j] == j + kPackStartupRounds);
@@ -391,17 +394,75 @@ void Run(uint32_t world, uint32_t owner, const std::string& scenario, bool timer
         assert(s.combinePuts[cv] == 1U && s.combineFlags[cv] == 1U);
         if (reverse) assert(s.sendOrder[cv] == s.remoteCount - 1U - cv);
     }
-    for (uint32_t cv = 0; cv < s.selfCount; ++cv) {
-        assert(s.selfFlags[cv] == uint32_t(cv % (world - 1U) == owner));
-        selfCoverage[cv] += s.selfFlags[cv];
-    }
+    for (uint32_t cv = 0; cv < s.selfCount; ++cv) assert(s.selfFlags[cv] == 0U);
     for (uint32_t i = 0; i < chunks.size(); ++i) {
         const auto& chunk = chunks[i];
-        const bool own = chunk.peer == s.peer || (chunk.peer == c.rank && chunk.cv % (world - 1U) == owner);
+        const bool own = chunk.peer == s.peer;
         assert(s.copyCounts[i] == (own ? ranges[i].spanCount : 0U));
         if (chunk.peer == c.rank && own)
             VerifyChunk(chunk, reinterpret_cast<const uint8_t*>(a.symmetric + c.returnYOffset +
                                                                chunk.remoteRow * c.hidden * 2U));
+    }
+}
+
+// The activation workers own the self copies now. Each one spreads the same CV
+// slice statically, publishes the local per-CV ready flag and reports one
+// aggregate reorder completion.
+void RunSelf(uint32_t world, uint32_t worker, bool timerEnabled, std::vector<uint32_t>& selfCoverage) {
+    Test::state = Test::State{};
+    auto& s = Test::state;
+    Arguments a{}; auto& c = a.config;
+    c.world = world; c.rank = world / 2U; c.hidden = 3584U; c.maxPeerChunks = kMaxPeerChunks;
+    c.epoch = 7U; c.barrierOffset = 0U; c.combineReadyOffset = 2U << 20U; c.returnYOffset = 4U << 20U;
+    const uint32_t selfCount = 6U;
+    s.selfCount = selfCount;
+    s.owner = worker;
+    s.args = &a;
+    std::vector<Chunk> chunks;
+    std::vector<PeerReorderRange> ranges;
+    std::vector<PeerReorderSpan> spans;
+    std::vector<uint32_t> indices;
+    std::vector<Fragment> fragments;
+    uint32_t receiveRows = 0U;
+    for (uint32_t cv = 0; cv < selfCount; ++cv) {
+        const uint32_t rows = cv % 2U + 1U;
+        chunks.push_back({c.rank, cv, receiveRows, cv * 8U, rows, uint32_t(spans.size()), rows, 0U});
+        ranges.push_back({uint32_t(spans.size()), rows});
+        for (uint32_t part = 0; part < rows; ++part) {
+            const uint32_t group = uint32_t(indices.size());
+            fragments.push_back({0U, 0U, receiveRows + part, 1U, 0U, group * 5U, group * 14U});
+            indices.push_back(group);
+            spans.push_back({receiveRows + part, cv * 8U + part, group, 1U});
+        }
+        receiveRows += rows;
+    }
+    s.copyCounts.resize(chunks.size());
+    s.selfFlags.resize(selfCount);
+    std::vector<uint16_t> scratch(uint64_t(receiveRows) * c.hidden);
+    for (uint64_t i = 0; i < scratch.size(); ++i) scratch[i] = uint16_t((i * 43U + 13U) % 65534U + 1U);
+    std::vector<int32_t> compute(indices.size() * 32U, 0U);
+    for (uint32_t group = 0; group < indices.size(); ++group) compute[group * 32U] = 14;
+    std::vector<uint64_t> symmetric((c.returnYOffset + uint64_t(selfCount + 1U) * 8U * c.hidden * 2U) / 8U);
+    std::array<int32_t, 16U * 32U> local{};
+    local[kLocalFlagDispatchDone * 32U] = int32_t(world);
+    a.symmetric = Test::Ptr(symmetric.data()); a.localFlags = Test::Ptr(local.data());
+    a.gmm2Done = Test::Ptr(compute.data()); a.gmm2Contiguous = Test::Ptr(scratch.data());
+    a.recvChunks = Test::Ptr(chunks.data()); a.peerReorderRanges = Test::Ptr(ranges.data());
+    a.peerReorderSpans = Test::Ptr(spans.data()); a.timer = timerEnabled ? 1U : 0U;
+    c.recvChunkCount = chunks.size(); c.fragmentCount = fragments.size();
+    Timer timer;
+    ReorderSelfSpans(a, worker, ActivationWorkers(world), timer);
+    assert(local[kLocalFlagReorderDone * 32U] == 1);
+    for (uint32_t cv = 0; cv < selfCount; ++cv) {
+        const bool own = cv % ActivationWorkers(world) == worker;
+        assert(s.selfFlags[cv] == uint32_t(own));
+        selfCoverage[cv] += s.selfFlags[cv];
+        for (uint32_t i = 0; i < chunks.size(); ++i) {
+            if (chunks[i].cv != cv) continue;
+            assert(s.copyCounts[i] == (own ? ranges[i].spanCount : 0U));
+            if (own) VerifyChunk(chunks[i], reinterpret_cast<const uint8_t*>(a.symmetric + c.returnYOffset +
+                                                                           chunks[i].remoteRow * c.hidden * 2U));
+        }
     }
 }
 int main(int argc, char** argv) {
@@ -409,9 +470,11 @@ int main(int argc, char** argv) {
     const uint32_t world = std::stoul(argv[1]);
     const std::string scenario = argv[2];
     const bool timer = std::stoul(argv[3]) != 0U;
-    std::vector<uint32_t> coverage(scenario == "empty" ? 0U : world + 1U);
-    for (uint32_t owner = 0; owner < world - 1U; ++owner) Run(world, owner, scenario, timer, coverage);
-    for (auto count : coverage) assert(count == 1U);
+    for (uint32_t owner = 0; owner < world - 1U; ++owner) Run(world, owner, scenario, timer);
+    std::vector<uint32_t> selfCoverage(6U, 0U);
+    for (uint32_t worker = 0; worker < ActivationWorkers(world); ++worker)
+        RunSelf(world, worker, timer, selfCoverage);
+    for (auto count : selfCoverage) assert(count == 1U);
 }
 """
 

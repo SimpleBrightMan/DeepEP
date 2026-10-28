@@ -49,13 +49,14 @@ __aicore__ inline bool ObserveIncomingCompletion(const Arguments& args, uint32_t
             peerCounted = true;
         }
     }
-    // Only owner 0 contributes self. Empty AIC/AIV1 workloads still report.
-    // All remote finished flags plus AIC28 alone must NOT bypass self reads:
-    // scratch can be complete while the last AIV1's self scatter is pending.
+    // Only owner 0 contributes self. Self rows are copied by the activation
+    // workers right before Reduce, so the aggregate waits for every one of
+    // them. All remote finished flags plus AIC28 alone must NOT bypass self
+    // reads: scratch can be complete while the last self copy is pending.
     if (owner == 0U && !selfCounted &&
         ReadGmByPassDCache(LocalCompletionFlag(args, kLocalFlagAicDone)) == static_cast<int32_t>(kAic) &&
         ReadGmByPassDCache(LocalCompletionFlag(args, kLocalFlagReorderDone)) ==
-            static_cast<int32_t>(CommunicationWorkers(args.config.world))) {
+            static_cast<int32_t>(ActivationWorkers(args.config.world))) {
         AtomicAdd(LocalCompletionFlag(args, kLocalFlagIncomingDone), 1);
         selfCounted = true;
     }
