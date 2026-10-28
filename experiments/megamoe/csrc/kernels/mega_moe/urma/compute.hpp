@@ -400,7 +400,12 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
     timer.End(Phase::Activation);
 }
 
-// Noncommunication AIV1 workers own activation, scale gather and static Pack.
+// Noncommunication AIV1 workers own scale gather, activation and static Pack,
+// strictly in that order. The gather moves only a small aligned scale plane,
+// but it publishes inputScaleDone, which gates the AIC's GMM1 for the whole
+// group; leaving it behind an activation tile stalls GMM1 longer than the
+// gather itself costs. Activation keeps tile granularity (one tile per turn),
+// and Pack only fills the bubbles the two stages above leave unused.
 // Reorder is exclusively performed by peer communication owners.
 __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Timer& timer)
 {
@@ -416,7 +421,6 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
     uint32_t nextActivation = 0U;
     uint32_t activationTile = 0U;
     uint32_t nextPackRound = kPackStartupRounds;
-    uint32_t fallbackTurn = 0U;
     bool packFinished = false;
     bool activationPrepared = false;
     bool idle = false;
@@ -426,54 +430,60 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
     while (nextGather < args.config.fragmentCount || nextActivation < args.config.fragmentCount ||
            nextPackRound < args.config.packRoundCount) {
         bool progress = false;
-        // Skip groups without this worker's activation tile, but never skip a
-        // scale gather merely because its owner has no activation in that group.
-        while (nextActivation < args.config.fragmentCount) {
-            const auto fragment = LoadFragment(args, nextActivation);
-            const uint32_t tileCount = FragmentGmm1Tiles(args, fragment);
-            if (!activationPrepared) {
-                activationTile = FirstOwnedComputeTile(fragment.gmm1TileBegin, worker, activationWorkers);
-                activationPrepared = true;
-            }
-            if (activationTile >= tileCount) {
-                ++nextActivation;
-                activationPrepared = false;
-                continue;
-            }
-            if (ReadGmByPassDCache(ComputeFlag(args.gmm1Done, fragment.gmm1TileBegin + activationTile)) != 0) {
+        // Scale gather first: it is short, but inputScaleDone is what the AIC
+        // waits on once per group before issuing GMM1. Finishing activation
+        // tiles ahead of it parks GMM1 behind the activation queue.
+        if (nextGather < args.config.fragmentCount) {
+            const auto fragment = LoadFragment(args, nextGather);
+            if (AreGroupInputsReady(args, fragment)) {
                 if (idle) {
                     timer.TraceEnd(idleEvent, idleStart, idleMeta);
                     idle = false;
                 }
-                RunReadyActivationTile(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
-                activationTile += activationWorkers;
+                GatherInputScale(args, fragment, nextGather, timer);
+                nextGather += activationWorkers;
                 progress = true;
             }
-            break;
         }
-        for (uint32_t attempt = 0U; !progress && attempt < 2U; ++attempt) {
-            const uint32_t kind = (fallbackTurn + attempt) % 2U;
-            if (kind == 0U && nextGather < args.config.fragmentCount) {
-                const auto fragment = LoadFragment(args, nextGather);
-                if (AreGroupInputsReady(args, fragment)) {
+        // Activation second: it keeps tile granularity, one tile per turn, so a
+        // freshly published GMM1 tile waits at most one gather or pack unit.
+        // Skip groups without this worker's activation tile, but never skip a
+        // scale gather merely because its owner has no activation in that group.
+        if (!progress) {
+            while (nextActivation < args.config.fragmentCount) {
+                const auto fragment = LoadFragment(args, nextActivation);
+                const uint32_t tileCount = FragmentGmm1Tiles(args, fragment);
+                if (!activationPrepared) {
+                    activationTile = FirstOwnedComputeTile(fragment.gmm1TileBegin, worker, activationWorkers);
+                    activationPrepared = true;
+                }
+                if (activationTile >= tileCount) {
+                    ++nextActivation;
+                    activationPrepared = false;
+                    continue;
+                }
+                if (ReadGmByPassDCache(ComputeFlag(args.gmm1Done, fragment.gmm1TileBegin + activationTile)) != 0) {
                     if (idle) {
                         timer.TraceEnd(idleEvent, idleStart, idleMeta);
                         idle = false;
                     }
-                    GatherInputScale(args, fragment, nextGather, timer);
-                    nextGather += activationWorkers;
+                    RunReadyActivationTile(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
+                    activationTile += activationWorkers;
                     progress = true;
                 }
-            } else if (kind == 1U && nextPackRound < args.config.packRoundCount) {
-                if (idle) {
-                    timer.TraceEnd(idleEvent, idleStart, idleMeta);
-                    idle = false;
-                }
-                PackOneRound(args, nextPackRound, worker + communicationWorkers, kAic, timer);
-                ++nextPackRound;
-                progress = true;
+                break;
             }
-            if (progress) fallbackTurn = (kind + 1U) % 2U;
+        }
+        // Pack is the last resort: it runs only when neither of the two stages
+        // above made progress in this turn.
+        if (!progress && nextPackRound < args.config.packRoundCount) {
+            if (idle) {
+                timer.TraceEnd(idleEvent, idleStart, idleMeta);
+                idle = false;
+            }
+            PackOneRound(args, nextPackRound, worker + communicationWorkers, kAic, timer);
+            ++nextPackRound;
+            progress = true;
         }
         if (!packFinished && nextPackRound >= args.config.packRoundCount) {
             MarkPackWorkerComplete(args);
@@ -483,9 +493,9 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
             if (!idle) {
                 idleStart = timer.TraceBegin();
                 idle = true;
-                const bool waitingActivation = nextActivation < args.config.fragmentCount;
-                const uint32_t index = waitingActivation ? nextActivation : nextGather;
-                idleEvent = waitingActivation ? TraceEvent::WaitGmm1 : TraceEvent::WaitDispatch;
+                const bool waitingGather = nextGather < args.config.fragmentCount;
+                const uint32_t index = waitingGather ? nextGather : nextActivation;
+                idleEvent = waitingGather ? TraceEvent::WaitDispatch : TraceEvent::WaitGmm1;
                 idleMeta = FragmentTraceMeta(LoadFragment(args, index), index);
             }
             const uint64_t backoff = GetSystemCycle();
