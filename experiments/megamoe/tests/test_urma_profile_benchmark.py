@@ -77,7 +77,7 @@ def test_run_profiles_all_formal_rounds_and_only_instruments_final_call(
         "make_weights",
         lambda *unused: ((np.zeros(1), np.ones(1)), (np.zeros(1), np.ones(1))),
     )
-    monkeypatch.setattr(api, "transform_weights_for_mega_moe", lambda *pairs: pairs)
+    monkeypatch.setattr(api, "transform_weights_for_mega_moe", lambda *pairs, **kwargs: pairs)
 
     class Group:
         def rank(self):
@@ -149,7 +149,7 @@ def test_run_profiles_all_formal_rounds_and_only_instruments_final_call(
 
     extension = SimpleNamespace(
         urma_api_protocol=1,
-        urma_compute_schedule="expert-m256-expected-lt128-gateup-v2",
+        urma_compute_schedule="expert-m128-gmm1-n512-v4",
         urma_local_pipeline="multi-slot",
         urma_tail_schedule="combine-ready-scan-reduce-world-v1",
         urma_timer_schema=1,

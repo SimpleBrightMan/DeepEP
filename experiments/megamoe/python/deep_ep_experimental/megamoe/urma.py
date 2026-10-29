@@ -35,7 +35,7 @@ def _extension():
         raise RuntimeError("URMA Python/native versions differ; rebuild and reinstall the complete wheel")
     if getattr(extension, "urma_tail_schedule", None) != "combine-ready-scan-reduce-world-v1":
         raise RuntimeError("URMA tailCover needs its matching native wheel; rebuild and reinstall the complete wheel")
-    if getattr(extension, "urma_compute_schedule", None) != "expert-m256-expected-lt128-gateup-v2":
+    if getattr(extension, "urma_compute_schedule", None) != "expert-m128-gmm1-n512-v4":
         raise RuntimeError(
             "URMA M-group lookahead needs its matching native wheel; rebuild and reinstall the complete wheel"
         )
@@ -143,7 +143,7 @@ class UrmaBuffer:
                 timeout,
                 allow_multi_host,
                 "combine-ready-scan-reduce-world-v1",
-                "expert-m256-expected-lt128-gateup-v2",
+                "expert-m128-gmm1-n512-v4",
             ),
         )
         self.group = group
@@ -358,7 +358,7 @@ class UrmaBuffer:
             if not isinstance(l1_weights, _RoutedWeightPair):
                 raise ValueError("prepare both GMM1 layouts using transform_weights_for_mega_moe")
             weight1, scale1 = l1_weights.select(
-                use_fused_gate_up(prepared.bs, self.group.size(), self.num_topk, self.num_experts)
+                use_fused_gate_up(prepared.bs, self.group.size(), self.num_topk, self.num_experts), gate_up_block=256
             )
             weight2, scale2 = l2_weights
             for name, weight in (("l1_weights", weight1), ("l2_weights", weight2)):

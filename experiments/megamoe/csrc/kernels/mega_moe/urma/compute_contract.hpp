@@ -12,9 +12,10 @@ constexpr uint32_t kComputeCores = kAic;
 // Minimum reducer count, used only to size UB for the largest per-core quota.
 constexpr uint32_t kReduceWorkers = kLocalWorkers - kCommunicationWorkers;
 constexpr uint32_t kComputeTileM = 256U;
+constexpr uint32_t kSmallComputeTileM = 128U;
 constexpr uint32_t kComputeTileN = 256U;
 constexpr uint32_t kFusedGateUpExpectedRows = 128U;
-// Keep matrix scheduling at M256; only the AIV1 epilogue works in M128
+// M256 is the default; the expected-small path uses M128. AIV1 always stages M128
 // slices. The W4 AIV0 prologue remains the largest UB user at exactly 192KiB.
 constexpr uint32_t kActivationTileM = 128U;
 // The URMA v1 input is H3584: each row has 112 E8M0 bytes. GM stays
@@ -180,13 +181,25 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr bool UseFusedGateUp(const Config& config)
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm1LogicalTileN(const Config& config)
 {
-    return UseFusedGateUp(config) ? kComputeTileN / 2U : kComputeTileN;
+    return kComputeTileN; // wide GMM1: logical gate/up width256, physical width512
+}
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ComputeGroupRows(const Config& config)
+{
+    return UseFusedGateUp(config) ? kSmallComputeTileM : kComputeTileM;
 }
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm1ComputeTileCount(uint32_t rows, const Config& config)
 {
     const uint32_t columns = Gmm1LogicalTileN(config);
-    return ((rows + kComputeTileM - 1U) / kComputeTileM) * ((config.intermediate + columns - 1U) / columns);
+    const uint32_t tileM = ComputeGroupRows(config);
+    return ((rows + tileM - 1U) / tileM) * ((config.intermediate + columns - 1U) / columns);
+}
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm2ComputeTileCount(uint32_t rows, const Config& config)
+{
+    const uint32_t tileM = ComputeGroupRows(config);
+    return ((rows + tileM - 1U) / tileM) * ((config.hidden + kComputeTileN - 1U) / kComputeTileN);
 }
 
 // All stage task IDs are global prefix sums. Sparse experts cannot repeatedly
@@ -206,7 +219,7 @@ struct OwnedComputeGroup {
 };
 
 // ownedTile is a batch-relative tile offset, starting at FirstOwnedComputeTile.
-// All nonempty M256 groups have the same N tile count, even with a short M tail.
+// Within either path all nonempty groups share the same N tile count, including a short M tail.
 // Advance by tileCount * workerCount to visit only this worker's next group;
 // consuming all owned tiles at once also supports groups wider than workerCount.
 // Call only with nonzero tilesPerGroup/workerCount and an in-range ownedTile.

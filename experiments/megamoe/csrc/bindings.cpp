@@ -16,7 +16,7 @@ PYBIND11_MODULE(_C, module)
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.def("buffer_size", &deepep::megamoe::buffer_size);
     module.attr("urma_api_protocol") = MegaMoeUrma::kProtocol;
-    module.attr("urma_compute_schedule") = "expert-m256-expected-lt128-gateup-v2";
+    module.attr("urma_compute_schedule") = "expert-m128-gmm1-n512-v4";
     module.attr("urma_local_pipeline") = "pack6-reduce6-output2";
     module.attr("urma_tail_schedule") = "combine-ready-scan-reduce-world-v1";
     module.attr("urma_timer_numel") = MegaMoeUrma::kTimerElements;

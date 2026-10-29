@@ -282,11 +282,11 @@ class SymmBuffer:
         warn_unclosed(self)
 
 
-def _interleave_gate_up_128(tensor):
+def _interleave_gate_up_128(tensor, block=128):
     """Permute the N axis of raw [E, 2I, ...] storage without numeric conversion."""
     experts, columns, *tail = tensor.shape
     return (
-        tensor.reshape((experts, 2, columns // 256, 128, *tail))
+        tensor.reshape((experts, 2, columns // (2 * block), block, *tail))
         .transpose(1, 2)
         .contiguous()
         .reshape((experts, columns, *tail))
@@ -296,25 +296,30 @@ def _interleave_gate_up_128(tensor):
 class _RoutedWeightPair(tuple):
     """Tuple-compatible immutable prepared weights; both layouts are built off the hot path."""
 
-    def __new__(cls, fused, planar):
+    def __new__(cls, fused, planar, gate_up_block=128):
         value = super().__new__(cls, fused)
         value._planar = planar
+        value._gate_up_block = gate_up_block
         value._versions = tuple(t._version for t in (*fused, *planar))
         return value
 
-    def select(self, fused):
+    def select(self, fused, *, gate_up_block=128):
         if tuple(t._version for t in (*self, *self._planar)) != self._versions:
             raise ValueError("Prepared GMM1 weights/scales were modified in-place; transform raw ND weights again")
+        if fused and self._gate_up_block != gate_up_block:
+            raise ValueError(f"Prepare raw weights with transform_weights_for_mega_moe(..., gate_up_block={gate_up_block})")
         return tuple(self) if fused else self._planar
 
 
 def transform_weights_for_mega_moe(
-    l1_weights: WeightPair, l2_weights: WeightPair, activation: str = "swiglu", *, shared: bool = False
+    l1_weights: WeightPair, l2_weights: WeightPair, activation: str = "swiglu", *, shared: bool = False,
+    gate_up_block: int = 128,
 ) -> tuple[WeightPair, WeightPair]:
     """Convert raw Ascend packed weights to NZ once, without quantizing again.
 
-    Raw inputs use [gate | up]. Routed FP4 GMM1 prepares both planar Prefill and
-    [gate128, up128] Decode layouts. Keep the returned l1 pair intact and immutable;
+    Raw inputs use [gate | up]. Routed FP4 GMM1 prepares planar and fused layouts.
+    gate_up_block=128 prepares [gate128, up128]; URMA N512 requests 256.
+    Keep the returned l1 pair intact and immutable;
     the API selects its layout by actual BS without a timed conversion. Pass shared=True for
     shared experts, whose GMM1 remains planar. FP8 and GMM2 keep their layout.
     This is not the CUDA UTCCP transform. Old prepared FP4 routed weights must
@@ -325,6 +330,8 @@ def transform_weights_for_mega_moe(
 
     if activation != "swiglu":
         raise NotImplementedError("Only SwiGLU is supported")
+    if gate_up_block not in (128, 256):
+        raise ValueError("gate_up_block must be 128 or 256")
     transformed = []
     for name, value in (("l1_weights", l1_weights), ("l2_weights", l2_weights)):
         weight, scale = _pair(value, name)
@@ -350,22 +357,22 @@ def transform_weights_for_mega_moe(
         scale = scale.contiguous()
         if weight.dtype == torch.uint8:
             if name == "l1_weights" and not shared:
-                if weight.shape[1] % 256:
-                    raise ValueError("Routed FP4 GMM1 requires gate/up widths divisible by 128")
+                if weight.shape[1] % (2 * gate_up_block):
+                    raise ValueError(f"Routed FP4 GMM1 requires gate/up widths divisible by {gate_up_block}")
                 # 两种布局一次准备；独立存储并启用版本计数，禁止原地修改后两份权重失配。
                 with torch.inference_mode(False):
                     planar_weight = torch_npu.npu_format_cast(
                         weight, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
                     )
                     planar_scale = scale.view(torch.uint8).clone().view(torch.float8_e8m0fnu)
-                    weight = _interleave_gate_up_128(weight)
-                    scale = _interleave_gate_up_128(scale.view(torch.uint8)).view(torch.float8_e8m0fnu)
+                    weight = _interleave_gate_up_128(weight, gate_up_block)
+                    scale = _interleave_gate_up_128(scale.view(torch.uint8), gate_up_block).view(torch.float8_e8m0fnu)
                     weight = torch_npu.npu_format_cast(
                         weight, 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
                     )
                     _check_fp4_weight_format(planar_weight, name)
                     _check_fp4_weight_format(weight, name)
-                    transformed.append(_RoutedWeightPair((weight, scale), (planar_weight, planar_scale)))
+                    transformed.append(_RoutedWeightPair((weight, scale), (planar_weight, planar_scale), gate_up_block))
                 continue
             # uint8 只是两个 FP4 的存储载体；FP8 布局参数不能代替输入的 FP4 类型声明。
             weight = torch_npu.npu_format_cast(

@@ -25,7 +25,7 @@
 #include "tla/tensor.hpp"
 
 namespace Catlass::Gemm::Block {
-template <class ArchTag, uint32_t L1B_STAGES_, class InType_, class OutType_, class TileShapeL1_, class TileCopy_>
+template <class ArchTag, uint32_t L1B_STAGES_, class InType_, class OutType_, class TileShapeL1_, class TileCopy_, bool WideN = false>
 struct MegaMoeBlockPrologueA8W4 {
 public:
     using DispatchPolicy = MxA8W4Prologue<ArchTag, L1B_STAGES_>;
@@ -57,7 +57,7 @@ public:
     };
 
     static_assert(std::is_same_v<LayoutIn, layout::Weight4BitnZ>, "MegaMoE requires packed NZ weights");
-    static_assert(tla::get<1>(TileShapeL1{}) * tla::get<2>(TileShapeL1{}) <= 64 * 1024,
+    static_assert(tla::get<1>(TileShapeL1{}) * tla::get<2>(TileShapeL1{}) <= (WideN ? 128 : 64) * 1024,
                   "Single-AIV weight output exceeds its UB stage");
     static_assert(L1B_STAGES == 2, "MegaMoE uses two weight stages");
 
@@ -70,7 +70,7 @@ public:
         }
         for (uint32_t i = 0; i < L1B_STAGES; i++) {
             // Assign L1/L0A/L0B space for each stages
-            l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(i * 384U * 1024U);
+            l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(i * (WideN ? 128U : 384U) * 1024U);
         }
         // Packed inputs occupy [0,64KiB); the four
         // output slots interleave 256-byte vectors throughout [64,192KiB).
@@ -124,8 +124,8 @@ public:
         uint32_t kSize = tla::get<0>(params.layoutPrologueB.originShape());
         const auto kPlan =
             MegaMoeImpl::GmmKernel::MakeA8W4KPlan(actualBlockShape.m(), actualBlockShape.n(), allowDynamicB);
-        const uint32_t kL1Size = kPlan.kb;
-        const uint32_t halfK = kL1Size / 2U;
+        const uint32_t kL1Size = WideN ? 256U : kPlan.kb;
+        const uint32_t halfK = WideN ? 64U : kL1Size / 2U; // keep each UB output <=32KiB
         const uint32_t kGmLoop = CeilDiv(kSize, kL1Size);
 
         // AIV1 runs dispatch/epilogue concurrently and must never enter this pipeline.
@@ -145,7 +145,7 @@ public:
                 ProcessL1Nz(l1Tile, gmTile, offset == 0U);
                 ubListId = (ubListId + 1U) % UB_STAGES;
             }
-            // Publish only after both halves are stored in the same L1 B slot.
+            // Publish after all pieces reach L1: 2 normally, 4 for N512. UB slot sizes are unchanged.
             AscendC::CrossCoreSetFlag<SYNC_MODE, PIPE_MTE3>(AIV_SYNC_AIC_FLAG + l1BListId);
             l1BListId = (l1BListId + 1) % L1B_STAGES;
         }

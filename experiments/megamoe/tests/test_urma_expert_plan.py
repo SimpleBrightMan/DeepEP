@@ -38,9 +38,12 @@ int main(int argc, char**) {
     for (uint32_t world : {4U, 8U, 16U}) {
         const uint32_t boundary = 384U * 128U / (world * 8U);
         auto c = Dimensions(boundary - 1U, 256U, world);
-        assert(UseFusedGateUp(c) && Gmm1ComputeTileCount(85U, c) == 10U);
+        assert(UseFusedGateUp(c) && Gmm1ComputeTileCount(85U, c) == 5U);
+        assert(ComputeGroupRows(c) == 128U && Gmm2ComputeTileCount(128U, c) == 14U);
+        assert(Gmm1ComputeTileCount(129U, c) == 10U && Gmm2ComputeTileCount(129U, c) == 28U);
         c.bs = boundary;
         assert(!UseFusedGateUp(c) && Gmm1ComputeTileCount(85U, c) == 5U);
+        assert(ComputeGroupRows(c) == 256U && Gmm2ComputeTileCount(129U, c) == 14U);
     }
     std::array<int64_t, 16 * 384> counts{};
     if (argc > 1) {
@@ -184,7 +187,9 @@ def check_plans(ids, cv_rows, routes, plans):
         assert self_send == routes[rank].peer_offsets[rank]
         assert self_recv == receive_base[rank, rank] and self_rows == counts[rank, rank]
         assert groups == len(plan["F"]) and sends == len(plan["T"]) and receives == len(plan["R"])
-        g1_tiles = 10 if len(ids[0]) * world * 8 < 384 * 128 else 5
+        small = len(ids[0]) * world * 8 < 384 * 128
+        group_m = 128 if small else 256
+        g1_tiles = 5
         assert g1 == groups * g1_tiles and g2 == groups * 14
         assert len(plan["B"]) == local_experts
         assert len(plan["A"]) == 2 * local_experts
@@ -214,13 +219,13 @@ def check_plans(ids, cv_rows, routes, plans):
                     peer_row = return_row - int(route.peer_offsets[rank])
                     expert_rows.append((source, int(receive_base[source, rank]) + peer_row, return_row))
             first, count = plan["B"][expert]
-            assert count == (len(expert_rows) + 255) // 256
+            assert count == (len(expert_rows) + group_m - 1) // group_m
             assert first == sum(b[1] for b in plan["B"][:expert])
             cursor = 0
             for group_index in range(first, first + count):
                 e, begin, row_begin, group_rows, segment_count, g1_begin, g2_begin = plan["F"][group_index]
-                assert e == expert and 0 < group_rows <= 256
-                assert group_rows == min(256, len(expert_rows) - cursor)
+                assert e == expert and 0 < group_rows <= group_m
+                assert group_rows == min(group_m, len(expert_rows) - cursor)
                 assert row_begin == len(expected_compact_rows) + cursor
                 assert g1_begin == group_index * g1_tiles and g2_begin == group_index * 14
                 compact[row_begin : row_begin + group_rows] += 1
@@ -323,6 +328,19 @@ def test_balanced_expert_groups_preserve_original_transport(expert_plan_binary, 
     routes, plans = read_plans(expert_plan_binary, ids, cv_rows)
     check_plans(ids, cv_rows, routes, plans)
     assert all(len(plan["F"]) == expected_groups for plan in plans)
+
+
+@pytest.mark.parametrize("world,bs", [(4, 1024), (4, 1535), (4, 1536), (8, 767), (8, 768), (16, 383), (16, 384)])
+def test_small_m128_and_strict_boundary_preserve_rows_and_self_dependencies(expert_plan_binary, world, bs):
+    ids = []
+    for rank in range(world):
+        # Include a hot expert spanning many M128 groups; specialization is not
+        # allowed to assume that every expert actually receives fewer than128.
+        value = np.full((bs, 8), (rank % 2) * (384 // world), dtype=np.int64)
+        value[::7, 3:] += 1
+        ids.append(value)
+    routes, plans = read_plans(expert_plan_binary, ids, 256)
+    check_plans(ids, 256, routes, plans)
 
 
 @pytest.mark.parametrize("world", [4, 8, 16])

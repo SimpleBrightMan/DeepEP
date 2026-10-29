@@ -157,7 +157,7 @@ def _check_activation(arrays, *, fused_gate_up=False):
         if np.any((actual_codes & 127) == 127) or np.any(actual_scales == 255):
             raise ValueError(f"non-finite activation code/scale in rows {begin}:{end}; comparison skipped")
         if fused_gate_up:
-            pairs = gmm1.reshape(end - begin, -1, 2, 128)
+            pairs = gmm1.reshape(end - begin, -1, 2, 256)
             gate = pairs[:, :, 0, :].reshape(end - begin, -1)
             up = pairs[:, :, 1, :].reshape(end - begin, -1)
         else:
@@ -307,7 +307,7 @@ def save_snapshot(raw, directory, *, bs, hidden, intermediate, topk, received_ro
 
     if all(name in arrays for name in ("gmm1", "activation", "activation_scale")):
         try:
-            report["stages"]["gmm1"]["layout"] = "gate128_up128" if fused_gate_up else "planar"
+            report["stages"]["gmm1"]["layout"] = "gate256_up256" if fused_gate_up else "planar"
             report["checks"]["cpu_activation_from_gmm1"] = _check_activation(arrays, fused_gate_up=fused_gate_up)
         except (ValueError, FloatingPointError) as error:
             report["errors"].append(f"cpu_activation_from_gmm1: {error}")

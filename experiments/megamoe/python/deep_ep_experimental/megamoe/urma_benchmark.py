@@ -276,7 +276,7 @@ def run(args, config, group):
         from .urma_debug import source_weight_prefixes
 
         debug_weight_sources = source_weight_prefixes(raw)
-    weights = transform_weights_for_mega_moe(*map(device_pair, raw))
+    weights = transform_weights_for_mega_moe(*map(device_pair, raw), gate_up_block=256)
     launch_guard = UrmaLaunchGuard(
         group, args.exp_shape, args.exp_repeat, args.launch_timeout, backend=args.guard_backend
     )
@@ -358,7 +358,7 @@ def run(args, config, group):
             expected_rows = bs * world * model["num_topk"] / model["num_experts"]
             print(
                 f"[URMA GMM1] BS={bs} EP={world} expected-rows/expert={expected_rows:.3f} "
-                f"gate_up={'fused128+128' if fused_gate_up else 'planar256+256'}",
+                f"gate_up={'fused256+256' if fused_gate_up else 'planar256+256'}",
                 flush=True,
             )
         host_x, host_ids, host_weights = inputs(config, rank, bs, args.routing, world=world)
@@ -422,7 +422,7 @@ def run(args, config, group):
             "received_rows_local": prepared.received_rows,
             "gmm1_ahead_mgroups": args.gmm1_ahead_mgroups,
             "gmm1_startup_mgroups_local": startup_mgroups,
-            "gmm1_gate_up_layout": "gate128_up128" if fused_gate_up else "planar",
+            "gmm1_gate_up_layout": "gate256_up256" if fused_gate_up else "planar",
             "profile": profile_report,
             "profile_directory": capture["profile_dir"],
             "diagnostic_sample": capture["diagnostic_sample"],
