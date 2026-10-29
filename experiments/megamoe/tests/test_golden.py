@@ -62,7 +62,7 @@ def naive(config, world, source, bs, routing, check_tokens):
     return bf16(result), counts[source * local : (source + 1) * local], selected
 
 
-@pytest.mark.parametrize("routing", ["balanced", "random", "skewed"])
+@pytest.mark.parametrize("routing", ["balanced", "random", "skewed", "random-balanced"])
 @pytest.mark.parametrize("check_tokens", [0, 3])
 @pytest.mark.parametrize("shared", [0, 1])
 def test_parallel_chunked_matches_old_oracle(config, routing, check_tokens, shared):

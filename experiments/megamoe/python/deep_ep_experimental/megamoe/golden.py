@@ -30,11 +30,15 @@ def contract(config, world, bs, input_kind, routing, check_tokens):
 
     if world <= 0 or config["model"]["num_experts"] % world:
         raise ValueError("Global experts must divide positive EP size")
-    if input_kind not in ("bf16", "fp8") or routing not in ("balanced", "random", "skewed"):
+    if input_kind not in ("bf16", "fp8") or routing not in ("balanced", "random", "skewed", "random-balanced"):
         raise ValueError("Invalid Golden input/routing")
     token_indices(bs, check_tokens)
     # 权重/输入或参考算法变化自动失效；编译参数、性能轮数不影响 Golden。
     source = inspect.getsource(reference) + inspect.getsource(inputs) + Path(__file__).read_text(encoding="utf-8")
+    if routing == "random-balanced":
+        from . import random_balanced
+
+        source += inspect.getsource(random_balanced)
     return dict(
         version=1,
         reference_sha256=hashlib.sha256(source.encode()).hexdigest(),
@@ -271,7 +275,7 @@ def main():
     parser.add_argument("--ranks", required=True, help="Source ranks on this host, e.g. 0-7")
     parser.add_argument("--golden-dir", type=Path, default=Path("benchmark-golden"))
     parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
-    parser.add_argument("--routing", choices=("balanced", "random", "skewed"), default="balanced")
+    parser.add_argument("--routing", choices=("balanced", "random", "skewed", "random-balanced"), default="balanced")
     parser.add_argument("--check-tokens", type=int, default=0)
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     parser.add_argument("--chunk-tokens", type=int, default=256)
