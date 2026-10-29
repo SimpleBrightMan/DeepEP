@@ -46,7 +46,7 @@ __aicore__ inline void WaitComputeFlag(uint64_t base, uint64_t index, uint32_t e
 
 __aicore__ inline uint32_t FragmentGmm1Tiles(const Arguments& args, const Fragment& fragment)
 {
-    return ComputeTileCount(fragment.rows, args.config.intermediate);
+    return Gmm1ComputeTileCount(fragment.rows, args.config);
 }
 
 __aicore__ inline uint32_t FragmentGmm2Tiles(const Arguments& args, const Fragment& fragment)
@@ -88,8 +88,10 @@ __aicore__ inline MegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& args, 
     return addr;
 }
 
-using UrmaGmmConfig = MegaMoeImpl::GmmKernel::Config<true, 0, fp8_e4m3fn_t, fp4x2_e2m1_t, bfloat16_t, fp8_e8m0_t,
-                                                     fp8_e8m0_t, false, false, false, false, false, false, false>;
+template <bool FuseGateUp>
+using UrmaGmmConfigFor = MegaMoeImpl::GmmKernel::Config<true, 0, fp8_e4m3fn_t, fp4x2_e2m1_t, bfloat16_t, fp8_e8m0_t,
+                                                     fp8_e8m0_t, false, false, false, false, false, false, FuseGateUp>;
+using UrmaGmmConfig = UrmaGmmConfigFor<false>;
 using UrmaProblemConfig = UrmaGmmConfig::ProblemConfig;
 using UrmaInputRows = MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false>;
 using UrmaOutputRows = MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, false, true>;
@@ -173,6 +175,7 @@ __aicore__ inline void CompleteComputeContext()
 using UrmaGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig, false, UrmaInputRows>;
 using UrmaGmm2 = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows>;
 
+template <bool FuseGateUp>
 __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
                                        uint32_t firstTile, UrmaGmm1& gmm1, bool endContext, Timer& timer)
 {
@@ -180,7 +183,7 @@ __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, ui
     const Fragment fragment = LoadFragment(args, fragmentIndex);
     const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
     const auto shape = FragmentShape(args, fragment);
-    auto config1 = UrmaGmmConfig::BuildGmm1ProblemConfig(shape, job, kComputeTileM);
+    auto config1 = UrmaGmmConfigFor<FuseGateUp>::BuildGmm1ProblemConfig(shape, job, kComputeTileM);
     MegaMoeImpl::GmmKernel::BlockScheduler schedule1(
         {config1.m, config1.schedulerN, config1.k},
         MegaMoeImpl::GmmKernel::BlockScheduler::Params{
@@ -343,7 +346,11 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
             const uint32_t fragmentIndex = range.begin + owned.group;
             const bool endContext = nextTile >= tileLimit;
             if (isGmm1) {
-                RunGmm1Fragment(args, block, fragmentIndex, owned.firstTile, gmm1, endContext, timer);
+                if (UseFusedGateUp(args.config)) {
+                    RunGmm1Fragment<true>(args, block, fragmentIndex, owned.firstTile, gmm1, endContext, timer);
+                } else {
+                    RunGmm1Fragment<false>(args, block, fragmentIndex, owned.firstTile, gmm1, endContext, timer);
+                }
             } else {
                 RunGmm2Fragment(args, block, fragmentIndex, owned.firstTile, gmm2, range.begin, endContext, timer);
             }
@@ -400,6 +407,7 @@ __aicore__ inline void GatherInputScale(const Arguments& args, const Fragment& f
     timer.TraceEnd(TraceEvent::InputScaleGather, start, meta);
 }
 
+template <bool FuseGateUp>
 __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t worker, const Fragment& fragment,
                                               uint32_t fragmentIndex, uint32_t tile, UrmaActivation& epilogue,
                                               Timer& timer)
@@ -410,14 +418,15 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
     addr.activationToGmm2Flag = nullptr;
     epilogue.UpdateGlobalAddr({static_cast<int64_t>(fragment.rowBegin * args.config.intermediate),
                                static_cast<int64_t>(fragment.rowBegin * (args.config.intermediate / 32U)), 0, 0, 0, 0});
-    auto config = UrmaGmmConfig::BuildGmm1ProblemConfig(FragmentShape(args, fragment), job, kComputeTileM);
-    const auto layouts = UrmaGmmConfig::BuildLayouts(config);
+    using GmmConfig = UrmaGmmConfigFor<FuseGateUp>;
+    auto config = GmmConfig::BuildGmm1ProblemConfig(FragmentShape(args, fragment), job, kComputeTileM);
+    const auto layouts = GmmConfig::BuildLayouts(config);
     auto gmC = Te::MakeTensor(
         Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ bfloat16_t*>(addr.gmm1OutGlobal)), layouts.c);
     MegaMoeImpl::GmmKernel::BlockScheduler scheduler(
         {config.m, config.outputN, config.k},
         MegaMoeImpl::GmmKernel::BlockScheduler::Params{
-            Te::MakeCoord(static_cast<int64_t>(kComputeTileM), static_cast<int64_t>(kComputeTileN))});
+            Te::MakeCoord(static_cast<int64_t>(kComputeTileM), static_cast<int64_t>(config.tileN))});
     epilogue.UpdateNextProblem({config.m, config.outputN, config.k, 0});
     const auto coord = scheduler.GetBlockCoord(tile);
     const auto tileShape = scheduler.GetBlockShape(coord);
@@ -488,7 +497,11 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
                     timer.TraceEnd(idleEvent, idleStart, idleMeta);
                     idle = false;
                 }
-                RunReadyActivationTile(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
+                if (UseFusedGateUp(args.config)) {
+                    RunReadyActivationTile<true>(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
+                } else {
+                    RunReadyActivationTile<false>(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
+                }
                 activationTile += activationWorkers;
                 progress = true;
             }

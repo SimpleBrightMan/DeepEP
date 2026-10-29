@@ -201,7 +201,7 @@ def run(args, config, group):
     import torch
     from .api import transform_weights_for_mega_moe
     from .reference import make_weights, quantize_input
-    from .urma import UrmaBuffer, _extension
+    from .urma import UrmaBuffer, _extension, use_fused_gate_up
     from .urma_timing import UrmaLaunchGuard, measure_profiled_forward, summarize_profile_rounds
     from .validation import collective_check
 
@@ -353,6 +353,14 @@ def run(args, config, group):
     for bs in config["bs_values"]:
         case = rank_dir / f"bs_{bs}"
         case.mkdir()
+        fused_gate_up = use_fused_gate_up(bs, world, model["num_topk"], model["num_experts"])
+        if rank == 0:
+            expected_rows = bs * world * model["num_topk"] / model["num_experts"]
+            print(
+                f"[URMA GMM1] BS={bs} EP={world} expected-rows/expert={expected_rows:.3f} "
+                f"gate_up={'fused128+128' if fused_gate_up else 'planar256+256'}",
+                flush=True,
+            )
         host_x, host_ids, host_weights = inputs(config, rank, bs, args.routing, world=world)
         codes, scales = quantize_input(host_x)
         x = (
@@ -414,6 +422,7 @@ def run(args, config, group):
             "received_rows_local": prepared.received_rows,
             "gmm1_ahead_mgroups": args.gmm1_ahead_mgroups,
             "gmm1_startup_mgroups_local": startup_mgroups,
+            "gmm1_gate_up_layout": "gate128_up128" if fused_gate_up else "planar",
             "profile": profile_report,
             "profile_directory": capture["profile_dir"],
             "diagnostic_sample": capture["diagnostic_sample"],
@@ -464,6 +473,7 @@ def run(args, config, group):
                     topk=model["num_topk"],
                     received_rows=prepared.received_rows,
                     rank=rank,
+                    fused_gate_up=fused_gate_up,
                 )
                 del debug_raw
             source_counts = group.all_gather(

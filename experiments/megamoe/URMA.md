@@ -180,7 +180,7 @@ GMM1直接Gather的X，以及AIC读取的已整理输入scale，均恢复默认L
 | 4096 | 144 | 720 | 2016 |
 | 8192 | 264 | 1320 | 3696 |
 
-benchmark打印`[URMA SCHEDULE] compute=expert-m256-mgroup-lookahead-v1`及M-group窗口并写入manifest；Python会拒绝不匹配的native扩展，需要重新编译安装完整wheel。流水图和正式耗时仍需实测验证；不能将tile数量减少倍数视为耗时加速倍数。
+benchmark打印`[URMA SCHEDULE] compute=expert-m256-expected-lt128-gateup-v2`及M-group窗口并写入manifest；Python会拒绝不匹配的native扩展，需要重新编译安装完整wheel。流水图和正式耗时仍需实测验证；不能将tile数量减少倍数视为耗时加速倍数。
 
 ### 本地多槽流水 A/B 验证（2026-10-20）
 
@@ -420,3 +420,13 @@ python3 experiments/megamoe/scripts/urma_trace_to_text.py \
 2026-10-20 本分支的`combine-ready-scan-reduce41`通过990项MegaMoE/runtime CPU回归、CANN 9.2.0完整wheel编译和native导入。新增检查直接运行生产Reduce头文件的异步流水模型，覆盖非单调token提交、最后一个token越过阻塞的第一个token、ready正缓存、跨epoch重置、六槽事件复用、精确计数16快路径及完整BF16输出；真实Host planner另验证极端偏斜/专家尾块下的UB与依赖位图容量。
 
 同版wheel在两台各8卡Ascend950DT上完成EP16运行回归。对照`db7d395`，balanced和random各执行BS2048/4096/8192、CV256、warmup=1、iters=2及独立timer调用；两种路由共96个rank/BS的完整BF16输出均有限且逐位相同，各进程正常结束。本次未使用独立Golden；短轮次双机耗时用于功能诊断，不作为UBX单机性能结论。通信协议、41个Reduce worker和每核一条Reduce trace保持不变。
+
+## 小专家期望下的 GMM1 gate/up 融合（2026-10-29）
+
+启用条件是 `BS_per_rank × EP × TopK < Experts × 128`，严格小于128行；不是简单的BS阈值，也不是buffer最大容量或某个专家的实际收到行数。当前E384/TopK8、BS1024至8192按1024递增时，只有EP4/BS1024启用。EP4/BS1536正好128，仍使用原路径。路由不要求均衡，热点/空专家仍按真实行数构建M-group。
+
+融合时选择离线准备的 `[gate128, up128]` 权重及scale；每个物理N256投影同时产生gate/up，逻辑激活列宽为128，每M-group由5个GMM1任务变为10个。Host planner、AIC/AIV0、SwiGLU和GMM2等待计数使用相同策略。未满足条件时保留原来的planar两次投影和5个任务。
+
+M-group仍为256，L1/L0的M/N/K、GMM2、Dispatch/Combine和前瞻group数均不变；本次没有引入unitflag分支的Reorder或通信实现。原始GMM1 trace的tileN/columns在融合路径表示逻辑激活坐标，物理投影的N起点及宽度各为两倍。
+
+每个case打印 `[URMA GMM1] ... expected-rows/expert=... gate_up=fused128+128|planar256+256`，rank报告记录 `gmm1_gate_up_layout`；中间精度诊断按实际布局解释GMM1。Python/native的compute schedule标记更新，需要完整重编译安装后使用。运行参数不变。本次按要求未编译、未运行测试。

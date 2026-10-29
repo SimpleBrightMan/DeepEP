@@ -13,6 +13,7 @@ constexpr uint32_t kComputeCores = kAic;
 constexpr uint32_t kReduceWorkers = kLocalWorkers - kCommunicationWorkers;
 constexpr uint32_t kComputeTileM = 256U;
 constexpr uint32_t kComputeTileN = 256U;
+constexpr uint32_t kFusedGateUpExpectedRows = 128U;
 // Keep matrix scheduling at M256; only the AIV1 epilogue works in M128
 // slices. The W4 AIV0 prologue remains the largest UB user at exactly 192KiB.
 constexpr uint32_t kActivationTileM = 128U;
@@ -167,6 +168,25 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr ActivationRowSlice ActivationSlice(uint32_
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ComputeTileCount(uint32_t rows, uint32_t columns)
 {
     return ((rows + kComputeTileM - 1U) / kComputeTileM) * ((columns + kComputeTileN - 1U) / kComputeTileN);
+}
+
+// Expected rows per expert across the active EP group, not buffer capacity or
+// this expert's actual count. Integer comparison keeps the strict boundary.
+MEGAMOE_URMA_COMPUTE_INLINE constexpr bool UseFusedGateUp(const Config& config)
+{
+    return static_cast<uint64_t>(config.bs) * config.world * config.topk <
+           static_cast<uint64_t>(kExperts) * kFusedGateUpExpectedRows;
+}
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm1LogicalTileN(const Config& config)
+{
+    return UseFusedGateUp(config) ? kComputeTileN / 2U : kComputeTileN;
+}
+
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm1ComputeTileCount(uint32_t rows, const Config& config)
+{
+    const uint32_t columns = Gmm1LogicalTileN(config);
+    return ((rows + kComputeTileM - 1U) / kComputeTileM) * ((config.intermediate + columns - 1U) / columns);
 }
 
 // All stage task IDs are global prefix sums. Sparse experts cannot repeatedly

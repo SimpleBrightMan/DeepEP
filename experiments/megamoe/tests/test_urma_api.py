@@ -67,7 +67,7 @@ def owner_for(stream):
     owner._last_prepared = object()
     owner._example = object()
     aborts = []
-    owner.group = SimpleNamespace(abort=aborts.append)
+    owner.group = SimpleNamespace(abort=aborts.append, size=lambda: 16)
     return owner, aborts
 
 
@@ -222,6 +222,7 @@ def prepared_call_setup(monkeypatch):
     monkeypatch.setattr(urma, "npu_api", lambda: Npu(caller, events))
     owner, aborts = owner_for(execution)
     owner.hidden, owner.num_topk, owner._device = 3584, 8, "npu:0"
+    owner.num_experts = 384
     x = Tensor((2048, 3584), "fp8"), Tensor((2048, 112), "scale")
     topk_weights = Tensor((2048, 8), "float")
     w1 = api._RoutedWeightPair((Tensor((), "fp4"), Tensor((), "scale")), (Tensor((), "fp4"), Tensor((), "scale")))
@@ -249,6 +250,34 @@ def test_epoch_is_monotonic_across_plans_and_input_scale_shape_is_normalized(mon
     owner.forward_prepared(x, probs, w1, w2, first)
     assert epochs == [1, 2, 3] and owner._epoch == 3
     assert not aborts
+    owner.destroy()
+
+
+@pytest.mark.parametrize(
+    "world,bs,expected",
+    [(4, 1024, True), (4, 1535, True), (4, 1536, False), (4, 2048, False),
+     (8, 767, True), (8, 768, False), (8, 1024, False),
+     (16, 383, True), (16, 384, False), (16, 1024, False)],
+)
+def test_gate_up_layout_uses_actual_expected_expert_rows(monkeypatch, world, bs, expected):
+    from dataclasses import replace
+
+    owner, _, _, _, w1, w2, _, make_plan = prepared_call_setup(monkeypatch)
+    owner.group.size = lambda: world
+    owner.num_max_tokens_per_rank = 8192  # Capacity must not select the layout.
+    prepared = replace(make_plan(), bs=bs)
+    selected = []
+
+    def forward(*operands):
+        selected.append((operands[5], operands[7]))
+        return Tensor((bs, 3584), "bf16")
+
+    prepared.native.forward = forward
+    x = Tensor((bs, 3584), "fp8"), Tensor((bs, 112), "scale")
+    owner.forward_prepared(x, Tensor((bs, 8), "float"), w1, w2, prepared)
+    wanted = tuple(w1) if expected else w1._planar
+    assert selected[0][0] is wanted[0] and selected[0][1] is wanted[1]
+    assert urma.use_fused_gate_up(bs, world) is expected
     owner.destroy()
 
 
@@ -294,7 +323,7 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
     assert created == [allow]
     assert checks[0][1][-3] is allow
     assert checks[0][1][-2] == "combine-ready-scan-reduce-world-v1"
-    assert checks[0][1][-1] == "expert-m256-mgroup-lookahead-v1"
+    assert checks[0][1][-1] == "expert-m256-expected-lt128-gateup-v2"
     assert buffer.gmm1_ahead_mgroups == 12
 
 
@@ -304,7 +333,7 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
 def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, tail):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
     extension = SimpleNamespace(
-        urma_api_protocol=1, urma_tail_schedule=tail, urma_compute_schedule="expert-m256-mgroup-lookahead-v1"
+        urma_api_protocol=1, urma_tail_schedule=tail, urma_compute_schedule="expert-m256-expected-lt128-gateup-v2"
     )
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
     urma._extension.cache_clear()
@@ -318,7 +347,7 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
         urma._extension.cache_clear()
 
 
-@pytest.mark.parametrize("schedule", [None, "expert-m256", "expert-m384-n128"])
+@pytest.mark.parametrize("schedule", [None, "expert-m256", "expert-m384-n128", "expert-m256-mgroup-lookahead-v1"])
 def test_native_mgroup_schedule_must_match_before_runtime_creation(monkeypatch, schedule):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
     extension = SimpleNamespace(

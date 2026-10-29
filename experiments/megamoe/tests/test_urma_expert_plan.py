@@ -34,6 +34,14 @@ Config Dimensions(uint32_t bs, uint32_t cv, uint32_t world = 16) {
     return c;
 }
 int main(int argc, char**) {
+    // The host planner and device use this same strict, integer predicate.
+    for (uint32_t world : {4U, 8U, 16U}) {
+        const uint32_t boundary = 384U * 128U / (world * 8U);
+        auto c = Dimensions(boundary - 1U, 256U, world);
+        assert(UseFusedGateUp(c) && Gmm1ComputeTileCount(85U, c) == 10U);
+        c.bs = boundary;
+        assert(!UseFusedGateUp(c) && Gmm1ComputeTileCount(85U, c) == 5U);
+    }
     std::array<int64_t, 16 * 384> counts{};
     if (argc > 1) {
         auto c = Dimensions(1, 128);
@@ -176,7 +184,8 @@ def check_plans(ids, cv_rows, routes, plans):
         assert self_send == routes[rank].peer_offsets[rank]
         assert self_recv == receive_base[rank, rank] and self_rows == counts[rank, rank]
         assert groups == len(plan["F"]) and sends == len(plan["T"]) and receives == len(plan["R"])
-        assert g1 == groups * 5 and g2 == groups * 14
+        g1_tiles = 10 if len(ids[0]) * world * 8 < 384 * 128 else 5
+        assert g1 == groups * g1_tiles and g2 == groups * 14
         assert len(plan["B"]) == local_experts
         assert len(plan["A"]) == 2 * local_experts
         assert [expert for stage, expert in plan["A"] if stage == 1] == list(range(local_experts))
@@ -213,7 +222,7 @@ def check_plans(ids, cv_rows, routes, plans):
                 assert e == expert and 0 < group_rows <= 256
                 assert group_rows == min(256, len(expert_rows) - cursor)
                 assert row_begin == len(expected_compact_rows) + cursor
-                assert g1_begin == group_index * 5 and g2_begin == group_index * 14
+                assert g1_begin == group_index * g1_tiles and g2_begin == group_index * 14
                 compact[row_begin : row_begin + group_rows] += 1
                 mapping = []
                 for segment_index in range(begin, begin + segment_count):
