@@ -45,7 +45,7 @@ def parse_args(argv=None):
     parser.add_argument("--config", default="deepseek_v4_pro")
     parser.add_argument("--bs-values", default=os.environ.get("BS_VALUES"))
     parser.add_argument("--input", choices=("fp8", "bf16"), default="fp8")
-    parser.add_argument("--routing", choices=("balanced", "random", "skewed"), default="balanced")
+    parser.add_argument("--routing", choices=("balanced", "random", "skewed", "random-balanced"), default="balanced")
     parser.add_argument("--mode", choices=("perf", "accuracy"), default="perf")
     parser.add_argument("--no-timer", action="store_true", help="Disable timer collection and parsing")
     timer_parse = parser.add_mutually_exclusive_group()
