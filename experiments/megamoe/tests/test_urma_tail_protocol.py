@@ -734,7 +734,7 @@ int main(int argc, char** argv) {
         MarkCubeComplete(args);
         assert(*aic == 28 && !ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
         assert(*incoming == 1); // AIC scratch ready is not self return ready.
-        for (unsigned i = 1; i < ActivationWorkers(world); ++i) MarkReorderComplete(args);
+        for (unsigned i = 1; i < CommunicationWorkers(world); ++i) MarkReorderComplete(args);
         assert(!ObserveIncomingCompletion(args, 0, peerCounted, selfCounted));
         assert(*incoming == 1);
         MarkReorderComplete(args);
@@ -752,7 +752,7 @@ int main(int argc, char** argv) {
         assert(!ObserveIncomingCompletion(args, 0, peerSeen[0], selfSeen[0]));
         assert(*incoming == 0);
         for (unsigned i = 0; i < 28; ++i) MarkCubeComplete(args);
-        for (unsigned i = 0; i < ActivationWorkers(world); ++i) MarkReorderComplete(args);
+        for (unsigned i = 0; i < CommunicationWorkers(world); ++i) MarkReorderComplete(args);
         for (unsigned owner = 0; owner < world - 1; ++owner) {
             *flag(owner) = 9;
             assert(ObserveIncomingCompletion(args, owner, peerSeen[owner], selfSeen[owner]));
@@ -775,7 +775,7 @@ int main(int argc, char** argv) {
         };
         readSelf = [&](int32_t* address) {
             assert(publications == 0 && (address == aic || address == reorder));
-            if (address == reorder) return static_cast<int32_t>(ActivationWorkers(world));
+            if (address == reorder) return static_cast<int32_t>(CommunicationWorkers(world));
             return selfPolls < 3 ? 27 : 28;
         };
         FinishCombinePeer(args, 0, peerCounted, selfCounted);
@@ -916,7 +916,7 @@ def test_actual_finished_helpers_count_once_require_aic_and_self_copy_cohort(red
 def test_finished_observation_and_aic_publication_integration():
     root = Path(__file__).resolve().parents[3]
     source = (root / "experiments/megamoe/csrc/kernels/mega_moe/urma/kernel.hpp").read_text()
-    combine = source[source.index("while (!sentComplete)") : source.index("__aicore__ inline void Process")]
+    combine = source[source.index("while (!sentComplete || !selfComplete)") : source.index("__aicore__ inline void Process")]
     assert (
         combine.index("Put(symmetric,")
         < combine.index("PublishOrdered(symmetric, args.config.combineReadyOffset")

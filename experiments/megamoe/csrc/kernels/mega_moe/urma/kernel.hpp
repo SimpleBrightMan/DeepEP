@@ -117,6 +117,7 @@ __aicore__ inline void PublishPeerStart(const Arguments& args, uint32_t owner, T
 __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Timer& timer)
 {
     const uint32_t peer = PeerForOwner(args.config.rank, owner);
+    const uint32_t workers = CommunicationWorkers(args.config.world);
     auto* symmetric = reinterpret_cast<__gm__ uint8_t*>(args.symmetric);
     TraceMeta peerMeta;
     peerMeta.peer = peer;
@@ -181,23 +182,34 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
 
     const uint32_t begin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer);
     const uint32_t end = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer + 1U);
-    // Remote CVs hold submitted ROW counts and become the submitted sentinel
-    // only after the full CV ready flag. Each row is written once, with no GM
-    // reuse before the final quiet. Self CVs are no longer this owner's duty:
-    // the activation workers copy them before Reduce, with no URMA operation.
+    const uint32_t selfBegin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, args.config.rank);
+    const uint32_t selfEnd = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, args.config.rank + 1U);
+    // Remote CVs hold submitted ROW counts; self CVs hold copied SPAN counts.
+    // Both become the submitted sentinel only after the full CV ready flag.
+    // Each row is written once, with no GM reuse before final quiet.
     LocalTensor<uint32_t> submitted(TPosition::VECCALC, kCommunicationSubmittedOffset, kMaxPeerChunks);
+    LocalTensor<uint32_t> selfCopied(TPosition::VECCALC, kCommunicationPendingOffset, kMaxPeerChunks);
     LocalTensor<uint32_t> remoteSpanCopied(TPosition::VECCALC, kRemoteReorderBitmapOffset, kPeerReorderBitmapWords);
+    LocalTensor<uint32_t> selfSpanCopied(TPosition::VECCALC, kSelfReorderBitmapOffset, kPeerReorderBitmapWords);
     const auto remoteSpans = PeerReorderSpanRange(args, begin, end);
+    const auto selfSpans = PeerReorderSpanRange(args, selfBegin, selfEnd);
     ClearReorderBitmap(remoteSpanCopied, remoteSpans.spanCount);
+    ClearReorderBitmap(selfSpanCopied, selfSpans.spanCount);
     uint32_t remaining = end - begin;
+    uint32_t selfRemaining = 0U;
     for (uint32_t j = 0U; j < remaining; ++j) submitted.SetValue(j, 0U);
+    for (uint32_t j = owner; j < selfEnd - selfBegin; j += workers) {
+        selfCopied.SetValue(j, 0U);
+        ++selfRemaining;
+    }
     bool sentComplete = false;
     bool finishedPublished = false;
+    bool selfComplete = false;
     bool peerCounted = false;
     bool selfCounted = false;
     bool waiting = false;
     uint64_t waitStart = 0U;
-    while (!sentComplete) {
+    while (!sentComplete || !selfComplete) {
         bool progress = false;
         for (uint32_t j = 0U; j < end - begin; ++j) {
             uint32_t sentRows = submitted.GetValue(j);
@@ -248,22 +260,47 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
                 timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
                 waiting = false;
             }
-            // Publish remote finished promptly, including empty edges. Only
-            // this owner's QP retirement is left; self copies run elsewhere.
+            // Publish remote finished promptly, including empty edges. Defer
+            // the blocking quiet until this owner's self copies are complete.
             const uint64_t publishStart = timer.TraceBegin();
             PublishOrdered(symmetric, PeerPhaseSlot(args, 1U, args.config.rank), peer, args.config.epoch);
             timer.TraceEnd(TraceEvent::CombinePublish, publishStart, peerMeta);
             finishedPublished = true;
             progress = true;
         }
-        if (finishedPublished && !sentComplete) {
+        for (uint32_t j = owner; j < selfEnd - selfBegin; j += workers) {
+            const uint32_t copied = selfCopied.GetValue(j);
+            if (copied == kReorderCvSubmitted) continue;
+            const Chunk chunk = LoadChunk(args.recvChunks, selfBegin + j);
+            const auto range = LoadPeerReorderRange(args, selfBegin + j);
+            const uint32_t advanced = ReorderReadyPeerSpans(args, range, chunk, selfSpans.spanBegin,
+                                                           selfSpanCopied, timer, waiting, waitStart, peerMeta);
+            if (advanced == 0U) continue;
+            progress = true;
+            selfCopied.SetValue(j, copied + advanced);
+            if (copied + advanced != range.spanCount) continue;
+            const uint64_t ready = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + chunk.cv;
+            // Reorder drained local stores. Self requires no URMA operation.
+            WriteGmByPassDCache(
+                reinterpret_cast<__gm__ uint64_t*>(symmetric + args.config.combineReadyOffset + ready * kFlagBytes),
+                args.config.epoch);
+            selfCopied.SetValue(j, kReorderCvSubmitted);
+            --selfRemaining;
+            progress = true;
+        }
+        if (selfRemaining == 0U && !selfComplete) {
+            MarkReorderComplete(args);
+            selfComplete = true;
+            progress = true;
+        }
+        if (finishedPublished && selfComplete && !sentComplete) {
             if (waiting) {
                 timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
                 waiting = false;
             }
-            // Final quiet is mandatory even when timer is disabled. Self rows
-            // are local copies on the activation workers, so this owner retires
-            // its QP as soon as its own peer stream is empty.
+            // Self ready must never depend on a remote final quiet. Unready
+            // self CVs are rescanned above while remote operations progress.
+            // Final quiet is mandatory even when timer is disabled.
             const uint64_t completeStart = timer.TraceBegin();
             Quiet(peer);
             timer.TraceEnd(TraceEvent::CombineSendComplete, completeStart, peerMeta);
@@ -284,59 +321,6 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     }
     if (waiting) timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
     FinishCombinePeer(args, owner, peerCounted, selfCounted);
-}
-
-// Self rows are a local copy from gmm2Contiguous into this rank's returnY: they
-// need no URMA operation and no peer ownership. Spread them statically over the
-// activation workers and drain the whole set before Reduce starts on that
-// engine, because Reduce reads the self route out of returnY and would
-// otherwise depend on another core's copy. The per-CV self ready flag is the
-// same combineReady slot a remote producer would publish.
-__aicore__ inline void ReorderSelfSpans(const Arguments& args, uint32_t worker, uint32_t workers, Timer& timer)
-{
-    const uint32_t selfBegin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, args.config.rank);
-    const uint32_t selfEnd = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, args.config.rank + 1U);
-    const uint32_t selfCvs = selfEnd - selfBegin;
-    if (selfCvs != 0U) {
-        LocalTensor<uint32_t> copied(TPosition::VECCALC, kSelfReorderBitmapOffset, kPeerReorderBitmapWords);
-        const auto spans = PeerReorderSpanRange(args, selfBegin, selfEnd);
-        ClearReorderBitmap(copied, spans.spanCount);
-        bool waiting = false;
-        uint64_t waitStart = 0U;
-        TraceMeta waitMeta;
-        for (uint32_t j = worker; j < selfCvs; j += workers) {
-            const Chunk chunk = LoadChunk(args.recvChunks, selfBegin + j);
-            const auto range = LoadPeerReorderRange(args, selfBegin + j);
-            waitMeta = ChunkTraceMeta(chunk);
-            uint32_t done = 0U;
-            while (done < range.spanCount) {
-                const uint32_t advanced = ReorderReadyPeerSpans(args, range, chunk, spans.spanBegin, copied, timer,
-                                                                waiting, waitStart, waitMeta);
-                if (advanced != 0U) {
-                    done += advanced;
-                    continue;
-                }
-                // Producer groups that are still running never block another
-                // CV; back off and rescan, exactly like the peer owners do.
-                if (!waiting) {
-                    waitStart = timer.TraceBegin();
-                    waiting = true;
-                }
-                const uint64_t start = GetSystemCycle();
-                while (GetSystemCycle() - start < 200U) {
-                }
-            }
-            // Reorder drained the local stores; self needs no URMA operation.
-            const uint64_t ready = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + chunk.cv;
-            WriteGmByPassDCache(
-                reinterpret_cast<__gm__ uint64_t*>(args.symmetric + args.config.combineReadyOffset + ready * kFlagBytes),
-                args.config.epoch);
-        }
-        if (waiting) timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, waitMeta);
-    }
-    // Every activation worker reports once, even with no self CV, so the local
-    // aggregate counts ActivationWorkers() exactly.
-    MarkReorderComplete(args);
 }
 
 __aicore__ inline void Process(const Arguments& args)
@@ -367,13 +351,7 @@ __aicore__ inline void Process(const Arguments& args)
     } else if (block < communicationWorkers) {
         CommunicatePeer(args, block, timer);
     } else {
-        // Self reorder runs after the local phases and before Reduce on this
-        // engine: the activation workers drain it, then fall straight through
-        // to their Reduce share. The barrier drains the activation UB stores
-        // before the reorder slots reuse the same low 128KiB.
         RunActivation(args, block - communicationWorkers, timer);
-        PipeBarrier<PIPE_ALL>();
-        ReorderSelfSpans(args, block - communicationWorkers, ActivationWorkers(args.config.world), timer);
     }
     if constexpr (g_coreType == AIV) {
         // Only this engine releases its phase-private UB/events. Other
