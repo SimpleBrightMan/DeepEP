@@ -16,7 +16,7 @@ namespace MegaMoeUrma {
 using namespace AscendC;
 using MegaMoeImpl::Get;
 
-// A fragment is an M128 (small path) or M256 group of one expert. Row segments preserve its
+// A fragment is a compute M256 group of one expert. Row segments preserve its
 // input/output correspondence with the original source-major communication CVs.
 __aicore__ inline Fragment LoadFragment(const Arguments& args, uint32_t index)
 {
@@ -46,25 +46,11 @@ __aicore__ inline void WaitComputeFlag(uint64_t base, uint64_t index, uint32_t e
 
 __aicore__ inline uint32_t FragmentGmm1Tiles(const Arguments& args, const Fragment& fragment)
 {
-    // Every planned fragment fits one M tile in its selected path. Preserve
-    // the original M256 arithmetic here to avoid another mode check on AIV1.
-    const uint32_t columns = Gmm1LogicalTileN(args.config);
-    return ((fragment.rows + kComputeTileM - 1U) / kComputeTileM) *
-           ((args.config.intermediate + columns - 1U) / columns);
-}
-
-template <bool Small>
-__aicore__ inline uint32_t FragmentGmm1TilesFor(const Arguments& args, const Fragment& fragment)
-{
-    constexpr uint32_t columns = Small ? kComputeTileN / 2U : kComputeTileN;
-    return ((fragment.rows + kComputeTileM - 1U) / kComputeTileM) *
-           ((args.config.intermediate + columns - 1U) / columns);
+    return Gmm1ComputeTileCount(fragment.rows, args.config);
 }
 
 __aicore__ inline uint32_t FragmentGmm2Tiles(const Arguments& args, const Fragment& fragment)
 {
-    // Both M128 and M256 fragments fit within one original M256 tile; N stays
-    // 256, so the existing count is valid without a new small-path branch.
     return ComputeTileCount(fragment.rows, args.config.hidden);
 }
 
@@ -186,22 +172,18 @@ __aicore__ inline void CompleteComputeContext()
     }
 }
 
-template <bool Small>
-using UrmaGmm1For = MegaMoeImpl::GmmKernel::CatlassGmm1<typename UrmaGmmConfigFor<Small>::ProblemConfig,
-                                                      false, UrmaInputRows, Small>;
-template <bool Small>
-using UrmaGmm2For = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows, Small>;
+using UrmaGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig, false, UrmaInputRows>;
+using UrmaGmm2 = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows>;
 
 template <bool FuseGateUp>
 __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
-                                       uint32_t firstTile, UrmaGmm1For<FuseGateUp>& gmm1, bool endContext, Timer& timer)
+                                       uint32_t firstTile, UrmaGmm1& gmm1, bool endContext, Timer& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
     const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
     const auto shape = FragmentShape(args, fragment);
-    constexpr uint32_t tileM = FuseGateUp ? kSmallComputeTileM : kComputeTileM;
-    auto config1 = UrmaGmmConfigFor<FuseGateUp>::BuildGmm1ProblemConfig(shape, job, tileM);
+    auto config1 = UrmaGmmConfigFor<FuseGateUp>::BuildGmm1ProblemConfig(shape, job, kComputeTileM);
     MegaMoeImpl::GmmKernel::BlockScheduler schedule1(
         {config1.m, config1.schedulerN, config1.k},
         MegaMoeImpl::GmmKernel::BlockScheduler::Params{
@@ -256,9 +238,8 @@ __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, ui
     timer.End(Phase::Gmm1);
 }
 
-template <bool Small>
 __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
-                                       uint32_t firstTile, UrmaGmm2For<Small>& gmm2, uint32_t batchBegin, bool endContext,
+                                       uint32_t firstTile, UrmaGmm2& gmm2, uint32_t batchBegin, bool endContext,
                                        Timer& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
@@ -266,12 +247,6 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
     const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
     const auto shape = FragmentShape(args, fragment);
     auto config2 = UrmaGmmConfig::BuildGmm2ProblemConfig(shape, job, kComputeTileM);
-    if constexpr (Small) {
-        // The shared builder deliberately defaults GMM2 to M256; override only
-        // this independent small-kernel instantiation and its block descriptor.
-        config2.tileM = kSmallComputeTileM;
-        config2.blockMmadTiling.tileM = kSmallComputeTileM;
-    }
     MegaMoeImpl::GmmKernel::BlockScheduler schedule2(
         {config2.m, config2.schedulerN, config2.k},
         MegaMoeImpl::GmmKernel::BlockScheduler::Params{
@@ -281,7 +256,7 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
         // The independent activation workers collectively publish one
         // contribution per original GMM1 tile after both FP8 planes drain.
         const uint64_t waitStart = timer.TraceBegin();
-        WaitComputeFlag(args.activationDone, fragmentIndex, FragmentGmm1TilesFor<Small>(args, fragment));
+        WaitComputeFlag(args.activationDone, fragmentIndex, FragmentGmm1Tiles(args, fragment));
         timer.TraceEnd(TraceEvent::WaitActivation, waitStart, fragmentMeta);
     }
     timer.Begin(Phase::Gmm2);
@@ -309,7 +284,7 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
     }
     if (endContext) {
         const uint64_t drainStart = timer.TraceBegin();
-        // One FIX drain per expert batch. Intermediate compute groups keep
+        // One FIX drain per expert batch. Intermediate M256 groups keep
         // submitting; the block's FIX_M events still protect each L0C slot.
         gmm2.End();
         CompleteComputeContext();
@@ -347,13 +322,12 @@ __aicore__ inline ComputeBatchTask LoadComputeTask(const Arguments& args, uint32
 // Only an AIC and its paired AIV0 enter this routine. They use the identical
 // host-planned expert schedule and global tile ownership. SwiGLU remains
 // independent; the GMM1 M-group window covers earlier activation latency.
-template <bool Small>
-__aicore__ inline void RunCubeAndProloguePath(const Arguments& args, uint32_t block, Timer& timer)
+__aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, Timer& timer)
 {
     // Only one stage owns the shared L1/L0/prologue buffers at a time. The
     // objects keep their views; each expert batch acquires/releases events.
-    UrmaGmm1For<Small> gmm1;
-    UrmaGmm2For<Small> gmm2;
+    UrmaGmm1 gmm1;
+    UrmaGmm2 gmm2;
     for (uint32_t step = 0U; step < args.config.computeTaskCount; ++step) {
         const auto task = LoadComputeTask(args, step);
         const auto range = LoadComputeBatch(args, task.batchIndex);
@@ -361,7 +335,7 @@ __aicore__ inline void RunCubeAndProloguePath(const Arguments& args, uint32_t bl
         const auto first = LoadFragment(args, range.begin);
         const bool isGmm1 = task.stage == ComputeBatchStage::Gmm1;
         const uint64_t tileBegin = isGmm1 ? first.gmm1TileBegin : first.gmm2TileBegin;
-        const uint32_t tilesPerGroup = isGmm1 ? FragmentGmm1TilesFor<Small>(args, first) : FragmentGmm2Tiles(args, first);
+        const uint32_t tilesPerGroup = isGmm1 ? FragmentGmm1Tiles(args, first) : FragmentGmm2Tiles(args, first);
         const uint64_t tileLimit = static_cast<uint64_t>(range.end - range.begin) * tilesPerGroup;
         // Jump directly between this core's groups before loading their GM
         // descriptors or building matmul configs. AIC/AIV0 keep identical
@@ -372,9 +346,13 @@ __aicore__ inline void RunCubeAndProloguePath(const Arguments& args, uint32_t bl
             const uint32_t fragmentIndex = range.begin + owned.group;
             const bool endContext = nextTile >= tileLimit;
             if (isGmm1) {
-                RunGmm1Fragment<Small>(args, block, fragmentIndex, owned.firstTile, gmm1, endContext, timer);
+                if (UseFusedGateUp(args.config)) {
+                    RunGmm1Fragment<true>(args, block, fragmentIndex, owned.firstTile, gmm1, endContext, timer);
+                } else {
+                    RunGmm1Fragment<false>(args, block, fragmentIndex, owned.firstTile, gmm1, endContext, timer);
+                }
             } else {
-                RunGmm2Fragment<Small>(args, block, fragmentIndex, owned.firstTile, gmm2, range.begin, endContext, timer);
+                RunGmm2Fragment(args, block, fragmentIndex, owned.firstTile, gmm2, range.begin, endContext, timer);
             }
             tile = nextTile;
         }
@@ -441,15 +419,14 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
     epilogue.UpdateGlobalAddr({static_cast<int64_t>(fragment.rowBegin * args.config.intermediate),
                                static_cast<int64_t>(fragment.rowBegin * (args.config.intermediate / 32U)), 0, 0, 0, 0});
     using GmmConfig = UrmaGmmConfigFor<FuseGateUp>;
-    constexpr uint32_t tileM = FuseGateUp ? kSmallComputeTileM : kComputeTileM;
-    auto config = GmmConfig::BuildGmm1ProblemConfig(FragmentShape(args, fragment), job, tileM);
+    auto config = GmmConfig::BuildGmm1ProblemConfig(FragmentShape(args, fragment), job, kComputeTileM);
     const auto layouts = GmmConfig::BuildLayouts(config);
     auto gmC = Te::MakeTensor(
         Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ bfloat16_t*>(addr.gmm1OutGlobal)), layouts.c);
     MegaMoeImpl::GmmKernel::BlockScheduler scheduler(
         {config.m, config.outputN, config.k},
         MegaMoeImpl::GmmKernel::BlockScheduler::Params{
-            Te::MakeCoord(static_cast<int64_t>(tileM), static_cast<int64_t>(config.tileN))});
+            Te::MakeCoord(static_cast<int64_t>(kComputeTileM), static_cast<int64_t>(config.tileN))});
     epilogue.UpdateNextProblem({config.m, config.outputN, config.k, 0});
     const auto coord = scheduler.GetBlockCoord(tile);
     const auto tileShape = scheduler.GetBlockShape(coord);
@@ -457,7 +434,7 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
     const uint32_t n = Get<MegaMoeImpl::N_VALUE>(coord);
     const uint32_t rows = Get<MegaMoeImpl::M_VALUE>(tileShape);
     const uint32_t columns = Get<MegaMoeImpl::N_VALUE>(tileShape);
-    // Activation stages at most M128; completion belongs to the whole compute group.
+    // Only the staging copy changes to M128; ready counters stay M256.
     config.tileM = kActivationTileM;
     timer.Begin(Phase::Activation);
     for (uint32_t offset = 0U; offset < rows; offset += kActivationTileM) {

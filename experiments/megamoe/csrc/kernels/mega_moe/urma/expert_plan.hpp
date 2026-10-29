@@ -68,7 +68,7 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
     plan.config = input;
     auto& config = plan.config;
     config.gmm1Tiles = config.gmm2Tiles = 0;
-    const uint32_t kRowsPerGroup = ComputeGroupRows(input);
+    constexpr uint32_t kRowsPerGroup = 256;
     const uint64_t expandedRows = static_cast<uint64_t>(config.bs) * config.topk;
     constexpr uint64_t kUnassignedDependency = std::numeric_limits<uint64_t>::max();
     plan.reduceDependencies.assign(expandedRows, kUnassignedDependency);
@@ -193,7 +193,7 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
             group.segmentCount = static_cast<uint32_t>(plan.segments.size()) - group.segmentBegin;
             plan.fragments.push_back(group);
             config.gmm1Tiles += Gmm1ComputeTileCount(group.rows, config);
-            config.gmm2Tiles += Gmm2ComputeTileCount(group.rows, config);
+            config.gmm2Tiles += (config.hidden + 255U) / 256U;
         }
         plan.computeBatches.push_back({firstGroup, static_cast<uint32_t>(plan.fragments.size()) - firstGroup});
         compactRow += expertRows;

@@ -41,8 +41,6 @@ def test_only_exact_urma_device_tasks_are_selected(tmp_path):
                     "mega_moe_kernel",
                     "mega_moe_urma_kernel_do",
                     "my_mega_moe_urma_kernel",
-                    "mega_moe_urma_m128_kernel_do",
-                    "my_mega_moe_urma_m128_kernel",
                     "_Z23mega_moe_urma_kernel_doN11MegaMoeUrma9ArgumentsE",
                     "_Z26my_mega_moe_urma_kernelN11MegaMoeUrma9ArgumentsE",
                 )
@@ -55,14 +53,9 @@ def test_only_exact_urma_device_tasks_are_selected(tmp_path):
     json.dumps(samples, allow_nan=False)
 
 
-@pytest.mark.parametrize("name", [
-    "_Z20mega_moe_urma_kernelN11MegaMoeUrma9ArgumentsE",
-    "_Z25mega_moe_urma_m128_kernelN11MegaMoeUrma9ArgumentsE",
-    "mega_moe_urma_m128_kernel",
-    "void mega_moe_urma_m128_kernel(MegaMoeUrma::Arguments)",
-])
-def test_cann_mangled_kernel_name_from_ubx_capture(tmp_path, monkeypatch, name):
+def test_cann_mangled_kernel_name_from_ubx_capture(tmp_path, monkeypatch):
     directory, log = tmp_path / "profile", []
+    name = "_Z20mega_moe_urma_kernelN11MegaMoeUrma9ArgumentsE"
     rows = [kernel(i, i + 1, name) for i in range(41)]
     fake_profiler(monkeypatch, directory, rows, log)
     guard = SimpleNamespace(begin=lambda: None, end=lambda: None)

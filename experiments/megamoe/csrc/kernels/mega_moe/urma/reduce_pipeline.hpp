@@ -21,10 +21,6 @@ struct ReduceUbContract {
     // Conservative bound across EP4/8/16: at most 16*8192*8 received rows
     // and at most 96 local experts, each contributing one partial M256 group.
     static constexpr uint32_t maxSelfDependencies = kWorld * 8192U * topk / kComputeTileM + kMaxLocalExperts;
-    // Small-path M128 only applies while global routed rows < 384*128.
-    // Even sending every row to one rank needs at most 384+96 groups; keep
-    // the old M256-sized cache/layout so the regular path consumes no extra UB.
-    static_assert(kExperts * kFusedGateUpExpectedRows / kSmallComputeTileM + kMaxLocalExperts <= maxSelfDependencies);
     static constexpr uint32_t bf16RowBytes = hidden * sizeof(uint16_t);
     static constexpr uint32_t fp32RowBytes = hidden * sizeof(float);
     static constexpr uint32_t inputBf16Offset = 0U;

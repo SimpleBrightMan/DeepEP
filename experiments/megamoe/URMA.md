@@ -180,7 +180,7 @@ GMM1直接Gather的X，以及AIC读取的已整理输入scale，均恢复默认L
 | 4096 | 144 | 720 | 2016 |
 | 8192 | 264 | 1320 | 3696 |
 
-benchmark打印`[URMA SCHEDULE] compute=expert-m128-a4c2-expected-lt128-v3`及M-group窗口并写入manifest；Python会拒绝不匹配的native扩展，需要重新编译安装完整wheel。流水图和正式耗时仍需实测验证；不能将tile数量减少倍数视为耗时加速倍数。
+benchmark打印`[URMA SCHEDULE] compute=expert-m256-expected-lt128-gateup-v2`及M-group窗口并写入manifest；Python会拒绝不匹配的native扩展，需要重新编译安装完整wheel。流水图和正式耗时仍需实测验证；不能将tile数量减少倍数视为耗时加速倍数。
 
 ### 本地多槽流水 A/B 验证（2026-10-20）
 
@@ -427,22 +427,6 @@ python3 experiments/megamoe/scripts/urma_trace_to_text.py \
 
 融合时选择离线准备的 `[gate128, up128]` 权重及scale；每个物理N256投影同时产生gate/up，逻辑激活列宽为128，每M-group由5个GMM1任务变为10个。Host planner、AIC/AIV0、SwiGLU和GMM2等待计数使用相同策略。未满足条件时保留原来的planar两次投影和5个任务。
 
-前一笔gate/up融合实验保持M-group256。下文“小M四槽”实验仅在同一选择条件下改为M128；Dispatch/Combine、前瞻group数以及大规模M256路径不变，没有引入unitflag分支的Reorder或通信实现。原始GMM1 trace的tileN/columns在融合路径表示逻辑激活坐标，物理投影的N起点及宽度各为两倍。
+M-group仍为256，L1/L0的M/N/K、GMM2、Dispatch/Combine和前瞻group数均不变；本次没有引入unitflag分支的Reorder或通信实现。原始GMM1 trace的tileN/columns在融合路径表示逻辑激活坐标，物理投影的N起点及宽度各为两倍。
 
 每个case打印 `[URMA GMM1] ... expected-rows/expert=... gate_up=fused128+128|planar256+256`，rank报告记录 `gmm1_gate_up_layout`；中间精度诊断按实际布局解释GMM1。Python/native的compute schedule标记更新，需要完整重编译安装后使用。运行参数不变。本次按要求未编译、未运行测试。
-
-## 专用 M128 / A四槽 / C双槽路径（2026-10-29）
-
-该实验沿用严格选择条件 `BS_per_rank × EP × TopK < Experts × 128`。当前1024至8192按1024扫描，只有EP4/BS1024满足；EP4/BS1536恰好128，走原M256。小路径仍使用已经有收益的gate128/up128融合，但现在host planner将所有专家（包括热点专家）按M128划分计算组，GMM1/GMM2的实际Mtile也为128。GMM1每组10个任务，GMM2每组14个任务，CV通信粒度不变。
-
-Host launcher只选择一次独立device入口：小路径为`mega_moe_urma_m128_kernel`，原`mega_moe_urma_kernel`仅保留M256实例，从编译入口隔离小路径的寄存器/栈和指令体积。AIC/AIV0计算使用编译期模板实例。小实例使用L1A四槽、L0A四槽、L0C两槽，右矩阵仍为原L1B/L0B双槽与原K粒度。大实例沿用原block实现、资源参数和事件流水；不会把四槽资源或小M的预取调度塞入M256实例。性能无变化仍需用户实测确认，本次不作跑分承诺。
-
-完成通知以真实的M128组重新生成，SwiGLU、GMM2、Combine CV依赖和self Reduce都按同一组索引解释。小路径全局展开行数严格少于384×128，即使所有路由都落到一张卡，最多约384+96个计算组，小于原Reduce self cache的4192组容量，因此无需扩大Reduce UB或改变M256的UB布局。
-
-GMM1仍保留当前逐tile FIX完成等待和立即发布，以及时启动SwiGLU；本次没有引入延迟发布。因此不能把L0C双槽理解为GMM1跨tile必然重叠，双槽主要用于GMM2连续计算和输出scatter。每个GMM2专家批次末尾仍统一drain后发布完整结果。
-
-benchmark按case打印 `m_group=128 compute_pipeline=L1A4-L0A4-L0C2` 或 `m_group=256 compute_pipeline=original-M256`，JSON同时记录这两个字段。Python/native标记更新为 `expert-m128-a4c2-expected-lt128-v3`，必须重编译安装完整wheel；运行参数不变。按用户要求，本次只进行源码编辑/检查，不编译、不运行测试。
-
-### M128 编译验证补记（2026-10-29）
-
-在177.22.25.1、CANN `/home/pkg/b080/cann-9.2.0`编译时发现Host launcher不能调用`__aicore__`选择函数；现改为使用相同常量的Host整数比较。修复后CANN编译、wheel打包、native import通过；234项纯CPU回归通过。固定门禁发现8卡均有`81B18603`（UB端口链路down）Warning，拒绝上卡；本次没有NPU功能、精度、性能验证结果。
