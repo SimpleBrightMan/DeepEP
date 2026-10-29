@@ -7,6 +7,7 @@
 #include "catlass/gemm/block/block_mmad.hpp"
 #include "catlass/gemm/gemm_type.hpp"
 #include "block_mmad_a8w4.hpp"
+#include "block_mmad_a8w4_small.hpp"
 #include "block_prologue_a8w4.hpp"
 
 namespace MegaMoeImpl::GmmKernel {
@@ -27,7 +28,7 @@ struct CatlassGroupedMatmulLayouts {
 
 // Shared AIC/AIV0 pipeline mechanics; projection semantics belong to GMM1/GMM2 below.
 namespace detail {
-template <class Config, bool BypassInputL2 = false, class RowIO = ContiguousRowIO>
+template <class Config, bool BypassInputL2 = false, class RowIO = ContiguousRowIO, bool SmallAStages = false>
 class A8W4MatmulPipeline {
     using C = typename Config::KernelConfig;
     using A = typename C::ElementAType;
@@ -42,8 +43,8 @@ class A8W4MatmulPipeline {
     using LayoutScaleA = CatlassGroupedMatmulLayouts::LayoutScaleA;
     using LayoutScaleB = CatlassGroupedMatmulLayouts::LayoutScaleB;
     using LayoutDequantizedB = CatlassGroupedMatmulLayouts::LayoutDequantizedB;
-    using L1 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<256>>;
-    using L0 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<128>>;
+    using L1 = tla::Shape<tla::Int<SmallAStages ? 128 : 256>, tla::Int<256>, tla::Int<256>>;
+    using L0 = tla::Shape<tla::Int<SmallAStages ? 128 : 256>, tla::Int<256>, tla::Int<128>>;
     using ScaleALayout = decltype(tla::MakeMxScaleLayout<SA, LayoutScaleA, false>(uint32_t{}, uint32_t{}));
     using ScaleBLayout = decltype(tla::MakeMxScaleLayout<SB, LayoutScaleB, true>(uint32_t{}, uint32_t{}));
     using TileCopy =
@@ -52,8 +53,13 @@ class A8W4MatmulPipeline {
                                                      Catlass::Gemm::Tile::ScaleGranularity::PER_TENSOR>;
     // A multi-store result needs ordinary NZ L0C and explicit FIX ownership.
     // Keep the existing transformed/unit-flag path for contiguous outputs.
-    using Policy = Catlass::Gemm::MmadA8W4Mx<Arch, !RowIO::kScatterOutput, false, 16, 1, 2, 2, 2, 2>;
-    using Mmad = Catlass::Gemm::Block::MegaMoeBlockMmadA8W4<Policy, L1, L0, A, A, Out, void, TileCopy>;
+    using Policy = std::conditional_t<SmallAStages,
+        Catlass::Gemm::MmadA8W4Mx<Arch, false, false, 16, 2, 4, 2, 4, 2>,
+        Catlass::Gemm::MmadA8W4Mx<Arch, !RowIO::kScatterOutput, false, 16, 1, 2, 2, 2, 2>>;
+    // Compile-time selection: the original M256 block and event graph are unchanged.
+    using Mmad = std::conditional_t<SmallAStages,
+        Catlass::Gemm::Block::MegaMoeBlockMmadA8W4Small<Policy, L1, L0, A, A, Out, void, TileCopy>,
+        Catlass::Gemm::Block::MegaMoeBlockMmadA8W4<Policy, L1, L0, A, A, Out, void, TileCopy>>;
     using Prologue =
         Catlass::Gemm::Block::MegaMoeBlockPrologueA8W4<Arch, 2, Catlass::Gemm::GemmType<W, LayoutB>,
                                                        Catlass::Gemm::GemmType<A, LayoutDequantizedB>, L1, TileCopy>;
@@ -220,12 +226,12 @@ protected:
 // Routed GMM1 consumes offline-packed [gate128, up128] in one N256 projection.
 // Shared GMM1 retains planar weights and its independently scheduled N192 tiles.
 // The object may remain alive across expert slices; Begin/End delimit scratch ownership.
-template <class Config, bool BypassInputL2 = false, class RowIO = ContiguousRowIO>
-class CatlassGmm1 : private detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO> {
+template <class Config, bool BypassInputL2 = false, class RowIO = ContiguousRowIO, bool SmallAStages = false>
+class CatlassGmm1 : private detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO, SmallAStages> {
     bool fused_ = false;
     bool planarSingle_ = false;
     uint32_t halfN_ = 0;
-    using Pipeline = detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO>;
+    using Pipeline = detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO, SmallAStages>;
 
 public:
     __aicore__ inline CatlassGmm1() = default;
@@ -267,9 +273,9 @@ public:
 };
 
 // GMM2 owns the down projection and always writes row-major output.
-template <class Config, bool BypassInputL2 = false, class RowIO = ContiguousRowIO>
-class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO> {
-    using Pipeline = detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO>;
+template <class Config, bool BypassInputL2 = false, class RowIO = ContiguousRowIO, bool SmallAStages = false>
+class CatlassGmm2 : private detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO, SmallAStages> {
+    using Pipeline = detail::A8W4MatmulPipeline<Config, BypassInputL2, RowIO, SmallAStages>;
 
 public:
     __aicore__ inline CatlassGmm2() = default;

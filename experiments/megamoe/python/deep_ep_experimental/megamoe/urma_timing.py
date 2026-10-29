@@ -129,8 +129,9 @@ class UrmaLaunchGuard:
 # Match the exact device entry/signature so the host launcher (_do) and other
 # kernels remain excluded; do not loosen this to a substring search.
 _URMA_KERNEL = re.compile(
-    r"(?:^|::|\s)mega_moe_urma_kernel(?=\s*(?:$|\(|<))"
+    r"(?:^|::|\s)mega_moe_urma_(?:m128_)?kernel(?=\s*(?:$|\(|<))"
     r"|^_Z20mega_moe_urma_kernelN11MegaMoeUrma9ArgumentsE$"
+    r"|^_Z25mega_moe_urma_m128_kernelN11MegaMoeUrma9ArgumentsE$"
 )
 
 
