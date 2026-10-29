@@ -88,7 +88,7 @@ def test_route_weight_does_not_commute_with_fp8_quantization():
     np.testing.assert_array_equal(current[5], 0)
 
 
-@pytest.mark.parametrize("routing", ["balanced", "random", "skewed"])
+@pytest.mark.parametrize("routing", ["balanced", "random", "skewed", "random-balanced"])
 def test_benchmark_routing_stress_patterns(routing):
     from deep_ep_experimental.megamoe.benchmark import inputs, load_config
     from deep_ep_experimental.megamoe.validation import check_routing
@@ -142,7 +142,7 @@ def test_balanced_routes_match_legacy_rank_first_order(world, bs):
         np.testing.assert_array_equal(counts, np.full(experts, bs))
 
 
-@pytest.mark.parametrize("routing", ["balanced", "random", "skewed"])
+@pytest.mark.parametrize("routing", ["balanced", "random", "skewed", "random-balanced"])
 def test_routing_update_preserves_input_and_route_weight_rng(routing):
     from deep_ep_experimental.megamoe.benchmark import inputs
 
@@ -161,7 +161,7 @@ def test_routing_update_preserves_input_and_route_weight_rng(routing):
     x, ids, actual_weights = inputs(config, rank, bs, routing, world=64)
     np.testing.assert_array_equal(x, expected_x)
     np.testing.assert_array_equal(actual_weights, weights)
-    if routing != "balanced":
+    if routing in ("random", "skewed"):
         np.testing.assert_array_equal(ids, expected_ids)
 
 

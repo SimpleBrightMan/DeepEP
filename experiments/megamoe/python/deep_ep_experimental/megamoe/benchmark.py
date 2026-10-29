@@ -58,6 +58,10 @@ def inputs(config, rank, bs, routing="balanced", *, world):
         route_start = rank * bs * model["num_topk"]
         routes = np.arange(route_start, route_start + bs * model["num_topk"], dtype=np.int64)
         ids = ((routes % world) * local_experts + (routes // world) % local_experts).reshape(bs, model["num_topk"])
+    elif routing == "random-balanced":
+        from .random_balanced import random_balanced_indices
+
+        ids = random_balanced_indices(bs, world, model["num_experts"], model["num_topk"], rank)
     elif routing == "skewed":
         ids = np.broadcast_to(np.arange(model["num_topk"]), (bs, model["num_topk"]))
     elif routing == "random":
@@ -121,7 +125,7 @@ def main():
     parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
     parser.add_argument(
         "--routing",
-        choices=("balanced", "random", "skewed"),
+        choices=("balanced", "random", "skewed", "random-balanced"),
         default="balanced",
         help="Reproducible accuracy stress pattern; record the same pattern for performance comparisons",
     )

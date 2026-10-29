@@ -19,7 +19,7 @@ def parse_args(argv=None):
         default="1024,2048,3072,4096,5120,6144,7168,8192",
         help="Comma-separated BS/rank sweep; each BS must be in [1, num_max_tokens_per_rank] (native capacity <= 8192)",
     )
-    parser.add_argument("--routing", choices=("balanced", "random", "skewed"), default="balanced")
+    parser.add_argument("--routing", choices=("balanced", "random", "skewed", "random-balanced"), default="balanced")
     parser.add_argument("--cv-rows", type=int, default=256)
     parser.add_argument(
         "--gmm1-ahead-mgroups",
