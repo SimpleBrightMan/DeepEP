@@ -320,7 +320,7 @@ void Run(uint32_t world, uint32_t owner, const std::string& scenario, bool timer
             for (uint32_t part = 0; part < 2U; ++part) {
                 const uint32_t length = part ? rows - 1U : 1U;
                 const uint32_t group = fragments.size();
-                fragments.push_back({0U, 0U, sourceRows, length, 0U, group * 10U, group * 14U});
+                fragments.push_back({0U, 0U, sourceRows, length, 0U, group * 5U, group * 14U});
                 indices.push_back(group);
                 spans.push_back({sourceRows, (peer == c.rank ? cv * 8U : receiveRows) + part, group, length});
                 sourceRows += length;

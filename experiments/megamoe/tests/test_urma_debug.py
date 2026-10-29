@@ -335,25 +335,6 @@ def test_conditional_activation_matches_golden_from_real_gmm1(tmp_path):
     assert not report["errors"]
 
 
-def test_fused_gate128_up128_activation_layout(tmp_path):
-    # Distinct random columns catch swapped gate/up and incorrect tile offsets.
-    raw = fixture_snapshot()
-    rows, width = 6, 1280
-    rng = np.random.default_rng(20261029)
-    planar = reference.bf16(rng.normal(0, 0.2, (rows, 2 * width)).astype(np.float32))
-    gate, up = np.split(planar, 2, axis=-1)
-    activation = reference.bf16(gate / (1 + np.exp(np.clip(-gate, -80, 80))) * up)
-    codes, scales = reference.quantize_input(activation)
-    fused = planar.reshape(rows, 2, width // 128, 128).transpose(0, 2, 1, 3).reshape(rows, 2 * width)
-    raw.update(gmm1=byte_view(bf16(fused)), activation=byte_view(codes), activation_scale=byte_view(scales))
-    report = save(raw, tmp_path, intermediate=width, fused_gate_up=True)
-    assert not report["errors"]
-    assert report["stages"]["gmm1"]["layout"] == "gate128_up128"
-    assert report["checks"]["cpu_activation_from_gmm1"]["exact_byte_match"]
-    wrong = save(raw, tmp_path / "wrong-layout", intermediate=width)
-    assert not wrong["checks"]["cpu_activation_from_gmm1"]["exact_byte_match"]
-
-
 @pytest.mark.parametrize("corrupt", ["code", "scale"])
 def test_conditional_activation_reports_corrupt_code_or_scale(tmp_path, corrupt):
     raw, first, codes, scales = with_reference_activation(fixture_snapshot())

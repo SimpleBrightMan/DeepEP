@@ -231,8 +231,6 @@ def prepared_call_setup(monkeypatch):
     def forward(*operands):
         assert len(operands) == 12  # The existing untraced native signature stays compatible.
         assert operands[1].shape == (2048, 56, 2)
-        assert operands[5] is w1[0] and operands[7] is w1[1]  # fused weight AND scale
-        assert operands[6] is w2[0] and operands[8] is w2[1]  # GMM2 remains unchanged
         epochs.append(operands[-1])
         return Tensor((2048, 3584), "bf16")
 
@@ -296,7 +294,7 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
     assert created == [allow]
     assert checks[0][1][-3] is allow
     assert checks[0][1][-2] == "combine-ready-scan-reduce-world-v1"
-    assert checks[0][1][-1] == "expert-m256-gateup128-lookahead-v2"
+    assert checks[0][1][-1] == "expert-m256-mgroup-lookahead-v1"
     assert buffer.gmm1_ahead_mgroups == 12
 
 
@@ -306,7 +304,7 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
 def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, tail):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
     extension = SimpleNamespace(
-        urma_api_protocol=1, urma_tail_schedule=tail, urma_compute_schedule="expert-m256-gateup128-lookahead-v2"
+        urma_api_protocol=1, urma_tail_schedule=tail, urma_compute_schedule="expert-m256-mgroup-lookahead-v1"
     )
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
     urma._extension.cache_clear()
@@ -320,7 +318,7 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
         urma._extension.cache_clear()
 
 
-@pytest.mark.parametrize("schedule", [None, "expert-m256", "expert-m384-n128", "expert-m256-mgroup-lookahead-v1"])
+@pytest.mark.parametrize("schedule", [None, "expert-m256", "expert-m384-n128"])
 def test_native_mgroup_schedule_must_match_before_runtime_creation(monkeypatch, schedule):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
     extension = SimpleNamespace(

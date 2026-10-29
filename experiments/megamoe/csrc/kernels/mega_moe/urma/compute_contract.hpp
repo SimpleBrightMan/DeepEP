@@ -13,9 +13,6 @@ constexpr uint32_t kComputeCores = kAic;
 constexpr uint32_t kReduceWorkers = kLocalWorkers - kCommunicationWorkers;
 constexpr uint32_t kComputeTileM = 256U;
 constexpr uint32_t kComputeTileN = 256U;
-// One physical N256 GMM1 tile contains gate128 and up128. Coordinates
-// and activation ownership use the logical (post-SwiGLU) N128 width.
-constexpr uint32_t kGmm1LogicalTileN = kComputeTileN / 2U;
 // Keep matrix scheduling at M256; only the AIV1 epilogue works in M128
 // slices. The W4 AIV0 prologue remains the largest UB user at exactly 192KiB.
 constexpr uint32_t kActivationTileM = 128U;
@@ -170,12 +167,6 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr ActivationRowSlice ActivationSlice(uint32_
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ComputeTileCount(uint32_t rows, uint32_t columns)
 {
     return ((rows + kComputeTileM - 1U) / kComputeTileM) * ((columns + kComputeTileN - 1U) / kComputeTileN);
-}
-
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm1ComputeTileCount(uint32_t rows, uint32_t intermediate)
-{
-    return ((rows + kComputeTileM - 1U) / kComputeTileM) *
-           ((intermediate + kGmm1LogicalTileN - 1U) / kGmm1LogicalTileN);
 }
 
 // All stage task IDs are global prefix sums. Sparse experts cannot repeatedly

@@ -138,7 +138,7 @@ def _bf16_round(value):
     return ((bits + 0x7FFF + ((bits >> 16) & 1)) & np.uint32(0xFFFF0000)).view(np.float32)
 
 
-def _check_activation(arrays, *, fused_gate_up=False):
+def _check_activation(arrays):
     """Condition the Golden activation on real GMM1; not hardware emulation."""
     from .reference import bf16, dequantize_input, quantize_input
 
@@ -156,13 +156,7 @@ def _check_activation(arrays, *, fused_gate_up=False):
             raise ValueError(f"non-finite GMM1 in rows {begin}:{end}; conditional activation comparison skipped")
         if np.any((actual_codes & 127) == 127) or np.any(actual_scales == 255):
             raise ValueError(f"non-finite activation code/scale in rows {begin}:{end}; comparison skipped")
-        if fused_gate_up:
-            # Decode only this diagnostic chunk, not the entire expanded matrix.
-            pairs = gmm1.reshape(end - begin, -1, 2, 128)
-            gate = pairs[:, :, 0, :].reshape(end - begin, -1)
-            up = pairs[:, :, 1, :].reshape(end - begin, -1)
-        else:
-            gate, up = np.split(gmm1, 2, axis=-1)
+        gate, up = np.split(gmm1, 2, axis=-1)
         with np.errstate(over="raise", invalid="raise", divide="raise"):
             # Keep this expression and the BF16/MX conversion identical to
             # reference.expert_forward; no independent rounding policy here.
@@ -218,7 +212,7 @@ def _check_activation(arrays, *, fused_gate_up=False):
     )
 
 
-def save_snapshot(raw, directory, *, bs, hidden, intermediate, topk, received_rows, rank, fused_gate_up=False):
+def save_snapshot(raw, directory, *, bs, hidden, intermediate, topk, received_rows, rank):
     """Save JSON statistics and small numeric samples; return the JSON report.
 
     Reduce is reconstructed in blocks of at most 64 tokens, one TopK term at
@@ -310,8 +304,7 @@ def save_snapshot(raw, directory, *, bs, hidden, intermediate, topk, received_ro
 
     if all(name in arrays for name in ("gmm1", "activation", "activation_scale")):
         try:
-            report["stages"]["gmm1"]["layout"] = "gate128_up128" if fused_gate_up else "planar"
-            report["checks"]["cpu_activation_from_gmm1"] = _check_activation(arrays, fused_gate_up=fused_gate_up)
+            report["checks"]["cpu_activation_from_gmm1"] = _check_activation(arrays)
         except (ValueError, FloatingPointError) as error:
             report["errors"].append(f"cpu_activation_from_gmm1: {error}")
 
