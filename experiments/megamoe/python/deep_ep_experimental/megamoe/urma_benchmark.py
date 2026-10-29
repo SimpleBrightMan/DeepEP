@@ -358,7 +358,8 @@ def run(args, config, group):
             expected_rows = bs * world * model["num_topk"] / model["num_experts"]
             print(
                 f"[URMA GMM1] BS={bs} EP={world} expected-rows/expert={expected_rows:.3f} "
-                f"gate_up={'fused128+128' if fused_gate_up else 'planar256+256'}",
+                f"gate_up={'fused128+128' if fused_gate_up else 'planar256+256'} "
+                f"compute_pipeline={'M128-G1A3B3-G2A3B4-C2' if fused_gate_up else 'original-M256'}",
                 flush=True,
             )
         host_x, host_ids, host_weights = inputs(config, rank, bs, args.routing, world=world)
@@ -423,6 +424,7 @@ def run(args, config, group):
             "gmm1_ahead_mgroups": args.gmm1_ahead_mgroups,
             "gmm1_startup_mgroups_local": startup_mgroups,
             "gmm1_gate_up_layout": "gate128_up128" if fused_gate_up else "planar",
+            "compute_pipeline": "M128-G1A3B3-G2A3B4-C2" if fused_gate_up else "original-M256",
             "profile": profile_report,
             "profile_directory": capture["profile_dir"],
             "diagnostic_sample": capture["diagnostic_sample"],

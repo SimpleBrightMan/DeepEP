@@ -122,6 +122,7 @@ int main() {
     for (auto& count : counts) assert(std::cin >> count);
     const auto plan = BuildExpertPlan(counts.data(), config, uint64_t(16) * config.bs * config.topk);
     const auto& fragments = plan.fragments;
+    const uint32_t groupM = ComputeGroupRows(config);
     const auto& chunks = plan.recvChunks;
     const auto& batches = plan.computeBatches;
     const auto prefix1 = plan.config.gmm1Tiles, prefix2 = plan.config.gmm2Tiles;
@@ -146,7 +147,7 @@ int main() {
             assert(chunk != UINT32_MAX);
             fragmentChunks[f].push_back(chunk);
         }
-        assert(rows == group.rows && rows > 0 && rows <= kComputeTileM);
+        assert(rows == group.rows && rows > 0 && rows <= groupM);
         // The actual scale DMA uses padded UB rows and compact GM rows.
         // Exercise ragged source/CV spans, including 43/85/171-row boundaries.
         std::vector<uint8_t> scratch(kInputScaleUbBytes + 32, 0xcd);
@@ -179,15 +180,15 @@ int main() {
     std::vector<uint32_t> g1Owners(prefix1), g2Owners(prefix2), actOwners(prefix1);
     for (uint32_t f = 0; f < fragments.size(); ++f) {
         auto &d = fragments[f];
-        auto n1 = Gmm1ComputeTileCount(d.rows, config), n2 = ComputeTileCount(d.rows, 3584);
+        auto n1 = Gmm1ComputeTileCount(d.rows, config), n2 = Gmm2ComputeTileCount(d.rows, config);
         const uint32_t logicalN = Gmm1LogicalTileN(config);
         const uint32_t g1Columns = 1280 / logicalN;
-        assert(n1 == ((d.rows + 255) / 256) * g1Columns);
-        assert(n2 == ((d.rows + 255) / 256) * 14);
+        assert(n1 == ((d.rows + groupM - 1) / groupM) * g1Columns);
+        assert(n2 == ((d.rows + groupM - 1) / groupM) * 14);
         std::vector<uint32_t> outputVisits(d.rows * g1Columns), scaleVisits(d.rows * 40);
         uint32_t originalTileContributions = 0;
-        for (uint32_t m = 0; m < d.rows; m += kComputeTileM) {
-            const auto tileRows = std::min(kComputeTileM, d.rows - m);
+        for (uint32_t m = 0; m < d.rows; m += groupM) {
+            const auto tileRows = std::min(groupM, d.rows - m);
             for (uint32_t n = 0; n < 1280; n += logicalN) {
                 uint32_t slices = 0, visitedRows = 0;
                 for (uint32_t offset = 0; offset < tileRows; offset += kActivationTileM) {
@@ -292,7 +293,7 @@ int main() {
             assert(fragment.expert == task.batchIndex);
             const bool first = task.stage == Stage::Gmm1;
             const auto prefix = first ? fragment.gmm1TileBegin : fragment.gmm2TileBegin;
-            const auto count = (first ? Gmm1ComputeTileCount(fragment.rows, config) : ComputeTileCount(fragment.rows, 3584));
+            const auto count = (first ? Gmm1ComputeTileCount(fragment.rows, config) : Gmm2ComputeTileCount(fragment.rows, config));
             for (uint32_t core = 0; core < 28; ++core)
                 for (uint32_t tile = FirstOwnedComputeTile(prefix, core, 28); tile < count; tile += 28) {
                     const auto id = prefix + tile;
@@ -306,7 +307,7 @@ int main() {
         const bool firstStage = task.stage == Stage::Gmm1;
         const auto& firstFragment = fragments[range.begin];
         const uint64_t prefix = firstStage ? firstFragment.gmm1TileBegin : firstFragment.gmm2TileBegin;
-        const auto width = (firstStage ? Gmm1ComputeTileCount(firstFragment.rows, config) : ComputeTileCount(firstFragment.rows, 3584));
+        const auto width = (firstStage ? Gmm1ComputeTileCount(firstFragment.rows, config) : Gmm2ComputeTileCount(firstFragment.rows, config));
         const uint64_t limit = uint64_t(batch.fragmentCount) * width;
         for (uint32_t core = 0; core < 28; ++core) {
             size_t cursor = 0;
@@ -314,7 +315,7 @@ int main() {
                 const auto owned = OwnedComputeGroupAt(tile, width, 28);
                 const auto f = range.begin + owned.group;
                 const auto& fragment = fragments[f];
-                assert((firstStage ? Gmm1ComputeTileCount(fragment.rows, config) : ComputeTileCount(fragment.rows, 3584)) == width);
+                assert((firstStage ? Gmm1ComputeTileCount(fragment.rows, config) : Gmm2ComputeTileCount(fragment.rows, config)) == width);
                 const uint64_t fragmentPrefix = firstStage ? fragment.gmm1TileBegin : fragment.gmm2TileBegin;
                 assert(fragmentPrefix == prefix + uint64_t(owned.group) * width);
                 uint32_t completed = 0;
@@ -428,7 +429,7 @@ int main() {
                 bool ready = true;
                 for (uint32_t j = 0; j < chunk.fragmentCount; ++j) {
                     const auto group = plan.chunkGroupIndices[chunk.fragmentBegin + j];
-                    if (g2Done[group] != ComputeTileCount(fragments[group].rows, 3584)) ready = false;
+                    if (g2Done[group] != Gmm2ComputeTileCount(fragments[group].rows, config)) ready = false;
                 }
                 if (!ready || tick < dispatchCompleteAt) continue;
                 for (uint32_t row = 0; row < chunk.rows; ++row)
@@ -446,7 +447,7 @@ int main() {
         for (uint32_t f = 0; f < fragments.size(); ++f) {
             assert(scaleDone[f] == 1);
             assert(actDone[f] == Gmm1ComputeTileCount(fragments[f].rows, config));
-            assert(g2Done[f] == ComputeTileCount(fragments[f].rows, 3584));
+            assert(g2Done[f] == Gmm2ComputeTileCount(fragments[f].rows, config));
         }
         assert(std::all_of(sent.begin(), sent.end(), [](auto n) { return n == 1; }));
         assert(std::all_of(outputWrites.begin(), outputWrites.end(), [](auto n) { return n == 1; }));

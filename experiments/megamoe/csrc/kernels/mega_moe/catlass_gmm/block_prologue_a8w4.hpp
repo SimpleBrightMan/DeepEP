@@ -25,7 +25,7 @@
 #include "tla/tensor.hpp"
 
 namespace Catlass::Gemm::Block {
-template <class ArchTag, uint32_t L1B_STAGES_, class InType_, class OutType_, class TileShapeL1_, class TileCopy_>
+template <class ArchTag, uint32_t L1B_STAGES_, class InType_, class OutType_, class TileShapeL1_, class TileCopy_, bool DeepL1 = false>
 struct MegaMoeBlockPrologueA8W4 {
 public:
     using DispatchPolicy = MxA8W4Prologue<ArchTag, L1B_STAGES_>;
@@ -59,7 +59,7 @@ public:
     static_assert(std::is_same_v<LayoutIn, layout::Weight4BitnZ>, "MegaMoE requires packed NZ weights");
     static_assert(tla::get<1>(TileShapeL1{}) * tla::get<2>(TileShapeL1{}) <= 64 * 1024,
                   "Single-AIV weight output exceeds its UB stage");
-    static_assert(L1B_STAGES == 2, "MegaMoE uses two weight stages");
+    static_assert(DeepL1 ? (L1B_STAGES == 3 || L1B_STAGES == 4) : L1B_STAGES == 2, "Expected original B2 or dedicated M128 B3/B4");
 
     CATLASS_DEVICE
     MegaMoeBlockPrologueA8W4(const Params& params, bool activate = true)
@@ -70,7 +70,7 @@ public:
         }
         for (uint32_t i = 0; i < L1B_STAGES; i++) {
             // Assign L1/L0A/L0B space for each stages
-            l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(i * 384U * 1024U);
+            l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>((DeepL1 ? 192U + i * 64U : i * 384U) * 1024U);
         }
         // Packed inputs occupy [0,64KiB); the four
         // output slots interleave 256-byte vectors throughout [64,192KiB).
@@ -292,7 +292,7 @@ public:
 
     static constexpr int32_t SYNC_MODE = 4;
     constexpr static uint16_t AIV_SYNC_AIC_FLAG = 6;
-    constexpr static uint16_t AIC_SYNC_AIV_FLAG = 8;
+    constexpr static uint16_t AIC_SYNC_AIV_FLAG = DeepL1 ? 12 : 8;
 
     static constexpr int64_t UB_STAGES = 4;
 

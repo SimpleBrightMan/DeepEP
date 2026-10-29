@@ -326,6 +326,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     FinishCombinePeer(args, owner, signal, peerCounted, selfCounted);
 }
 
+template <bool Small>
 __aicore__ inline void Process(const Arguments& args)
 {
     Timer timer;
@@ -347,10 +348,10 @@ __aicore__ inline void Process(const Arguments& args)
     // No CV loop contains a rank-wide or local full-core synchronization.
     TraceLocalSync(timer, 0U);
     if constexpr (g_coreType == AIC) {
-        RunCubeAndPrologue(args, block, timer);
+        RunCubeAndProloguePath<Small>(args, block, timer);
         MarkCubeComplete(args);
     } else if (GetSubBlockIdx() == 0U) {
-        RunCubeAndPrologue(args, block, timer);
+        RunCubeAndProloguePath<Small>(args, block, timer);
     } else if (block < communicationWorkers) {
         CommunicatePeer(args, block, timer);
     } else {
