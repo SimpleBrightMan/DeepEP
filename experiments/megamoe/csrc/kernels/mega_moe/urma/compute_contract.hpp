@@ -199,7 +199,8 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm1ComputeTileCount(uint32_t row
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm2ComputeTileCount(uint32_t rows, const Config& config)
 {
     const uint32_t tileM = ComputeGroupRows(config);
-    return ((rows + tileM - 1U) / tileM) * ((config.hidden + kComputeTileN - 1U) / kComputeTileN);
+    const uint32_t tileN = UseFusedGateUp(config) ? 512U : kComputeTileN;
+    return ((rows + tileM - 1U) / tileM) * ((config.hidden + tileN - 1U) / tileN);
 }
 
 // All stage task IDs are global prefix sums. Sparse experts cannot repeatedly

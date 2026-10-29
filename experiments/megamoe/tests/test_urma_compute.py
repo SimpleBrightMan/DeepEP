@@ -120,6 +120,7 @@ int main() {
     config.maxPeerChunks = (config.bs * config.topk + config.cvRows - 1) / config.cvRows;
     std::vector<int64_t> counts(16 * 384);
     for (auto& count : counts) assert(std::cin >> count);
+    const uint32_t g2Columns = UseFusedGateUp(config) ? 7U : 14U;
     const auto plan = BuildExpertPlan(counts.data(), config, uint64_t(16) * config.bs * config.topk);
     const auto& fragments = plan.fragments;
     const uint32_t groupM = ComputeGroupRows(config);
@@ -184,7 +185,7 @@ int main() {
         const uint32_t logicalN = Gmm1LogicalTileN(config);
         const uint32_t g1Columns = 1280 / logicalN;
         assert(n1 == ((d.rows + groupM - 1) / groupM) * g1Columns);
-        assert(n2 == ((d.rows + groupM - 1) / groupM) * 14);
+        assert(n2 == ((d.rows + groupM - 1) / groupM) * g2Columns);
         std::vector<uint32_t> outputVisits(d.rows * g1Columns), scaleVisits(d.rows * 40);
         uint32_t originalTileContributions = 0;
         for (uint32_t m = 0; m < d.rows; m += groupM) {
@@ -362,7 +363,7 @@ int main() {
         uint32_t activationStart[13]{};
         activationStart[0] = 95;  // Stress an independently delayed activation worker.
         const uint32_t dispatchCompleteAt = 140;
-        std::vector<uint32_t> outputWrites(plan.config.receiveRows * 14), nextPeerChunk(16), sent(chunkCount);
+        std::vector<uint32_t> outputWrites(plan.config.receiveRows * g2Columns), nextPeerChunk(16), sent(chunkCount);
         uint32_t remainingChunks = 0;
         for (uint32_t index = 0; index < chunkCount; ++index) {
             if (chunks[index].peer == config.rank) sent[index] = 1;
@@ -408,13 +409,13 @@ int main() {
                 else {
                     const auto& group = fragments[t.fragment];
                     const uint32_t n = t.tile - group.gmm2TileBegin;
-                    assert(n < 14);
+                    assert(n < g2Columns);
                     // This models the actual completion boundary: scatter
                     // every span of this N tile before incrementing gmm2Done.
                     for (uint32_t j = 0; j < group.segmentCount; ++j) {
                         const auto& segment = plan.segments[group.segmentBegin + j];
                         for (uint32_t row = 0; row < segment.rows; ++row)
-                            assert(++outputWrites[(segment.receiveRow + row) * 14 + n] == 1);
+                            assert(++outputWrites[(segment.receiveRow + row) * g2Columns + n] == 1);
                     }
                     ++g2Done[t.fragment];
                 }
@@ -433,8 +434,8 @@ int main() {
                 }
                 if (!ready || tick < dispatchCompleteAt) continue;
                 for (uint32_t row = 0; row < chunk.rows; ++row)
-                    for (uint32_t n = 0; n < 14; ++n)
-                        assert(outputWrites[(chunk.localRow + row) * 14 + n] == 1);
+                    for (uint32_t n = 0; n < g2Columns; ++n)
+                        assert(outputWrites[(chunk.localRow + row) * g2Columns + n] == 1);
                 assert(++sent[index] == 1);
                 ++nextPeerChunk[peer]; --remainingChunks; ++progress;
             }

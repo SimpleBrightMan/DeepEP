@@ -13,3 +13,11 @@
 - 小路径独立入口 `mega_moe_urma_m128_kernel`，profiler已支持。GMM1 trace的tileN/columns为逻辑激活坐标（宽256），物理输出为512列。中间诊断按gate256/up256解析。
 
 按要求未编译、未运行测试。拉取后需重新编译安装，benchmark运行参数不变。
+
+## 第二笔：叠加 GMM2 N512
+
+在第一笔之上将小路径GMM2也接入同一宽N block：每组7个逻辑N512任务；每个K128激活输入只加载一次L0A，分别计算两个N256输出子块。整个M128×N512结果完成后，按原RowSegment遍历Scatter各来源对应的512列。
+
+GMM2总输出字节量和权重字节量不变；优化目标为A复用、减少任务/Scatter遍历。AIC的gmm2Done贡献、Host前缀分配、Combine CV依赖、本卡Reduce就绪阈值统一从14改为7。非小路径仍为14。GMM2专家批次末尾drain和通信quiet节奏不改。
+
+两笔都没有编译运行。对比时分别固定第一笔与第二笔commit并重新编译；不要用第二笔的wheel测试第一笔源码。

@@ -87,13 +87,16 @@ __aicore__ inline void PublishPeerStart(const Arguments& args, uint32_t owner, T
 // Neither speculative Combine nor a full scan waits on an unready CV.
 // Each dependency covers the complete GMM2 N direction and all FIX stores.
 // Inspect once and return at the first incomplete compute group.
+template <bool Small = false>
 __aicore__ inline bool IsChunkComputed(const Arguments& args, const Chunk& chunk)
 {
+    constexpr uint32_t tileM = Small ? 128U : 256U;
+    constexpr uint32_t tileN = Small ? 512U : 256U;
     for (uint32_t j = 0U; j < chunk.fragmentCount; ++j) {
         const uint32_t index = reinterpret_cast<__gm__ uint32_t*>(args.chunkGroupIndices)[chunk.fragmentBegin + j];
         const uint32_t rows = reinterpret_cast<__gm__ Fragment*>(args.fragments)[index].rows;
         if (ReadGmByPassDCache(ComputeFlag(args.gmm2Done, index)) <
-            static_cast<int32_t>(ComputeTileCount(rows, args.config.hidden))) {
+            static_cast<int32_t>(((rows + tileM - 1U) / tileM) * ((args.config.hidden + tileN - 1U) / tileN))) {
             return false;
         }
     }
@@ -136,6 +139,7 @@ __aicore__ inline void RetireCombineBatch(const Arguments& args, uint32_t owner,
 // One and only one AIV1 owns all PUT/quiet operations for this peer for the
 // entire invocation. Dispatch uses QP0 and Combine uses QP1, so a Dispatch
 // quiet cannot drain early Combine. Both queues retain the same single owner.
+template <bool Small = false>
 __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Timer& timer)
 {
     const uint32_t peer = PeerForOwner(args.config.rank, owner);
@@ -198,7 +202,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         // No Combine quiet or ready publication occurs during Dispatch.
         if (chunk.cv + 2U >= dispatchCvs && nextCombine + 1U < combineEnd) {
             const Chunk early = LoadChunk(args.recvChunks, nextCombine);
-            if (IsChunkComputed(args, early)) {
+            if (IsChunkComputed<Small>(args, early)) {
                 if (!combineStarted) {
                     timer.Begin(Phase::Combine);
                     combineStarted = true;
@@ -271,7 +275,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         for (uint32_t i = 0U; i < combineCount; ++i) {
             if (submitted.GetValue(i) != 0U) continue;
             const Chunk chunk = LoadChunk(args.recvChunks, combineBegin + i);
-            if (!IsChunkComputed(args, chunk)) continue;
+            if (!IsChunkComputed<Small>(args, chunk)) continue;
             if (waiting) {
                 // Close idle scope BEFORE emitting any PUT/quiet/flag trace.
                 timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
@@ -353,7 +357,7 @@ __aicore__ inline void Process(const Arguments& args)
     } else if (GetSubBlockIdx() == 0U) {
         RunCubeAndProloguePath<Small>(args, block, timer);
     } else if (block < communicationWorkers) {
-        CommunicatePeer(args, block, timer);
+        CommunicatePeer<Small>(args, block, timer);
     } else {
         RunActivation(args, block - communicationWorkers, timer);
     }
@@ -364,7 +368,7 @@ __aicore__ inline void Process(const Arguments& args)
         const uint32_t worker = ReduceWorkerIndex(block, GetSubBlockIdx(), args.config.world);
         if (worker < ReduceWorkers(args.config.world)) {
             timer.Begin(Phase::ReducePhase);
-            Reduce(args, worker, timer);
+            Reduce<Small>(args, worker, timer);
             const uint64_t owned = ReduceOwnedRows(args.config.bs, worker, args.config.world);
             timer.End(Phase::ReducePhase, owned * args.config.hidden * sizeof(bfloat16_t));
             PipeBarrier<PIPE_ALL>();

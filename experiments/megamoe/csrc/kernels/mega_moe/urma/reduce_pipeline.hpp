@@ -72,12 +72,16 @@ __aicore__ inline void SetReduceBit(AscendC::LocalTensor<uint32_t>& bits, uint32
 
 // Never wait inside a token probe. A false dependency immediately returns to
 // the scanner. Only positive observations are cached, for this invocation.
+template <bool Small = false>
 __aicore__ inline bool TryReduceToken(const Arguments& args, AscendC::LocalTensor<uint64_t>& dependencies,
                                       AscendC::LocalTensor<uint32_t>& remoteCache,
                                       AscendC::LocalTensor<uint32_t>& selfCache, uint32_t firstRoute)
 {
     using namespace AscendC;
-    constexpr uint32_t expectedSelfTiles = (ReduceUbContract::hidden + kComputeTileN - 1U) / kComputeTileN;
+    // Every descriptor is one complete M-group: small N512 needs 7 completed
+    // tiles, the original N256 path needs 14. Remote readiness stays CV-based.
+    constexpr uint32_t tileN = Small ? 512U : kComputeTileN;
+    constexpr uint32_t expectedSelfTiles = (ReduceUbContract::hidden + tileN - 1U) / tileN;
     for (uint32_t slot = 0U; slot < ReduceUbContract::topk; ++slot) {
         const uint64_t dependency = dependencies.GetValue(firstRoute + slot);
         const bool self = (dependency & kReduceSelfDependency) != 0U;
@@ -231,7 +235,7 @@ private:
     AscendC::LocalTensor<uint32_t> routes_;
 };
 
-template <typename TraceSink>
+template <bool Small = false, typename TraceSink>
 __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink& timer)
 {
     using namespace AscendC;
@@ -281,7 +285,7 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
                 }
                 ++probes;
             }
-            if (!allInputsReady && !TryReduceToken(args, dependenciesUb, remoteCache, selfCache, token * Ub::topk)) {
+            if (!allInputsReady && !TryReduceToken<Small>(args, dependenciesUb, remoteCache, selfCache, token * Ub::topk)) {
                 // Keep prior ready tokens moving while inspecting other work.
                 if (pipeline.HasPending()) pipeline.ConsumeOne();
                 continue;

@@ -63,9 +63,15 @@ __aicore__ inline uint32_t FragmentGmm1TilesFor(const Arguments& args, const Fra
 
 __aicore__ inline uint32_t FragmentGmm2Tiles(const Arguments& args, const Fragment& fragment)
 {
-    // Both M128 and M256 fragments fit within one original M256 tile; N stays
-    // 256, so the existing count is valid without a new small-path branch.
-    return ComputeTileCount(fragment.rows, args.config.hidden);
+    return Gmm2ComputeTileCount(fragment.rows, args.config);
+}
+
+template <bool Small>
+__aicore__ inline uint32_t FragmentGmm2TilesFor(const Arguments& args, const Fragment& fragment)
+{
+    constexpr uint32_t tileM = Small ? 128U : kComputeTileM;
+    constexpr uint32_t tileN = Small ? 512U : kComputeTileN;
+    return ((fragment.rows + tileM - 1U) / tileM) * ((args.config.hidden + tileN - 1U) / tileN);
 }
 
 __aicore__ inline MegaMoeImpl::GMMAddrInfo Gmm1Addresses(const Arguments& args, const Fragment& fragment)
@@ -190,7 +196,7 @@ template <bool Small>
 using UrmaGmm1For = MegaMoeImpl::GmmKernel::CatlassGmm1<typename UrmaGmmConfigFor<Small>::ProblemConfig,
                                                       false, UrmaInputRows, Small>;
 template <bool Small>
-using UrmaGmm2For = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows>;
+using UrmaGmm2For = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows, Small>;
 
 template <bool FuseGateUp>
 __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
@@ -267,6 +273,12 @@ __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, ui
     const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
     const auto shape = FragmentShape(args, fragment);
     auto config2 = UrmaGmmConfig::BuildGmm2ProblemConfig(shape, job, kComputeTileM);
+    if constexpr (Small) {
+        config2.tileM = kSmallComputeTileM;
+        config2.tileN = 512U;
+        config2.blockMmadTiling.tileM = kSmallComputeTileM;
+        config2.blockMmadTiling.tileN = 512U;
+    }
     MegaMoeImpl::GmmKernel::BlockScheduler schedule2(
         {config2.m, config2.schedulerN, config2.k},
         MegaMoeImpl::GmmKernel::BlockScheduler::Params{
@@ -356,7 +368,7 @@ __aicore__ inline void RunCubeAndProloguePath(const Arguments& args, uint32_t bl
         const auto first = LoadFragment(args, range.begin);
         const bool isGmm1 = task.stage == ComputeBatchStage::Gmm1;
         const uint64_t tileBegin = isGmm1 ? first.gmm1TileBegin : first.gmm2TileBegin;
-        const uint32_t tilesPerGroup = isGmm1 ? FragmentGmm1TilesFor<Small>(args, first) : FragmentGmm2Tiles(args, first);
+        const uint32_t tilesPerGroup = isGmm1 ? FragmentGmm1TilesFor<Small>(args, first) : FragmentGmm2TilesFor<Small>(args, first);
         const uint64_t tileLimit = static_cast<uint64_t>(range.end - range.begin) * tilesPerGroup;
         // Jump directly between this core's groups before loading their GM
         // descriptors or building matmul configs. AIC/AIV0 keep identical

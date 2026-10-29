@@ -40,7 +40,7 @@ int main(int argc, char**) {
         auto c = Dimensions(boundary - 1U, 256U, world);
         assert(UseFusedGateUp(c) && Gmm1ComputeTileCount(85U, c) == 5U);
         assert(ComputeGroupRows(c) == 128U && Gmm2ComputeTileCount(128U, c) == 14U);
-        assert(Gmm1ComputeTileCount(129U, c) == 10U && Gmm2ComputeTileCount(129U, c) == 28U);
+        assert(Gmm1ComputeTileCount(129U, c) == 10U && Gmm2ComputeTileCount(129U, c) == 14U);
         c.bs = boundary;
         assert(!UseFusedGateUp(c) && Gmm1ComputeTileCount(85U, c) == 5U);
         assert(ComputeGroupRows(c) == 256U && Gmm2ComputeTileCount(129U, c) == 14U);
@@ -190,7 +190,8 @@ def check_plans(ids, cv_rows, routes, plans):
         small = len(ids[0]) * world * 8 < 384 * 128
         group_m = 128 if small else 256
         g1_tiles = 5
-        assert g1 == groups * g1_tiles and g2 == groups * 14
+        g2_tiles = 7 if small else 14
+        assert g1 == groups * g1_tiles and g2 == groups * g2_tiles
         assert len(plan["B"]) == local_experts
         assert len(plan["A"]) == 2 * local_experts
         assert [expert for stage, expert in plan["A"] if stage == 1] == list(range(local_experts))
@@ -227,7 +228,7 @@ def check_plans(ids, cv_rows, routes, plans):
                 assert e == expert and 0 < group_rows <= group_m
                 assert group_rows == min(group_m, len(expert_rows) - cursor)
                 assert row_begin == len(expected_compact_rows) + cursor
-                assert g1_begin == group_index * g1_tiles and g2_begin == group_index * 14
+                assert g1_begin == group_index * g1_tiles and g2_begin == group_index * g2_tiles
                 compact[row_begin : row_begin + group_rows] += 1
                 mapping = []
                 for segment_index in range(begin, begin + segment_count):
