@@ -179,14 +179,14 @@ int main() {
     std::vector<uint32_t> g1Owners(prefix1), g2Owners(prefix2), actOwners(prefix1);
     for (uint32_t f = 0; f < fragments.size(); ++f) {
         auto &d = fragments[f];
-        auto n1 = ComputeTileCount(d.rows, 1280), n2 = ComputeTileCount(d.rows, 3584);
-        assert(n1 == ((d.rows + 255) / 256) * 5);
+        auto n1 = Gmm1ComputeTileCount(d.rows, 1280), n2 = ComputeTileCount(d.rows, 3584);
+        assert(n1 == ((d.rows + 255) / 256) * 10);
         assert(n2 == ((d.rows + 255) / 256) * 14);
-        std::vector<uint32_t> outputVisits(d.rows * 5), scaleVisits(d.rows * 40);
+        std::vector<uint32_t> outputVisits(d.rows * 10), scaleVisits(d.rows * 40);
         uint32_t originalTileContributions = 0;
         for (uint32_t m = 0; m < d.rows; m += kComputeTileM) {
             const auto tileRows = std::min(kComputeTileM, d.rows - m);
-            for (uint32_t n = 0; n < 1280; n += 256) {
+            for (uint32_t n = 0; n < 1280; n += 128) {
                 uint32_t slices = 0, visitedRows = 0;
                 for (uint32_t offset = 0; offset < tileRows; offset += kActivationTileM) {
                     auto slice = ActivationSlice(m, tileRows, offset);
@@ -197,8 +197,8 @@ int main() {
                     assert(ActivationUbContract::reciprocalOffset + slice.rows * 8 * 2 <=
                            ActivationUbContract::scratchEnd);
                     for (uint32_t row = slice.rowBegin; row < slice.rowBegin + slice.rows; ++row) {
-                        ++outputVisits[row * 5 + n / 256];
-                        for (uint32_t scale = n / 32; scale < (n + 256) / 32; ++scale)
+                        ++outputVisits[row * 10 + n / 128];
+                        for (uint32_t scale = n / 32; scale < (n + 128) / 32; ++scale)
                             ++scaleVisits[row * 40 + scale];
                     }
                     visitedRows += slice.rows;
@@ -290,7 +290,7 @@ int main() {
             assert(fragment.expert == task.batchIndex);
             const bool first = task.stage == Stage::Gmm1;
             const auto prefix = first ? fragment.gmm1TileBegin : fragment.gmm2TileBegin;
-            const auto count = ComputeTileCount(fragment.rows, first ? 1280 : 3584);
+            const auto count = (first ? Gmm1ComputeTileCount(fragment.rows, 1280) : ComputeTileCount(fragment.rows, 3584));
             for (uint32_t core = 0; core < 28; ++core)
                 for (uint32_t tile = FirstOwnedComputeTile(prefix, core, 28); tile < count; tile += 28) {
                     const auto id = prefix + tile;
@@ -304,7 +304,7 @@ int main() {
         const bool firstStage = task.stage == Stage::Gmm1;
         const auto& firstFragment = fragments[range.begin];
         const uint64_t prefix = firstStage ? firstFragment.gmm1TileBegin : firstFragment.gmm2TileBegin;
-        const auto width = ComputeTileCount(firstFragment.rows, firstStage ? 1280 : 3584);
+        const auto width = (firstStage ? Gmm1ComputeTileCount(firstFragment.rows, 1280) : ComputeTileCount(firstFragment.rows, 3584));
         const uint64_t limit = uint64_t(batch.fragmentCount) * width;
         for (uint32_t core = 0; core < 28; ++core) {
             size_t cursor = 0;
@@ -312,7 +312,7 @@ int main() {
                 const auto owned = OwnedComputeGroupAt(tile, width, 28);
                 const auto f = range.begin + owned.group;
                 const auto& fragment = fragments[f];
-                assert(ComputeTileCount(fragment.rows, firstStage ? 1280 : 3584) == width);
+                assert((firstStage ? Gmm1ComputeTileCount(fragment.rows, 1280) : ComputeTileCount(fragment.rows, 3584)) == width);
                 const uint64_t fragmentPrefix = firstStage ? fragment.gmm1TileBegin : fragment.gmm2TileBegin;
                 assert(fragmentPrefix == prefix + uint64_t(owned.group) * width);
                 uint32_t completed = 0;
@@ -392,7 +392,7 @@ int main() {
                 if (t.kind == 0 && !scaleDone[t.fragment]) continue;
                 if (t.kind == 1 && tick < activationStart[actor - 28]) continue;
                 if (t.kind == 1 && !g1Done[t.tile]) continue;
-                if (t.kind == 2 && actDone[t.fragment] != ComputeTileCount(fragments[t.fragment].rows, 1280))
+                if (t.kind == 2 && actDone[t.fragment] != Gmm1ComputeTileCount(fragments[t.fragment].rows, 1280))
                     continue;
                 if (t.kind == 0) {
                     // AIC gates only on scaleDone. Under arbitrary arrivals,
@@ -443,7 +443,7 @@ int main() {
         }
         for (uint32_t f = 0; f < fragments.size(); ++f) {
             assert(scaleDone[f] == 1);
-            assert(actDone[f] == ComputeTileCount(fragments[f].rows, 1280));
+            assert(actDone[f] == Gmm1ComputeTileCount(fragments[f].rows, 1280));
             assert(g2Done[f] == ComputeTileCount(fragments[f].rows, 3584));
         }
         assert(std::all_of(sent.begin(), sent.end(), [](auto n) { return n == 1; }));

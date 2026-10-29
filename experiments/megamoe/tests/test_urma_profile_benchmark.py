@@ -149,7 +149,7 @@ def test_run_profiles_all_formal_rounds_and_only_instruments_final_call(
 
     extension = SimpleNamespace(
         urma_api_protocol=1,
-        urma_compute_schedule="expert-m256-mgroup-lookahead-v1",
+        urma_compute_schedule="expert-m256-gateup128-lookahead-v2",
         urma_local_pipeline="multi-slot",
         urma_tail_schedule="combine-ready-scan-reduce-world-v1",
         urma_timer_schema=1,

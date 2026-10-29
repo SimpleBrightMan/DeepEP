@@ -464,6 +464,7 @@ def run(args, config, group):
                     topk=model["num_topk"],
                     received_rows=prepared.received_rows,
                     rank=rank,
+                    fused_gate_up=True,
                 )
                 del debug_raw
             source_counts = group.all_gather(

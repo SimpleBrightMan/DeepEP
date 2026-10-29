@@ -49,7 +49,7 @@ __aicore__ inline void WaitComputeFlag(uint64_t base, uint64_t index, uint32_t e
 
 __aicore__ inline uint32_t FragmentGmm1Tiles(const Arguments& args, const Fragment& fragment)
 {
-    return ComputeTileCount(fragment.rows, args.config.intermediate);
+    return Gmm1ComputeTileCount(fragment.rows, args.config.intermediate);
 }
 
 __aicore__ inline uint32_t FragmentGmm2Tiles(const Arguments& args, const Fragment& fragment)
@@ -91,8 +91,9 @@ __aicore__ inline MegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& args, 
 }
 
 using UrmaGmmConfig = MegaMoeImpl::GmmKernel::Config<true, 0, fp8_e4m3fn_t, fp4x2_e2m1_t, bfloat16_t, fp8_e8m0_t,
-                                                     fp8_e8m0_t, false, false, false, false, false, false, false>;
+                                                     fp8_e8m0_t, false, false, false, false, false, false, true>;
 using UrmaProblemConfig = UrmaGmmConfig::ProblemConfig;
+static_assert(UrmaProblemConfig::GMM1_TILE_N == kGmm1LogicalTileN);
 using UrmaInputRows = MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false>;
 using UrmaOutputRows = MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, false, true>;
 // Only URMA uses a separate FP32 sigmoid, matching the NPU cascade's operation order.
@@ -375,7 +376,7 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
     MegaMoeImpl::GmmKernel::BlockScheduler scheduler(
         {config.m, config.outputN, config.k},
         MegaMoeImpl::GmmKernel::BlockScheduler::Params{
-            Te::MakeCoord(static_cast<int64_t>(kComputeTileM), static_cast<int64_t>(kComputeTileN))});
+            Te::MakeCoord(static_cast<int64_t>(kComputeTileM), static_cast<int64_t>(kGmm1LogicalTileN))});
     epilogue.UpdateNextProblem({config.m, config.outputN, config.k, 0});
     const auto coord = scheduler.GetBlockCoord(tile);
     const auto tileShape = scheduler.GetBlockShape(coord);

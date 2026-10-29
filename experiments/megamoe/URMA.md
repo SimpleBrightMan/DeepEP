@@ -155,7 +155,8 @@ for e = 0 .. localExperts-1:
     pending_groups -= actual_group_count[e]
 ```
 
-H3584/I1280/E384/TopK8、EP16均衡时，每个M256 group有5个GMM1逻辑tile（gate/up成对），让28个AIC每核至少领到2个tile需要 `ceil(28*2/5)=12` 个group；至少3个需要17个group，可设置18进行实验。默认12时，BS2048首轮从原6个group增加到12个（60tile，每核2～3个）；BS4096原本就是12个、BS8192原本是22个，两个规模的整条专家任务顺序与旧版相同。真实路由按实际group计数，不能用此均衡算例保证任意路由的并行度。
+H3584/I1280/E384/TopK8 时，每个 M256 group 现在有 **10 个 GMM1 任务**：每个任务输出物理 N256 的 gate128+up128，对应激活 N128。默认 `--gmm1-ahead-mgroups 12` 保持不变，以隔离本次布局实验；12个group提供120个任务。按数量计算，28个AIC各至少2个任务需要6个group，但实际就绪时间取决于路由、Dispatch和scale gather，不能据此保证并行度。
+
 
 `--gmm1-ahead-mgroups 0` 精确恢复原调度，便于对照。窗口持续补充，不仅影响启动预热；所有GMM1和GMM2仍各执行一次。Host在路由准备时生成任务数组，AIC和对应AIV0读取同一份顺序；中间结果使用既有独立GM行，不新增L1/L0/UB槽位，专家结束握手保留。更深窗口可能推迟Combine/Reduce或提前遇到尚未到达的Dispatch CV，应同时比较完整算子耗时。新的起跑对齐和连续采样方式见 [URMA_TIMING.md](URMA_TIMING.md)。
 
@@ -185,7 +186,7 @@ GMM1直接Gather的X，以及AIC读取的已整理输入scale，均恢复默认L
 | 4096 | 144 | 720 | 2016 |
 | 8192 | 264 | 1320 | 3696 |
 
-benchmark打印`[URMA SCHEDULE] compute=expert-m256-mgroup-lookahead-v1`及M-group窗口并写入manifest；Python会拒绝不匹配的native扩展，需要重新编译安装完整wheel。流水图和正式耗时仍需实测验证；不能将tile数量减少倍数视为耗时加速倍数。
+benchmark打印`[URMA SCHEDULE] compute=expert-m256-gateup128-lookahead-v2`及M-group窗口并写入manifest；Python会拒绝不匹配的native扩展，需要重新编译安装完整wheel。流水图和正式耗时仍需实测验证；不能将tile数量减少倍数视为耗时加速倍数。
 
 ### 本地多槽流水 A/B 验证（2026-10-20）
 
@@ -425,3 +426,11 @@ python3 experiments/megamoe/scripts/urma_trace_to_text.py \
 2026-10-20 本分支的`combine-ready-scan-reduce41`通过990项MegaMoE/runtime CPU回归、CANN 9.2.0完整wheel编译和native导入。新增检查直接运行生产Reduce头文件的异步流水模型，覆盖非单调token提交、最后一个token越过阻塞的第一个token、ready正缓存、跨epoch重置、六槽事件复用、精确计数16快路径及完整BF16输出；真实Host planner另验证极端偏斜/专家尾块下的UB与依赖位图容量。
 
 同版wheel在两台各8卡Ascend950DT上完成EP16运行回归。对照`db7d395`，balanced和random各执行BS2048/4096/8192、CV256、warmup=1、iters=2及独立timer调用；两种路由共96个rank/BS的完整BF16输出均有限且逐位相同，各进程正常结束。本次未使用独立Golden；短轮次双机耗时用于功能诊断，不作为UBX单机性能结论。通信协议、41个Reduce worker和每核一条Reduce trace保持不变。
+
+## Unitflag GMM1 gate/up 融合（2026-10-29）
+
+本分支将 GMM1 统一改为 `[gate128, up128]` 交错布局，直接选择 `transform_weights_for_mega_moe` 已经离线准备好的 fused 权重和 scale，无 forward 内转换。一个逻辑 N128 任务只下发一次物理 N256 投影；GMM2 仍为 N256。M-group256、L1 256×256×256、L0 256×256×128、通信与Reorder分工均不变。
+
+Host planner 和设备端统一按每group10个任务分配 `gmm1Done`，每个激活任务读取同一物理tile的两半，写出逻辑N128，所有10个任务完成才允许GMM2读取该group。保持GMM1立即drain/发布及GMM2延迟drain、共享上下文。
+
+`Gmm1Tile`/`Gmm1Dequant` 的 trace `tileN`、`columns` 是逻辑激活列坐标（每tile128）；实际投影的列起点和宽度各为两倍。debug snapshot 的GMM1原始数据也为交错布局，诊断解析会显式按此还原gate/up。compute schedule标记升级为 `expert-m256-gateup128-lookahead-v2`，需要重新编译安装，避免旧native读取新布局。

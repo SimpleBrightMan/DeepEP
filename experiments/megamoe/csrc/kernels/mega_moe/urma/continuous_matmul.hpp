@@ -40,7 +40,6 @@ class ContinuousMatmul
     : private MegaMoeImpl::GmmKernel::detail::A8W4MatmulPipeline<Config, false, ContinuousComputeRows> {
     using Pipeline = MegaMoeImpl::GmmKernel::detail::A8W4MatmulPipeline<Config, false, ContinuousComputeRows>;
     bool gateUp_ = false;
-    uint32_t halfN_ = 0U;
 
 public:
     using Pipeline::Begin;
@@ -50,23 +49,22 @@ public:
     template <class Problem>
     __aicore__ inline void UpdateProblem(const Problem& config, const MegaMoeImpl::GMMAddrInfo& addr, bool gmm1)
     {
-        // URMA uses planar gate/up, never fused weight columns.
-        static_assert(!Problem::FUSED_GATE_UP);
+        static_assert(Problem::FUSED_GATE_UP);
         Pipeline::UpdateProblem(config, addr, gmm1 ? addr.gmm1OutGlobal : addr.gmm2OutGlobal);
         gateUp_ = gmm1;
-        halfN_ = config.outputN;
     }
 
     __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t columns)
     {
-        Pipeline::ComputeProjection(m, n, rows, columns, n);
-        if (gateUp_) Pipeline::ComputeProjection(m, n + halfN_, rows, columns, n + halfN_);
+        // Logical N128 -> physical [gate128, up128]. GMM2 stays N256.
+        const uint32_t physicalN = gateUp_ ? 2U * n : n;
+        const uint32_t physicalColumns = gateUp_ ? 2U * columns : columns;
+        Pipeline::ComputeProjection(m, physicalN, rows, physicalColumns, physicalN);
     }
 
     __aicore__ inline void Dequantize(uint32_t n, uint32_t rows, uint32_t columns)
     {
-        Pipeline::DequantizeWeight(n, rows, columns);
-        if (gateUp_) Pipeline::DequantizeWeight(n + halfN_, rows, columns);
+        Pipeline::DequantizeWeight(gateUp_ ? 2U * n : n, rows, gateUp_ ? 2U * columns : columns);
     }
 };
 
