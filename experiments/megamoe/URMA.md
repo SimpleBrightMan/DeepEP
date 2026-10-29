@@ -442,3 +442,7 @@ Host launcher只选择一次独立device入口：小路径为`mega_moe_urma_m128
 GMM1仍保留当前逐tile FIX完成等待和立即发布，以及时启动SwiGLU；本次没有引入延迟发布。因此不能把L0C双槽理解为GMM1跨tile必然重叠，双槽主要用于GMM2连续计算和输出scatter。每个GMM2专家批次末尾仍统一drain后发布完整结果。
 
 benchmark按case打印 `m_group=128 compute_pipeline=L1A4-L0A4-L0C2` 或 `m_group=256 compute_pipeline=original-M256`，JSON同时记录这两个字段。Python/native标记更新为 `expert-m128-a4c2-expected-lt128-v3`，必须重编译安装完整wheel；运行参数不变。按用户要求，本次只进行源码编辑/检查，不编译、不运行测试。
+
+### M128 编译验证补记（2026-10-29）
+
+在177.22.25.1、CANN `/home/pkg/b080/cann-9.2.0`编译时发现Host launcher不能调用`__aicore__`选择函数；现改为使用相同常量的Host整数比较。修复后CANN编译、wheel打包、native import通过；234项纯CPU回归通过。固定门禁发现8卡均有`81B18603`（UB端口链路down）Warning，拒绝上卡；本次没有NPU功能、精度、性能验证结果。

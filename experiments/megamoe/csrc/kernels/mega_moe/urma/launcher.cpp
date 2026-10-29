@@ -37,7 +37,13 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_urma_kernel_do(u
                                                                                void* stream,
                                                                                const MegaMoeUrma::Arguments* arguments)
 {
-    if (MegaMoeUrma::UseFusedGateUp(arguments->config)) {
+    // This wrapper is compiled as host code even in the device compilation
+    // pass; it must not call the __aicore__ UseFusedGateUp helper. Keep the
+    // same integer predicate and shared threshold constants on the host.
+    const auto& config = arguments->config;
+    const bool small = static_cast<uint64_t>(config.bs) * config.world * config.topk <
+                       static_cast<uint64_t>(MegaMoeUrma::kExperts) * MegaMoeUrma::kFusedGateUpExpectedRows;
+    if (small) {
         mega_moe_urma_m128_kernel<<<block_dim, ub_bytes, stream>>>(*arguments);
     } else {
         mega_moe_urma_kernel<<<block_dim, ub_bytes, stream>>>(*arguments);
