@@ -109,3 +109,16 @@ not the uninstrumented multi-round average. Each rank's clock is independent.
 
 CPU tests validate collection order, sample filtering, aggregation and trace
 export. They do not establish NPU correctness or prove absence of target spills.
+
+## Independent Dispatch-to-Combine transition
+
+Both comparison branches remove only the local Dispatch/Pack rendezvous.
+Each owner completes its own Dispatch and its original static Pack quota,
+then scans ready Combine CVs without waiting for other owners. The original
+Pack assignment, lookahead, short/empty-peer remainder loop and completion
+counter updates are unchanged. For balanced routes the remainder loop is
+normally empty; skewed routes retain the work needed for correctness.
+
+There is no `WaitLocalDispatch` event or Dispatch-done counter update.
+Per-CV GMM2 readiness, SO publication, final outbound quiet and the final
+local kernel join remain. Different peer owners may be in different phases.

@@ -14,7 +14,7 @@
 
 ## Combine
 
-Dispatch全部完成、所有静态Pack份额完成后才开始Combine；删除Dispatch末尾的提前Combine。
+每个通信核完成自己对端的Dispatch与自己原有的Pack份额后，直接扫描Combine，不再等待本卡其它通信核或其它Pack worker。原Pack划分、lookahead和短/空peer补完循环保持不变；不提前Combine到本核Dispatch阶段。同一peer不交叠Dispatch和Combine，不同peer可以交叠。
 
 每轮扫描未发送CV，跳过未ready者。相邻ready CV的source/destination行都连续时合并为一个PUT；遇空洞、已发送CV、64位bitmap word边界或256MiB PUT上限就另起一段。最后一个实际未发送的通信CV不并入其它PUT。
 

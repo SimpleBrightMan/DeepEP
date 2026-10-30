@@ -104,7 +104,8 @@ __aicore__ inline bool IsChunkComputed(const Arguments& args, const Chunk& chunk
     return true;
 }
 
-// One owner per peer, QP0 only. Dispatch finishes before any Combine PUT.
+// One owner per peer, QP0 only. Each owner finishes its own Dispatch and
+// original Pack quota before Combine; there is no cross-owner phase join.
 __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Timer& timer)
 {
     const uint32_t peer = PeerForOwner(args.config.rank, owner);
@@ -194,14 +195,8 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     while (nextPackRound < args.config.packRoundCount)
         PackOneRound(args, nextPackRound++, owner, kAic, timer);
     MarkPackWorkerComplete(args);
-    AtomicAdd(ComputeFlag(args.localFlags, kLocalFlagDispatchDone), 1);
-    start = timer.TraceBegin();
-    if (owner == 0U) {
-        WaitComputeFlag(args.localFlags, kLocalFlagPackDone, kAic);
-        AtomicAdd(ComputeFlag(args.localFlags, kLocalFlagDispatchDone), 1);
-    }
-    WaitComputeFlag(args.localFlags, kLocalFlagDispatchDone, args.config.world);
-    timer.TraceEnd(TraceEvent::WaitLocalDispatch, start, peerMeta);
+    // This owner has completed its original static Pack quota. Do not wait
+    // for other owners: each Combine CV is protected by GMM2 readiness.
 
     constexpr uint32_t kSubmittedOffset = 32U;
     static_assert(kSubmittedOffset + kMaxPeerChunks * sizeof(uint32_t) <= kRequiredUbBytes);
