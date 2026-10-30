@@ -237,7 +237,7 @@ def filter_trace_waits(trace):
         if event.get("ph") == "X" and event.get("cat") == "wait.sync":
             name = event["name"]
             final_barrier = name in ("RankBarrier", "FinalPeerHandshake") or (
-                name == "LocalSync" and event.get("args", {}).get("sync_stage") == 2
+                name == "LocalSync" and event.get("args", {}).get("sync_stage") in (2, 3)
             )
             if not final_barrier:
                 hidden += 1
