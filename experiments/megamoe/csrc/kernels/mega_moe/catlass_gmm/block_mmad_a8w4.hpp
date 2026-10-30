@@ -639,7 +639,9 @@ protected:
     int32_t l1BEventList[L1B_STAGES];
     int32_t l0AEventList[L0A_STAGES];
     int32_t l0BEventList[L0B_STAGES];
-    int32_t l0CEventList[L0C_STAGES];
+    // UnitFlag's single C slot skips the explicit FIX-credit constructor
+    // loop, but its operand-ready MTE1_M event must still be initialized.
+    int32_t l0CEventList[L0C_STAGES]{};
 
     __gm__ typename AscendC::GlobalTensor<ElementA>::PrimType* lastAddrA[L1A_STAGES];
     __gm__ typename AscendC::GlobalTensor<ElementB>::PrimType* lastAddrB[L1B_STAGES];

@@ -360,6 +360,7 @@ def run(args, config, group):
     for bs in config["bs_values"]:
         case = rank_dir / f"bs_{bs}"
         case.mkdir()
+        wave_mgroups = 12 if world == 4 and bs == 1024 else 0
         fused_gate_up = use_fused_gate_up(bs, world, model["num_topk"], model["num_experts"])
         if rank == 0:
             expected_rows = bs * world * model["num_topk"] / model["num_experts"]
@@ -368,6 +369,8 @@ def run(args, config, group):
                 f"gate_up={'fused128+128' if fused_gate_up else 'planar256+256'}",
                 flush=True,
             )
+        if rank == 0 and wave_mgroups:
+            print("[URMA WAVE] EP4 BS1024: 12 real M-groups/wave; GMM1(wave)->GMM2(wave); ahead-mgroups not applied", flush=True)
         host_x, host_ids, host_weights = inputs(config, rank, bs, args.routing, world=world)
         codes, scales = quantize_input(host_x)
         x = (
@@ -429,6 +432,8 @@ def run(args, config, group):
             "received_rows_local": prepared.received_rows,
             "gmm1_ahead_mgroups": args.gmm1_ahead_mgroups,
             "gmm1_startup_mgroups_local": startup_mgroups,
+            "compute_wave_mgroups": wave_mgroups,
+            "gmm1_ahead_mgroups_applied": not bool(wave_mgroups),
             "gmm1_gate_up_layout": "gate128_up128" if fused_gate_up else "planar",
             "profile": profile_report,
             "profile_directory": capture["profile_dir"],

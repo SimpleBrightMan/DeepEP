@@ -34,3 +34,15 @@ Combine中间没有每CV quiet，也不再通过MTE发布Combine ready。Reduce�
 需重新编译完整wheel。core和experimental扩展都必须带`commfirst-so-bitmap-v1`标记，防止旧协议混装。benchmark命令和配置参数保持不变。
 
 完成了源码协议检查及相关纯Python回归；未进行CANN编译、C++模型执行或NPU功能/精度/性能测试。
+
+## Tile通知与EP4/BS1024 wave12
+
+GMM1/GMM2都按tile完成发布。FIX_S1事件在目标tile全部计算/FIX指令下发之后立即捕获；若本核下一实际任务仍为同类型且输入已ready，先下发下一tile，再等待旧事件并发布上一tile。若下一类型不同、输入尚未ready或本核结束，则先Flush，不允许扣住GMM1结果导致激活/GMM2自等待。
+
+同类型跨专家保持其原上下文和槽位状态；切换GMM类型才End、完成AIC/AIV0交接、再开启另一上下文。GMM1仍是UnitFlag输出、GMM2仍是普通NZ Scatter；没有引入跨阶段混用输出协议、M128、N512或新槽位。GMM2每完成一个tile增加一次组计数，Combine仍需等该组所有14个N方向结果完成。
+
+仅EP4且每rank BS1024时，planner按专家顺序遍历真实M256 groups，每12组一个wave（尾wave允许不足12）：GMM1(w0)→GMM2(w0)→GMM1(w1)→GMM2(w1)…。不增加全卡或全核barrier，也不按“12个专家”假定稀疏/热点路由。此case不使用--gmm1-ahead-mgroups；其它EP/BS仍用原前瞻调度。
+
+均衡或random-balanced时每卡96组、8个wave。GMM1总960 tile、GMM2总1344 tile不变；每核阶段切换15次，上下文开启/关闭16对。通知仍逐tile，不等整个wave结束才通知。
+
+打印新增 `[URMA WAVE]` 和报告字段compute_wave_mgroups/gmm1_ahead_mgroups_applied。不同type切换或依赖等待的Drain条对应上一tile，下一同type Submit可出现在该Drain之前；没有新增PIPE_ALL打点。需要重编译安装匹配新的compute schedule标记。
