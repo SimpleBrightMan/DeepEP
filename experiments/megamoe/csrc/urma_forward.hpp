@@ -22,7 +22,7 @@ public:
                           torch::Tensor topk_weights, torch::Tensor weight1, torch::Tensor weight2,
                           torch::Tensor weight_scales1, torch::Tensor weight_scales2,
                           c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> out, int64_t epoch,
-                          c10::optional<torch::Tensor> trace = c10::nullopt);
+                          c10::optional<torch::Tensor> trace = c10::nullopt, bool coarse_trace = false);
     int64_t workspace_bytes() const;
     // Explicit diagnostic only: synchronize before copying owned intermediates.
     std::map<std::string, torch::Tensor> debug_snapshot() const;

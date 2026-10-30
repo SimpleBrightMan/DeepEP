@@ -174,9 +174,10 @@ __aicore__ inline void CompleteComputeContext()
 }
 
 // Per-tile publication. Event1 is distinct from context teardown FIX_S0.
+template <class TimerT>
 struct TileOutputBackend {
     const Arguments& args;
-    Timer& timer;
+    TimerT& timer;
     __aicore__ inline void Arm() { SetFlag<HardEvent::FIX_S>(EVENT_ID1); }
     __aicore__ inline void Complete(bool gmm1, uint64_t tile, const TraceMeta& meta)
     {
@@ -187,14 +188,15 @@ struct TileOutputBackend {
         else AtomicAdd(ComputeFlag(args.gmm2Done, meta.fragment), 1);
     }
 };
-using PendingTile = TileCompletion<TileOutputBackend>;
+template <class TimerT>
+using PendingTile = TileCompletion<TileOutputBackend<TimerT>>;
 
 using UrmaGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig, false, UrmaInputRows>;
 using UrmaGmm2 = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows>;
 
-template <bool FuseGateUp>
+template <bool FuseGateUp, class TimerT>
 __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
-                                       uint32_t firstTile, UrmaGmm1& gmm1, PendingTile& pending, Timer& timer)
+                                       uint32_t firstTile, UrmaGmm1& gmm1, PendingTile<TimerT>& pending, TimerT& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
@@ -247,8 +249,9 @@ __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, ui
     timer.End(Phase::Gmm1);
 }
 
+template <class TimerT>
 __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
-                                       uint32_t firstTile, UrmaGmm2& gmm2, PendingTile& pending, Timer& timer)
+                                       uint32_t firstTile, UrmaGmm2& gmm2, PendingTile<TimerT>& pending, TimerT& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
@@ -313,14 +316,15 @@ __aicore__ inline ComputeBatchTask LoadComputeTask(const Arguments& args, uint32
 // Only an AIC and its paired AIV0 enter this routine. They use the identical
 // host-planned expert schedule and global tile ownership. SwiGLU remains
 // independent; the GMM1 M-group window covers earlier activation latency.
-__aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, Timer& timer)
+template <class TimerT>
+__aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, TimerT& timer)
 {
     // Only one stage owns the shared L1/L0/prologue buffers at a time. The
     // objects keep their views; only an actual local GMM-type switch releases events.
     UrmaGmm1 gmm1;
     UrmaGmm2 gmm2;
-    TileOutputBackend backend{args, timer};
-    PendingTile pending(backend);
+    TileOutputBackend<TimerT> backend{args, timer};
+    PendingTile<TimerT> pending(backend);
     bool active = false, activeGmm1 = false;
     uint32_t lastFragment = 0U;
     for (uint32_t step = 0U; step < args.config.computeTaskCount; ++step) {

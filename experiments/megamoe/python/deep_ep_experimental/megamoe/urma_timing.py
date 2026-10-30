@@ -26,7 +26,7 @@ class UrmaLaunchGuard:
     benchmark must not already have a torch.distributed default process group.
     """
 
-    def __init__(self, group, shape=(100000, 20000), repeat=50, timeout=300, *, backend="hccl"):
+    def __init__(self, group, shape=(100000, 20000), repeat=80, timeout=300, *, backend="hccl"):
         import torch
         import torch.distributed as dist
 
@@ -36,6 +36,7 @@ class UrmaLaunchGuard:
         self.shape, self.repeat = tuple(shape), repeat
         self.bytes = math.prod(self.shape) * 4 * 2
         self.input = self.output = self.store = self.process_group = None
+        self.alignment = None
         error = None
         try:
             if backend not in ("hccl", "store"):
@@ -86,6 +87,17 @@ class UrmaLaunchGuard:
         for _ in range(self.repeat):
             self.torch.exp(self.input, out=self.output)
 
+    def prepare_per_call_alignment(self):
+        if self.process_group is None:
+            raise RuntimeError("per-call device all-reduce requires --guard-backend hccl; no host fallback")
+        # SUM of zero stays finite across every invocation; allocate outside profiling.
+        self.alignment = self.torch.zeros((1,), dtype=self.torch.float32, device="npu")
+
+    def before_forward(self):
+        if self.alignment is None:
+            raise RuntimeError("prepare_per_call_alignment must precede profiling")
+        self.dist.all_reduce(self.alignment, group=self.process_group)
+
     def end(self):
         # forward_prepared orders caller after owner. The barrier therefore sees
         # the completed block; neither this barrier nor synchronization is timed.
@@ -99,13 +111,13 @@ class UrmaLaunchGuard:
         if self.process_group is not None:
             self.dist.destroy_process_group(self.process_group)
             self.process_group = None
-        self.input = self.output = None
+        self.input = self.output = self.alignment = None
 
     def describe(self):
         if self.backend == "hccl":
             method = "HCCL barrier + finite-input exp before continuous block; HCCL barrier + synchronize after"
             limitations = (
-                "reduces host launch skew; does not equalize physical device speeds or synchronize every iteration"
+                "reduces host launch skew; does not equalize physical device speeds; device all-reduce precedes each invocation when enabled"
             )
         else:
             method = "host Store barrier + finite-input exp before continuous block; host Store barrier + synchronize after"
@@ -115,6 +127,7 @@ class UrmaLaunchGuard:
             )
         return dict(
             method=method,
+            per_call_device_all_reduce=self.alignment is not None,
             backend=self.backend,
             exp_shape=list(self.shape),
             exp_repeat=self.repeat,
@@ -220,8 +233,10 @@ def measure_profiled_forward(forward, *, warmup, iters, guard, directory, last_f
         # exp and the continuous launches or insert a profiler step per round.
         guard.begin()
         for _ in range(warmup + iters):
+            guard.before_forward()
             forward()
         if last_forward is not None:
+            guard.before_forward()
             last_forward()
         guard.end()
         capture.step()

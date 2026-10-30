@@ -25,6 +25,23 @@ def trace_buffer(capacity=4):
     return raw
 
 
+def test_coarse_envelopes_preserve_sync_and_initial_wait_scope(tmp_path):
+    raw = trace_buffer(4)
+    add_record(raw, engine=0, event="CoarseLocalSyncStart", start=10, end=20)
+    add_record(raw, engine=0, event="CoarseGMM", start=21, end=100)
+    add_record(raw, engine=0, event="CoarseLocalSyncEnd", start=101, end=120)
+    add_record(raw, engine=1, event="CoarsePack", start=1, end=9)
+    add_record(raw, engine=1, event="CoarseDequant", start=21, end=98)
+    add_record(raw, engine=1, event="CoarseReduce", start=99, end=119)
+    path = tmp_path / "coarse.json"
+    export_trace(raw, path, rank=0, clock_mhz=1000)
+    trace = json.loads(path.read_text())
+    assert trace["metadata"]["instrumentation"] == "coarse"
+    assert len(events(trace)) == 6
+    assert any(row["name"] == "CoarseLocalSyncStart" for row in events(trace))
+    assert next(row for row in events(trace) if row["name"] == "CoarseGMM")["dur"] == 0.079
+
+
 def add_record(raw, engine=2, event="DispatchPutX", start=1000, end=1010, **metadata):
     index = int(raw[engine, 2])
     record = raw[engine, HEADER_WORDS + index * RECORD_WORDS : HEADER_WORDS + (index + 1) * RECORD_WORDS]
@@ -71,7 +88,7 @@ def test_every_event_id_has_a_name_and_no_fabricated_async_events():
             continue
         add_record(raw, engine=event_id, event=name)
     result = decode_trace(raw, rank=0, clock_mhz=1000)
-    assert len(events(result)) == sum(name is not None for name in EVENTS) == 35
+    assert len(events(result)) == sum(name is not None for name in EVENTS) == 44
     assert {row["ph"] for row in result["traceEvents"]} == {"M", "X"}
     assert {row["args"]["event_id"] for row in events(result)} == {index for index, name in enumerate(EVENTS) if name is not None}
 
@@ -368,7 +385,7 @@ def test_benchmark_trace_implies_timer_and_validates_capacity(tmp_path):
     args = parse_args(["--output-dir", str(tmp_path), "--trace"])
     assert args.trace and args.timer and args.trace_capacity == 4096
     plain = parse_args(["--output-dir", str(tmp_path)])
-    assert not plain.timer and not plain.trace
+    assert plain.timer and plain.trace
     with pytest.raises(SystemExit):
         parse_args(["--output-dir", str(tmp_path), "--trace-capacity", "0"])
     with pytest.raises(SystemExit):

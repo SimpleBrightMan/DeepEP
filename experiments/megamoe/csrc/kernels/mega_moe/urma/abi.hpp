@@ -77,7 +77,9 @@ enum class TraceEvent : uint32_t {
     ReduceDrain,      // Reserved: the Reduce envelope now includes its drain.
     // 33..41 remain reserved (including historical JSON-only composites).
     CombineSendComplete = 42U, // Final quiet: all outgoing Combine writes/flags complete.
-    DispatchSendComplete      // Final MTE3 drain: all Dispatch payloads and publications complete.
+    DispatchSendComplete,     // Final MTE3 drain: all Dispatch payloads and publications complete.
+    CoarsePack, CoarseLocalSyncStart, CoarseGMM, CoarseDequant,
+    CoarseDispatch, CoarseCombine, CoarseActivation, CoarseReduce, CoarseLocalSyncEnd
 };
 
 struct TraceMeta {
@@ -229,6 +231,7 @@ struct Arguments {
     uint64_t timer;
     uint64_t trace;
     uint64_t traceCapacity;
+    uint64_t coarseTrace; // explicit per-invocation mode; zero keeps detailed tracing
     uint64_t systemWorkspace;
     uint64_t ffts;
 };
