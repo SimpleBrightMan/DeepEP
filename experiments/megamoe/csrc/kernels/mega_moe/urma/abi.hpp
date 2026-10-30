@@ -74,7 +74,10 @@ enum class TraceEvent : uint32_t {
     WaitInputScale,
     CombinePublish,
     WaitReduceReady,  // Reserved for historical per-token Reduce traces.
-    ReduceDrain       // Reserved: the Reduce envelope now includes its drain.
+    ReduceDrain,      // Reserved: the Reduce envelope now includes its drain.
+    // 33..41 remain reserved (including historical JSON-only composites).
+    CombineSendComplete = 42U, // Final quiet: all outgoing Combine writes/flags complete.
+    DispatchSendComplete      // Final MTE3 drain: all Dispatch payloads and publications complete.
 };
 
 struct TraceMeta {

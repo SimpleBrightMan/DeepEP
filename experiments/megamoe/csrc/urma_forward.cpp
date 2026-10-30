@@ -291,6 +291,17 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     CheckTensor(output, 2, "out", device);
     TORCH_CHECK(output.scalar_type() == torch::kBFloat16 && output.sizes() == x.sizes(), "out must be BF16 [BS,H]");
     auto stream = c10_npu::getCurrentNPUStream();
+    // Combine SO uses disjoint ready bits rather than per-CV epoch values.
+    // Clear before PublishStart: a peer cannot submit this invocation's data
+    // until it observes that start. The previous invocation's final QP quiet
+    // has already completed every SO write before this stream can reuse it.
+    const uint64_t combine_ready_bytes = static_cast<uint64_t>(c.world) * c.maxPeerChunks * MegaMoeUrma::kFlagBytes;
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemsetAsync(reinterpret_cast<void*>(args_.symmetric + c.combineReadyOffset),
+                                             combine_ready_bytes, 0, combine_ready_bytes, stream.stream()));
+    const uint64_t finished_bytes = static_cast<uint64_t>(c.world) * MegaMoeUrma::kFlagBytes;
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemsetAsync(
+        reinterpret_cast<void*>(args_.symmetric + c.barrierOffset + finished_bytes), finished_bytes, 0,
+        finished_bytes, stream.stream()));
     for (auto* tensor :
          {&gmm1_done_, &input_scale_done_, &activation_done_, &gmm2_done_, &local_flags_, &pack_ready_}) {
         ASCEND_DEEPEP_CHECK_ACL(

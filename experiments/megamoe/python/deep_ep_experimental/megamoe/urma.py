@@ -19,6 +19,8 @@ from deep_ep._store import StoreGroup
 from .urma_routing import DeviceRoutes, prepare_routes
 from .validation import collective_check
 
+COMMUNICATION_PROTOCOL = "commfirst-so-bitmap-v1"
+
 
 def use_fused_gate_up(bs, world, topk=8, num_experts=384):
     """Match native UseFusedGateUp: expected expert rows strictly below 128."""
@@ -39,6 +41,11 @@ def _extension():
         raise RuntimeError(
             "URMA M-group lookahead needs its matching native wheel; rebuild and reinstall the complete wheel"
         )
+    if (
+        getattr(core, "megamoe_urma_communication_protocol", None) != COMMUNICATION_PROTOCOL
+        or getattr(extension, "urma_communication_protocol", None) != COMMUNICATION_PROTOCOL
+    ):
+        raise RuntimeError("URMA commfirst/SO requires matching core and experimental extensions; rebuild the complete wheel")
     return extension
 
 
@@ -144,6 +151,7 @@ class UrmaBuffer:
                 allow_multi_host,
                 "combine-ready-scan-reduce-world-v1",
                 "expert-m256-expected-lt128-gateup-v2",
+                COMMUNICATION_PROTOCOL,
             ),
         )
         self.group = group

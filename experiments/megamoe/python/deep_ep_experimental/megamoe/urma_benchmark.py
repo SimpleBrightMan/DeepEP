@@ -201,7 +201,7 @@ def run(args, config, group):
     import torch
     from .api import transform_weights_for_mega_moe
     from .reference import make_weights, quantize_input
-    from .urma import UrmaBuffer, _extension, use_fused_gate_up
+    from .urma import COMMUNICATION_PROTOCOL, UrmaBuffer, _extension, use_fused_gate_up
     from .urma_timing import UrmaLaunchGuard, measure_profiled_forward, summarize_profile_rounds
     from .validation import collective_check
 
@@ -299,7 +299,13 @@ def run(args, config, group):
         ranks_per_node=ranks_per_node,
         allow_multi_host=args.allow_multi_host,
         bandwidth_topology="logical contiguous rank groups of four; multi-host validation is not UBX bandwidth equivalence",
-        transport="URMA PUT-only",
+        transport="URMA QP0 RO PUT + SO Combine bitmap publication; Dispatch MTE publication",
+        communication_protocol=COMMUNICATION_PROTOCOL,
+        communication_qps_per_peer=1,
+        dispatch_combine_overlap=False,
+        dispatch_batch_cvs="1,1,2,4,8,8,...; ready remainder after Pack completes",
+        combine_publication="one disjoint SO bitmap mask per contiguous run within a 64-CV word",
+        communication_completion="Dispatch final MTE3 publication drain after quiet; Combine final outbound quiet; independent of Reduce",
         remote_workers=world - 1,
         swiglu_workers=28 - (world - 1),
         reduce_workers=56 - (world - 1),
@@ -339,7 +345,8 @@ def run(args, config, group):
         print(
             f"[URMA SCHEDULE] compute={manifest['compute_schedule']} communication_cv_rows={args.cv_rows} "
             f"gmm1_ahead_mgroups={args.gmm1_ahead_mgroups} "
-            f"local_pipeline={manifest['local_pipeline']} tail={manifest['tail_schedule']}",
+            f"local_pipeline={manifest['local_pipeline']} tail={manifest['tail_schedule']} "
+            f"communication={COMMUNICATION_PROTOCOL}",
             flush=True,
         )
         print(

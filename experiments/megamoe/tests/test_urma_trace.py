@@ -67,11 +67,13 @@ def test_export_fields_thread_mapping_and_submission_semantics():
 def test_every_event_id_has_a_name_and_no_fabricated_async_events():
     raw = trace_buffer(1)
     for event_id, name in enumerate(EVENTS):
+        if name is None:
+            continue
         add_record(raw, engine=event_id, event=name)
     result = decode_trace(raw, rank=0, clock_mhz=1000)
-    assert len(events(result)) == len(EVENTS) == 33
+    assert len(events(result)) == sum(name is not None for name in EVENTS) == 35
     assert {row["ph"] for row in result["traceEvents"]} == {"M", "X"}
-    assert {row["args"]["event_id"] for row in events(result)} == set(range(len(EVENTS)))
+    assert {row["args"]["event_id"] for row in events(result)} == {index for index, name in enumerate(EVENTS) if name is not None}
 
 
 def test_historical_tail_cover_events_keep_completion_signal_and_hide_only_ready_wait():
@@ -99,6 +101,46 @@ def test_reduce_envelope_is_one_visible_interval_including_internal_waits():
     assert event["name"] == "Reduce" and event["dur"] == 900.0
     assert event["args"]["rows"] == 100 and event["args"]["bytes"] == 716800
     assert "readiness waits" in event["args"]["meaning"] and "output drain" in event["args"]["meaning"]
+
+
+def test_combine_outbound_completion_is_visible_and_does_not_overlap_put():
+    from deep_ep_experimental.megamoe.urma_trace import filter_trace_waits
+
+    raw = trace_buffer(3)
+    add_record(raw, event="CombinePut", start=1000, end=1020, peer=1, cv=2, rows=512, bytes=512 * 3584 * 2)
+    add_record(raw, event="CombinePublish", start=1020, end=1030, peer=1)
+    add_record(raw, event="CombineSendComplete", start=1030, end=201000, peer=1)
+    filtered = events(filter_trace_waits(decode_trace(raw, rank=0, clock_mhz=1000)))
+    assert [e["args"]["event_id"] for e in filtered] == [10, 30, 42]
+    assert filtered[-1]["cat"] == "transport.quiet"
+    assert filtered[-1]["ts"] + filtered[-1]["dur"] == 200.0
+    assert filtered[-1]["args"]["bytes"] == 0
+    assert filtered[0]["args"]["cv"] == 2 and filtered[0]["args"]["rows"] == 512
+
+
+def test_empty_peer_final_quiet_is_visible_without_payload():
+    from deep_ep_experimental.megamoe.urma_trace import filter_trace_waits
+
+    raw = trace_buffer(1)
+    add_record(raw, event="CombineSendComplete", start=1000, end=1100, peer=3)
+    filtered = events(filter_trace_waits(decode_trace(raw, rank=0, clock_mhz=1000)))
+    assert len(filtered) == 1 and filtered[0]["args"]["event_id"] == 42
+    assert filtered[0]["args"]["peer"] == 3 and filtered[0]["args"]["bytes"] == 0
+
+
+def test_dispatch_publication_drain_is_visible_after_quiet():
+    from deep_ep_experimental.megamoe.urma_trace import filter_trace_waits
+
+    raw = trace_buffer(4)
+    add_record(raw, event="DispatchPutX", start=1000, end=1020, peer=2, cv=4, rows=1024, bytes=1024 * 3584)
+    add_record(raw, event="DispatchQuiet", start=1020, end=2000, peer=2)
+    add_record(raw, event="DispatchPublish", start=2000, end=2010, peer=2)
+    add_record(raw, event="DispatchSendComplete", start=2010, end=3000, peer=2)
+    filtered = events(filter_trace_waits(decode_trace(raw, rank=0, clock_mhz=1000)))
+    assert [e["args"]["event_id"] for e in filtered] == [1, 3, 4, 43]
+    assert filtered[-1]["cat"] == "transport.quiet"
+    assert filtered[-1]["ts"] + filtered[-1]["dur"] == 2.0
+    assert filtered[-1]["args"]["bytes"] == 0
 
 
 def test_expert_group_trace_keeps_multisource_identity_and_scale_preparation():
@@ -235,6 +277,7 @@ def test_overflow_lists_all_affected_engines_and_writes_no_partial_trace(tmp_pat
         (0, UNKNOWN, "ticks"),
         (1, UNKNOWN, "ticks"),
         (2, len(EVENTS), "event id"),
+        (2, 33, "event id"),
         (3, 16, "peer"),
         (13, 1, "reserved record"),
     ],

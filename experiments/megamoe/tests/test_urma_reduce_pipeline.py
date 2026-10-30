@@ -336,6 +336,7 @@ int main(int argc, char** argv) {
         std::vector<bool> admitted(count), written(count);
         std::vector<uint64_t> payloadVisits(rows), payloadGates(rows);
         std::map<uint64_t, uint32_t> positiveReads, failedReads;
+        std::map<uint64_t, uint64_t> publishedWords; // reset each invocation before its start handshake
         std::set<uint32_t> failedTokens;
         TraceSink timer;
         timer.expectedRow = begin; timer.expectedRows = count;
@@ -371,7 +372,8 @@ int main(int argc, char** argv) {
                 if (complete) { allInputsObserved = true; gatesBeforeLatch = readyGateSubmissions; }
                 return uint64_t(complete ? 16U : mode == "overcount" ? 17U : 15U);
             }
-            uint64_t dependency;
+            uint64_t dependency = 0U, readyWord = 0U;
+            bool bitmapRead = false;
             if (address >= args.gmm2Done && address < args.gmm2Done + uint64_t(4119U) * 128U) {
                 assert((address - args.gmm2Done) % 128U == 0U);
                 dependency = kReduceSelfDependency | ((address - args.gmm2Done) / 128U);
@@ -379,17 +381,32 @@ int main(int argc, char** argv) {
                 const uintptr_t remote = args.symmetric + args.config.combineReadyOffset;
                 assert(address >= remote && address < remote + uint64_t(8192U) * 128U);
                 assert((address - remote) % 128U == 0U);
-                dependency = (address - remote) / 128U;
+                const uint64_t wordIndex = (address - remote) / 128U;
+                const uint32_t source = wordIndex / args.config.maxPeerChunks;
+                const uint32_t word = wordIndex % args.config.maxPeerChunks;
+                assert(word < (args.config.maxPeerChunks + 63U) / 64U);
+                bitmapRead = true;
+                readyWord = publishedWords[wordIndex];
+                for (uint32_t bit = 0; bit < 64; ++bit) {
+                    const uint64_t d = source * args.config.maxPeerChunks + word * 64U + bit;
+                    if (d != 8191U && !(d >= 512U && d < 512U + count)) continue;
+                    if (ready(d)) readyWord |= uint64_t{1} << bit;
+                    if ((readyWord & (uint64_t{1} << bit)) != 0U) positiveReads[d] = 1U;
+                    else { ++failedReads[d]; failedTokens.insert(d - 512U); }
+                }
+                publishedWords[wordIndex] = readyWord;
             }
-            assert(positiveReads[dependency] == 0U && "positive readiness must be cached for the invocation");
-            const bool complete = ready(dependency);
-            if (complete) ++positiveReads[dependency];
-            else {
-                ++failedReads[dependency];
-                const uint64_t index = dependency & ~kReduceSelfDependency;
-                failedTokens.insert(dependency & kReduceSelfDependency ? index : index - 512U);
+            if (!bitmapRead) {
+                assert(positiveReads[dependency] == 0U && "positive readiness must be cached for the invocation");
+                const bool complete = ready(dependency);
+                if (complete) ++positiveReads[dependency];
+                else {
+                    ++failedReads[dependency];
+                    const uint64_t index = dependency & ~kReduceSelfDependency;
+                    failedTokens.insert(dependency & kReduceSelfDependency ? index : index - 512U);
+                }
             }
-            if (complete) for (uint32_t local = 0U; local < count; ++local) {
+            for (uint32_t local = 0U; local < count; ++local) {
                 if (admitted[local]) continue;
                 bool tokenReady = true;
                 for (uint32_t slot = 0U; slot < 8U; ++slot)
@@ -399,8 +416,8 @@ int main(int argc, char** argv) {
                     readyCandidate = local;
                 }
             }
-            if (dependency & kReduceSelfDependency) return uint64_t(complete ? 14U : 13U);
-            return complete ? args.config.epoch : mode == "future" ? args.config.epoch + 1U : args.config.epoch - 1U;
+            if (bitmapRead) return readyWord;
+            return uint64_t(positiveReads[dependency] ? 14U : 13U);
         };
         beforePayload = [&](uintptr_t address) {
             assert(timer.active);

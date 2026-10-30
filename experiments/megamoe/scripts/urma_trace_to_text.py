@@ -205,14 +205,14 @@ def render_report(document, *, source="trace.json", cores=None, engines=None, de
             f"span_us={s['span']:.3f} sum_us={s['sum']:.3f} union_us={s['union']:.3f} "
             f"gap_us={max(0.0, s['span'] - s['union']):.3f} op={by_phase}"
         )
-    lines.append("[PEER] peer DX_n DX_B DS_n DS_B CY_n CY_B Dquiet_us Cquiet_us; submit payload only")
+    lines.append("[PEER] peer DX_n DX_B DS_n DS_B CY_n CY_B Dcompletion_wait_us Ccompletion_wait_us; submit payload only")
     for peer, rows in sorted(by_peer.items()):
         parts = [str(peer)]
         for name in ("DispatchPutX", "DispatchPutScale", "CombinePut"):
             matching = [row for row in rows if row["name"] == name]
             parts.extend((str(len(matching)), str(sum(row["args"].get("bytes", 0) or 0 for row in matching))))
-        for name in ("DispatchQuiet", "CombineQuiet"):
-            parts.append(f"{math.fsum(row['dur'] for row in rows if row['name'] == name):.3f}")
+        for names in (("DispatchQuiet", "DispatchSendComplete"), ("CombineQuiet", "CombineSendComplete")):
+            parts.append(f"{math.fsum(row['dur'] for row in rows if row['name'] in names):.3f}")
         lines.append(" ".join(parts))
     lines.append(
         "[FIELDS] p=peer c=CV f=fragment e=local_expert r=row l=rows m=tile_m n=tile_n "

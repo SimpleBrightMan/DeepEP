@@ -18,6 +18,7 @@ namespace py = pybind11;
 PYBIND11_MODULE(_C, module)
 {
     module.attr("runtime_protocol") = 1;
+    module.attr("megamoe_urma_communication_protocol") = "commfirst-so-bitmap-v1";
     module.def("shmem_library_path", []() {
         Dl_info info{};
         if (dladdr(reinterpret_cast<void*>(&aclshmemx_init_attr), &info) == 0 || info.dli_fname == nullptr) {

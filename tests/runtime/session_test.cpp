@@ -241,7 +241,7 @@ int main(int argc, char** argv)
             assert(session.megamoe_urma() && session.udma() && !session.peer_table() && !session.sparse_qp_enabled());
             assert(session.workspace_address() == reinterpret_cast<uintptr_t>(&storage));
             assert(session.megamoe_urma_topology_error().empty());
-            assert(qp_count == 2 && allocations == 1 && memsets == 1 && barriers == 0);
+            assert(qp_count == 1 && allocations == 1 && memsets == 1 && barriers == 0);
             session.close();
             assert(frees == 1 && finalized == 1 && !deepep::Session::busy());
         } else if (fault.rfind("topology-", 0) == 0) {

@@ -65,11 +65,19 @@ inline void* aclshmem_ptr(uint8_t* local, int peer) {
     auto offset = local - windows[currentRank]; assert(offset >= 0 && offset < 4096);
     return windows[peer] + offset;
 }
-template <typename T, pipe_t P>
+struct aclshmemx_udma_op_config_t { uint32_t cqe, se, fence, odr; };
+inline constexpr aclshmemx_udma_op_config_t ACLSHMEMX_UDMA_OP_CONFIG_RO{1,0,0,5};
+inline constexpr aclshmemx_udma_op_config_t ACLSHMEMX_UDMA_OP_CONFIG_SO{1,0,0,6};
+template <typename T, pipe_t P, const aclshmemx_udma_op_config_t& Config>
 void aclshmemx_udma_qp_put_nbi(T* dst, T* src, T* scratch, uint32_t n, uint32_t peer, uint32_t qp,
                                uint32_t event) {
-    static_assert(P == PIPE_S); assert(scratch == nullptr && event == 0 && peer != currentRank && qp < 2);
+    static_assert(P == PIPE_S && Config.odr == 5); assert(scratch == nullptr && event == 0 && peer != currentRank && qp < 2);
     pending.push_back({static_cast<uint8_t*>(aclshmem_ptr(dst, peer)), src, n, peer, qp}); ++submitted;
+}
+template<class T, const aclshmemx_udma_op_config_t& Config>
+void aclshmemx_udma_atomic_add(T* dst, T value, int32_t peer) {
+    static_assert(Config.odr == 6);
+    *reinterpret_cast<T*>(aclshmem_ptr(reinterpret_cast<uint8_t*>(dst), peer)) += value;
 }
 inline void aclshmemx_udma_qp_quiet(uint32_t peer, uint32_t qp) {
     for (auto it = pending.begin(); it != pending.end();) {
@@ -115,25 +123,20 @@ int main() {
     bool rejected = false;
     try { Put(base, 0, x, kMaxPutBytes + 1, 9); } catch (const std::runtime_error&) { rejected = true; }
     assert(rejected && submitted == 2);
-    // One peer owner submits early Combine on QP1 while Dispatch remains on
-    // QP0. Dispatch quiet must not drain either Combine or another peer's SQ.
-    static_assert(kDispatchQp == 0 && kCombineQp == 1);
+    // Dispatch and Combine are sequential and share ordered QP0. No quiet
+    // may accidentally drain another peer's queue.
+    static_assert(kDispatchQp == 0 && kCombineQp == 0);
     Put(base, 256, x, 64, 9, kDispatchQp);
     Put(base, 384, scale, 32, 9, kCombineQp);
     Put(base, 256, x, 64, 10, kDispatchQp);
-    assert(submitted == 5 && completed == 2);
     Quiet(9, kDispatchQp);
-    assert(completed == 3 && pending.size() == 2);
-    assert(windows[9][256] == 7 && windows[9][384] == 0 && windows[10][256] == 0);
-    Put(base, 448, scale, 32, 9, kCombineQp);
-    assert(submitted == 6 && completed == 3 && windows[9][448] == 0);
-    Quiet(9, kCombineQp);
-    assert(completed == 5 && pending.size() == 1);
-    assert(windows[9][384] == 9 && windows[9][448] == 9 && windows[10][256] == 0);
-    PublishDone(base, 512, 9, 124, {signal}, 3);
-    WaitLocalDone(windows[9] + 512, 124);
-    Quiet(10, kDispatchQp);
-    assert(completed == 6 && pending.empty() && windows[10][256] == 7);
+    assert(completed == 4 && pending.size() == 1);
+    assert(windows[9][256] == 7 && windows[9][384] == 9 && windows[10][256] == 0);
+    Quiet(10);
+    assert(completed == 5 && pending.empty());
+    bool badQueue = false;
+    try { Put(base, 0, x, 1, 9, 1); } catch (const std::runtime_error&) { badQueue = true; }
+    assert(badQueue);
     // Other ranks have reached the barrier already. A later generation may
     // replace one flag; the monotone barrier must not wait for exact equality.
     for (uint32_t p = 0; p < 16; ++p) *reinterpret_cast<uint64_t*>(base + 1024 + p*128) = 202;
