@@ -175,9 +175,9 @@ __aicore__ inline void CompleteComputeContext()
 using UrmaGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig, false, UrmaInputRows>;
 using UrmaGmm2 = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig, false, UrmaOutputRows>;
 
-template <bool FuseGateUp>
+template <bool FuseGateUp, class TimerT>
 __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
-                                       uint32_t firstTile, UrmaGmm1& gmm1, bool endContext, Timer& timer)
+                                       uint32_t firstTile, UrmaGmm1& gmm1, bool endContext, TimerT& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
@@ -238,9 +238,10 @@ __aicore__ inline void RunGmm1Fragment(const Arguments& args, uint32_t block, ui
     timer.End(Phase::Gmm1);
 }
 
+template <class TimerT>
 __aicore__ inline void RunGmm2Fragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
                                        uint32_t firstTile, UrmaGmm2& gmm2, uint32_t batchBegin, bool endContext,
-                                       Timer& timer)
+                                       TimerT& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
@@ -322,7 +323,8 @@ __aicore__ inline ComputeBatchTask LoadComputeTask(const Arguments& args, uint32
 // Only an AIC and its paired AIV0 enter this routine. They use the identical
 // host-planned expert schedule and global tile ownership. SwiGLU remains
 // independent; the GMM1 M-group window covers earlier activation latency.
-__aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, Timer& timer)
+template <class TimerT>
+__aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, TimerT& timer)
 {
     // Only one stage owns the shared L1/L0/prologue buffers at a time. The
     // objects keep their views; each expert batch acquires/releases events.

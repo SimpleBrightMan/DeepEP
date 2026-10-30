@@ -219,8 +219,9 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
                                 torch::Tensor reduce_index, torch::Tensor topk_weights, torch::Tensor weight1,
                                 torch::Tensor weight2, torch::Tensor weight_scales1, torch::Tensor weight_scales2,
                                 c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> out, int64_t epoch,
-                                c10::optional<torch::Tensor> trace)
+                                c10::optional<torch::Tensor> trace, bool coarse_trace)
 {
+    TORCH_CHECK(!coarse_trace || (trace && !timer), "coarse trace requires trace storage and no aggregate timer");
     const auto& c = args_.config;
     const auto device = expanded_x_.device();
     TORCH_CHECK(reduce_dependencies_.defined() && bound_reduce_index_.defined(),
@@ -329,6 +330,7 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     args_.timer = timer ? Address(*timer) : 0;
     args_.trace = trace ? Address(*trace) : 0;
     args_.traceCapacity = trace_capacity;
+    args_.coarseTrace = coarse_trace;
     mega_moe_urma_kernel_do(platform_.block_dim, platform_.ub, stream.stream(), &args_);
     last_epoch_ = epoch;
     for (const auto* tensor : {&x,

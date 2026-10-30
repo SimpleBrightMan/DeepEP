@@ -1,6 +1,7 @@
 """Full URMA MegaMoE benchmark; EP4/EP8/EP16, with explicit opt-in for multiple hosts."""
 
 import argparse
+import csv
 from datetime import datetime, timezone
 from functools import partial
 import json
@@ -38,7 +39,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--exp-repeat",
         type=int,
-        default=50,
+        default=80,
         help="Exp repetitions once before each continuous profile block; 0 retains only HCCL barrier",
     )
     parser.add_argument("--launch-timeout", type=int, default=300, help="Benchmark HCCL group timeout in seconds")
@@ -62,12 +63,12 @@ def parse_args(argv=None):
     parser.add_argument(
         "--timer",
         action="store_true",
-        help="Native aggregate timer on the final extra invocation, excluded from performance",
+        help="Compatibility flag; performance runs always collect none/coarse/fine blocks",
     )
     parser.add_argument(
         "--trace",
         action="store_true",
-        help="Trace only the final extra invocation; implies --timer; this invocation is excluded from performance",
+        help="Compatibility flag; retain final coarse/fine trace of each block; no trace in none block",
     )
     parser.add_argument(
         "--trace-include-waits",
@@ -113,6 +114,10 @@ def parse_args(argv=None):
         parser.error("gmm1-ahead-mgroups must be in [0,65536]")
     if any(n <= 0 for n in args.exp_shape) or args.exp_repeat < 0 or args.launch_timeout <= 0:
         parser.error("exp-shape/launch-timeout must be positive; exp-repeat must be nonnegative")
+    if not args.accuracy_only:
+        if args.guard_backend != "hccl":
+            parser.error("three-mode profiling requires HCCL device all-reduce; --guard-backend store is unsupported")
+        args.timer = args.trace = True
     args.timer = args.timer or args.trace
     return args
 
@@ -291,6 +296,7 @@ def run(args, config, group):
             error = f"{type(failure).__name__}: {failure}"
         collective_check(group, "URMA cascade preparation", error)
     del raw
+    launch_guard.prepare_per_call_alignment()
     manifest = dict(
         created_utc=datetime.now(timezone.utc).isoformat(),
         config=config,
@@ -319,7 +325,7 @@ def run(args, config, group):
             else "torch_npu profiler device kernel duration; no Event or host-wall timing"
         ),
         performance_scope="mega_moe_urma_kernel only; routes prepared once before profiling",
-        performance_rounds="all iters after warmup; final instrumented diagnostic invocation excluded",
+        performance_rounds="three independent blocks none/coarse/fine; each measures all iters after warmup",
         profile_config="Level0/AiCoreNone/Text; shapes/memory/stack/FLOPs/modules disabled",
         max_recv_rows=owner.max_recv_rows,
         symmetric_buffer_bytes=owner.symmetric_buffer_bytes,
@@ -338,7 +344,8 @@ def run(args, config, group):
         trace_capacity_per_engine=args.trace_capacity,
         trace_include_waits=args.trace_include_waits,
         trace_clock_alignment="per-rank independent zero; no synchronized cross-rank timeline",
-        trace_scope="only the last extra invocation of each BS block; aggregate timer shares it; excluded from performance",
+        trace_scope="last measured invocation of coarse/fine block; paired with its own profiler duration",
+        coarse_compute_scope="stage entry through final output drain; includes initial input wait and all internal gaps",
     )
     (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     if rank == 0:
@@ -353,7 +360,7 @@ def run(args, config, group):
             f"[URMA LAUNCH GUARD] {args.guard_backend} barrier + exp shape={tuple(args.exp_shape)} "
             f"repeat={args.exp_repeat}; "
             f"buffers={manifest['launch_guard']['allocated_bytes_per_rank'] / 2**30:.2f} GiB/rank; "
-            "once per continuous profile block; guard excluded from kernel timings",
+            "once per mode block; device all-reduce before every call; both excluded from kernel timings",
             flush=True,
         )
     all_reports = []
@@ -383,12 +390,14 @@ def run(args, config, group):
         prepared = owner.prepare_routes(ids)
         # Allocate once before profiling. Only the final extra invocation gets
         # these buffers; all formal samples execute without internal timers.
-        timer, trace, error = None, None, None
+        timer, trace, coarse_trace, error = None, None, None, None
         try:
             if args.timer:
                 timer = owner.allocate_timer()
             if args.trace:
                 trace = owner.allocate_trace(args.trace_capacity)
+                if not args.accuracy_only:
+                    coarse_trace = owner.allocate_trace(16)
         except Exception as failure:
             error = f"{type(failure).__name__}: {failure}"
         collective_check(group, f"URMA diagnostic allocation BS={bs}", error)
@@ -399,31 +408,46 @@ def run(args, config, group):
         if args.accuracy_only:
             launch_guard.begin()
             for _ in range(config["warmup"] + config["iters"]):
+                launch_guard.before_forward()
                 forward()
             if diagnostic is not None:
+                launch_guard.before_forward()
                 diagnostic()
             launch_guard.end()
             capture = dict(profile_dir=None, diagnostic_sample=None)
             profile_report = dict(skipped=True, reason="accuracy-only; no profiler or Event timing")
         else:
-            capture = measure_profiled_forward(
-                forward,
-                warmup=config["warmup"],
-                iters=config["iters"],
-                guard=launch_guard,
-                directory=case / "profile",
-                last_forward=diagnostic,
-            )
+            mode_captures, mode_reports = {}, {}
+            coarse_forward = partial(forward, trace=coarse_trace, coarse_trace=True)
+            # All modes receive identical warmup/round count, exp guard and
+            # per-invocation HCCL all-reduce. Buffers retain only the final round.
+            for mode, call in (("none", forward), ("coarse", coarse_forward), ("fine", diagnostic)):
+                capture = measure_profiled_forward(
+                    call, warmup=config["warmup"], iters=config["iters"],
+                    guard=launch_guard, directory=case / mode / "profile",
+                )
+                capture["instrumentation"] = mode
+                capture["diagnostic_sample"] = capture["samples"][-1] if mode != "none" else None
+                mode_captures[mode] = capture
+                (case / mode / "kernel_samples.json").write_text(json.dumps(capture, indent=2), encoding="utf-8")
+                records = group.all_gather(capture["durations_us"], f"URMA {mode} profile samples BS={bs}")
+                report = summarize_profile_rounds(records, ranks_per_node=ranks_per_node)
+                report.update(instrumentation=mode, launch_guard=launch_guard.describe(),
+                              warmup_iterations=config["warmup"], per_call_device_all_reduce=True,
+                              measured_scope="profiler mega_moe_urma_kernel only; excludes all-reduce and exp")
+                final_samples = group.all_gather(capture["samples"][-1]["duration_us"], f"URMA {mode} last sample BS={bs}")
+                report["last_round_rank_max_us"] = max(final_samples)
+                report["last_round_rank_min_us"] = min(final_samples)
+                mode_reports[mode] = report
+                if rank == 0:
+                    print(f"[URMA PROFILE {mode.upper()}] BS={bs} "
+                          f"round-max-mean={report['rank_max_mean_us']:.3f}us "
+                          f"round-min-mean={report['rank_min_mean_us']:.3f}us "
+                          f"last-round-max={max(final_samples):.3f}us", flush=True)
+            capture = mode_captures["none"]
+            profile_report = mode_reports["none"]
             (case / "kernel_samples.json").write_text(json.dumps(capture, indent=2), encoding="utf-8")
-            profile_records = group.all_gather(capture["durations_us"], f"URMA profile samples BS={bs}")
-            profile_report = summarize_profile_rounds(profile_records, ranks_per_node=ranks_per_node)
-            profile_report.update(
-                launch_guard=launch_guard.describe(),
-                warmup_iterations=config["warmup"],
-                continuous_iterations=config["warmup"] + config["iters"] + int(args.timer),
-                diagnostic_iterations=int(args.timer),
-                measured_scope="profiler device mega_moe_urma_kernel task; no Event timing",
-            )
+
         reports = {
             "bs": bs,
             "received_rows_local": prepared.received_rows,
@@ -432,9 +456,12 @@ def run(args, config, group):
             "gmm1_gate_up_layout": "gate128_up128" if fused_gate_up else "planar",
             "profile": profile_report,
             "profile_directory": capture["profile_dir"],
-            "diagnostic_sample": capture["diagnostic_sample"],
+            "diagnostic_sample": capture["diagnostic_sample"] if args.accuracy_only else mode_captures["fine"]["diagnostic_sample"],
             "validation": "skipped",
         }
+        if not args.accuracy_only:
+            reports["profiles"] = mode_reports
+            reports["profile_directories"] = {mode: value["profile_dir"] for mode, value in mode_captures.items()}
         if rank == 0 and not args.accuracy_only:
             print(
                 f"[URMA PROFILE] BS={bs} cv_rows={args.cv_rows} "
@@ -535,7 +562,7 @@ def run(args, config, group):
                 dtype="little-endian int64",
                 schema=getattr(_extension(), "urma_timer_schema", None),
                 note="URMA format; do not parse using the legacy MegaMoE Wave timer parser",
-                scope="final diagnostic invocation; excluded from formal profile samples",
+                scope="final fine-mode invocation; excluded from uninstrumented samples",
                 detailed_trace_enabled=args.trace,
             )
             (case / "timer.json").write_text(json.dumps(timer_metadata, indent=2), encoding="utf-8")
@@ -558,16 +585,24 @@ def run(args, config, group):
                             flush=True,
                         )
             del raw_timer
+        if not args.accuracy_only:
+            from .urma_trace_merge import merge_trace_collective
+            coarse_case = case / "coarse"
+            coarse_case.mkdir(exist_ok=True)
+            records = export_trace_collective(group, coarse_trace.cpu().numpy(), coarse_case,
+                                              bs=bs, clock_mhz=args.timer_clock_mhz, include_waits=True)
+            reports["coarse_trace_per_rank"] = records
+            reports["coarse_trace_allrank"] = merge_trace_collective(
+                group, records, args.output_dir / f"bs_{bs}" / "coarse" / "allrank.json", bs=bs, include_waits=True)
         if args.trace:
             from .urma_trace_merge import merge_trace_collective
 
-            # The only detailed trace is the final extra invocation already
-            # enqueued above. No second run, launch guard, or profiled sample.
+            # Reused detailed buffer contains the final measured fine-mode invocation.
             raw_trace = trace.cpu().numpy()
             reports["trace_per_rank"] = export_trace_collective(
                 group,
                 raw_trace,
-                case,
+                case if args.accuracy_only else case / "fine",
                 bs=bs,
                 clock_mhz=args.timer_clock_mhz,
                 include_waits=args.trace_include_waits,
@@ -575,7 +610,7 @@ def run(args, config, group):
             reports["trace_allrank"] = merge_trace_collective(
                 group,
                 reports["trace_per_rank"],
-                args.output_dir / f"bs_{bs}" / "allrank.json",
+                args.output_dir / f"bs_{bs}" / "fine" / "allrank.json",
                 bs=bs,
                 include_waits=args.trace_include_waits,
             )
@@ -583,12 +618,14 @@ def run(args, config, group):
                 print(
                     f"[URMA TRACE] BS={bs} all {world} ranks exported; "
                     f"capacity={args.trace_capacity}/engine; rank-local clocks; "
-                    f"{args.output_dir}/rank_*/bs_{bs}/urma_trace.json",
+                    f"{args.output_dir}/rank_*/bs_{bs}/fine/urma_trace.json",
                     flush=True,
                 )
                 print(f"[URMA ALLRANK] BS={bs}; {reports['trace_allrank']['path']}", flush=True)
             del raw_trace
-        del prepared, timer, trace, diagnostic, forward
+        del prepared, timer, trace, coarse_trace, diagnostic, forward
+        if not args.accuracy_only:
+            del coarse_forward, call
         (case / "summary.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
         all_reports.append(reports)
         if rank == 0:
@@ -609,8 +646,19 @@ def run(args, config, group):
     owner.destroy()
     launch_guard.close()
     group.close()
-    if rank == 0 and not args.accuracy_only and len(all_reports) > 1:
+    if rank == 0 and not args.accuracy_only:
         print(format_profile_summary(all_reports, world), flush=True)
+        with (args.output_dir / "mode_summary.csv").open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(["bs", "ep", "mode", "round_max_mean_us", "round_min_mean_us", "last_round_rank_max_us"])
+            for item in all_reports:
+                for mode, row in item["profiles"].items():
+                    writer.writerow([item["bs"], world, mode, row["rank_max_mean_us"], row["rank_min_mean_us"], row["last_round_rank_max_us"]])
+        print("[THREE MODE SUMMARY] BS EP mode round-max-mean(us) round-min-mean(us) last-round-max(us)", flush=True)
+        for item in all_reports:
+            for mode, row in item["profiles"].items():
+                print(f"{item['bs']:5d} {world:2d} {mode:6s} {row['rank_max_mean_us']:12.3f} "
+                      f"{row['rank_min_mean_us']:12.3f} {row['last_round_rank_max_us']:12.3f}", flush=True)
 
 
 if __name__ == "__main__":

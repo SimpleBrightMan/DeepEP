@@ -58,7 +58,7 @@ def test_cann_mangled_kernel_name_from_ubx_capture(tmp_path, monkeypatch):
     name = "_Z20mega_moe_urma_kernelN11MegaMoeUrma9ArgumentsE"
     rows = [kernel(i, i + 1, name) for i in range(41)]
     fake_profiler(monkeypatch, directory, rows, log)
-    guard = SimpleNamespace(begin=lambda: None, end=lambda: None)
+    guard = SimpleNamespace(begin=lambda: None, end=lambda: None, before_forward=lambda: None)
     result = measure_profiled_forward(
         lambda: None, warmup=20, iters=20, guard=guard, directory=directory, last_forward=lambda: None
     )
@@ -143,6 +143,7 @@ def test_one_continuous_profile_block_preserves_alignment_and_last_trace_only(tm
     # Event nor perform extra synchronization apart from the guard's one drain.
     guard = SimpleNamespace(
         begin=lambda: log.extend(["barrier", "exp"]),
+        before_forward=lambda: log.append("all-reduce"),
         end=lambda: log.extend(["barrier", "synchronize"]),
     )
     result = measure_profiled_forward(
@@ -157,8 +158,8 @@ def test_one_continuous_profile_block_preserves_alignment_and_last_trace_only(tm
         "profile-enter",
         "barrier",
         "exp",
-        *(["forward"] * 4),
-        *(["diagnostic-with-timer-trace"] if diagnostic else []),
+        *(["all-reduce", "forward"] * 4),
+        *(["all-reduce", "diagnostic-with-timer-trace"] if diagnostic else []),
         "barrier",
         "synchronize",
         "profile-step",

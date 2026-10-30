@@ -12,7 +12,7 @@ from deep_ep_experimental.megamoe import api, reference, urma, urma_timer, urma_
 
 
 @pytest.mark.parametrize("diagnostic_option", (None, "--timer", "--trace"))
-def test_run_profiles_all_formal_rounds_and_only_instruments_final_call(
+def test_run_profiles_three_modes_and_exports_only_last_trace(
     monkeypatch, tmp_path, capsys, diagnostic_option
 ):
     """Run the real BS loop while replacing hardware and profiler I/O only."""
@@ -88,7 +88,7 @@ def test_run_profiles_all_formal_rounds_and_only_instruments_final_call(
 
         def all_gather(self, value, stage):
             calls.append(("gather", stage))
-            if stage.startswith("URMA profile samples"):
+            if "profile samples" in stage:
                 assert value == profile_durations
                 return per_rank_durations
             return [value] * 16
@@ -134,9 +134,10 @@ def test_run_profiles_all_formal_rounds_and_only_instruments_final_call(
             calls.append(("allocate-trace", self.prepared.bs, capacity))
             return Tensor(np.zeros(1, dtype=np.int64))
 
-        def forward_prepared(self, x, topk_weights, *weights_and_prepared, timer=None, trace=None, out=None):
+        def forward_prepared(self, x, topk_weights, *weights_and_prepared, timer=None, trace=None, out=None, coarse_trace=False):
             assert weights_and_prepared[-1] is self.prepared
             assert out is not None
+            assert not coarse_trace or (trace is not None and timer is None)
             self.ordinal += 1
             calls.append(("forward", self.prepared.bs, self.ordinal, timer is not None, trace is not None))
             for buffer in (timer, trace):
@@ -161,6 +162,12 @@ def test_run_profiles_all_formal_rounds_and_only_instruments_final_call(
         def __init__(self, group, shape, repeat, timeout, *, backend="hccl"):
             calls.append(("guard-create", tuple(shape), repeat, timeout, backend))
 
+        def prepare_per_call_alignment(self):
+            calls.append(("alignment-prepare",))
+
+        def before_forward(self):
+            calls.append(("all-reduce",))
+
         def describe(self):
             return {"allocated_bytes_per_rank": 48}
 
@@ -175,10 +182,12 @@ def test_run_profiles_all_formal_rounds_and_only_instruments_final_call(
 
     def profile(forward, *, warmup, iters, guard, directory, last_forward=None):
         assert (warmup, iters) == (2, 3)
-        bs = int(directory.parent.name.removeprefix("bs_"))
+        directory.mkdir(parents=True)
+        bs = int(directory.parent.parent.name.removeprefix("bs_"))
         calls.append(("profile-begin", bs))
         guard.begin()
         for _ in range(warmup + iters):
+            guard.before_forward()
             forward()
         if last_forward is not None:
             last_forward()
@@ -199,7 +208,7 @@ def test_run_profiles_all_formal_rounds_and_only_instruments_final_call(
     def bandwidth(raw, rank, *, world, clock_mhz):
         assert world == group.size()
         calls.append(("timer-export", int(raw[0])))
-        assert int(raw[0]) == 6
+        assert int(raw[0]) == 15
         return {"rank": rank}
 
     monkeypatch.setattr(urma_timer, "communication_bandwidth", bandwidth)
@@ -207,7 +216,7 @@ def test_run_profiles_all_formal_rounds_and_only_instruments_final_call(
 
     def export_trace(group, raw, case, *, bs, clock_mhz, include_waits=False):
         calls.append(("trace-export", bs, int(raw[0])))
-        assert int(raw[0]) == 6
+        assert int(raw[0]) == (10 if case.name == "coarse" else 15)
         return [{"rank": rank, "chrome_path": str(case / f"rank{rank}.json")} for rank in range(16)]
 
     def merge_trace(group, records, path, *, bs, include_waits=False):
@@ -219,47 +228,29 @@ def test_run_profiles_all_formal_rounds_and_only_instruments_final_call(
 
     benchmark.run(args, config, group)
 
-    has_timer = diagnostic_option is not None
-    has_trace = diagnostic_option == "--trace"
     for bs in config["bs_values"]:
         assert calls.count(("prepare", bs)) == 1
-        expected_forwards = [("forward", bs, ordinal, False, False) for ordinal in range(1, 6)]
-        if has_timer:
-            expected_forwards.append(("forward", bs, 6, True, has_trace))
-        actual_forwards = [call for call in calls if call[0] == "forward" and call[1] == bs]
-        assert actual_forwards == expected_forwards
-        begin = calls.index(("profile-begin", bs))
-        end = calls.index(("profile-end", bs))
-        assert [call[0] for call in calls[begin + 1 : end]] == [
-            "guard-begin",
-            *(["forward"] * (5 + int(has_timer))),
-            "guard-end",
-        ]
-        assert calls.count(("allocate-timer", bs)) == int(has_timer)
-        assert calls.count(("allocate-trace", bs, args.trace_capacity)) == int(has_trace)
+        expected = [("forward", bs, n, False, False) for n in range(1, 6)]
+        expected += [("forward", bs, n, False, True) for n in range(6, 11)]
+        expected += [("forward", bs, n, True, True) for n in range(11, 16)]
+        assert [call for call in calls if call[0] == "forward" and call[1] == bs] == expected
+        assert calls.count(("allocate-timer", bs)) == 1
+        assert calls.count(("allocate-trace", bs, 16)) == 1
         case = tmp_path / "rank_0" / f"bs_{bs}"
         summary = json.loads((case / "summary.json").read_text())
-        report = summary["profile"]
-        assert report["raw_per_rank_rounds_us"] == per_rank_durations
-        assert report["rank_max_rounds_us"] == [90.0, 80.0, 40.0]
-        assert report["rank_min_rounds_us"] == [10.0, 5.0, 20.0]
-        assert report["rank_max_mean_us"] == pytest.approx(70.0)
-        assert report["rank_min_mean_us"] == pytest.approx(35.0 / 3)
-        assert report["rounds"] == 3
-        assert report["continuous_iterations"] == 5 + int(has_timer)
-        assert report["diagnostic_iterations"] == int(has_timer)
-        assert len(report["per_node"]) == 2
-        assert (summary["diagnostic_sample"] is not None) == has_timer
-        assert (case / "urma_timer.bin").exists() == has_timer
-        if has_timer:
-            assert np.fromfile(case / "urma_timer.bin", dtype="<i8").tolist() == [6]
-        if has_trace:
-            assert calls.count(("trace-export", bs, 6)) == 1
-            assert calls.count(("trace-merge", bs, 16, str(tmp_path / f"bs_{bs}" / "allrank.json"))) == 1
-            assert len(summary["trace_per_rank"]) == 16
-        else:
-            assert "trace_per_rank" not in summary
-    assert calls.count(("guard-begin",)) == calls.count(("guard-end",)) == 3
+        assert set(summary["profiles"]) == {"none", "coarse", "fine"}
+        for mode, report in summary["profiles"].items():
+            assert report["rank_max_rounds_us"] == [90.0, 80.0, 40.0]
+            assert report["rank_max_mean_us"] == pytest.approx(70.0)
+            assert report["rank_min_mean_us"] == pytest.approx(35.0 / 3)
+            assert report["per_call_device_all_reduce"]
+            capture = json.loads((case / mode / "kernel_samples.json").read_text())
+            assert (capture["diagnostic_sample"] is None) == (mode == "none")
+        assert np.fromfile(case / "urma_timer.bin", dtype="<i8").tolist() == [15]
+        assert calls.count(("trace-export", bs, 10)) == 1
+        assert calls.count(("trace-export", bs, 15)) == 1
+    assert calls.count(("guard-begin",)) == calls.count(("guard-end",)) == 9
+    assert calls.count(("all-reduce",)) == 45
     assert [call[0] for call in calls[-3:]] == ["owner-destroy", "guard-close", "group-close"]
     output = capsys.readouterr().out
     assert output.count("[URMA PROFILE]") == 3
