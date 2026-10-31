@@ -60,6 +60,8 @@ def parse_args(argv=None):
     parser.add_argument("--warmup", type=int)
     parser.add_argument("--iters", type=int)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--skip-fine", action="store_true",
+                        help="Run only none/coarse profile blocks; overrides --timer/--trace, no fine warmup or allocation")
     parser.add_argument(
         "--timer",
         action="store_true",
@@ -104,6 +106,8 @@ def parse_args(argv=None):
         "--check-tokens", type=int, default=0, help="Must match --check-tokens used to create the optional Golden cache"
     )
     args = parser.parse_args(argv)
+    if args.skip_fine and args.accuracy_only:
+        parser.error("--skip-fine applies to performance profiling, not --accuracy-only")
     if args.accuracy_only and not args.golden_dir:
         parser.error("--accuracy-only requires --golden-dir; generate the FP8 CPU Golden first")
     if args.debug_intermediates and not args.accuracy_only:
@@ -117,7 +121,7 @@ def parse_args(argv=None):
     if not args.accuracy_only:
         if args.guard_backend != "hccl":
             parser.error("three-mode profiling requires HCCL device all-reduce; --guard-backend store is unsupported")
-        args.timer = args.trace = True
+        args.timer = args.trace = not args.skip_fine
     args.timer = args.timer or args.trace
     return args
 
@@ -266,8 +270,8 @@ def run(args, config, group):
         max_recv_rows=args.max_recv_rows,
         allow_multi_host=args.allow_multi_host,
     )
-    if args.timer and not owner.timer_enabled:
-        raise RuntimeError("--timer requires native URMA timer support in the installed wheel")
+    if (args.timer or not args.accuracy_only) and not owner.timer_enabled:
+        raise RuntimeError("coarse/fine diagnostics require native URMA timer support in the installed wheel")
 
     def device_pair(pair):
         data, scales = pair
@@ -327,7 +331,8 @@ def run(args, config, group):
             else "torch_npu profiler device kernel duration; no Event or host-wall timing"
         ),
         performance_scope="mega_moe_urma_kernel only; routes prepared once before profiling",
-        performance_rounds="three independent blocks none/coarse/fine; each measures all iters after warmup",
+        performance_rounds="independent mode blocks; each measures all iters after warmup",
+        profile_modes=["none", "coarse"] + ([] if args.skip_fine else ["fine"]),
         profile_config="Level0/AiCoreNone/Text; shapes/memory/stack/FLOPs/modules disabled",
         max_recv_rows=owner.max_recv_rows,
         symmetric_buffer_bytes=owner.symmetric_buffer_bytes,
@@ -398,8 +403,8 @@ def run(args, config, group):
                 timer = owner.allocate_timer()
             if args.trace:
                 trace = owner.allocate_trace(args.trace_capacity)
-                if not args.accuracy_only:
-                    coarse_trace = owner.allocate_trace(16)
+            if not args.accuracy_only:
+                coarse_trace = owner.allocate_trace(16)
         except Exception as failure:
             error = f"{type(failure).__name__}: {failure}"
         collective_check(group, f"URMA diagnostic allocation BS={bs}", error)
@@ -423,7 +428,10 @@ def run(args, config, group):
             coarse_forward = partial(forward, trace=coarse_trace, coarse_trace=True)
             # All modes receive identical warmup/round count, exp guard and
             # per-invocation HCCL all-reduce. Buffers retain only the final round.
-            for mode, call in (("none", forward), ("coarse", coarse_forward), ("fine", diagnostic)):
+            mode_calls = [("none", forward), ("coarse", coarse_forward)]
+            if not args.skip_fine:
+                mode_calls.append(("fine", diagnostic))
+            for mode, call in mode_calls:
                 capture = measure_profiled_forward(
                     call, warmup=config["warmup"], iters=config["iters"],
                     guard=launch_guard, directory=case / mode / "profile",
@@ -458,7 +466,7 @@ def run(args, config, group):
             "gmm1_gate_up_layout": "gate128_up128" if fused_gate_up else "planar",
             "profile": profile_report,
             "profile_directory": capture["profile_dir"],
-            "diagnostic_sample": capture["diagnostic_sample"] if args.accuracy_only else mode_captures["fine"]["diagnostic_sample"],
+            "diagnostic_sample": capture["diagnostic_sample"] if args.accuracy_only else mode_captures["coarse" if args.skip_fine else "fine"]["diagnostic_sample"],
             "validation": "skipped",
         }
         if not args.accuracy_only:
@@ -627,7 +635,7 @@ def run(args, config, group):
             del raw_trace
         del prepared, timer, trace, coarse_trace, diagnostic, forward
         if not args.accuracy_only:
-            del coarse_forward, call
+            del coarse_forward, call, mode_calls
         (case / "summary.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
         all_reports.append(reports)
         if rank == 0:
@@ -656,7 +664,7 @@ def run(args, config, group):
             for item in all_reports:
                 for mode, row in item["profiles"].items():
                     writer.writerow([item["bs"], world, mode, row["rank_max_mean_us"], row["rank_min_mean_us"], row["last_round_rank_max_us"]])
-        print("[THREE MODE SUMMARY] BS EP mode round-max-mean(us) round-min-mean(us) last-round-max(us)", flush=True)
+        print("[MODE SUMMARY] BS EP mode round-max-mean(us) round-min-mean(us) last-round-max(us)", flush=True)
         for item in all_reports:
             for mode, row in item["profiles"].items():
                 print(f"{item['bs']:5d} {world:2d} {mode:6s} {row['rank_max_mean_us']:12.3f} "

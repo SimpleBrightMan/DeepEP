@@ -11,7 +11,7 @@ from deep_ep_experimental.megamoe import urma_benchmark as benchmark
 from deep_ep_experimental.megamoe import api, reference, urma, urma_timer, urma_timing, urma_trace_merge, validation
 
 
-@pytest.mark.parametrize("diagnostic_option", (None, "--timer", "--trace"))
+@pytest.mark.parametrize("diagnostic_option", (None, "--timer", "--trace", "--skip-fine"))
 def test_run_profiles_three_modes_and_exports_only_last_trace(
     monkeypatch, tmp_path, capsys, diagnostic_option
 ):
@@ -29,6 +29,9 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
     argv = ["--output-dir", str(tmp_path), "--exp-shape", "2", "3", "--exp-repeat", "1"]
     if diagnostic_option:
         argv.append(diagnostic_option)
+    skip_fine = diagnostic_option == "--skip-fine"
+    if skip_fine:
+        argv += ["--timer", "--trace"]  # skip overrides old commands too
     args = benchmark.parse_args(argv)
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
 
@@ -232,13 +235,15 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
         assert calls.count(("prepare", bs)) == 1
         expected = [("forward", bs, n, False, False) for n in range(1, 6)]
         expected += [("forward", bs, n, False, True) for n in range(6, 11)]
-        expected += [("forward", bs, n, True, True) for n in range(11, 16)]
+        if not skip_fine:
+            expected += [("forward", bs, n, True, True) for n in range(11, 16)]
         assert [call for call in calls if call[0] == "forward" and call[1] == bs] == expected
-        assert calls.count(("allocate-timer", bs)) == 1
+        assert calls.count(("allocate-timer", bs)) == int(not skip_fine)
+        assert calls.count(("allocate-trace", bs, args.trace_capacity)) == int(not skip_fine)
         assert calls.count(("allocate-trace", bs, 16)) == 1
         case = tmp_path / "rank_0" / f"bs_{bs}"
         summary = json.loads((case / "summary.json").read_text())
-        assert set(summary["profiles"]) == {"none", "coarse", "fine"}
+        assert set(summary["profiles"]) == ({"none", "coarse"} if skip_fine else {"none", "coarse", "fine"})
         for mode, report in summary["profiles"].items():
             assert report["rank_max_rounds_us"] == [90.0, 80.0, 40.0]
             assert report["rank_max_mean_us"] == pytest.approx(70.0)
@@ -246,11 +251,15 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
             assert report["per_call_device_all_reduce"]
             capture = json.loads((case / mode / "kernel_samples.json").read_text())
             assert (capture["diagnostic_sample"] is None) == (mode == "none")
-        assert np.fromfile(case / "urma_timer.bin", dtype="<i8").tolist() == [15]
+        if skip_fine:
+            assert not (case / "fine").exists()
+            assert not (case / "urma_timer.bin").exists()
+        else:
+            assert np.fromfile(case / "urma_timer.bin", dtype="<i8").tolist() == [15]
         assert calls.count(("trace-export", bs, 10)) == 1
-        assert calls.count(("trace-export", bs, 15)) == 1
-    assert calls.count(("guard-begin",)) == calls.count(("guard-end",)) == 9
-    assert calls.count(("all-reduce",)) == 45
+        assert calls.count(("trace-export", bs, 15)) == int(not skip_fine)
+    assert calls.count(("guard-begin",)) == calls.count(("guard-end",)) == (6 if skip_fine else 9)
+    assert calls.count(("all-reduce",)) == (30 if skip_fine else 45)
     assert [call[0] for call in calls[-3:]] == ["owner-destroy", "guard-close", "group-close"]
     output = capsys.readouterr().out
     assert output.count("[URMA PROFILE]") == 3
