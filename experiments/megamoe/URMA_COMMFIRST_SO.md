@@ -6,7 +6,7 @@
 
 按原通信CV为单位，发送批次目标为 `1,1,2,4,8,8,...`；本通信owner的Pack任务做完后，后续剩余连续数据一次下发（前两批仍各1个CV）。默认CV256即256、256、512、1024、2048…行。其它cv_rows按同样倍数处理。
 
-每批X是一条大PUT，scale是一条独立PUT；不把多个原CV循环成多个X PUT。合并要求source和destination都连续。所有旧Pack静态份额仍恰好做一次：先将本owner的Pack cursor补到当前合并范围末尾，再等待全体生产者ready；PUT下发后补到末尾+2轮。这样4/8 CV增长不会等待本核尚未执行的Pack任务。短peer和空peer仍做完其它peer/self相关的Pack份额。
+每批X是一条大PUT，scale是一条独立PUT；不把多个原CV循环成多个X PUT。合并要求source和destination都连续。所有旧Pack静态份额仍恰好做一次：开头仍准备2轮；每批PUT下发后、quiet前，按下一批Dispatch份数准备1、2、4、8、8…份原始CV的本核静态配额，按剩余份额截断。删除PUT之前的追赶Pack循环。已完成的份额不重复执行，仍等全体生产者的PackReady。短peer和空peer仍做完其它peer/self相关的Pack份额。
 
 每批按“PUT → 补后续Pack → 等上一批flag MTE3完成 → quiet本批payload → 异步下发本批各CV的MTE flag”运行。epoch UB缓冲全程只读、不逐次改写；异步flag不能在payload quiet之前发布。最后一次MTE3 drain保证所有Dispatch flags完成。Pack自己的MTE3完成等待可能自然覆盖已排入的flag，但Publish本身不再逐CV阻塞Scalar。
 
@@ -14,7 +14,7 @@
 
 ## Combine
 
-每个通信核完成自己对端的Dispatch与自己原有的Pack份额后，直接扫描Combine，不再等待本卡其它通信核或其它Pack worker。原Pack划分、lookahead和短/空peer补完循环保持不变；不提前Combine到本核Dispatch阶段。同一peer不交叠Dispatch和Combine，不同peer可以交叠。
+每个通信核完成自己对端的Dispatch与自己原有的Pack份额后，直接扫描Combine，不再等待本卡其它通信核或其它Pack worker。原Pack静态划分和短/空peer补完循环保持不变；lookahead按下一批发送份数准备；不提前Combine到本核Dispatch阶段。同一peer不交叠Dispatch和Combine，不同peer可以交叠。
 
 每轮扫描未发送CV，跳过未ready者。相邻ready CV的source/destination行都连续时合并为一个PUT；遇空洞、已发送CV、64位bitmap word边界或256MiB PUT上限就另起一段。最后一个实际未发送的通信CV不并入其它PUT。
 

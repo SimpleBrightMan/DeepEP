@@ -115,10 +115,23 @@ export. They do not establish NPU correctness or prove absence of target spills.
 Both comparison branches remove only the local Dispatch/Pack rendezvous.
 Each owner completes its own Dispatch and its original static Pack quota,
 then scans ready Combine CVs without waiting for other owners. The original
-Pack assignment, lookahead, short/empty-peer remainder loop and completion
+Pack assignment, short/empty-peer remainder loop and completion
 counter updates are unchanged. For balanced routes the remainder loop is
 normally empty; skewed routes retain the work needed for correctness.
 
 There is no `WaitLocalDispatch` event or Dispatch-done counter update.
 Per-CV GMM2 readiness, SO publication, final outbound quiet and the final
 local kernel join remain. Different peer owners may be in different phases.
+
+## Next-batch Pack preparation
+
+The two startup Pack rounds remain. After each Dispatch PUT, before its quiet,
+the owner prepares the next batch's count of original CV quotas: 1,2,4,8,8,...,
+clamped to remaining CVs and unprocessed Pack rounds. The cursor prevents any
+duplicate work. There is no pre-PUT catch-up Pack loop. If all Pack is already
+done, the existing ready-remainder merge remains allowed. Short/empty-peer
+remainder processing and activation-worker static assignments are unchanged.
+
+For balanced EP4 BS2048/CV256 (16 CVs per peer), startup prepares 2 rounds;
+PUT batch counts are 1,1,2,4,8 and the Pack counts before their quiet are
+1,2,4,7,0. The last 8-CV PUT therefore no longer needs a pre-submission Pack burst.

@@ -16,6 +16,17 @@ URMA_COMM_INLINE constexpr uint32_t DispatchBatchLimit(uint32_t step, uint32_t r
     return cap < remaining ? cap : remaining;
 }
 
+// After submitting batch `step`, prepare one NEXT batch's original CV quotas
+// before quiet. The two startup rounds are already complete and never repeated.
+URMA_COMM_INLINE constexpr uint32_t DispatchPackLimit(uint32_t step, uint32_t remainingCvs,
+                                                     uint32_t nextPackRound, uint32_t totalPackRounds)
+{
+    if (nextPackRound >= totalPackRounds) return nextPackRound;
+    const uint32_t count = DispatchBatchLimit(step + 1U, remainingCvs, false);
+    const uint32_t left = totalPackRounds - nextPackRound;
+    return nextPackRound + (count < left ? count : left);
+}
+
 URMA_COMM_INLINE constexpr bool AdjacentChunks(const Chunk& first, uint64_t rows, uint32_t count, const Chunk& next)
 {
     return next.peer == first.peer && next.cv == first.cv + count &&
