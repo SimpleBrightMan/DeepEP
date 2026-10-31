@@ -1,6 +1,7 @@
 """Full URMA MegaMoE benchmark; EP4/EP8/EP16, with explicit opt-in for multiple hosts."""
 
 import argparse
+import csv
 from datetime import datetime, timezone
 from functools import partial
 import json
@@ -59,16 +60,8 @@ def parse_args(argv=None):
     parser.add_argument("--warmup", type=int)
     parser.add_argument("--iters", type=int)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument(
-        "--timer",
-        action="store_true",
-        help="Native aggregate timer on the final extra invocation, excluded from performance",
-    )
-    parser.add_argument(
-        "--trace",
-        action="store_true",
-        help="Trace only the final extra invocation; implies --timer; this invocation is excluded from performance",
-    )
+    parser.add_argument("--timer", action="store_true", help="Append one coarse diagnostic after formal rounds")
+    parser.add_argument("--trace", action="store_true", help="Legacy alias for --fine (also enables coarse)")
     parser.add_argument(
         "--trace-include-waits",
         action="store_true",
@@ -102,7 +95,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--check-tokens", type=int, default=0, help="Must match --check-tokens used to create the optional Golden cache"
     )
+    parser.add_argument("--fine", action="store_true", help="Append one detailed diagnostic after coarse; implies --timer")
     args = parser.parse_args(argv)
+    if args.guard_backend != "hccl":
+        parser.error("per-call device all-reduce requires --guard-backend hccl")
     if args.accuracy_only and not args.golden_dir:
         parser.error("--accuracy-only requires --golden-dir; generate the FP8 CPU Golden first")
     if args.debug_intermediates and not args.accuracy_only:
@@ -113,7 +109,8 @@ def parse_args(argv=None):
         parser.error("gmm1-ahead-mgroups must be in [0,65536]")
     if any(n <= 0 for n in args.exp_shape) or args.exp_repeat < 0 or args.launch_timeout <= 0:
         parser.error("exp-shape/launch-timeout must be positive; exp-repeat must be nonnegative")
-    args.timer = args.timer or args.trace
+    args.fine = args.fine or args.trace
+    args.timer = args.timer or args.fine
     return args
 
 
@@ -223,7 +220,7 @@ def run(args, config, group):
             args.max_recv_rows,
             args.timer,
             args.timer_clock_mhz,
-            args.trace,
+            args.fine,
             args.trace_capacity,
             args.trace_include_waits,
             str(args.golden_dir),
@@ -262,7 +259,7 @@ def run(args, config, group):
         allow_multi_host=args.allow_multi_host,
     )
     if args.timer and not owner.timer_enabled:
-        raise RuntimeError("--timer requires native URMA timer support in the installed wheel")
+        raise RuntimeError("coarse/fine diagnostics require native URMA timer support in the installed wheel")
 
     def device_pair(pair):
         data, scales = pair
@@ -291,6 +288,7 @@ def run(args, config, group):
             error = f"{type(failure).__name__}: {failure}"
         collective_check(group, "URMA cascade preparation", error)
     del raw
+    launch_guard.prepare_per_call_alignment()
     manifest = dict(
         created_utc=datetime.now(timezone.utc).isoformat(),
         config=config,
@@ -302,7 +300,9 @@ def run(args, config, group):
         transport="URMA QP0 RO PUT + SO Combine bitmap publication; Dispatch MTE publication",
         communication_protocol=COMMUNICATION_PROTOCOL,
         communication_qps_per_peer=1,
-        dispatch_combine_overlap=False,
+        dispatch_combine_overlap="across independent peer owners only",
+        same_peer_dispatch_combine_overlap=False,
+        dispatch_combine_transition="own Dispatch completion -> ready Combine scan; no local Dispatch/Pack join",
         dispatch_batch_cvs="1,1,2,4,8,8,...; ready remainder after Pack completes",
         combine_publication="one disjoint SO bitmap mask per contiguous run within a 64-CV word",
         communication_completion="Dispatch final MTE3 publication drain after quiet; Combine final outbound quiet; independent of Reduce",
@@ -319,7 +319,8 @@ def run(args, config, group):
             else "torch_npu profiler device kernel duration; no Event or host-wall timing"
         ),
         performance_scope="mega_moe_urma_kernel only; routes prepared once before profiling",
-        performance_rounds="all iters after warmup; final instrumented diagnostic invocation excluded",
+        performance_rounds="formal iterations only; optional one-shot diagnostics excluded",
+        profile_modes=["none"] + (["coarse"] if args.timer else []) + (["fine"] if args.fine else []),
         profile_config="Level0/AiCoreNone/Text; shapes/memory/stack/FLOPs/modules disabled",
         max_recv_rows=owner.max_recv_rows,
         symmetric_buffer_bytes=owner.symmetric_buffer_bytes,
@@ -334,11 +335,12 @@ def run(args, config, group):
         tail_schedule=_extension().urma_tail_schedule,
         timer_clock_mhz=args.timer_clock_mhz,
         timer_clock_source="explicit assumption; default follows legacy timer/protocol.py CYCLE_TO_US=1000",
-        detailed_trace=args.trace,
+        detailed_trace=args.fine,
         trace_capacity_per_engine=args.trace_capacity,
         trace_include_waits=args.trace_include_waits,
         trace_clock_alignment="per-rank independent zero; no synchronized cross-rank timeline",
-        trace_scope="only the last extra invocation of each BS block; aggregate timer shares it; excluded from performance",
+        trace_scope="one optional coarse and one optional fine invocation, after formal rounds in the same profiler",
+        coarse_compute_scope="stage entry through final output drain; includes initial input wait and all internal gaps",
     )
     (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     if rank == 0:
@@ -353,7 +355,7 @@ def run(args, config, group):
             f"[URMA LAUNCH GUARD] {args.guard_backend} barrier + exp shape={tuple(args.exp_shape)} "
             f"repeat={args.exp_repeat}; "
             f"buffers={manifest['launch_guard']['allocated_bytes_per_rank'] / 2**30:.2f} GiB/rank; "
-            "once per continuous profile block; guard excluded from kernel timings",
+            "once per BS; device all-reduce before every call; both excluded from kernel timings",
             flush=True,
         )
     all_reports = []
@@ -384,13 +386,13 @@ def run(args, config, group):
             # Diagnose missing stores separately from stores that produce zero.
             output.fill_(float("nan"))
         prepared = owner.prepare_routes(ids)
-        # Allocate once before profiling. Only the final extra invocation gets
-        # these buffers; all formal samples execute without internal timers.
-        timer, trace, error = None, None, None
+        # Reuse the exact formal forward with optional diagnostic buffers.
+        timer, trace, coarse_trace, error = None, None, None, None
         try:
             if args.timer:
+                coarse_trace = owner.allocate_trace(16)
+            if args.fine:
                 timer = owner.allocate_timer()
-            if args.trace:
                 trace = owner.allocate_trace(args.trace_capacity)
         except Exception as failure:
             error = f"{type(failure).__name__}: {failure}"
@@ -398,56 +400,61 @@ def run(args, config, group):
         torch.npu.synchronize()
         startup_mgroups = int(prepared.native.gmm1_startup_mgroups)
         forward = partial(owner.forward_prepared, x, topk_weights, *weights, prepared, out=output)
-        diagnostic = partial(forward, timer=timer, trace=trace) if args.timer else None
+        coarse_forward = partial(forward, trace=coarse_trace, coarse_trace=True) if args.timer else None
+        fine_forward = partial(forward, timer=timer, trace=trace) if args.fine else None
+        mode_reports = {}
         if args.accuracy_only:
             launch_guard.begin()
             for _ in range(config["warmup"] + config["iters"]):
+                launch_guard.before_forward()
                 forward()
-            if diagnostic is not None:
-                diagnostic()
+            if coarse_forward is not None:
+                launch_guard.before_forward()
+                coarse_forward()
+            if fine_forward is not None:
+                launch_guard.before_forward()
+                fine_forward()
             launch_guard.end()
-            capture = dict(profile_dir=None, diagnostic_sample=None)
+            capture = dict(profile_dir=None, diagnostic_sample=None, diagnostics={})
             profile_report = dict(skipped=True, reason="accuracy-only; no profiler or Event timing")
         else:
             capture = measure_profiled_forward(
-                forward,
-                warmup=config["warmup"],
-                iters=config["iters"],
-                guard=launch_guard,
-                directory=case / "profile",
-                last_forward=diagnostic,
+                forward, warmup=config["warmup"], iters=config["iters"], guard=launch_guard,
+                directory=case / "profile", coarse_forward=coarse_forward, fine_forward=fine_forward,
             )
             (case / "kernel_samples.json").write_text(json.dumps(capture, indent=2), encoding="utf-8")
-            profile_records = group.all_gather(capture["durations_us"], f"URMA profile samples BS={bs}")
-            profile_report = summarize_profile_rounds(profile_records, ranks_per_node=ranks_per_node)
-            profile_report.update(
-                launch_guard=launch_guard.describe(),
-                warmup_iterations=config["warmup"],
-                continuous_iterations=config["warmup"] + config["iters"] + int(args.timer),
-                diagnostic_iterations=int(args.timer),
-                measured_scope="profiler device mega_moe_urma_kernel task; no Event timing",
-            )
-        reports = {
-            "bs": bs,
-            "received_rows_local": prepared.received_rows,
-            "gmm1_ahead_mgroups": args.gmm1_ahead_mgroups,
-            "gmm1_startup_mgroups_local": startup_mgroups,
-            "compute_wave_mgroups": wave_mgroups,
-            "gmm1_ahead_mgroups_applied": not bool(wave_mgroups),
-            "gmm1_gate_up_layout": "gate128_up128" if fused_gate_up else "planar",
-            "profile": profile_report,
-            "profile_directory": capture["profile_dir"],
-            "diagnostic_sample": capture["diagnostic_sample"],
-            "validation": "skipped",
-        }
+            mode_values = {"none": capture["durations_us"]}
+            mode_values.update({mode: [sample["duration_us"]] for mode, sample in capture["diagnostics"].items()})
+            for mode, durations in mode_values.items():
+                records = group.all_gather(durations, f"URMA {mode} profile samples BS={bs}")
+                report = summarize_profile_rounds(records, ranks_per_node=ranks_per_node)
+                report.update(instrumentation=mode, launch_guard=launch_guard.describe(),
+                              per_call_device_all_reduce=True, measured_scope="profiler mega_moe_urma_kernel only",
+                              scope="formal rounds" if mode == "none" else "single diagnostic invocation")
+                report["last_round_rank_max_us"] = max(row[-1] for row in records)
+                report["last_round_rank_min_us"] = min(row[-1] for row in records)
+                mode_reports[mode] = report
+                if mode != "none":
+                    mode_case = case / mode
+                    mode_case.mkdir(exist_ok=True)
+                    (mode_case / "kernel_samples.json").write_text(json.dumps(dict(
+                        instrumentation=mode, diagnostic_sample=capture["diagnostics"][mode],
+                        profile_dir=capture["profile_dir"]), indent=2), encoding="utf-8")
+                    if rank == 0:
+                        print(f"[URMA {mode.upper()}] BS={bs} rank-max={report['rank_max_mean_us']:.3f}us "
+                              f"rank-min={report['rank_min_mean_us']:.3f}us (one diagnostic; excluded from formal mean)", flush=True)
+            profile_report = mode_reports["none"]
+        reports = dict(
+            bs=bs, received_rows_local=prepared.received_rows,
+            gmm1_ahead_mgroups=args.gmm1_ahead_mgroups, gmm1_startup_mgroups_local=startup_mgroups,
+            profile=profile_report, profiles=mode_reports, profile_directory=capture["profile_dir"],
+            diagnostic_sample=capture["diagnostic_sample"], diagnostics=capture["diagnostics"], validation="skipped",
+        )
         if rank == 0 and not args.accuracy_only:
-            print(
-                f"[URMA PROFILE] BS={bs} cv_rows={args.cv_rows} "
-                f"round-max-mean={profile_report['rank_max_mean_us']:.3f}us "
-                f"round-min-mean={profile_report['rank_min_mean_us']:.3f}us "
-                f"rounds={profile_report['rounds']} (device kernel; timer/trace off)",
-                flush=True,
-            )
+            print(f"[URMA PROFILE] BS={bs} cv_rows={args.cv_rows} "
+                  f"round-max-mean={profile_report['rank_max_mean_us']:.3f}us "
+                  f"round-min-mean={profile_report['rank_min_mean_us']:.3f}us "
+                  f"rounds={profile_report['rounds']} (device kernel; timer/trace off)", flush=True)
         if args.golden_dir:
             import numpy as np
             from .golden import contract, load
@@ -530,7 +537,7 @@ def run(args, config, group):
                 (case / "summary.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
                 raise AssertionError(f"BS={bs} URMA dual-reference accuracy failed; inspect {case / 'accuracy.json'}")
             del cascade_output, cascade_counts
-        if args.timer:
+        if args.fine:
             from .urma_timer import communication_bandwidth, summarize_bandwidth
 
             raw_timer = timer.cpu().numpy().astype("<i8", copy=False)
@@ -540,8 +547,8 @@ def run(args, config, group):
                 dtype="little-endian int64",
                 schema=getattr(_extension(), "urma_timer_schema", None),
                 note="URMA format; do not parse using the legacy MegaMoE Wave timer parser",
-                scope="final diagnostic invocation; excluded from formal profile samples",
-                detailed_trace_enabled=args.trace,
+                scope="fine diagnostic invocation; excluded from formal profile samples",
+                detailed_trace_enabled=args.fine,
             )
             (case / "timer.json").write_text(json.dumps(timer_metadata, indent=2), encoding="utf-8")
             bandwidth = communication_bandwidth(raw_timer, rank, world=world, clock_mhz=args.timer_clock_mhz)
@@ -549,7 +556,7 @@ def run(args, config, group):
             reports["bandwidth"] = summarize_bandwidth(bandwidth_records)
             reports["bandwidth_per_rank"] = bandwidth_records
             reports["bandwidth_scope"] = timer_metadata["scope"]
-            reports["bandwidth_with_trace"] = args.trace
+            reports["bandwidth_with_trace"] = args.fine
             if rank == 0:
                 for row in reports["bandwidth"]:
                     if row["mean_gbps"] is not None:
@@ -563,16 +570,25 @@ def run(args, config, group):
                             flush=True,
                         )
             del raw_timer
-        if args.trace:
+        if args.timer:
+            from .urma_trace_merge import merge_trace_collective
+            coarse_case = case / "coarse"
+            coarse_case.mkdir(exist_ok=True)
+            records = export_trace_collective(group, coarse_trace.cpu().numpy(), coarse_case,
+                                              bs=bs, clock_mhz=args.timer_clock_mhz, include_waits=True)
+            reports["coarse_trace_per_rank"] = records
+            reports["coarse_trace_allrank"] = merge_trace_collective(
+                group, records, args.output_dir / f"bs_{bs}" / "coarse" / "allrank.json", bs=bs, include_waits=True)
+        if args.fine:
             from .urma_trace_merge import merge_trace_collective
 
-            # The only detailed trace is the final extra invocation already
-            # enqueued above. No second run, launch guard, or profiled sample.
+            # One final detailed diagnostic, excluded from formal samples.
+            (case / "fine").mkdir(exist_ok=True)
             raw_trace = trace.cpu().numpy()
             reports["trace_per_rank"] = export_trace_collective(
                 group,
                 raw_trace,
-                case,
+                case / "fine",
                 bs=bs,
                 clock_mhz=args.timer_clock_mhz,
                 include_waits=args.trace_include_waits,
@@ -580,7 +596,7 @@ def run(args, config, group):
             reports["trace_allrank"] = merge_trace_collective(
                 group,
                 reports["trace_per_rank"],
-                args.output_dir / f"bs_{bs}" / "allrank.json",
+                args.output_dir / f"bs_{bs}" / "fine" / "allrank.json",
                 bs=bs,
                 include_waits=args.trace_include_waits,
             )
@@ -588,12 +604,12 @@ def run(args, config, group):
                 print(
                     f"[URMA TRACE] BS={bs} all {world} ranks exported; "
                     f"capacity={args.trace_capacity}/engine; rank-local clocks; "
-                    f"{args.output_dir}/rank_*/bs_{bs}/urma_trace.json",
+                    f"{args.output_dir}/rank_*/bs_{bs}/fine/urma_trace.json",
                     flush=True,
                 )
                 print(f"[URMA ALLRANK] BS={bs}; {reports['trace_allrank']['path']}", flush=True)
             del raw_trace
-        del prepared, timer, trace, diagnostic, forward
+        del prepared, timer, trace, coarse_trace, coarse_forward, fine_forward, forward
         (case / "summary.json").write_text(json.dumps(reports, indent=2), encoding="utf-8")
         all_reports.append(reports)
         if rank == 0:
@@ -614,8 +630,15 @@ def run(args, config, group):
     owner.destroy()
     launch_guard.close()
     group.close()
-    if rank == 0 and not args.accuracy_only and len(all_reports) > 1:
+    if rank == 0 and not args.accuracy_only:
         print(format_profile_summary(all_reports, world), flush=True)
+        with (args.output_dir / "mode_summary.csv").open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(["bs", "ep", "mode", "rounds", "rank_max_mean_us", "rank_min_mean_us", "scope"])
+            for item in all_reports:
+                for mode, row in item["profiles"].items():
+                    writer.writerow([item["bs"], world, mode, row["rounds"], row["rank_max_mean_us"], row["rank_min_mean_us"], row["scope"]])
+
 
 
 if __name__ == "__main__":
