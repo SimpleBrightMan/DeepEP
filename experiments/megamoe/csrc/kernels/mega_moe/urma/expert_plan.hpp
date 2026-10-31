@@ -216,7 +216,20 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
         throw std::logic_error("URMA Reduce dependencies do not cover all expanded rows");
     }
     config.fragmentCount = static_cast<uint32_t>(plan.fragments.size());
-    plan.computeTasks = BuildComputeTasks(plan.computeBatches, config.gmm1AheadMGroups);
+    if (config.world == 4U && config.bs == 1024U) {
+        // A wave is twelve REAL nonempty M-groups, not twelve expert IDs.
+        // It may cross experts or split a hot expert. No device-wide barrier.
+        plan.computeBatches.clear();
+        for (uint32_t first = 0U; first < config.fragmentCount; first += 12U) {
+            const uint32_t count = std::min(12U, config.fragmentCount - first);
+            const uint32_t wave = static_cast<uint32_t>(plan.computeBatches.size());
+            plan.computeBatches.push_back({first, count});
+            plan.computeTasks.push_back({ComputeBatchStage::Gmm1, wave});
+            plan.computeTasks.push_back({ComputeBatchStage::Gmm2, wave});
+        }
+    } else {
+        plan.computeTasks = BuildComputeTasks(plan.computeBatches, config.gmm1AheadMGroups);
+    }
     config.computeTaskCount = static_cast<uint32_t>(plan.computeTasks.size());
     config.sendChunkCount = static_cast<uint32_t>(plan.sendChunks.size());
     config.recvChunkCount = static_cast<uint32_t>(plan.recvChunks.size());

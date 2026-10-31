@@ -52,6 +52,8 @@ EVENTS = {
     "WaitGmm1": (22, "wait.sync"),
     "LocalSync": (26, "wait.sync"),
     "Gmm1Drain": (27, "compute.drain"),
+    "CombineSendComplete": (42, "transport.quiet"),
+    "DispatchSendComplete": (43, "transport.quiet"),
 }
 
 
@@ -266,6 +268,18 @@ def test_report_does_not_mutate_source_or_convert_submit_time_to_bandwidth(trace
     assert "DispatchPutX" in result and "CombinePut" in result
     # peer, X count/bytes, scale count/bytes, return count/bytes, D/C quiet time.
     assert section_rows(result, "PEER") == [["7", "1", "4096", "1", "128", "1", "8192", "30.000", "50.000"]]
+
+
+def test_peer_completion_totals_include_final_dispatch_and_combine_waits(trace_text):
+    doc = document(
+        event("DispatchPutX", 0, 1, peer=7, byte_count=4096),
+        event("DispatchQuiet", 2, 3, peer=7),
+        event("DispatchSendComplete", 5, 4, peer=7),
+        event("CombinePut", 10, 1, peer=7, byte_count=8192),
+        event("CombineSendComplete", 12, 8, peer=7),
+    )
+    result = trace_text.render_report(doc)
+    assert section_rows(result, "PEER") == [["7", "1", "4096", "0", "0", "1", "8192", "7.000", "8.000"]]
 
 
 def test_longest_sync_quiet_and_drain_are_ranked_separately(trace_text):

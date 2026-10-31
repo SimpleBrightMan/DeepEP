@@ -3,6 +3,7 @@
 #pragma once
 
 #include "compute_contract.hpp"
+#include "combine_ready.hpp"
 #include "kernel_operator.h"
 
 namespace MegaMoeUrma {
@@ -85,9 +86,7 @@ __aicore__ inline bool TryReduceToken(const Arguments& args, AscendC::LocalTenso
             auto* flag = reinterpret_cast<__gm__ int32_t*>(args.gmm2Done + static_cast<uint64_t>(index) * kFlagBytes);
             ready = ReadGmByPassDCache(flag) >= static_cast<int32_t>(expectedSelfTiles);
         } else {
-            auto* flag = reinterpret_cast<__gm__ uint64_t*>(args.symmetric + args.config.combineReadyOffset +
-                                                            static_cast<uint64_t>(index) * kFlagBytes);
-            ready = ReadGmByPassDCache(flag) == args.config.epoch;
+            ready = CombineCvReady(args, index);
         }
         if (!ready) return false;
         SetReduceBit(cache, index);

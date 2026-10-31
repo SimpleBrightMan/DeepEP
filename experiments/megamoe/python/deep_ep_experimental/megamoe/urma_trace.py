@@ -48,6 +48,10 @@ EVENTS = (
     "CombinePublish",
     "WaitReduceReady",
     "ReduceDrain",
+    # 33..41 are reserved, matching abi.hpp. JSON composites use 33/34.
+    None, None, None, None, None, None, None, None, None,
+    "CombineSendComplete",
+    "DispatchSendComplete",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
 SYNC_STAGES = {0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
@@ -80,6 +84,20 @@ def event_style(event):
             "transport.quiet",
             "thread_state_iowait",
             "wait for prior peer PUT completion",
+        )
+    if event == "CombineSendComplete":
+        return (
+            event + " [outbound completion]",
+            "transport.quiet",
+            "thread_state_iowait",
+            "final owner quiet; end confirms all Combine payload PUTs and SO flags to this peer completed",
+        )
+    if event == "DispatchSendComplete":
+        return (
+            event + " [outbound completion]",
+            "transport.quiet",
+            "thread_state_iowait",
+            "final owner MTE3 drain after payload quiet; end confirms all Dispatch data and ready publications completed",
         )
     if event.endswith("Drain"):
         return event + " [drain]", "compute.drain", "thread_state_iowait", "explicit pipeline drain scope"
@@ -147,7 +165,7 @@ def decode_trace(raw, *, rank, clock_mhz):
             offset = HEADER_WORDS + ordinal * RECORD_WORDS
             row = tuple(map(int, data[offset : offset + RECORD_WORDS]))
             start, end, event_id = row[:3]
-            if event_id >= len(EVENTS):
+            if event_id >= len(EVENTS) or EVENTS[event_id] is None:
                 raise ValueError(f"engine={engine} record={ordinal}: unknown event id={event_id}")
             if end < start or start == UNKNOWN or end == UNKNOWN:
                 raise ValueError(f"engine={engine} record={ordinal}: invalid ticks start={start} end={end}")
@@ -252,7 +270,7 @@ def filter_trace_waits(trace):
         visible_record_count=sum(per_engine),
         visible_records_per_engine=per_engine,
         hidden_wait_count=metadata.get("hidden_wait_count", 0) + hidden,
-        wait_filter="dependency waits and local sync hidden; final rank barrier/handshake retained; timestamps unchanged",
+        wait_filter="dependency waits and startup sync hidden; final rank barrier/handshake/local completion retained; timestamps unchanged",
     )
     return dict(trace, traceEvents=kept, metadata=metadata)
 

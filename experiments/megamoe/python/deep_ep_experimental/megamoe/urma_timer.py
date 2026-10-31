@@ -44,6 +44,7 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
         clock_source="caller supplied; default 1000 follows legacy MegaMoE protocol",
         metric="single_direction_aggregate_effective_payload_gbps",
         denominator="same-rank class max(last_tick) - min(first_tick)",
+        completion="Dispatch final MTE3 publication drain after payload quiet / Combine final quiet including SO notifications",
         includes_self_copy_in_intra=False,
         classes=[],
     )

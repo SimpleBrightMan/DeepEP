@@ -140,10 +140,10 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     try {
         if (megamoe_urma) {
             // Each of the world-1 communication workers owns one remote PE.
-            // Each owner uses QP0 for Dispatch and QP1 for Combine, allowing
-            // early Combine PUTs to remain pending through Dispatch quiet.
+            // Dispatch precedes Combine. SO notifications use QP0 and must
+            // share the payload queue to order earlier RO writes.
             // Disable shared Clos SQs so different peer owners stay isolated.
-            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 2U), "aclshmemx_set_qp_num(MegaMoE URMA)");
+            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 1U), "aclshmemx_set_qp_num(MegaMoE URMA)");
             attr.runtime_config.udma_shared_jetty = ACLSHMEM_CONFIG_DISABLED;
             if (set_masks) {
                 check(set_masks(nullptr, 0U), "aclshmemx_set_udma_peer_qp_masks(clear, MegaMoE URMA)");

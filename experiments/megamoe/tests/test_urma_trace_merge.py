@@ -78,6 +78,8 @@ def test_filter_keeps_final_global_sync_and_never_compresses_time():
 def test_default_export_filters_but_optional_full_export_preserves_all_ids(tmp_path):
     raw = trace_buffer(1)
     for index, name in enumerate(EVENTS):
+        if name is None:
+            continue
         add_record(raw, engine=index, event=name)
     default, full = tmp_path / "default.json", tmp_path / "full.json"
     export_trace(raw, default, rank=0, clock_mhz=1000)
@@ -85,7 +87,7 @@ def test_default_export_filters_but_optional_full_export_preserves_all_ids(tmp_p
     filtered = json.loads(default.read_text())
     assert all(not row["name"].startswith("Wait") for row in events(filtered))
     assert any(row["name"] == "RankBarrier" for row in events(filtered))
-    assert len(events(json.loads(full.read_text()))) == len(EVENTS)
+    assert len(events(json.loads(full.read_text()))) == sum(name is not None for name in EVENTS)
 
 
 def test_local_invocation_join_remains_visible_at_the_actual_tail():
@@ -154,7 +156,7 @@ def test_filtered_input_merges_without_double_counting_hidden_waits(tmp_path):
     for path in paths:
         path.write_text(json.dumps(filter_trace_waits(json.loads(path.read_text()))))
     result = merge_trace_files(paths, tmp_path / "allrank.json", world=2)
-    assert result["visible_record_count"] == 14 and result["hidden_wait_count"] == 10
+    assert result["visible_record_count"] == 16 and result["hidden_wait_count"] == 8
 
 
 def test_offline_cli_discovers_cases_and_can_keep_waits(tmp_path, capsys):
@@ -176,7 +178,7 @@ def test_collective_merge_shared_or_nonshared_filesystem(tmp_path, monkeypatch, 
     reports = together(peers, lambda group: merge_trace_collective(group, records, output, bs=4096))
     assert reports[0] == reports[1] and reports[0]["error"] is None
     assert reports[0]["metadata"]["rank_count"] == 2
-    assert len(events(json.loads(output.read_text()))) == 14
+    assert len(events(json.loads(output.read_text()))) == 16
     assert not list(output.parent.glob(".rank-traces-*"))
 
 

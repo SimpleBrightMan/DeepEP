@@ -321,9 +321,10 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
     assert buffer.allow_multi_host is allow
     assert buffer.num_max_tokens_per_rank == capacity
     assert created == [allow]
-    assert checks[0][1][-3] is allow
-    assert checks[0][1][-2] == "combine-ready-scan-reduce-world-v1"
-    assert checks[0][1][-1] == "expert-m256-expected-lt128-gateup-v2"
+    assert checks[0][1][-4] is allow
+    assert checks[0][1][-3] == "combine-ready-scan-reduce-world-v1"
+    assert checks[0][1][-2] == "wave12-ep4-bs1024-samestage-deferred-v3"
+    assert checks[0][1][-1] == urma.COMMUNICATION_PROTOCOL
     assert buffer.gmm1_ahead_mgroups == 12
 
 
@@ -331,9 +332,10 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
     "tail", [None, "combine-cv-flag-reduce41", "combine-finished-fast-reduce41", "combine-ready-scan-reduce-world-v1"]
 )
 def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, tail):
-    monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
+    monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object(), megamoe_urma_communication_protocol=urma.COMMUNICATION_PROTOCOL))
     extension = SimpleNamespace(
-        urma_api_protocol=1, urma_tail_schedule=tail, urma_compute_schedule="expert-m256-expected-lt128-gateup-v2"
+        urma_api_protocol=1, urma_tail_schedule=tail, urma_compute_schedule="wave12-ep4-bs1024-samestage-deferred-v3",
+        urma_communication_protocol=urma.COMMUNICATION_PROTOCOL
     )
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
     urma._extension.cache_clear()
@@ -349,7 +351,7 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
 
 @pytest.mark.parametrize("schedule", [None, "expert-m256", "expert-m384-n128", "expert-m256-mgroup-lookahead-v1"])
 def test_native_mgroup_schedule_must_match_before_runtime_creation(monkeypatch, schedule):
-    monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
+    monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object(), megamoe_urma_communication_protocol=urma.COMMUNICATION_PROTOCOL))
     extension = SimpleNamespace(
         urma_api_protocol=1, urma_tail_schedule="combine-ready-scan-reduce-world-v1", urma_compute_schedule=schedule
     )
@@ -367,6 +369,30 @@ def test_benchmark_summaries_preserve_two_eight_rank_nodes():
 
     report = summarize_profile_rounds([[float(rank + 1)] * 4 for rank in range(16)], ranks_per_node=8)
     assert [node["rank_start"] for node in report["per_node"]] == [0, 8]
+
+
+@pytest.mark.parametrize("old_module", ["core", "experimental"])
+def test_commfirst_protocol_rejects_old_native_modules(monkeypatch, old_module):
+    protocol = urma.COMMUNICATION_PROTOCOL
+    core = SimpleNamespace(create_megamoe_urma_runtime=object(), megamoe_urma_communication_protocol=protocol)
+    extension = SimpleNamespace(
+        urma_api_protocol=1,
+        urma_tail_schedule="combine-ready-scan-reduce-world-v1",
+        urma_compute_schedule="wave12-ep4-bs1024-samestage-deferred-v3",
+        urma_communication_protocol=protocol,
+    )
+    if old_module == "core":
+        del core.megamoe_urma_communication_protocol
+    else:
+        del extension.urma_communication_protocol
+    monkeypatch.setattr(urma, "require_native", lambda *_: core)
+    monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
+    urma._extension.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="matching core and experimental"):
+            urma._extension()
+    finally:
+        urma._extension.cache_clear()
 
 
 def trace_extension(**changes):

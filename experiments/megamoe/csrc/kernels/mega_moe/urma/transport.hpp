@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include "combine_ready.hpp"
 #include "kernel_operator.h"
 #include "shmem.h"
 
@@ -15,11 +16,10 @@ constexpr uint32_t kSignalSlotBytes = 128U;
 constexpr uint32_t kSignalCopyBytes = 32U;
 constexpr uint32_t kMaxPutBytes = 256U * 1024U * 1024U;
 constexpr uint32_t kDispatchQp = 0U;
-constexpr uint32_t kCombineQp = 1U;
+constexpr uint32_t kCombineQp = 0U;
 
-// The dedicated Session creates independent Dispatch/Combine QPs for every
-// peer and disables shared jetty. Exactly one AIV1 worker owns both QPs of each
-// remote peer. Other workers must not submit or quiet either peer queue.
+// Dispatch completes before Combine. Both use the same peer-owned QP0 because
+// the SO atomic API publishes on QP0. No second worker may touch that SQ/CQ.
 __aicore__ inline uint32_t PeerForOwner(uint32_t rank, uint32_t owner)
 {
     return owner < rank ? owner : owner + 1U;
@@ -37,16 +37,92 @@ __aicore__ inline void Put(__gm__ uint8_t* symmetricBase, uint64_t dstOffset, __
         aclshmemi_kernel_abort("MegaMoE URMA PUT exceeds 256 MiB: bytes=%u peer=%u\n", bytes, peer);
         return;
     }
-    aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_S>(symmetricBase + dstOffset, src, nullptr, bytes, peer, qp, 0U);
+    if (qp != kDispatchQp) {
+        aclshmemi_kernel_abort("MegaMoE commfirst SO requires QP0: peer=%u qp=%u\n", peer, qp);
+        return;
+    }
+    aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_S, ACLSHMEMX_UDMA_OP_CONFIG_RO>(
+        symmetricBase + dstOffset, src, nullptr, bytes, peer, qp, 0U);
 }
 
-// Blocking completion of only this peer/QP, not merely WQE publication. A
-// Dispatch quiet must leave speculative Combine work pending on its own QP.
+// Blocking completion of only this peer/QP, including all prior SO markers.
 // The one-owner rule also applies here: no second worker may poll the same CQ.
 __aicore__ inline void Quiet(uint32_t peer, uint32_t qp = kDispatchQp)
 {
+    if (qp != kDispatchQp) {
+        aclshmemi_kernel_abort("MegaMoE commfirst SO requires QP0 quiet: peer=%u qp=%u\n", peer, qp);
+        return;
+    }
     aclshmemx_udma_qp_quiet(peer, qp);
 }
+
+// One SO operation can mark a contiguous merged run of up to 64 CVs. The
+// sender's submitted bitmap must guarantee that no bit is ever added twice:
+// addition of DISJOINT masks is exactly OR, with no carry between bits.
+// Host clears this receiver-owned area before start publication; every sender
+// waits for that start, and final quiet retires all flags before reuse.
+__aicore__ inline void PublishCombineRange(__gm__ uint8_t* symmetricBase, uint64_t readyOffset,
+                                           uint32_t maxPeerChunks, uint32_t source, uint32_t peer,
+                                           uint32_t firstCv, uint32_t count)
+{
+    if (!CombineRangeFitsWord(firstCv, count) || firstCv >= maxPeerChunks || count > maxPeerChunks - firstCv) {
+        aclshmemi_kernel_abort("Invalid Combine SO range: cv=%u count=%u capacity=%u\n", firstCv, count, maxPeerChunks);
+        return;
+    }
+    auto* flag = reinterpret_cast<__gm__ uint64_t*>(
+        symmetricBase + readyOffset + CombineReadyWordIndex(maxPeerChunks, source, firstCv) * kSignalSlotBytes);
+    aclshmemx_udma_atomic_add<uint64_t, ACLSHMEMX_UDMA_OP_CONFIG_SO>(flag, CombineReadyMask(firstCv, count), peer);
+}
+
+// One marker per source/peer/invocation. The receiver resets finished slots
+// before PublishStart, so adding epoch writes the new generation exactly once.
+__aicore__ inline void PublishOrdered(__gm__ uint8_t* symmetricBase, uint64_t offset,
+                                      uint32_t peer, uint64_t epoch)
+{
+    aclshmemx_udma_atomic_add<uint64_t, ACLSHMEMX_UDMA_OP_CONFIG_SO>(
+        reinterpret_cast<__gm__ uint64_t*>(symmetricBase + offset), epoch, peer);
+}
+
+// Immutable 32B epoch signal throughout the invocation. Enqueue does not wait
+// for MTE3: the next payload may be submitted before Drain waits for previous
+// publications. Only after Drain may the caller overwrite/reuse this UB.
+class AsyncPublishBuffer {
+public:
+    __aicore__ inline AsyncPublishBuffer(AscendC::LocalTensor<uint64_t> signal, AscendC::TEventID event)
+        : signal_(signal), event_(event) {}
+
+    __aicore__ inline void Init(uint64_t epoch)
+    {
+        Drain();
+        signal_.SetValue(0, epoch);
+        signal_.SetValue(1, 0U);
+        signal_.SetValue(2, 0U);
+        signal_.SetValue(3, 0U);
+        AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(event_);
+        AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(event_);
+    }
+
+    __aicore__ inline void Enqueue(__gm__ uint8_t* symmetricBase, uint64_t offset, uint32_t peer)
+    {
+        AscendC::GlobalTensor<uint64_t> destination;
+        destination.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(aclshmem_ptr(symmetricBase + offset, peer)));
+        AscendC::DataCopy(destination, signal_, kSignalCopyBytes / sizeof(uint64_t));
+        pending_ = true;
+    }
+
+    __aicore__ inline void Drain()
+    {
+        if (!pending_) return;
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(event_);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(event_);
+        pending_ = false;
+    }
+
+private:
+    AscendC::LocalTensor<uint64_t> signal_;
+    AscendC::TEventID event_;
+    bool pending_ = false;
+};
 
 // Publish only AFTER Quiet(peer, phaseQp) covered every payload PUT for this chunk.
 // Each (source peer, CV chunk, phase) owns a separate 128B destination slot.
@@ -81,8 +157,8 @@ __aicore__ inline void WaitLocalDone(__gm__ uint8_t* localSlot, uint64_t sequenc
 }
 
 // Empty peer edges may advance to the next invocation before the slow owner
-// observes the old start. Accept a later start only here; CV data readiness
-// still requires the exact epoch. Any nonempty edge prevents such advancement
+// observes the old start. Accept a later start only here; Dispatch flags retain
+// exact epochs and Combine bitmaps were cleared before this start. Any nonempty edge prevents such advancement
 // until its old payload has been consumed and locally reduced.
 __aicore__ inline void WaitStartAtLeast(__gm__ uint8_t* localSlot, uint64_t sequence)
 {
