@@ -140,10 +140,9 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             ++count;
         }
         const uint32_t end = nextDispatch + count;
-        // Growing a send from 2 to 4/8 CVs must not wait for this owner's
-        // own still-unexecuted Pack quota. Produce exactly once, by cursor.
-        while (nextPackRound < end && nextPackRound < args.config.packRoundCount)
-            PackOneRound(args, nextPackRound++, owner, kAic, timer);
+        // Startup prepares two rounds. Each preceding PUT prepares the next
+        // batch before quiet, so this owner's quota is ready without a Pack
+        // catch-up loop before submission. Other producers still use PackReady.
         TraceMeta meta = ChunkTraceMeta(first); meta.rows = rows;
         start = timer.TraceBegin();
         for (uint32_t cv = nextDispatch; cv < end; ++cv) {
@@ -167,9 +166,11 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             reinterpret_cast<__gm__ uint8_t*>(args.expandedScale + first.localRow * scales),
             static_cast<uint32_t>(meta.bytes), peer);
         timer.TraceEnd(TraceEvent::DispatchPutScale, start, meta);
-        // Preserve two original Pack rounds of lookahead; all original quotas
-        // still execute once, including those moved before this larger PUT.
-        while (nextPackRound < end + kPackStartupRounds && nextPackRound < args.config.packRoundCount)
+        // PUT sizes 1,1,2,4,8,8... prepare 1,2,4,8,8... original Pack rounds.
+        // Bound by remaining work; no next batch means no speculative Pack.
+        const uint32_t packLimit = DispatchPackLimit(step, dispatchCvs - end,
+                                                     nextPackRound, args.config.packRoundCount);
+        while (nextPackRound < packLimit)
             PackOneRound(args, nextPackRound++, owner, kAic, timer);
         meta.bytes = 0U;
         start = timer.TraceBegin();
