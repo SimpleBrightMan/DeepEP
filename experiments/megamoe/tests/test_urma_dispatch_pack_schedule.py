@@ -8,7 +8,7 @@ import subprocess
 import pytest
 
 
-def test_next_batch_is_prepacked_without_duplicate_or_missing_quota(tmp_path):
+def test_pack_before_put_covers_batch_without_duplicate_or_missing_quota(tmp_path):
     command = shlex.split(os.environ.get("CXX", "c++"))
     if not command or not shutil.which(command[0]):
         pytest.skip("A host C++ compiler is required")
@@ -20,11 +20,23 @@ def test_next_batch_is_prepacked_without_duplicate_or_missing_quota(tmp_path):
 #include <vector>
 using namespace MegaMoeUrma;
 int main() {
-    // Full batches: after two startup rounds, increments are 1,2,4,8,8.
+    // Full batches: after two startup rounds, increments are 2,2,3,5,9.
     unsigned p=2;
     for(unsigned step=0;step<5;++step) {
-        unsigned next=DispatchPackLimit(step,100,p,100);
-        assert(next-p==(step==0?1:step==1?2:step==2?4:8)); p=next;
+        unsigned count=DispatchBatchLimit(step,100,false);
+        unsigned next=DispatchPackLimit(count,p,100);
+        assert(next-p==count+1); p=next;
+    }
+    { // Exact EP4/BS2048/CV256 example, including final clamping.
+        unsigned sends[]{1,1,2,4,8}, packs[]{2,2,3,5,2};
+        unsigned packed=2,sent=0;
+        for(unsigned step=0;step<5;++step) {
+            unsigned count=DispatchBatchLimit(step,16-sent,packed>=16);
+            unsigned limit=DispatchPackLimit(count,packed,16);
+            assert(count==sends[step] && limit-packed==packs[step]);
+            packed=limit;sent+=count;
+        }
+        assert(packed==16 && sent==16);
     }
     for(unsigned total=0;total<=kMaxPeerChunks;++total)
     for(unsigned peer=0;peer<=total;++peer)
@@ -35,10 +47,12 @@ int main() {
         while(sent<peer) {
             unsigned count=DispatchBatchLimit(step,peer-sent,packed>=total);
             if(count>split) count=split; // adjacency/PUT-size truncation
-            assert(count>0 && sent+count<=packed); // no pre-PUT catch-up
-            sent+=count;
-            unsigned limit=DispatchPackLimit(step,peer-sent,packed,total);
+            unsigned limit=DispatchPackLimit(count,packed,total);
+            assert(limit-packed<=count+1);
             while(packed<limit) { assert(packed<total); ++visits[packed++]; }
+            assert(count>0 && sent+count<=packed); // this owner's entire batch is ready
+            if(step<2) assert(count==1);
+            sent+=count;
             ++step;
         }
         // Existing short/empty-peer remainder loop is unchanged.

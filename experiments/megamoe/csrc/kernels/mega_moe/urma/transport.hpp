@@ -74,8 +74,9 @@ __aicore__ inline void PublishCombineRange(__gm__ uint8_t* symmetricBase, uint64
     aclshmemx_udma_atomic_add<uint64_t, ACLSHMEMX_UDMA_OP_CONFIG_SO>(flag, CombineReadyMask(firstCv, count), peer);
 }
 
-// One marker per source/peer/invocation. The receiver resets finished slots
-// before PublishStart, so adding epoch writes the new generation exactly once.
+// One marker per slot/invocation (Dispatch CV or peer-finished). The receiver
+// resets these slots before PublishStart; adding epoch writes it exactly once.
+// Same-QP SO makes each flag visible only after preceding payload writes.
 __aicore__ inline void PublishOrdered(__gm__ uint8_t* symmetricBase, uint64_t offset,
                                       uint32_t peer, uint64_t epoch)
 {

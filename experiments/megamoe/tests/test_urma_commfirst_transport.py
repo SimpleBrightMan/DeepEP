@@ -109,6 +109,28 @@ int main() {
     publish.Drain();assert(AscendC::drains==1);
     Quiet(1);assert(windows[1][0]==71);
 
+    // Dispatch: merged X/scale writes precede every per-CV SO epoch.
+    // No quiet is needed between submissions. Each invocation resets slots
+    // before publishing start; the final quiet retires all in-flight writes.
+    for(uint32_t epoch: {1U,2U,17U}) {
+        assert(pending.empty());
+        std::memset(windows[1]+2048,0,256);
+        auto* cv0=reinterpret_cast<uint64_t*>(windows[1]+2048);
+        auto* cv1=reinterpret_cast<uint64_t*>(windows[1]+2176);
+        const auto previousQuiets=quiets;
+        Put(windows[0],512,data,32,1);
+        Put(windows[0],544,data+32,32,1);
+        PublishOrdered(windows[0],2048,1,epoch);
+        PublishOrdered(windows[0],2176,1,epoch);
+        assert(quiets==previousQuiets && *cv0==0 && *cv1==0);
+        assert(Progress(1) && *cv0==0 && *cv1==0);
+        assert(Progress(1) && *cv0==0 && *cv1==0);
+        assert(Progress(1) && *cv0==epoch && *cv1==0);
+        assert(windows[1][512]==71 && windows[1][544]==71);
+        Quiet(1);
+        assert(*cv0==epoch && *cv1==epoch && pending.empty());
+    }
+
     constexpr uint64_t readyOffset=4096;
     Arguments receive{};receive.symmetric=uintptr_t(windows[1]);
     receive.config.combineReadyOffset=readyOffset;receive.config.maxPeerChunks=128;

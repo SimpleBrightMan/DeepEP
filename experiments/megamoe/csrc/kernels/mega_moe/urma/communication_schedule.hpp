@@ -16,13 +16,14 @@ URMA_COMM_INLINE constexpr uint32_t DispatchBatchLimit(uint32_t step, uint32_t r
     return cap < remaining ? cap : remaining;
 }
 
-// After submitting batch `step`, prepare one NEXT batch's original CV quotas
-// before quiet. The two startup rounds are already complete and never repeated.
-URMA_COMM_INLINE constexpr uint32_t DispatchPackLimit(uint32_t step, uint32_t remainingCvs,
+// Before submitting a batch, prepare send-count + 1 original CV quotas.
+// Counts are 2,2,3,5,9,... for sends 1,1,2,4,8,...; startup's two rounds
+// are already complete. Bound by unprocessed quotas, never repeat a row.
+URMA_COMM_INLINE constexpr uint32_t DispatchPackLimit(uint32_t sendCount,
                                                      uint32_t nextPackRound, uint32_t totalPackRounds)
 {
     if (nextPackRound >= totalPackRounds) return nextPackRound;
-    const uint32_t count = DispatchBatchLimit(step + 1U, remainingCvs, false);
+    const uint32_t count = sendCount + 1U;
     const uint32_t left = totalPackRounds - nextPackRound;
     return nextPackRound + (count < left ? count : left);
 }

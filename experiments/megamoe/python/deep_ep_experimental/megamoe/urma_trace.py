@@ -101,7 +101,7 @@ def event_style(event):
             event + " [outbound completion]",
             "transport.quiet",
             "thread_state_iowait",
-            "final owner MTE3 drain after payload quiet; end confirms all Dispatch data and ready publications completed",
+            "final owner QP quiet; end confirms all Dispatch payload PUTs and SO ready publications completed",
         )
     if event.endswith("Drain"):
         return event + " [drain]", "compute.drain", "thread_state_iowait", "explicit pipeline drain scope"

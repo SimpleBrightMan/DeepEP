@@ -110,9 +110,6 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
 {
     const uint32_t peer = PeerForOwner(args.config.rank, owner);
     auto* symmetric = reinterpret_cast<__gm__ uint8_t*>(args.symmetric);
-    LocalTensor<uint64_t> signal(TPosition::VECCALC, 0U, 4U);
-    AsyncPublishBuffer publisher(signal, EVENT_ID0);
-    publisher.Init(args.config.epoch);
     TraceMeta peerMeta; peerMeta.peer = peer;
     timer.Begin(Phase::Barrier);
     uint64_t start = timer.TraceBegin();
@@ -140,9 +137,12 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             ++count;
         }
         const uint32_t end = nextDispatch + count;
-        // Startup prepares two rounds. Each preceding PUT prepares the next
-        // batch before quiet, so this owner's quota is ready without a Pack
-        // catch-up loop before submission. Other producers still use PackReady.
+        // Pack is the intentional spacing between submissions. Startup's two
+        // rounds are not repeated. This prepares only this owner's static
+        // quota; PackReady still certifies every row from all producers.
+        const uint32_t packLimit = DispatchPackLimit(count, nextPackRound, args.config.packRoundCount);
+        while (nextPackRound < packLimit)
+            PackOneRound(args, nextPackRound++, owner, kAic, timer);
         TraceMeta meta = ChunkTraceMeta(first); meta.rows = rows;
         start = timer.TraceBegin();
         for (uint32_t cv = nextDispatch; cv < end; ++cv) {
@@ -166,21 +166,14 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             reinterpret_cast<__gm__ uint8_t*>(args.expandedScale + first.localRow * scales),
             static_cast<uint32_t>(meta.bytes), peer);
         timer.TraceEnd(TraceEvent::DispatchPutScale, start, meta);
-        // PUT sizes 1,1,2,4,8,8... prepare 1,2,4,8,8... original Pack rounds.
-        // Bound by remaining work; no next batch means no speculative Pack.
-        const uint32_t packLimit = DispatchPackLimit(step, dispatchCvs - end,
-                                                     nextPackRound, args.config.packRoundCount);
-        while (nextPackRound < packLimit)
-            PackOneRound(args, nextPackRound++, owner, kAic, timer);
         meta.bytes = 0U;
         start = timer.TraceBegin();
-        publisher.Drain();  // previous publication, AFTER this batch's PUTs
-        Quiet(peer);
-        timer.TraceEnd(TraceEvent::DispatchQuiet, start, meta);
-        start = timer.TraceBegin();
+        // Same-QP SO orders each CV epoch after both merged payload PUTs.
+        // No per-batch quiet and no MTE flag write; flags are zeroed by the
+        // receiver before its start handshake. Each slot is added exactly once.
         for (uint32_t cv = nextDispatch; cv < end; ++cv) {
             const uint64_t index = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + cv;
-            publisher.Enqueue(symmetric, args.config.dispatchReadyOffset + index * kFlagBytes, peer);
+            PublishOrdered(symmetric, args.config.dispatchReadyOffset + index * kFlagBytes, peer, args.config.epoch);
         }
         timer.TraceEnd(TraceEvent::DispatchPublish, start, meta);
         dispatchBytes += rows * (h + scales);
@@ -188,7 +181,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         ++step;
     }
     start = timer.TraceBegin();
-    publisher.Drain();
+    Quiet(peer); // Required in every mode: retire all Dispatch payloads and SO flags.
     timer.CoarseEnd(CoarsePhase::Dispatch);
     timer.TraceEnd(TraceEvent::DispatchSendComplete, start, peerMeta);
     if (dispatchStarted) timer.End(Phase::Dispatch, dispatchBytes);

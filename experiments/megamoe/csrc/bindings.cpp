@@ -16,7 +16,7 @@ PYBIND11_MODULE(_C, module)
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.def("buffer_size", &deepep::megamoe::buffer_size);
     module.attr("urma_api_protocol") = MegaMoeUrma::kProtocol;
-    module.attr("urma_communication_protocol") = "commfirst-so-bitmap-v1";
+    module.attr("urma_communication_protocol") = "commfirst-dispatch-so-pack-before-v2";
     module.attr("urma_compute_schedule") = "wave12-ep4-bs1024-samestage-deferred-v3";
     module.attr("urma_local_pipeline") = "pack6-reduce6-output2";
     module.attr("urma_tail_schedule") = "combine-ready-scan-reduce-world-v1";

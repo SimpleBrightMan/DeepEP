@@ -53,7 +53,7 @@ Target compiler spill/register-pressure effects are not ruled out by CPU tests.
 Other envelopes: initial Pack only, startup/final LocalSync, first Dispatch PUT
 through last outgoing Dispatch completion, first Combine PUT through final
 outbound quiet, helper Activation loop (including later Pack and ScaleGather),
-and Reduce. Main Dispatch completion includes final MTE ready publication;
+and Reduce. Main Dispatch completion is the final QP quiet covering X/scale and SO CV ready flags;
 unitflag Dispatch completion is the last CV's quiet, which includes its SO flag.
 Unitflag Combine includes interleaved Reorder and may wait for self Reorder
 before its existing final quiet. No Reorder algorithm is changed by diagnostics.

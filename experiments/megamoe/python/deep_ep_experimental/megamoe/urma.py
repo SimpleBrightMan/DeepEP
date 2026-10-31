@@ -19,7 +19,7 @@ from deep_ep._store import StoreGroup
 from .urma_routing import DeviceRoutes, prepare_routes
 from .validation import collective_check
 
-COMMUNICATION_PROTOCOL = "commfirst-so-bitmap-v1"
+COMMUNICATION_PROTOCOL = "commfirst-dispatch-so-pack-before-v2"
 
 
 def use_fused_gate_up(bs, world, topk=8, num_experts=384):

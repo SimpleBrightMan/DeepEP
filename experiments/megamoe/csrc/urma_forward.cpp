@@ -292,6 +292,13 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     CheckTensor(output, 2, "out", device);
     TORCH_CHECK(output.scalar_type() == torch::kBFloat16 && output.sizes() == x.sizes(), "out must be BF16 [BS,H]");
     auto stream = c10_npu::getCurrentNPUStream();
+    // Dispatch now publishes epoch via SO atomic-add, not MTE overwrite.
+    // Reset the receiver-owned CV slots before this invocation's PublishStart.
+    // Peers observe that start before submitting; final quiet prevents late
+    // writes from the completed invocation. Without this reset epochs add up.
+    const uint64_t dispatch_ready_bytes = static_cast<uint64_t>(c.world) * c.maxPeerChunks * MegaMoeUrma::kFlagBytes;
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemsetAsync(reinterpret_cast<void*>(args_.symmetric + c.dispatchReadyOffset),
+                                             dispatch_ready_bytes, 0, dispatch_ready_bytes, stream.stream()));
     // Combine SO uses disjoint ready bits rather than per-CV epoch values.
     // Clear before PublishStart: a peer cannot submit this invocation's data
     // until it observes that start. The previous invocation's final QP quiet

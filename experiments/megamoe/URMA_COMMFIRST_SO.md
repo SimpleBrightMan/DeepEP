@@ -6,15 +6,17 @@
 
 按原通信CV为单位，发送批次目标为 `1,1,2,4,8,8,...`；本通信owner的Pack任务做完后，后续剩余连续数据一次下发（前两批仍各1个CV）。默认CV256即256、256、512、1024、2048…行。其它cv_rows按同样倍数处理。
 
-每批X是一条大PUT，scale是一条独立PUT；不把多个原CV循环成多个X PUT。合并要求source和destination都连续。所有旧Pack静态份额仍恰好做一次：开头仍准备2轮；每批PUT下发后、quiet前，按下一批Dispatch份数准备1、2、4、8、8…份原始CV的本核静态配额，按剩余份额截断。删除PUT之前的追赶Pack循环。已完成的份额不重复执行，仍等全体生产者的PackReady。短peer和空peer仍做完其它peer/self相关的Pack份额。
+每批X是一条大PUT，scale是一条独立PUT。通信核先准备本批发送份数+1的原始CV静态Pack配额，再等整批PackReady，然后PUT X、PUT scale、按覆盖的原始CV逐个SO发布epoch。**没有逐批quiet，也没有MTE覆盖写ready flag**。启动仍由全部AIV准备2轮；随后通信核Pack为2、2、3、5、9…份，发送为1、1、2、4、8…份。Pack数量按剩余全局Pack轮次截断，cursor保证每份恰好一次。
 
-每批按“PUT → 补后续Pack → 等上一批flag MTE3完成 → quiet本批payload → 异步下发本批各CV的MTE flag”运行。epoch UB缓冲全程只读、不逐次改写；异步flag不能在payload quiet之前发布。最后一次MTE3 drain保证所有Dispatch flags完成。Pack自己的MTE3完成等待可能自然覆盖已排入的flag，但Publish本身不再逐CV阻塞Scalar。
+例如EP4/BS2048/CV256，16份CV的实际Pack为 `2 | 2,2,3,5,2`，发送为 `0 | 1,1,2,4,8`。这是每轮新增Pack不超过本轮发送+1，不是累计未发送余量不超过1。第一笔PUT会比启动结束额外等待本核2轮Pack，这正是本实验的主动间隔。
 
-当前“每轮Pack保持一致”按原始CV份额不丢、不重复实现，不是每个合并PUT后固定只调用一次Pack。
+Pack只保证本核份额完成，仍须等所有生产者的PackReady。已下发源区在最终quiet前不覆盖，后续Pack写其它行。SO通知使用同一peer QP0的ordered atomic-add，接收端在每次PublishStart前清零Dispatch CV槽位，再等待对应epoch。每个原始CV只发布一次；合并一个数据PUT不代表只发布一个CV的flag。全部Dispatch提交后执行一次最终quiet，`DispatchSendComplete`及coarse结束点均位于该quiet之后，再进入Combine。
+
+短peer/空peer原有的余量Pack循环保留，辅助激活核的静态Pack分工及优先级不变。Pack是提交间隔，不能保证上一批已经远端完成；正确性依赖SO发布而不是估算Pack耗时。
 
 ## Combine
 
-每个通信核完成自己对端的Dispatch与自己原有的Pack份额后，直接扫描Combine，不再等待本卡其它通信核或其它Pack worker。原Pack静态划分和短/空peer补完循环保持不变；lookahead按下一批发送份数准备；不提前Combine到本核Dispatch阶段。同一peer不交叠Dispatch和Combine，不同peer可以交叠。
+每个通信核完成自己对端的Dispatch与自己原有的Pack份额后，直接扫描Combine，不再等待本卡其它通信核或其它Pack worker。原Pack静态划分和短/空peer补完循环保持不变；通信核Pack按当前发送份数+1在PUT前准备；不提前Combine到本核Dispatch阶段。同一peer不交叠Dispatch和Combine，不同peer可以交叠。
 
 每轮扫描未发送CV，跳过未ready者。相邻ready CV的source/destination行都连续时合并为一个PUT；遇空洞、已发送CV、64位bitmap word边界或256MiB PUT上限就另起一段。最后一个实际未发送的通信CV不并入其它PUT。
 
@@ -26,7 +28,7 @@ Combine中间没有每CV quiet，也不再通过MTE发布Combine ready。Reduce�
 
 ## 计时与使用
 
-- Dispatch从第一次X PUT计至通信核的最终flag MTE3 drain，新增可见事件 `DispatchSendComplete=43`。
+- Dispatch从第一次X PUT计至通信核的最终QP quiet，新增可见事件 `DispatchSendComplete=43`。
 - Combine从第一次PUT计至通信核的最终quiet，新增可见事件 `CombineSendComplete=42`。最终quiet在timer关闭时也执行。
 - 42/43仅画最终等待本身，不从首PUT画重叠条；总体带宽使用聚合timer首尾跨度和真实payload字节数。没有给Reduce加打点。
 - 本卡入站完成仍由通信owner轮询peer finished并更新incoming计数；它不是本卡出站带宽的终点。
