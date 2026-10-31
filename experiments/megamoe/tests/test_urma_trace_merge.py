@@ -62,15 +62,16 @@ def test_filter_keeps_final_global_sync_and_never_compresses_time():
         ("FinalPeerHandshake", None),
         ("RankBarrier", None),
         ("LocalSync", 2),
+        ("LocalSync", 3),
         ("DispatchQuiet [completion wait]", None),
         ("Gmm2Drain [drain]", None),
         ("Reduce", None),
     ]
-    assert [row["ts"] for row in rows] == [0.1, 0.5, 0.6, 0.7, 0.9, 1.0, 1.1]
+    assert [row["ts"] for row in rows] == [0.1, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1]
     assert complete == original
     assert filtered["metadata"]["record_count"] == 12
-    assert filtered["metadata"]["visible_record_count"] == 7
-    assert filtered["metadata"]["hidden_wait_count"] == 5
+    assert filtered["metadata"]["visible_record_count"] == 8
+    assert filtered["metadata"]["hidden_wait_count"] == 4
     assert filter_trace_waits(filtered) == filtered
 
 
@@ -89,6 +90,15 @@ def test_default_export_filters_but_optional_full_export_preserves_all_ids(tmp_p
     assert len(events(json.loads(full.read_text()))) == sum(name is not None for name in EVENTS)
 
 
+def test_local_invocation_join_remains_visible_at_the_actual_tail():
+    raw = trace_buffer(2)
+    add_record(raw, event="Gmm2Tile", start=1000, end=2000)
+    add_record(raw, event="LocalSync", cv=3, start=2100, end=9000)
+    complete = decode_trace(raw, rank=0, clock_mhz=1000)
+    filtered = filter_trace_waits(complete)
+    assert max(e["ts"] + e["dur"] for e in events(filtered)) == complete["metadata"]["envelope_us"]
+
+
 def test_merge_all_16_ranks_preserves_identity_clocks_and_raw_metadata(tmp_path):
     paths, records = export_ranks(tmp_path, 16)
     output = tmp_path / "bs_4096" / "allrank.json"
@@ -96,8 +106,8 @@ def test_merge_all_16_ranks_preserves_identity_clocks_and_raw_metadata(tmp_path)
     merged = json.loads(output.read_text())
     assert result == merged["metadata"]
     assert result["ranks"] == list(range(16))
-    assert result["record_count"] == 16 * 12 and result["visible_record_count"] == 16 * 7
-    assert result["hidden_wait_count"] == 16 * 5
+    assert result["record_count"] == 16 * 12 and result["visible_record_count"] == 16 * 8
+    assert result["hidden_wait_count"] == 16 * 4
     assert len({row["origin_tick"] for row in result["per_rank"]}) == 16
     assert "not synchronized" in result["clock_alignment"]
     rows = events(merged)
@@ -146,7 +156,7 @@ def test_filtered_input_merges_without_double_counting_hidden_waits(tmp_path):
     for path in paths:
         path.write_text(json.dumps(filter_trace_waits(json.loads(path.read_text()))))
     result = merge_trace_files(paths, tmp_path / "allrank.json", world=2)
-    assert result["visible_record_count"] == 14 and result["hidden_wait_count"] == 10
+    assert result["visible_record_count"] == 16 and result["hidden_wait_count"] == 8
 
 
 def test_offline_cli_discovers_cases_and_can_keep_waits(tmp_path, capsys):
@@ -168,7 +178,7 @@ def test_collective_merge_shared_or_nonshared_filesystem(tmp_path, monkeypatch, 
     reports = together(peers, lambda group: merge_trace_collective(group, records, output, bs=4096))
     assert reports[0] == reports[1] and reports[0]["error"] is None
     assert reports[0]["metadata"]["rank_count"] == 2
-    assert len(events(json.loads(output.read_text()))) == 14
+    assert len(events(json.loads(output.read_text()))) == 16
     assert not list(output.parent.glob(".rank-traces-*"))
 
 

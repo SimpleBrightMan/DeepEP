@@ -11,12 +11,22 @@ enum Phase : uint32_t { Pack = 0, Dispatch, Gmm1, Activation, Gmm2, Combine, Bar
 // Each engine/phase owns a complete 128B cache line. Values are raw system
 // counter ticks: first start, last end, sum of measured intervals, bytes,
 // interval count, reserved, schema. No cross-rank clock subtraction is valid.
+struct NoopTimer {
+    __aicore__ inline uint64_t TraceBegin() const { return 0U; }
+    __aicore__ inline void TraceEnd(TraceEvent, uint64_t, const TraceMeta& = TraceMeta{}) {}
+    __aicore__ inline void Begin(Phase) {}
+    __aicore__ inline void End(Phase, uint64_t = 0U) {}
+};
+
+enum class CoarsePhase : uint32_t { Pack, SyncStart, Gmm, Dequant, Dispatch, Combine, Activation, Reduce, SyncEnd, Count };
+
 class Timer {
 public:
-    __aicore__ inline void Init(uint64_t address, uint64_t traceAddress = 0U, uint64_t traceCapacity = 0U)
+    __aicore__ inline void Init(uint64_t address, uint64_t traceAddress = 0U, uint64_t traceCapacity = 0U, bool coarse = false)
     {
 #ifdef DEEPEP_MEGAMOE_TIMER
-        address_ = address;
+        coarse_ = coarse;
+        address_ = coarse ? 0U : address;
         traceAddress_ = traceAddress;
         traceCapacity_ = traceCapacity;
         if constexpr (g_coreType == AscendC::AIV) {
@@ -28,12 +38,13 @@ public:
         (void)address;
         (void)traceAddress;
         (void)traceCapacity;
+        (void)coarse;
 #endif
     }
 
     __aicore__ inline uint64_t TraceBegin() const
     {
-        return traceAddress_ == 0U ? 0U : AscendC::GetSystemCycle();
+        return traceAddress_ == 0U || coarse_ ? 0U : AscendC::GetSystemCycle();
     }
 
     // This interval measures the instrumented call, not a synthesized DMA or
@@ -41,8 +52,13 @@ public:
     // separate events; recording never introduces an extra pipeline drain.
     __aicore__ inline void TraceEnd(TraceEvent event, uint64_t start, const TraceMeta& meta = TraceMeta{})
     {
-        if (traceAddress_ == 0U) return;
+        if (traceAddress_ == 0U || coarse_) return;
         const uint64_t end = AscendC::GetSystemCycle();
+        WriteTrace(event, start, end, meta);
+    }
+
+    __aicore__ inline void WriteTrace(TraceEvent event, uint64_t start, uint64_t end, const TraceMeta& meta)
+    {
         if (traceCount_ >= traceCapacity_) {
             ++traceDropped_;
             return;
@@ -68,11 +84,38 @@ public:
         ++traceCount_;
     }
 
+    __aicore__ inline void CoarseBegin(CoarsePhase phase)
+    {
+        if (!coarse_ || traceAddress_ == 0U) return;
+        const uint32_t p = static_cast<uint32_t>(phase);
+        if (coarseStart_[p] == 0U) coarseStart_[p] = AscendC::GetSystemCycle();
+    }
+    __aicore__ inline void CoarseEnd(CoarsePhase phase)
+    {
+        if (!coarse_ || traceAddress_ == 0U) return;
+        const uint32_t p = static_cast<uint32_t>(phase);
+        if (coarseStart_[p] != 0U) coarseEnd_[p] = AscendC::GetSystemCycle();
+    }
+
     // Called once by every AIC/AIV engine, including engines with zero events.
     // An unfinished kernel leaves a zero header and is rejected by the reader.
     __aicore__ inline void FinishTrace()
     {
         if (traceAddress_ == 0U) return;
+        // All engines have passed the final local join. Emit only now, sorted
+        // by start so the ordinary raw trace decoder keeps its ordering checks.
+        if (coarse_) {
+            constexpr uint32_t count = static_cast<uint32_t>(CoarsePhase::Count);
+            for (uint32_t n = 0U; n < count; ++n) {
+                uint32_t selected = count;
+                for (uint32_t p = 0U; p < count; ++p)
+                    if (coarseStart_[p] && (selected == count || coarseStart_[p] < coarseStart_[selected])) selected = p;
+                if (selected == count) break;
+                TraceMeta meta;
+                WriteTrace(static_cast<TraceEvent>(static_cast<uint32_t>(TraceEvent::CoarsePack) + selected), coarseStart_[selected], coarseEnd_[selected], meta);
+                coarseStart_[selected] = 0U;
+            }
+        }
         auto* header = TraceHeader();
         header[0] = kTraceSchema;
         header[1] = traceCapacity_;
@@ -135,6 +178,9 @@ private:
                                           AscendC::DcciDst::CACHELINE_OUT>(tensor);
     }
 
+    bool coarse_ = false;
+    uint64_t coarseStart_[static_cast<uint32_t>(CoarsePhase::Count)]{};
+    uint64_t coarseEnd_[static_cast<uint32_t>(CoarsePhase::Count)]{};
     uint64_t address_ = 0U;
     uint64_t traceAddress_ = 0U;
     uint64_t traceCapacity_ = 0U;

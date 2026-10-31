@@ -34,7 +34,7 @@ PYBIND11_MODULE(_C, module)
         .def("forward", &deepep::megamoe::UrmaPlan::forward, py::arg("x"), py::arg("x_scales"), py::arg("order"),
              py::arg("reduce_index"), py::arg("topk_weights"), py::arg("weight1"), py::arg("weight2"),
              py::arg("weight_scales1"), py::arg("weight_scales2"), py::arg("timer"), py::arg("out"), py::arg("epoch"),
-             py::arg("trace") = py::none())
+             py::arg("trace") = py::none(), py::arg("coarse_trace") = false)
         .def_property_readonly("workspace_bytes", &deepep::megamoe::UrmaPlan::workspace_bytes)
         .def("debug_snapshot", &deepep::megamoe::UrmaPlan::debug_snapshot)
         .def_property_readonly("gmm1_startup_mgroups", &deepep::megamoe::UrmaPlan::gmm1_startup_mgroups);

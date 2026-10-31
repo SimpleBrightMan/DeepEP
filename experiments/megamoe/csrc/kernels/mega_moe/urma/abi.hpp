@@ -82,7 +82,10 @@ enum class TraceEvent : uint32_t {
     // IDs 33..39 are reserved for historical JSON-only GMM envelopes.
     Gmm2Reorder = 40U,
     WaitGmm2Reorder,
-    CombineSendComplete
+    CombineSendComplete,
+    DispatchSendComplete, // Reserved here, shared coarse event IDs start at 44.
+    CoarsePack, CoarseLocalSyncStart, CoarseGMM, CoarseDequant,
+    CoarseDispatch, CoarseCombine, CoarseActivation, CoarseReduce, CoarseLocalSyncEnd
 };
 
 struct TraceMeta {
@@ -250,6 +253,7 @@ struct Arguments {
     uint64_t timer;
     uint64_t trace;
     uint64_t traceCapacity;
+    uint64_t coarseTrace;
     uint64_t systemWorkspace;
     uint64_t ffts;
 };

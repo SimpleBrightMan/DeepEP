@@ -173,9 +173,10 @@ __aicore__ inline void CompleteComputeContext()
 }
 
 // Completion fences are distinct from the CATLASS FIX_S0 context teardown.
+template <class TimerT>
 struct ComputeOutputBackend {
     const Arguments& args;
-    Timer& timer;
+    TimerT& timer;
     __aicore__ inline void Arm()
     {
         SetFlag<HardEvent::FIX_S>(EVENT_ID1);
@@ -192,9 +193,10 @@ struct ComputeOutputBackend {
 
 using UrmaContinuousGmm = ContinuousMatmul<UrmaProblemConfig>;
 
+template <class TimerT>
 __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
                                           uint32_t firstTile, bool gmm1, UrmaContinuousGmm& pipeline,
-                                          DeferredOutput<ComputeOutputBackend>& pending, Timer& timer)
+                                          DeferredOutput<ComputeOutputBackend<TimerT>>& pending, TimerT& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
@@ -276,11 +278,12 @@ __aicore__ inline ComputeBatchTask LoadComputeTask(const Arguments& args, uint32
 // Only an AIC and its paired AIV0 enter this routine. They use the identical
 // host-planned expert schedule and global tile ownership. SwiGLU remains
 // independent; the GMM1 M-group window covers earlier activation latency.
-__aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, Timer& timer)
+template <class TimerT>
+__aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, TimerT& timer)
 {
     UrmaContinuousGmm pipeline;
-    ComputeOutputBackend backend{args, timer};
-    DeferredOutput<ComputeOutputBackend> pending(backend);
+    ComputeOutputBackend<TimerT> backend{args, timer};
+    DeferredOutput<ComputeOutputBackend<TimerT>> pending(backend);
     bool hasWork = false;
     for (uint32_t step = 0U; step < args.config.computeTaskCount; ++step) {
         const auto task = LoadComputeTask(args, step);

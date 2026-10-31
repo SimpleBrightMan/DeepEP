@@ -71,7 +71,7 @@ def test_every_event_id_has_a_name_and_no_fabricated_async_events():
             continue
         add_record(raw, engine=event_id, event=name)
     result = decode_trace(raw, rank=0, clock_mhz=1000)
-    assert len(events(result)) == sum(name is not None for name in EVENTS) == 36
+    assert len(events(result)) == sum(name is not None for name in EVENTS) == 46
     assert {row["ph"] for row in result["traceEvents"]} == {"M", "X"}
     assert {row["args"]["event_id"] for row in events(result)} == {
         index for index, name in enumerate(EVENTS) if name is not None
@@ -403,3 +403,20 @@ def test_peer_overflow_causes_valid_local_rank_to_fail_after_exchange(tmp_path):
     with pytest.raises(RuntimeError, match="rank=7"):
         export_trace_collective(group, raw, tmp_path, bs=2048, clock_mhz=1000)
     assert (tmp_path / "urma_trace.json").exists()
+
+
+def test_coarse_envelopes_preserve_sync_and_initial_wait_scope(tmp_path):
+    raw = trace_buffer(4)
+    add_record(raw, engine=0, event="CoarseLocalSyncStart", start=10, end=20)
+    add_record(raw, engine=0, event="CoarseGMM", start=21, end=100)
+    add_record(raw, engine=0, event="CoarseLocalSyncEnd", start=101, end=120)
+    add_record(raw, engine=1, event="CoarsePack", start=1, end=9)
+    add_record(raw, engine=1, event="CoarseDequant", start=21, end=98)
+    add_record(raw, engine=1, event="CoarseReduce", start=99, end=119)
+    path = tmp_path / "coarse.json"
+    export_trace(raw, path, rank=0, clock_mhz=1000)
+    trace = json.loads(path.read_text())
+    assert trace["metadata"]["instrumentation"] == "coarse"
+    assert len(events(trace)) == 6
+    assert any(row["name"] == "CoarseLocalSyncStart" for row in events(trace))
+    assert next(row for row in events(trace) if row["name"] == "CoarseGMM")["dur"] == 0.079

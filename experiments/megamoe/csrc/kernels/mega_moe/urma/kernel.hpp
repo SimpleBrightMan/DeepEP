@@ -89,7 +89,10 @@ __aicore__ inline void TraceLocalSync(Timer& timer, uint32_t stage)
     TraceMeta meta;
     meta.cv = stage;  // 0=two-round startup pack, 3=local invocation completion.
     const uint64_t start = timer.TraceBegin();
+    const auto coarsePhase = stage == 0U ? CoarsePhase::SyncStart : CoarsePhase::SyncEnd;
+    timer.CoarseBegin(coarsePhase);
     SyncAll<false>();
+    timer.CoarseEnd(coarsePhase);
     timer.TraceEnd(TraceEvent::LocalSync, start, meta);
 }
 
@@ -129,12 +132,21 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     const uint64_t h = args.config.hidden;
     const uint64_t scales = h / 32U;
     const uint64_t rowBytes = h * sizeof(bfloat16_t);
+    uint32_t dispatchCvs = 0U;
+    if (args.coarseTrace != 0U) {
+        const uint32_t last = ChunkPeerLowerBound(args.sendChunks, args.config.sendChunkCount, peer + 1U);
+        if (last != 0U) {
+            const auto chunk = LoadChunk(args.sendChunks, last - 1U);
+            if (chunk.peer == peer) dispatchCvs = chunk.cv + 1U;
+        }
+    }
     for (uint32_t round = 0U; round < args.config.packRoundCount; ++round) {
         const Chunk chunk = LoadPackChunk(args, round, peer);
         if (chunk.rows != 0U) {
             auto meta = ChunkTraceMeta(chunk);
             WaitProgressFlag(PackReadyFlag(args, peer, round), static_cast<int32_t>(chunk.rows), timer,
                              TraceEvent::WaitDispatch, meta);
+            timer.CoarseBegin(CoarsePhase::Dispatch);
             timer.Begin(Phase::Dispatch);
             meta.bytes = chunk.rows * h;
             uint64_t start = timer.TraceBegin();
@@ -164,6 +176,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             const auto meta = ChunkTraceMeta(chunk);
             const uint64_t start = timer.TraceBegin();
             Quiet(peer);
+            if (round + 1U == dispatchCvs) timer.CoarseEnd(CoarsePhase::Dispatch);
             timer.TraceEnd(TraceEvent::DispatchQuiet, start, meta);
             timer.MarkSendComplete(Phase::Dispatch);
         }
@@ -229,6 +242,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
                 meta.row = chunk.localRow + sentRows;
                 meta.rows = putRows;
                 meta.bytes = putRows * rowBytes;
+                timer.CoarseBegin(CoarsePhase::Combine);
                 timer.Begin(Phase::Combine);
                 const uint64_t start = timer.TraceBegin();
                 Put(symmetric, args.config.returnYOffset + (chunk.remoteRow + sentRows) * rowBytes,
@@ -303,6 +317,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             // Final quiet is mandatory even when timer is disabled.
             const uint64_t completeStart = timer.TraceBegin();
             Quiet(peer);
+            timer.CoarseEnd(CoarsePhase::Combine);
             timer.TraceEnd(TraceEvent::CombineSendComplete, completeStart, peerMeta);
             if (end != begin) timer.MarkSendComplete(Phase::Combine);
             sentComplete = true;
@@ -323,10 +338,25 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     FinishCombinePeer(args, owner, peerCounted, selfCounted);
 }
 
+__aicore__ inline void RunProfiledCompute(const Arguments& args, uint32_t block, Timer& timer)
+{
+    // Select once, outside the loop. NoopTimer has no state, clocks, stores,
+    // cache operations or fences; both coarse and formal use this instantiation.
+    if (args.coarseTrace != 0U || (args.trace == 0U && args.timer == 0U)) {
+        const auto phase = g_coreType == AIC ? CoarsePhase::Gmm : CoarsePhase::Dequant;
+        timer.CoarseBegin(phase);
+        NoopTimer disabled;
+        RunCubeAndPrologue(args, block, disabled);
+        timer.CoarseEnd(phase);
+    } else {
+        RunCubeAndPrologue(args, block, timer);
+    }
+}
+
 __aicore__ inline void Process(const Arguments& args)
 {
     Timer timer;
-    timer.Init(args.timer, args.trace, args.traceCapacity);
+    timer.Init(args.timer, args.trace, args.traceCapacity, args.coarseTrace != 0U);
     const uint32_t block = GetBlockIdx() / GetTaskRation();
     const uint32_t communicationWorkers = CommunicationWorkers(args.config.world);
     const int64_t originalOverflow = GetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL, MegaMoeImpl::OVERFLOW_MODE_CTRL>();
@@ -336,22 +366,26 @@ __aicore__ inline void Process(const Arguments& args)
         if (GetSubBlockIdx() == 1U && block < communicationWorkers) {
             PublishPeerStart(args, block, timer);
         }
+        timer.CoarseBegin(CoarsePhase::Pack);
         const uint32_t worker = LocalWorkerIndex(block, GetSubBlockIdx());
         for (uint32_t round = 0U; round < kPackStartupRounds; ++round) {
             PackOneRound(args, round, worker, kLocalWorkers, timer);
         }
     }
+    if constexpr (g_coreType == AIV) timer.CoarseEnd(CoarsePhase::Pack);
     // No CV loop contains a rank-wide or local full-core synchronization.
     TraceLocalSync(timer, 0U);
     if constexpr (g_coreType == AIC) {
-        RunCubeAndPrologue(args, block, timer);
+        RunProfiledCompute(args, block, timer);
         MarkCubeComplete(args);
     } else if (GetSubBlockIdx() == 0U) {
-        RunCubeAndPrologue(args, block, timer);
+        RunProfiledCompute(args, block, timer);
     } else if (block < communicationWorkers) {
         CommunicatePeer(args, block, timer);
     } else {
+        timer.CoarseBegin(CoarsePhase::Activation);
         RunActivation(args, block - communicationWorkers, timer);
+        timer.CoarseEnd(CoarsePhase::Activation);
     }
     if constexpr (g_coreType == AIV) {
         // Only this engine releases its phase-private UB/events. Other
@@ -360,7 +394,9 @@ __aicore__ inline void Process(const Arguments& args)
         const uint32_t worker = ReduceWorkerIndex(block, GetSubBlockIdx(), args.config.world);
         if (worker < ReduceWorkers(args.config.world)) {
             timer.Begin(Phase::ReducePhase);
+            timer.CoarseBegin(CoarsePhase::Reduce);
             Reduce(args, worker, timer);
+            timer.CoarseEnd(CoarsePhase::Reduce);
             const uint64_t owned = ReduceOwnedRows(args.config.bs, worker, args.config.world);
             timer.End(Phase::ReducePhase, owned * args.config.hidden * sizeof(bfloat16_t));
             PipeBarrier<PIPE_ALL>();

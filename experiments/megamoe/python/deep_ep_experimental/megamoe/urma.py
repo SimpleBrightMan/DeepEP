@@ -325,7 +325,7 @@ class UrmaBuffer:
                 self, plan, routing, bs, received_by_rank[self.group.rank()], tuple(value._version for value in tensors)
             )
 
-    def forward_prepared(self, x, topk_weights, l1_weights, l2_weights, prepared, *, timer=None, out=None, trace=None):
+    def forward_prepared(self, x, topk_weights, l1_weights, l2_weights, prepared, *, timer=None, out=None, trace=None, coarse_trace=False):
         """Expand/Dispatch/GMM1/SwiGLU/GMM2/return PUT and flag-gated weighted reduction."""
         import torch
         from .api import _check_fp4_weight_format, _RoutedWeightPair
@@ -399,15 +399,21 @@ class UrmaBuffer:
             )
             # Preserve the original positional signature for untraced calls,
             # including older test doubles and wheels used without this feature.
+            if coarse_trace and (trace is None or timer is not None):
+                raise ValueError("coarse_trace requires trace storage and no aggregate timer")
             if trace is not None:
                 native_operands += (trace,)
+                if coarse_trace:
+                    native_operands += (True,)
             return self._enqueue_forward(prepared, native_operands)
 
-    def forward(self, x, topk_idx, topk_weights, l1_weights, l2_weights, *, timer=None, out=None, trace=None):
+    def forward(self, x, topk_idx, topk_weights, l1_weights, l2_weights, *, timer=None, out=None, trace=None, coarse_trace=False):
         """Complete invocation, including fresh real-input route preparation."""
         with self._lock:
             prepared = self.prepare_routes(topk_idx)
             options = dict(timer=timer, out=out)
+            if coarse_trace:
+                options["coarse_trace"] = True
             if trace is not None:
                 options["trace"] = trace
             return self.forward_prepared(x, topk_weights, l1_weights, l2_weights, prepared, **options)

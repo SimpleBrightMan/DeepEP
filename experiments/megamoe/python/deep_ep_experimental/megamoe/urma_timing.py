@@ -36,6 +36,7 @@ class UrmaLaunchGuard:
         self.shape, self.repeat = tuple(shape), repeat
         self.bytes = math.prod(self.shape) * 4 * 2
         self.input = self.output = self.store = self.process_group = None
+        self.alignment = None
         error = None
         try:
             if backend not in ("hccl", "store"):
@@ -86,6 +87,17 @@ class UrmaLaunchGuard:
         for _ in range(self.repeat):
             self.torch.exp(self.input, out=self.output)
 
+    def prepare_per_call_alignment(self):
+        if self.process_group is None:
+            raise RuntimeError("per-call device all-reduce requires --guard-backend hccl; no host fallback")
+        # SUM of zero stays finite across every invocation; allocate outside profiling.
+        self.alignment = self.torch.zeros((1,), dtype=self.torch.float32, device="npu")
+
+    def before_forward(self):
+        if self.alignment is None:
+            raise RuntimeError("prepare_per_call_alignment must precede profiling")
+        self.dist.all_reduce(self.alignment, group=self.process_group)
+
     def end(self):
         # forward_prepared orders caller after owner. The barrier therefore sees
         # the completed block; neither this barrier nor synchronization is timed.
@@ -99,13 +111,13 @@ class UrmaLaunchGuard:
         if self.process_group is not None:
             self.dist.destroy_process_group(self.process_group)
             self.process_group = None
-        self.input = self.output = None
+        self.input = self.output = self.alignment = None
 
     def describe(self):
         if self.backend == "hccl":
             method = "HCCL barrier + finite-input exp before continuous block; HCCL barrier + synchronize after"
             limitations = (
-                "reduces host launch skew; does not equalize physical device speeds or synchronize every iteration"
+                "reduces host launch skew; does not equalize physical device speeds; device all-reduce precedes each invocation when enabled"
             )
         else:
             method = "host Store barrier + finite-input exp before continuous block; host Store barrier + synchronize after"
@@ -115,11 +127,12 @@ class UrmaLaunchGuard:
             )
         return dict(
             method=method,
+            per_call_device_all_reduce=self.alignment is not None,
             backend=self.backend,
             exp_shape=list(self.shape),
             exp_repeat=self.repeat,
             allocated_bytes_per_rank=self.bytes if self.repeat else 0,
-            scope="one continuous profiler block: warmup + formal iterations + optional final diagnostic",
+            scope="one profiler block: warmup + formal iterations + optional coarse + optional fine",
             stream_order="caller barrier/exp -> owner.wait_stream(caller) -> native -> caller.wait_stream(owner)",
             limitations=limitations,
         )
@@ -187,13 +200,18 @@ def read_profiled_kernels(directory, expected_samples):
     return samples
 
 
-def measure_profiled_forward(forward, *, warmup, iters, guard, directory, last_forward=None):
+def measure_profiled_forward(forward, *, warmup, iters, guard, directory, last_forward=None, coarse_forward=None, fine_forward=None):
     """Profile one guarded continuous block, with no Events or per-round sync.
 
-    The optional final call owns timer/trace buffers. It is captured exactly
-    once after the formal samples, and is excluded from performance statistics.
+    Optional coarse and fine calls each run once after formal iterations,
+    inside the same profiler context, and are excluded from formal statistics.
     """
     import torch_npu
+
+    if last_forward is not None:
+        if fine_forward is not None:
+            raise ValueError("Use fine_forward or legacy last_forward, not both")
+        fine_forward = last_forward
 
     if type(warmup) is not int or warmup < 0 or type(iters) is not int or iters < 1:
         raise ValueError("warmup must be a nonnegative integer and iters a positive integer")
@@ -220,21 +238,30 @@ def measure_profiled_forward(forward, *, warmup, iters, guard, directory, last_f
         # exp and the continuous launches or insert a profiler step per round.
         guard.begin()
         for _ in range(warmup + iters):
+            guard.before_forward()
             forward()
-        if last_forward is not None:
-            last_forward()
+        if coarse_forward is not None:
+            guard.before_forward()
+            coarse_forward()
+        if fine_forward is not None:
+            guard.before_forward()
+            fine_forward()
         guard.end()
         capture.step()
-    samples = read_profiled_kernels(directory, warmup + iters + int(last_forward is not None))
+    modes = (["coarse"] if coarse_forward is not None else []) + (["fine"] if fine_forward is not None else [])
+    samples = read_profiled_kernels(directory, warmup + iters + len(modes))
     for iteration, sample in enumerate(samples):
         sample["iteration"] = iteration
-        sample["phase"] = "warmup" if iteration < warmup else "formal" if iteration < warmup + iters else "diagnostic"
+        sample["phase"] = "warmup" if iteration < warmup else "formal" if iteration < warmup + iters else modes[iteration-warmup-iters]
+    diagnostics = dict(zip(modes, samples[warmup+iters:]))
     return dict(
         samples=samples,
         durations_us=[sample["duration_us"] for sample in samples[warmup : warmup + iters]],
-        diagnostic_sample=samples[-1] if last_forward is not None else None,
+        diagnostics=diagnostics,
+        diagnostic_sample=samples[-1] if modes else None,
         profile_dir=str(directory),
     )
+
 
 
 def summarize_profile_rounds(per_rank, ranks_per_node=16):

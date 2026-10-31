@@ -58,14 +58,14 @@ def test_cann_mangled_kernel_name_from_ubx_capture(tmp_path, monkeypatch):
     name = "_Z20mega_moe_urma_kernelN11MegaMoeUrma9ArgumentsE"
     rows = [kernel(i, i + 1, name) for i in range(41)]
     fake_profiler(monkeypatch, directory, rows, log)
-    guard = SimpleNamespace(begin=lambda: None, end=lambda: None)
+    guard = SimpleNamespace(begin=lambda: None, end=lambda: None, before_forward=lambda: None)
     result = measure_profiled_forward(
         lambda: None, warmup=20, iters=20, guard=guard, directory=directory, last_forward=lambda: None
     )
     assert len(result["samples"]) == 41
     assert result["durations_us"] == list(range(21, 41))
     assert result["diagnostic_sample"]["duration_us"] == 41
-    assert result["diagnostic_sample"]["phase"] == "diagnostic"
+    assert result["diagnostic_sample"]["phase"] == "fine"
     assert all(sample["name"] == name for sample in result["samples"])
 
 
@@ -143,6 +143,7 @@ def test_one_continuous_profile_block_preserves_alignment_and_last_trace_only(tm
     # Event nor perform extra synchronization apart from the guard's one drain.
     guard = SimpleNamespace(
         begin=lambda: log.extend(["barrier", "exp"]),
+        before_forward=lambda: log.append("all-reduce"),
         end=lambda: log.extend(["barrier", "synchronize"]),
     )
     result = measure_profiled_forward(
@@ -157,8 +158,8 @@ def test_one_continuous_profile_block_preserves_alignment_and_last_trace_only(tm
         "profile-enter",
         "barrier",
         "exp",
-        *(["forward"] * 4),
-        *(["diagnostic-with-timer-trace"] if diagnostic else []),
+        *(["all-reduce", "forward"] * 4),
+        *(["all-reduce", "diagnostic-with-timer-trace"] if diagnostic else []),
         "barrier",
         "synchronize",
         "profile-step",
@@ -166,7 +167,7 @@ def test_one_continuous_profile_block_preserves_alignment_and_last_trace_only(tm
     ]
     assert result["durations_us"] == [5, 6]
     assert [sample["phase"] for sample in result["samples"]] == ["warmup", "warmup", "formal", "formal"] + (
-        ["diagnostic"] if diagnostic else []
+        ["fine"] if diagnostic else []
     )
     assert result["diagnostic_sample"] == (result["samples"][-1] if diagnostic else None)
     assert result["profile_dir"] == str(directory)
@@ -179,6 +180,26 @@ def test_one_continuous_profile_block_preserves_alignment_and_last_trace_only(tm
         for field in ("record_shapes", "profile_memory", "with_stack", "with_flops", "with_modules")
     )
     json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize("coarse,fine", [(False, False), (True, False), (True, True)])
+def test_optional_modes_share_one_profiler_and_never_enter_formal_mean(tmp_path, monkeypatch, coarse, fine):
+    directory, log = tmp_path / "profile", []
+    durations = [999, 11, 12] + ([100] if coarse else []) + ([200] if fine else [])
+    fake_profiler(monkeypatch, directory, [kernel(i, d) for i, d in enumerate(durations)], log)
+    guard = SimpleNamespace(begin=lambda: log.append("guard"), end=lambda: log.append("end"),
+                            before_forward=lambda: log.append("all-reduce"))
+    result = measure_profiled_forward(
+        lambda: log.append("forward"), warmup=1, iters=2, guard=guard, directory=directory,
+        coarse_forward=(lambda: log.append("coarse")) if coarse else None,
+        fine_forward=(lambda: log.append("fine")) if fine else None,
+    )
+    assert log == (["profile-enter", "guard"] + ["all-reduce", "forward"] * 3
+                   + (["all-reduce", "coarse"] if coarse else [])
+                   + (["all-reduce", "fine"] if fine else [])
+                   + ["end", "profile-step", "profile-export"])
+    assert result["durations_us"] == [11, 12]
+    assert list(result["diagnostics"]) == (["coarse"] if coarse else []) + (["fine"] if fine else [])
 
 
 def test_fresh_profile_directory_rejects_old_capture(tmp_path, monkeypatch):

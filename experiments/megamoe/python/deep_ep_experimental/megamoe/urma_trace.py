@@ -48,16 +48,12 @@ EVENTS = (
     "CombinePublish",
     "WaitReduceReady",
     "ReduceDrain",
-    None,  # 33..39 remain reserved for historical JSON-only GMM envelopes.
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    "Gmm2Reorder",
-    "WaitGmm2Reorder",
+    # 33..41 are reserved, matching abi.hpp. JSON composites use 33/34.
+    None, None, None, None, None, None, None, "Gmm2Reorder", "WaitGmm2Reorder",
     "CombineSendComplete",
+    "DispatchSendComplete",
+    "CoarsePack", "CoarseLocalSyncStart", "CoarseGMM", "CoarseDequant",
+    "CoarseDispatch", "CoarseCombine", "CoarseActivation", "CoarseReduce", "CoarseLocalSyncEnd",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
 SYNC_STAGES = {0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
@@ -68,6 +64,8 @@ class TraceOverflowError(ValueError):
 
 
 def event_style(event):
+    if event.startswith("Coarse"):
+        return event, "coarse.envelope", "good", "stage envelope including internal gaps; buffered until final join"
     if event == "Reduce":
         return (
             event,
@@ -204,10 +202,24 @@ def decode_trace(raw, *, rank, clock_mhz):
         envelope_us=(last - origin) / clock_mhz,
         clock_alignment="each rank starts at its own earliest event; cross-rank clocks are not synchronized",
         scope="diagnostic invocation; excluded from formal performance samples",
+        instrumentation="coarse" if any(record[4][2] >= 44 for record in records) else "fine",
         interpretation="PUT/Cube submit bars do not measure asynchronous completion; inspect quiet/drain/wait separately",
         events=dict(Counter(EVENTS[record[4][2]] for record in records)),
     )
     events = [dict(ph="M", pid=rank, tid=0, name="process_name", args=dict(name=f"rank {rank} (independent clock)"))]
+    if metadata["instrumentation"] == "coarse":
+        metadata["coarse_stage_envelopes_us"] = {}
+        for name in EVENTS[44:]:
+            selected = [record for record in records if EVENTS[record[4][2]] == name]
+            if selected:
+                metadata["coarse_stage_envelopes_us"][name] = (
+                    max(record[1] for record in selected) - min(record[0] for record in selected)
+                ) / clock_mhz
+        metadata["interpretation"] = (
+            "Stage envelopes include internal idle time. GMM/Dequant start at task-loop entry, "
+            "including initial readiness wait, and end after final context drain. "
+            "All records are written after final LocalSync; record writeback is outside the raw envelope."
+        )
     for engine in range(ENGINE_COUNT):
         block, kind = divmod(engine, 3)
         events.extend(
@@ -261,7 +273,7 @@ def filter_trace_waits(trace):
         if event.get("ph") == "X" and event.get("cat") == "wait.sync":
             name = event["name"]
             final_barrier = name in ("RankBarrier", "FinalPeerHandshake") or (
-                name == "LocalSync" and event.get("args", {}).get("sync_stage") == 2
+                name == "LocalSync" and event.get("args", {}).get("sync_stage") in (2, 3)
             )
             if not final_barrier:
                 hidden += 1
@@ -276,7 +288,7 @@ def filter_trace_waits(trace):
         visible_record_count=sum(per_engine),
         visible_records_per_engine=per_engine,
         hidden_wait_count=metadata.get("hidden_wait_count", 0) + hidden,
-        wait_filter="dependency waits and local sync hidden; final rank barrier/handshake retained; timestamps unchanged",
+        wait_filter="dependency waits and startup sync hidden; final rank barrier/handshake/local completion retained; timestamps unchanged",
     )
     return dict(trace, traceEvents=kept, metadata=metadata)
 
