@@ -135,3 +135,13 @@ remainder processing and activation-worker static assignments are unchanged.
 For balanced EP4 BS2048/CV256 (16 CVs per peer), startup prepares 2 rounds;
 PUT batch counts are 1,1,2,4,8 and the Pack counts before their quiet are
 1,2,4,7,0. The last 8-CV PUT therefore no longer needs a pre-submission Pack burst.
+
+## Skip fine temporarily
+
+Add `--skip-fine` to the benchmark command. This overrides legacy `--timer
+--trace` flags and runs only none/coarse blocks, retaining the same warmup,
+iterations, per-call all-reduce and exp80 alignment. No fine buffer, warmup,
+profile block or export is created. With warmup10/iters20 this reduces MegaMoE
+calls per BS from 90 to 60. Remove the flag to restore all three modes.
+This switch changes only the Python benchmark; an already installed wheel from
+these coarse-capable branches does not need its native kernels rebuilt.
