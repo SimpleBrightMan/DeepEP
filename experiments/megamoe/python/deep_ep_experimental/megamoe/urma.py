@@ -37,9 +37,9 @@ def _extension():
         raise RuntimeError("URMA Python/native versions differ; rebuild and reinstall the complete wheel")
     if getattr(extension, "urma_tail_schedule", None) != "combine-ready-scan-reduce-world-v1":
         raise RuntimeError("URMA tailCover needs its matching native wheel; rebuild and reinstall the complete wheel")
-    if getattr(extension, "urma_compute_schedule", None) != "wave12-ep4-bs1024-samestage-deferred-v3":
+    if getattr(extension, "urma_compute_schedule", None) != "wave12-all-shapes-samestage-deferred-v4":
         raise RuntimeError(
-            "URMA M-group lookahead needs its matching native wheel; rebuild and reinstall the complete wheel"
+            "URMA fixed wave12 schedule needs its matching native wheel; rebuild and reinstall the complete wheel"
         )
     if (
         getattr(core, "megamoe_urma_communication_protocol", None) != COMMUNICATION_PROTOCOL
@@ -93,7 +93,11 @@ class PreparedUrmaRoutes:
 
 
 class UrmaBuffer:
-    """EP4/EP8/EP16 owner; multiple hosts require explicit opt-in on every rank."""
+    """EP4/EP8/EP16 owner; multiple hosts require explicit opt-in on every rank.
+
+    All shapes use fixed waves of 12 actual M-groups. ``gmm1_ahead_mgroups``
+    remains accepted/validated for compatibility but does not change scheduling.
+    """
 
     def __init__(
         self,
@@ -150,7 +154,7 @@ class UrmaBuffer:
                 timeout,
                 allow_multi_host,
                 "combine-ready-scan-reduce-world-v1",
-                "wave12-ep4-bs1024-samestage-deferred-v3",
+                "wave12-all-shapes-samestage-deferred-v4",
                 COMMUNICATION_PROTOCOL,
             ),
         )

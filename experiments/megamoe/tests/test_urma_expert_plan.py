@@ -186,25 +186,9 @@ def check_plans(ids, cv_rows, routes, plans):
         assert groups == len(plan["F"]) and sends == len(plan["T"]) and receives == len(plan["R"])
         g1_tiles = 10 if len(ids[0]) * world * 8 < 384 * 128 else 5
         assert g1 == groups * g1_tiles and g2 == groups * 14
-        wave12 = world == 4 and len(ids[0]) == 1024
-        if wave12:
-            expected_batches = [[first, min(12, groups - first)] for first in range(0, groups, 12)]
-            assert plan["B"] == expected_batches
-            assert plan["A"] == [[stage, wave] for wave in range(len(expected_batches)) for stage in (1, 2)]
-        else:
-            assert len(plan["B"]) == local_experts
-            assert len(plan["A"]) == 2 * local_experts
-            assert [expert for stage, expert in plan["A"] if stage == 1] == list(range(local_experts))
-            assert [expert for stage, expert in plan["A"] if stage == 2] == list(range(local_experts))
-            submitted = consumed = 0
-            for stage, expert in plan["A"]:
-                if stage == 1:
-                    submitted += 1
-                else:
-                    assert expert == consumed and submitted >= min(local_experts, consumed + 2)
-                    queued = sum(count for _, count in plan["B"][consumed:submitted])
-                    assert submitted == local_experts or queued >= 12
-                    consumed += 1
+        expected_batches = [[first, min(12, groups - first)] for first in range(0, groups, 12)]
+        assert plan["B"] == expected_batches
+        assert plan["A"] == [[stage, wave] for wave in range(len(expected_batches)) for stage in (1, 2)]
         covered = np.zeros(rows, dtype=np.int8)
         compact = np.zeros(rows, dtype=np.int8)
         used_segments = np.zeros(len(plan["S"]), dtype=np.int8)
@@ -221,8 +205,6 @@ def check_plans(ids, cv_rows, routes, plans):
                     expert_rows.append((source, int(receive_base[source, rank]) + peer_row, return_row))
             count = (len(expert_rows) + 255) // 256
             first = sum(1 for f in plan["F"] if f[0] < expert)
-            if not wave12:
-                assert plan["B"][expert] == [first, count]
             cursor = 0
             for group_index in range(first, first + count):
                 e, begin, row_begin, group_rows, segment_count, g1_begin, g2_begin = plan["F"][group_index]
@@ -320,16 +302,20 @@ def check_plans(ids, cv_rows, routes, plans):
         assert sum(c[4] for c in plan["R"] if c[0] != rank) == counts[:, rank].sum() - self_rows
 
 
-@pytest.mark.parametrize("bs,expected_groups", [(2048, 72), (4096, 144), (8192, 264)])
+@pytest.mark.parametrize("world", [4, 8, 16])
+@pytest.mark.parametrize("bs", [1024, 2048, 4096, 8192])
 @pytest.mark.parametrize("cv_rows", [128, 256, 1024, 4096])
-def test_balanced_expert_groups_preserve_original_transport(expert_plan_binary, bs, expected_groups, cv_rows):
+def test_balanced_expert_groups_preserve_original_transport(expert_plan_binary, world, bs, cv_rows):
     ids = []
-    for rank in range(16):
+    local = 384 // world
+    for rank in range(world):
         linear = np.arange(rank * bs * 8, (rank + 1) * bs * 8)
-        ids.append(((linear % 16) * 24 + (linear // 16) % 24).reshape(bs, 8))
+        ids.append(((linear % world) * local + (linear // world) % local).reshape(bs, 8))
     routes, plans = read_plans(expert_plan_binary, ids, cv_rows)
     check_plans(ids, cv_rows, routes, plans)
-    assert all(len(plan["F"]) == expected_groups for plan in plans)
+    expert_counts = np.stack([r.expert_counts for r in routes]).sum(axis=0)
+    for rank, plan in enumerate(plans):
+        assert len(plan["F"]) == int(((expert_counts[rank*local:(rank+1)*local] + 255) // 256).sum())
 
 
 @pytest.mark.parametrize("world,bs", [(4, 257), (8, 257), (16, 257), (4, 1024)])

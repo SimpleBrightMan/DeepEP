@@ -127,7 +127,7 @@ int main() {
     const auto prefix1 = plan.config.gmm1Tiles, prefix2 = plan.config.gmm2Tiles;
     const auto chunkCount = static_cast<uint32_t>(chunks.size());
     const auto batchCount = static_cast<uint32_t>(batches.size());
-    assert(batchCount == config.localExperts);
+    assert(batchCount == (fragments.size() + kComputeWaveMGroups - 1U) / kComputeWaveMGroups);
     std::vector<uint32_t> readyToChunk(16 * config.maxPeerChunks, UINT32_MAX);
     std::vector<std::vector<uint32_t>> fragmentChunks(fragments.size()), peerChunks(16);
     for (uint32_t index = 0; index < chunkCount; ++index) {
@@ -234,8 +234,8 @@ int main() {
     for (auto* owners : {&g1Owners, &g2Owners, &actOwners})
         assert(std::all_of(owners->begin(), owners->end(), [](auto n) { return n == 1; }));
 
-    // Exercise the real expert-batch schedule. Empty experts remain explicit
-    // batches; communication CV count/identity never controls compute order.
+    // Retain comparisons for legacy helpers, but production uses wave12.
+    // Empty experts have no groups/tasks; transport descriptors do not change.
     using Stage = ComputeBatchStage;
     std::vector<ComputeBatchTask> legacy;
     if (!batches.empty()) {
@@ -271,25 +271,25 @@ int main() {
     for (const auto task : plan.computeTasks) {
         assert(task.batchIndex < batches.size());
         if (task.stage == Stage::Gmm1) {
+            assert(nextG1 == nextG2); // G1(w) directly precedes G2(w).
             assert(task.batchIndex == nextG1++);
         } else {
             assert(task.stage == Stage::Gmm2 && task.batchIndex == nextG2);
-            assert(nextG1 >= std::min(batchCount, nextG2 + 2U));
-            uint64_t queued = 0;
-            for (uint32_t b = nextG2; b < nextG1; ++b) queued += batches[b].fragmentCount;
-            assert(nextG1 == batchCount || queued >= config.gmm1AheadMGroups);
+            assert(nextG1 == nextG2 + 1U);
             ++nextG2;
         }
         auto& batchVisits = task.stage == Stage::Gmm1 ? g1BatchVisits : g2BatchVisits;
         assert(++batchVisits[task.batchIndex] == 1);
         if (task.stage == Stage::Gmm2) assert(g1BatchVisits[task.batchIndex] == 1);
         const auto& batch = batches[task.batchIndex];
+        assert(batch.fragmentBegin == task.batchIndex * kComputeWaveMGroups);
+        assert(batch.fragmentCount == std::min<uint32_t>(kComputeWaveMGroups, fragments.size() - batch.fragmentBegin));
         const auto range = ComputeBatchFragments(batch);
         assert(range.begin == batch.fragmentBegin && range.end == batch.fragmentBegin + batch.fragmentCount);
         std::vector<std::vector<Task>> reference(28);
         for (uint32_t f = range.begin; f < range.end; ++f) {
             const auto& fragment = fragments[f];
-            assert(fragment.expert == task.batchIndex);
+            assert(f == range.begin || fragment.expert >= fragments[f-1].expert);
             const bool first = task.stage == Stage::Gmm1;
             const auto prefix = first ? fragment.gmm1TileBegin : fragment.gmm2TileBegin;
             const auto count = (first ? Gmm1ComputeTileCount(fragment.rows, config) : ComputeTileCount(fragment.rows, 3584));
@@ -525,7 +525,7 @@ def test_activation_subtile_bounds_and_one_completion_per_original_tile(schedule
 
 @pytest.mark.parametrize("active_experts", [0, 1, 2, 3, 7, 16, 24])
 @pytest.mark.parametrize("ahead_mgroups", [0, 12, 18, 65536])
-def test_expert_warmup_alternating_lookahead_empty_batches_and_tail(scheduler_binary, active_experts, ahead_mgroups):
+def test_fixed_waves_ignore_legacy_lookahead_with_empty_destinations_and_tail(scheduler_binary, active_experts, ahead_mgroups):
     counts = empty_destination_counts(128)
     for expert in range(active_experts):
         source = expert % 16

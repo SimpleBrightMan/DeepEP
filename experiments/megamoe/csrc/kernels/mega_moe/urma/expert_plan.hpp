@@ -31,6 +31,7 @@ struct ExpertPlan {
     std::vector<uint64_t> reduceDependencies;
 };
 
+// Legacy comparison helper, not used by BuildExpertPlan's fixed wave12 path.
 // Replenish the outstanding GMM1 group window before EACH GMM2 expert, not
 // just at startup. Count actual M-groups, including a short final group, and
 // retain at least the legacy one-expert lookahead. Zero exactly reproduces
@@ -147,7 +148,6 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
                 sourceBegin[source] + counts[source * kExperts + config.rank * config.localExperts + expert];
         }
         const uint64_t expertRows = sourceBegin[config.world];
-        const auto firstGroup = static_cast<uint32_t>(plan.fragments.size());
         for (uint64_t begin = 0; begin < expertRows; begin += kRowsPerGroup) {
             const uint64_t end = std::min<uint64_t>(begin + kRowsPerGroup, expertRows);
             const auto groupIndex = static_cast<uint32_t>(plan.fragments.size());
@@ -195,7 +195,6 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
             config.gmm1Tiles += Gmm1ComputeTileCount(group.rows, config);
             config.gmm2Tiles += (config.hidden + 255U) / 256U;
         }
-        plan.computeBatches.push_back({firstGroup, static_cast<uint32_t>(plan.fragments.size()) - firstGroup});
         compactRow += expertRows;
         for (uint32_t source = 0; source < config.world; ++source) {
             peerExpertBegin[source] += sourceBegin[source + 1U] - sourceBegin[source];
@@ -216,19 +215,16 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
         throw std::logic_error("URMA Reduce dependencies do not cover all expanded rows");
     }
     config.fragmentCount = static_cast<uint32_t>(plan.fragments.size());
-    if (config.world == 4U && config.bs == 1024U) {
-        // A wave is twelve REAL nonempty M-groups, not twelve expert IDs.
-        // It may cross experts or split a hot expert. No device-wide barrier.
-        plan.computeBatches.clear();
-        for (uint32_t first = 0U; first < config.fragmentCount; first += 12U) {
-            const uint32_t count = std::min(12U, config.fragmentCount - first);
-            const uint32_t wave = static_cast<uint32_t>(plan.computeBatches.size());
-            plan.computeBatches.push_back({first, count});
-            plan.computeTasks.push_back({ComputeBatchStage::Gmm1, wave});
-            plan.computeTasks.push_back({ComputeBatchStage::Gmm2, wave});
-        }
-    } else {
-        plan.computeTasks = BuildComputeTasks(plan.computeBatches, config.gmm1AheadMGroups);
+    // All EP/BS/routing cases: twelve REAL nonempty M-groups per wave.
+    // Expert order is unchanged. A wave may cross experts or split a hot
+    // expert; its final group can be short. Empty destinations create no tasks.
+    // Paired engines execute G1(w), G2(w), G1(w+1), ... without a wave barrier.
+    for (uint32_t first = 0U; first < config.fragmentCount; first += kComputeWaveMGroups) {
+        const uint32_t count = std::min(kComputeWaveMGroups, config.fragmentCount - first);
+        const uint32_t wave = static_cast<uint32_t>(plan.computeBatches.size());
+        plan.computeBatches.push_back({first, count});
+        plan.computeTasks.push_back({ComputeBatchStage::Gmm1, wave});
+        plan.computeTasks.push_back({ComputeBatchStage::Gmm2, wave});
     }
     config.computeTaskCount = static_cast<uint32_t>(plan.computeTasks.size());
     config.sendChunkCount = static_cast<uint32_t>(plan.sendChunks.size());

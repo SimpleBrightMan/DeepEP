@@ -1,6 +1,7 @@
 """CPU integration contracts for the URMA profiler-only benchmark runner."""
 
 import json
+import inspect
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -17,6 +18,7 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
 ):
     """Run the real BS loop while replacing hardware and profiler I/O only."""
     calls = []
+    buffer_signature = inspect.signature(urma.UrmaBuffer)
     profile_durations = [10.0, 80.0, 20.0]
     per_rank_durations = [profile_durations, [90.0, 5.0, 30.0]] + [[40.0, 40.0, 40.0] for _ in range(14)]
     config = dict(
@@ -117,6 +119,7 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
         symmetric_buffer_bytes = 1234
 
         def __init__(self, group, **kwargs):
+            buffer_signature.bind(group, **kwargs)
             calls.append(("owner-create", kwargs))
             self.prepared = None
             self.ordinal = 0
@@ -154,7 +157,7 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
 
     extension = SimpleNamespace(
         urma_api_protocol=1,
-        urma_compute_schedule="wave12-ep4-bs1024-samestage-deferred-v3",
+        urma_compute_schedule="wave12-all-shapes-samestage-deferred-v4",
         urma_local_pipeline="multi-slot",
         urma_tail_schedule="combine-ready-scan-reduce-world-v1",
         urma_timer_schema=1,
@@ -248,6 +251,8 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
         assert calls.count(("allocate-trace", bs, args.trace_capacity)) == int(fine)
         case = tmp_path / "rank_0" / f"bs_{bs}"
         summary = json.loads((case / "summary.json").read_text())
+        assert summary["compute_wave_mgroups"] == 12
+        assert summary["gmm1_ahead_mgroups_applied"] is False
         assert set(summary["profiles"]) == {"none"} | ({"coarse"} if coarse else set()) | ({"fine"} if fine else set())
         report = summary["profiles"]["none"]
         assert report["rank_max_rounds_us"] == [90.0, 80.0, 40.0]

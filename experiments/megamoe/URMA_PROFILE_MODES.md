@@ -2,7 +2,7 @@
 
 `megamoe-urma` and `megamoe-urma-unitflag-so` use this identical capture policy.
 They do not share operator algorithms. The main branch incorporates the
-wave12-after operator optimizations; unitflag retains its compute/Reorder/Pack
+wave12-after operator optimizations, now generalized to every supported EP/BS/routing case; unitflag retains its compute/Reorder/Pack
 and communication schedule.
 
 | Options | Warmup10 + iters20 | Captured data |
@@ -108,3 +108,17 @@ Only requested diagnostic directories exist. Compare each trace against the
 matching diagnostic profiler sample, not the formal average. Rank clocks are
 independently zeroed; cross-rank absolute timestamps cannot establish simultaneity.
 Use Insight for coarse traces; detailed dashboards may not recognize coarse IDs.
+
+## Main branch: fixed wave12 in every scenario
+
+`megamoe-urma` groups real nonempty M256 fragments in expert order into waves
+of 12, then schedules GMM1(w), GMM2(w), GMM1(w+1), GMM2(w+1). A wave may span
+experts or split one hot expert. Short final waves and empty destinations are
+handled without padding the task count. No all-core or cross-rank wave barrier
+is added. This applies to EP4/EP8/EP16, all supported BS and routing patterns.
+
+The legacy `--gmm1-ahead-mgroups` option is accepted and validated but ignored
+on this branch. Logs and summaries set `compute_wave_mgroups=12` and
+`gmm1_ahead_mgroups_applied=false`. Unitflag's algorithm is not modified by this
+change. Rebuild the main-branch wheel: its native compute-schedule marker changes
+to `wave12-all-shapes-samestage-deferred-v4` to reject mismatched installations.

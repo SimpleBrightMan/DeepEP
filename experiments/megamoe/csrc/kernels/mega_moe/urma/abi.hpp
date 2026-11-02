@@ -11,6 +11,7 @@ constexpr uint32_t kMinWorld = 4;
 constexpr uint32_t kExperts = 384;
 constexpr uint32_t kMaxLocalExperts = kExperts / kMinWorld;
 constexpr uint32_t kAic = 28;
+constexpr uint32_t kComputeWaveMGroups = 12U;
 constexpr uint32_t kLocalWorkers = 2U * kAic;
 // EP16 bounds/defaults; active work partitions are derived from Config::world.
 constexpr uint32_t kCommunicationWorkers = kWorld - 1U;
@@ -171,7 +172,7 @@ struct Config {
     uint32_t fragmentCount;
     uint32_t sendChunkCount;
     uint32_t recvChunkCount;
-    uint32_t gmm1AheadMGroups = 12U;
+    uint32_t gmm1AheadMGroups = 12U; // Compatibility field; fixed wave12 ignores lookahead.
     uint32_t computeTaskCount;
     uint32_t packRoundCount;
     uint64_t receiveRows;
