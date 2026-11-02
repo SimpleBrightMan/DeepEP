@@ -54,6 +54,7 @@ EVENTS = (
     "DispatchSendComplete",
     "CoarsePack", "CoarseLocalSyncStart", "CoarseGMM", "CoarseDequant",
     "CoarseDispatch", "CoarseCombine", "CoarseActivation", "CoarseReduce", "CoarseLocalSyncEnd",
+    "CoarseDispatchSubmit",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
 SYNC_STAGES = {0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
@@ -64,6 +65,8 @@ class TraceOverflowError(ValueError):
 
 
 def event_style(event):
+    if event == "CoarseDispatchSubmit":
+        return event, "coarse.envelope", "thread_state_runnable", "Dispatch submission envelope, not remote completion; final Combine quiet retires both phases"
     if event.startswith("Coarse"):
         return event, "coarse.envelope", "good", "stage envelope including internal gaps; timestamps buffered until final local join"
     if event == "Reduce":

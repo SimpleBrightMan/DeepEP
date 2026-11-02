@@ -300,14 +300,14 @@ def run(args, config, group):
         transport="URMA QP0 RO PUT + per-CV SO Dispatch epochs + SO Combine bitmap publication",
         communication_protocol=COMMUNICATION_PROTOCOL,
         communication_qps_per_peer=1,
-        dispatch_combine_overlap="across independent peer owners only",
-        same_peer_dispatch_combine_overlap=False,
-        dispatch_combine_transition="own Dispatch completion -> ready Combine scan; no local Dispatch/Pack join",
+        dispatch_combine_overlap="in-flight Dispatch and Combine on each peer QP",
+        same_peer_dispatch_combine_overlap=True,
+        dispatch_combine_transition="own Dispatch submission -> remaining own Pack quota -> ready Combine scan; no Dispatch quiet or local join",
         dispatch_batch_cvs="1,1,2,4,8,8,...; ready remainder after Pack completes",
         dispatch_pack_cvs="startup2; before PUT: send-count+1 (2,2,3,5,9,...), capped by remaining quota",
         dispatch_publication="one SO epoch per covered original CV; no per-batch quiet",
         combine_publication="one disjoint SO bitmap mask per contiguous run within a 64-CV word",
-        communication_completion="Dispatch/Combine final outbound QP quiet; independent of Reduce",
+        communication_completion="only final Combine quiet, covering both phases; no independent Dispatch completion timestamp",
         remote_workers=world - 1,
         swiglu_workers=28 - (world - 1),
         reduce_workers=56 - (world - 1),
@@ -565,6 +565,9 @@ def run(args, config, group):
             reports["bandwidth"] = summarize_bandwidth(bandwidth_records)
             reports["bandwidth_per_rank"] = bandwidth_records
             reports["bandwidth_scope"] = timer_metadata["scope"]
+            reports["dispatch_bandwidth_unavailable"] = "Dispatch submission end is not completion; no independent completion probe"
+            if rank == 0:
+                print("[URMA BW] Dispatch completion bandwidth unavailable: no separate Dispatch quiet", flush=True)
             reports["bandwidth_with_trace"] = args.fine
             if rank == 0:
                 for row in reports["bandwidth"]:

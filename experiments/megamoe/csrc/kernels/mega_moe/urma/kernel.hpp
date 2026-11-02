@@ -104,8 +104,8 @@ __aicore__ inline bool IsChunkComputed(const Arguments& args, const Chunk& chunk
     return true;
 }
 
-// One owner per peer, QP0 only. Each owner finishes its own Dispatch and
-// original Pack quota before Combine; there is no cross-owner phase join.
+// One owner per peer, QP0 only. After Dispatch submission and its original
+// Pack quota, this owner scans Combine without waiting for Dispatch completion.
 __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Timer& timer)
 {
     const uint32_t peer = PeerForOwner(args.config.rank, owner);
@@ -180,11 +180,10 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         nextDispatch = end;
         ++step;
     }
-    start = timer.TraceBegin();
-    Quiet(peer); // Required in every mode: retire all Dispatch payloads and SO flags.
+    // Submission boundary only: Dispatch may still be in flight when this
+    // owner starts Combine on the same QP. Do not introduce a quiet here.
     timer.CoarseEnd(CoarsePhase::Dispatch);
-    timer.TraceEnd(TraceEvent::DispatchSendComplete, start, peerMeta);
-    if (dispatchStarted) timer.End(Phase::Dispatch, dispatchBytes);
+    if (dispatchStarted) timer.End(Phase::Dispatch, dispatchBytes, true);
     // A short/empty peer still owns quotas belonging to other destinations.
     while (nextPackRound < args.config.packRoundCount)
         PackOneRound(args, nextPackRound++, owner, kAic, timer);
@@ -254,7 +253,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     // SO finished follows all ready masks on QP0, including an empty stream.
     PublishOrdered(symmetric, PeerPhaseSlot(args, 1U, args.config.rank), peer, args.config.epoch);
     start = timer.TraceBegin();
-    Quiet(peer); // Always required, even with timer disabled: protect next invocation.
+    Quiet(peer); // Retire BOTH Dispatch and Combine payloads/flags before reuse, in every mode.
     timer.CoarseEnd(CoarsePhase::Combine);
     timer.TraceEnd(TraceEvent::CombineSendComplete, start, peerMeta);
     if (combineStarted) timer.End(Phase::Combine, combineBytes);

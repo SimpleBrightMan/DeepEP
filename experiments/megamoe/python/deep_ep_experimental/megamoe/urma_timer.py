@@ -44,7 +44,7 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
         clock_source="caller supplied; default 1000 follows legacy MegaMoE protocol",
         metric="single_direction_aggregate_effective_payload_gbps",
         denominator="same-rank class max(last_tick) - min(first_tick)",
-        completion="Dispatch final MTE3 publication drain after payload quiet / Combine final quiet including SO notifications",
+        completion="per-record completion; submission-only Dispatch has no independently observed end; final Combine quiet retires both phases",
         includes_self_copy_in_intra=False,
         classes=[],
     )
@@ -60,6 +60,7 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
                     if record[4] <= 0 or record[6] != TIMER_SCHEMA:
                         raise ValueError("payload without a completed timer record")
                     selected.append((owner, peer, record))
+            completion_observed = bool(selected) and all(int(record[5]) == 0 for _, _, record in selected)
             payload = sum(int(record[3]) for _, _, record in selected)
             includes_self_copy = any(peer == rank for _, peer, _ in selected)
             result["includes_self_copy_in_intra"] |= includes_self_copy
@@ -74,13 +75,15 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
             result["classes"].append(
                 dict(
                     phase=phase,
+                    completion_observed=completion_observed,
+                    envelope_scope="completed" if completion_observed else "submission_only_or_empty",
                     communication_class=kind,
                     payload_bytes=payload,
                     first_tick=first,
                     last_tick=last,
                     envelope_ticks=span,
                     envelope_us=span / clock_mhz if clock_mhz is not None else None,
-                    bandwidth_gbps=payload * clock_mhz / (span * 1000) if span and clock_mhz is not None else None,
+                    bandwidth_gbps=payload * clock_mhz / (span * 1000) if span and clock_mhz is not None and completion_observed else None,
                     workers=[owner for owner, _, _ in selected],
                     peers=[peer for _, peer, _ in selected],
                     includes_self_copy=includes_self_copy,

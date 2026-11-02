@@ -14,6 +14,17 @@ def timer_with_records():
     return value.reshape(-1)
 
 
+def test_submission_only_dispatch_cannot_be_reported_as_completion_bandwidth():
+    raw = timer_with_records().reshape(28, 3, 8, 16)
+    raw[:, :, 1, 5] = 1
+    report = communication_bandwidth(raw, 0, clock_mhz=1000)
+    dispatch = [r for r in report["classes"] if r["phase"] == "Dispatch"]
+    assert all(r["payload_bytes"] > 0 and r["envelope_ticks"] > 0 for r in dispatch)
+    assert all(r["bandwidth_gbps"] is None and not r["completion_observed"] for r in dispatch)
+    combine = next(r for r in report["classes"] if r["phase"] == "Combine" and r["communication_class"] == "CROSS")
+    assert combine["completion_observed"] and combine["bandwidth_gbps"] == 20
+
+
 def test_bandwidth_uses_envelope_and_separates_stages_and_classes():
     report = communication_bandwidth(timer_with_records(), 0, clock_mhz=1000)
     rows = {(r["phase"], r["communication_class"]): r for r in report["classes"]}
