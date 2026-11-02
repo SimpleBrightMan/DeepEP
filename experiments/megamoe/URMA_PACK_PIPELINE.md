@@ -3,7 +3,9 @@
 Both `megamoe-urma` and `megamoe-urma-gmm1Ahead` use the same Pack implementation.
 Their existing GMM schedule difference is retained. Token ownership, original
 CV quotas, startup two-round Pack, communication batch sizes, and the single-QP
-PUT/SO protocol are unchanged.
+PUT/SO protocol are unchanged. On `megamoe-urma`, each communication batch now
+submits PUT/SO first, then performs its post-submit Pack quota. The six-slot
+implementation is unchanged; `megamoe-urma-gmm1Ahead` is not updated by this scheduling change.
 
 ## Submit, capture, retire
 

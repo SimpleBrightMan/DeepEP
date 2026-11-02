@@ -6,9 +6,17 @@
 
 按原通信CV为单位，发送批次目标为 `1,1,2,4,8,8,...`；本通信owner的Pack任务做完后，后续剩余连续数据一次下发（前两批仍各1个CV）。默认CV256即256、256、512、1024、2048…行。其它cv_rows按同样倍数处理。
 
-每批X是一条大PUT，scale是一条独立PUT。通信核先准备本批发送份数+1的原始CV静态Pack配额，再等整批PackReady，然后PUT X、PUT scale、按覆盖的原始CV逐个SO发布epoch。**没有逐批quiet，也没有MTE覆盖写ready flag**。启动仍由全部AIV准备2轮；随后通信核Pack为2、2、3、5、9…份，发送为1、1、2、4、8…份。Pack数量按剩余全局Pack轮次截断，cursor保证每份恰好一次。
+每批先等待已准备的PackReady，然后PUT X、PUT scale、逐CV SO发布epoch；**本批发送完成下发后**，才执行该轮后续Pack。没有逐批quiet。启动仍由全部AIV准备2轮，首批Dispatch不再额外等待本通信核的新Pack。
 
-例如EP4/BS2048/CV256，16份CV的实际Pack为 `2 | 2,2,3,5,2`，发送为 `0 | 1,1,2,4,8`。这是每轮新增Pack不超过本轮发送+1，不是累计未发送余量不超过1。第一笔PUT会比启动结束额外等待本核2轮Pack，这正是本实验的主动间隔。
+发送批次仍为 `1,1,2,4,8,8,...`（Pack全部完成后保留原来合并剩余发送的规则）。发送后Pack的基础配额是本批发送份数+1，并补足下一批所需的累计前缀。例如第四批发送4份后，如果只Pack5份，累计准备仅14份，下一批8份发送需要累计16份，因此该轮Pack增加至7份。
+
+```text
+启动：Pack 2
+随后：Dispatch 1 → Pack 2 → Dispatch 1 → Pack 2 → Dispatch 2 → Pack 3
+      → Dispatch 4 → Pack 7 → Dispatch 8 → Pack 9 → Dispatch 8 → Pack 9 …
+```
+
+Pack按剩余全局轮次截断，不重复任何静态配额。EP4/BS2048/CV256共有16份：实际为 `P2 | D1 P2 | D1 P2 | D2 P3 | D4 P7 | D8`。短/空peer仍补完属于其它目的rank的本核Pack配额；不在当前PUT之前补新Pack。
 
 Pack只保证本核份额完成，仍须等所有生产者的PackReady。已下发源区在最终quiet前不覆盖，后续Pack写其它行。SO通知使用同一peer QP0的ordered atomic-add，接收端在每次PublishStart前清零Dispatch CV槽位，再等待对应epoch。每个原始CV只发布一次；合并一个数据PUT不代表只发布一个CV的flag。全部Dispatch提交后不再quiet，本核补完原有剩余Pack配额后直接扫描Combine。最终Combine quiet统一收齐Dispatch和Combine的payload与SO flags。
 
@@ -16,7 +24,7 @@ Pack只保证本核份额完成，仍须等所有生产者的PackReady。已下�
 
 ## Combine
 
-每个通信核提交完自己对端的Dispatch并完成自己原有的Pack份额后，直接扫描Combine，不再等待本卡其它通信核或其它Pack worker。原Pack静态划分和短/空peer补完循环保持不变；通信核Pack按当前发送份数+1在PUT前准备；不提前Combine到本核Dispatch阶段。同一peer的Dispatch仍在途时即可提交Combine，共用QP0；接收端仍由SO flag保护。
+每个通信核提交完自己对端的Dispatch并完成自己原有的Pack份额后，直接扫描Combine，不再等待本卡其它通信核或其它Pack worker。原Pack静态划分和短/空peer补完循环保持不变；通信核Pack在当前PUT和SO之后进行，并保证下一批前缀已经准备；不提前Combine到本核Dispatch阶段。同一peer的Dispatch仍在途时即可提交Combine，共用QP0；接收端仍由SO flag保护。
 
 每轮扫描未发送CV，跳过未ready者。相邻ready CV的source/destination行都连续时合并为一个PUT；遇空洞、已发送CV、64位bitmap word边界或256MiB PUT上限就另起一段。最后一个实际未发送的通信CV不并入其它PUT。
 
@@ -28,14 +36,14 @@ Combine中间没有每CV quiet，也不再通过MTE发布Combine ready。Reduce�
 
 ## 计时与使用
 
-- Dispatch粗条使用新事件 `CoarseDispatchSubmit=53`，只计提交跨度；不再产生 `DispatchSendComplete=43`。不以提交时间计算完成带宽。
+- Dispatch粗条在最后一批SO提交后立即结束，不包含其后的尾部Pack；使用事件 `CoarseDispatchSubmit=53`，只计提交跨度；不再产生 `DispatchSendComplete=43`。不以提交时间计算完成带宽。
 - Combine从第一次PUT计至通信核的最终quiet，新增可见事件 `CombineSendComplete=42`。最终quiet在timer关闭时也执行。
 - 42/43仅画最终等待本身，不从首PUT画重叠条；总体带宽使用聚合timer首尾跨度和真实payload字节数。没有给Reduce加打点。
 - 本卡入站完成仍由通信owner轮询peer finished并更新incoming计数；它不是本卡出站带宽的终点。
 
-需重新编译完整wheel。core和experimental扩展都必须带`commfirst-so-bitmap-v1`标记，防止旧协议混装。benchmark命令和配置参数保持不变。
+需重新编译完整wheel。core和experimental扩展都必须带`commfirst-dispatch-so-pack-after-v6`标记，防止旧协议混装。benchmark命令和配置参数保持不变。
 
-完成了源码协议检查及相关纯Python回归；未进行CANN编译、C++模型执行或NPU功能/精度/性能测试。
+本次先发后Pack修改通过160项Python回归及纯CPU C++调度穷举：覆盖0..512全局/peer CV数量、空peer、短peer和批次拆分，验证发送前已准备好本核配额、每个Pack配额恰好执行一次。未进行CANN编译或NPU功能、精度、性能测试。
 
 ## Tile通知与EP4所有BS的wave12
 

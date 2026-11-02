@@ -138,13 +138,8 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             ++count;
         }
         const uint32_t end = nextDispatch + count;
-        // Pack is the intentional spacing between submissions. Startup's two
-        // rounds are not repeated. This prepares only this owner's static
-        // quota; PackReady still certifies every row from all producers.
-        const uint32_t packLimit = DispatchPackLimit(count, nextPackRound, args.config.packRoundCount);
-        while (nextPackRound < packLimit)
-            PackOneRound(args, nextPackRound++, owner, kAic, pack);
-        // This batch may depend on our last pending quota: publish before
+        // Startup/the previous iteration already prepared our current quota.
+        // This batch may depend on the previous pending quota: publish before
         // polling PackReady. Keep the six event credits/cursor across scalar PUTs.
         pack.FlushReady();
         TraceMeta meta = ChunkTraceMeta(first); meta.rows = rows;
@@ -183,11 +178,21 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         dispatchBytes += rows * (h + scales);
         nextDispatch = end;
         ++step;
+        if (nextDispatch == dispatchCvs) {
+            // Submission-only endpoint must precede the final post-PUT Pack.
+            timer.CoarseEnd(CoarsePhase::Dispatch);
+            timer.End(Phase::Dispatch, dispatchBytes, true);
+        }
+        // Issue this round FIRST, then prepare future data while it is in flight.
+        // Keep every original static quota, extending Pack when the next 8-CV
+        // batch would otherwise outrun this owner's prepared prefix.
+        const uint32_t packLimit = DispatchPackAfterLimit(count, nextDispatch, step, dispatchCvs,
+                                                         nextPackRound, args.config.packRoundCount);
+        while (nextPackRound < packLimit)
+            PackOneRound(args, nextPackRound++, owner, kAic, pack);
     }
     // Submission boundary only: Dispatch may still be in flight when this
     // owner starts Combine on the same QP. Do not introduce a quiet here.
-    timer.CoarseEnd(CoarsePhase::Dispatch);
-    if (dispatchStarted) timer.End(Phase::Dispatch, dispatchBytes, true);
     // A short/empty peer still owns quotas belonging to other destinations.
     while (nextPackRound < args.config.packRoundCount)
         PackOneRound(args, nextPackRound++, owner, kAic, pack);

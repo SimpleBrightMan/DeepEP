@@ -304,7 +304,7 @@ def run(args, config, group):
         same_peer_dispatch_combine_overlap=True,
         dispatch_combine_transition="own Dispatch submission -> remaining own Pack quota -> ready Combine scan; no Dispatch quiet or local join",
         dispatch_batch_cvs="1,1,2,4,8,8,...; ready remainder after Pack completes",
-        dispatch_pack_cvs="startup2; before PUT: send-count+1 (2,2,3,5,9,...), capped by remaining quota",
+        dispatch_pack_cvs="startup2; after PUT+SO: max(send-count+1, next-batch prefix deficit); full ramp 2,2,3,7,9,...; capped by remaining quota",
         dispatch_publication="one SO epoch per covered original CV; no per-batch quiet",
         combine_publication="one disjoint SO bitmap mask per contiguous run within a 64-CV word",
         communication_completion="only final Combine quiet, covering both phases; no independent Dispatch completion timestamp",
