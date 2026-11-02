@@ -2,6 +2,7 @@
 #include "tiling/platform/platform_ascendc.h"
 #include "shmem.h"
 #include "layout.hpp"
+#include "plan.hpp"
 #include "exp_guard.hpp"
 #include <algorithm>
 #include <cstring>
@@ -30,19 +31,20 @@ int main(int argc,char** argv) {
     };
     Demo::Args a{};
     a.rank=number("--rank");a.world=number("--ep-size");a.bs=number("--bs");
-    a.hidden=3584;a.topk=8;a.l1Enable=number("--l1-enable");
-    a.l1Repeat=number("--l1-repeat");a.gapCycles=number("--l1-gap-cycles");
+    a.hidden=3584;a.topk=8;a.computeEnable=number("--compute-enable");
     const uint32_t warmup=number("--warmup"),iters=number("--iters"),rounds=warmup+iters;
     if((a.world!=4 && a.world!=8 && a.world!=16) || a.rank>=a.world ||
-       a.bs<1024 || a.bs>8192 || a.bs%128 || a.l1Enable>1 || !a.l1Repeat || a.l1Repeat>64 ||
-       !iters || iters>1000 || warmup>1000 || a.gapCycles>10000000)
+       a.bs<1024 || a.bs>8192 || a.bs%128 || a.computeEnable>1 ||
+       !iters || iters>1000 || warmup>1000)
         throw std::runtime_error("Invalid case/configuration");
     const uint32_t rows=a.bs*a.topk/a.world,cvs=(rows+255)/256;
     const uint64_t slot=uint64_t(rows)*a.hidden*2,storage=a.world*slot;
-    const uint64_t flagBytes=uint64_t(a.world)*cvs*128;
-    const uint32_t recordCount=Demo::cores+a.world-1;
+    const uint64_t scaleSlot=uint64_t(rows)*(a.hidden/32),scaleStorage=a.world*scaleSlot;
+    const uint64_t dispatchStorage=storage/2+scaleStorage;
+    const uint32_t recordCount=2*Demo::cores+a.world-1;
     const uint64_t recordBytes=uint64_t(rounds)*recordCount*Demo::words*8;
-    a.l1Bytes=Demo::L1Bytes(a.bs,a.hidden,1280,a.topk);
+    const auto plan=Demo::MakePlan(a.bs,a.world,a.rank);
+    a.compute.config=plan.config;
     CHECK(aclInit(nullptr));CHECK(aclrtSetDevice(number("--device")));
     const char* soc=aclrtGetSocName();
     if(!soc || std::string(soc).find("950")==std::string::npos) throw std::runtime_error("Ascend950 required");
@@ -53,7 +55,7 @@ int main(int argc,char** argv) {
     uint64_t ub=0,l1=0;
     platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB,ub);
     platform->GetCoreMemSize(platform_ascendc::CoreMemType::L1,l1);
-    if(l1<Demo::copyBytes*Demo::slots) throw std::runtime_error("Needs 256KiB L1");
+    if(l1<512*1024 || ub<MegaMoeUrma::kRequiredUbBytes) throw std::runtime_error("Needs production L1/UB capacity");
     const auto blocks=platform->CalcTschBlockDim(56,28,56);
     aclshmemx_init_attr_t attr{};aclshmemx_uniqueid_t uid{};
     attr.my_pe=a.rank;attr.n_pes=a.world;attr.local_mem_size=2ULL<<30;
@@ -72,68 +74,102 @@ int main(int argc,char** argv) {
         std::cout<<"[ROUTE] rank="<<a.rank<<" peer="<<peer<<" qp=0 layer="<<uint32_t(layer)<<'\n';
     }
     auto* source=static_cast<uint8_t*>(aclshmem_malloc(storage));
+    auto* sourceScale=static_cast<uint8_t*>(aclshmem_malloc(scaleStorage));
+    auto* dispatch=static_cast<uint8_t*>(aclshmem_malloc(dispatchStorage));
     auto* destination=static_cast<uint8_t*>(aclshmem_malloc(storage));
-    auto* flags=static_cast<uint8_t*>(aclshmem_malloc(flagBytes));
-    if(!source || !destination || !flags) throw std::runtime_error("Symmetric allocation failed");
-    void *l1Source=nullptr,*records=nullptr,*workspace=nullptr;
-    // Both off/on allocate and initialize the SAME buffers (allocation footprint control).
-    CHECK(aclrtMalloc(&l1Source,a.l1Bytes,ACL_MEM_MALLOC_HUGE_FIRST));
-    CHECK(aclrtMemset(l1Source,a.l1Bytes,0x35,a.l1Bytes));
-    CHECK(aclrtMalloc(&records,recordBytes,ACL_MEM_MALLOC_HUGE_FIRST));
-    CHECK(aclrtMemset(records,recordBytes,0,recordBytes));
-    CHECK(aclrtMalloc(&workspace,platform->GetLibApiWorkSpaceSize(),ACL_MEM_MALLOC_HUGE_FIRST));
-    a.source=uintptr_t(source);a.destination=uintptr_t(destination);a.flags=uintptr_t(flags);
-    a.l1Source=uintptr_t(l1Source);a.workspace=uintptr_t(workspace);a.ffts=shmemx_get_ffts_config();
+    if(!source || !sourceScale || !dispatch || !destination) throw std::runtime_error("Symmetric allocation failed");
+    std::vector<void*> owned;
+    auto allocate=[&](uint64_t n,int pattern)->uint64_t {
+        void* ptr=nullptr;CHECK(aclrtMalloc(&ptr,n,ACL_MEM_MALLOC_HUGE_FIRST));owned.push_back(ptr);
+        CHECK(aclrtMemset(ptr,n,pattern,n));return uintptr_t(ptr);
+    };
+    auto upload=[&](const auto& values)->uint64_t {
+        const uint64_t bytes=values.size()*sizeof(values[0]);
+        uint64_t dst=allocate(bytes,0);
+        CHECK(aclrtMemcpy(reinterpret_cast<void*>(dst),bytes,values.data(),bytes,ACL_MEMCPY_HOST_TO_DEVICE));
+        return dst;
+    };
+    // All modes allocate exactly the same operands. These are independent of
+    // communication buffers and of each other's producer outputs.
+    auto& c=a.compute.config;auto& g=a.compute;
+    const uint64_t r=c.receiveRows,h=a.hidden,i=1280,e=c.localExperts;
+    c.receiveXOffset=0;c.returnYOffset=r*h;c.receiveScaleOffset=0;
+    g.symmetric=allocate(r*h+r*h*2,0x38); // GMM1 input + private self-GMM2 return
+    g.gatheredInputScale=allocate(r*(h/32),0x7f);
+    g.activation=allocate(r*i,0x38);g.activationScale=allocate(r*(i/32),0x7f);
+    g.weight1=allocate(e*h*2*i/2,0x11);g.weightScale1=allocate(e*(h/32)*2*i,0x7f);
+    g.weight2=allocate(e*i*h/2,0x11);g.weightScale2=allocate(e*(i/32)*h,0x7f);
+    g.gmm1Output=allocate(r*2*i*2,0);g.gmm2Output=allocate(r*h*2,0);
+    g.fragments=upload(plan.fragments);g.segments=upload(plan.segments);
+    g.computeBatches=upload(plan.computeBatches);g.computeTasks=upload(plan.computeTasks);
+    auto* records=reinterpret_cast<void*>(allocate(recordBytes,0));
+    a.workspace=allocate(platform->GetLibApiWorkSpaceSize(),0);a.ffts=shmemx_get_ffts_config();
+    a.source=uintptr_t(source);a.sourceScale=uintptr_t(sourceScale);
+    a.dispatchDestination=uintptr_t(dispatch);a.destination=uintptr_t(destination);
+    g.systemWorkspace=a.workspace;g.ffts=a.ffts;
     std::vector<uint8_t> host(slot);
     for(uint32_t peer=0;peer<a.world;++peer) {
         for(uint64_t i=0;i<slot;++i)host[i]=Demo::Pattern(a.rank,peer,i);
         CHECK(aclrtMemcpy(source+peer*slot,slot,host.data(),slot,ACL_MEMCPY_HOST_TO_DEVICE));
     }
+    for(uint32_t peer=0;peer<a.world;++peer) {
+        for(uint64_t j=0;j<scaleSlot;++j)host[j]=Demo::Pattern(a.rank,peer,j);
+        CHECK(aclrtMemcpy(sourceScale+peer*scaleSlot,scaleSlot,host.data(),scaleSlot,ACL_MEMCPY_HOST_TO_DEVICE));
+    }
     CHECK(aclrtMemset(destination,storage,0xCD,storage));
+    CHECK(aclrtMemset(dispatch,dispatchStorage,0xCD,dispatchStorage));
     ExpGuard guard;guard.Init(number("--exp-rows"),number("--exp-cols"),number("--exp-repeat"));guard.Prepare();
-    std::cout<<"[CONFIG] rank="<<a.rank<<" mode="<<(a.l1Enable?"on":"off")
-             <<" rows/peer="<<rows<<" puts+SO/peer="<<cvs<<" combine_bytes/card="<<(a.world-1)*slot
-             <<" l1_bytes/pass="<<a.l1Bytes<<" l1_repeat="<<a.l1Repeat<<" gap_cycles="<<a.gapCycles<<std::endl;
+    std::cout<<"[CONFIG] rank="<<a.rank<<" compute+dequant="<<(a.computeEnable?"on":"off")
+             <<" rows/peer="<<rows<<" CVs/peer="<<cvs<<" SO_flags=0"
+             <<" dispatch_bytes/card="<<(a.world-1)*(slot/2+scaleSlot)
+             <<" combine_bytes/card="<<(a.world-1)*slot
+             <<" compute_input=independent-prepared L2=production-default"<<std::endl;
     aclshmem_barrier_all();launch_barrier(stream);guard.Enqueue(stream);
     for(uint32_t round=0;round<rounds;++round) {
-        // Previous round's post-barrier prevents reset racing a late old SO add.
-        CHECK(aclrtMemsetAsync(flags,flagBytes,0,flagBytes,stream));
+        // Device start/end joins protect the next invocation; no stage-ready flags.
         launch_barrier(stream);
         a.records=uintptr_t(records)+uint64_t(round)*recordCount*Demo::words*8;
         launch_demo(blocks,ub,stream,&a);
         launch_barrier(stream);
     }
     CHECK(aclrtSynchronizeStream(stream));aclshmem_barrier_all();
-    std::vector<uint64_t> hr(recordBytes/8),hf(flagBytes/8);
+    std::vector<uint64_t> hr(recordBytes/8);
     CHECK(aclrtMemcpy(hr.data(),recordBytes,records,recordBytes,ACL_MEMCPY_DEVICE_TO_HOST));
-    CHECK(aclrtMemcpy(hf.data(),flagBytes,flags,flagBytes,ACL_MEMCPY_DEVICE_TO_HOST));
     for(uint32_t peer=0;peer<a.world;++peer) {
         CHECK(aclrtMemcpy(host.data(),slot,destination+peer*slot,slot,ACL_MEMCPY_DEVICE_TO_HOST));
         for(uint64_t i=0;i<slot;++i) if(host[i]!=(peer==a.rank?0xCD:Demo::Pattern(peer,a.rank,i)))
             throw std::runtime_error("Payload mismatch peer="+std::to_string(peer)+" byte="+std::to_string(i));
-        for(uint32_t word=0;word<cvs;++word) for(uint32_t lane=0;lane<16;++lane) {
-            uint64_t expected=0;
-            if(peer!=a.rank && lane==0 && word*64<cvs) {
-                uint32_t bits=std::min(64U,cvs-word*64);expected=bits==64?~uint64_t{0}:(uint64_t{1}<<bits)-1;
-            }
-            if(hf[(uint64_t(peer)*cvs+word)*16+lane]!=expected) throw std::runtime_error("SO bitmap mismatch");
+        for(unsigned part=0;part<2;++part) {
+            uint64_t n=part?scaleSlot:slot/2;
+            uint8_t* ptr=dispatch+(part?storage/2:0)+peer*n;
+            CHECK(aclrtMemcpy(host.data(),n,ptr,n,ACL_MEMCPY_DEVICE_TO_HOST));
+            for(uint64_t j=0;j<n;++j)if(host[j]!=(peer==a.rank?0xCD:Demo::Pattern(peer,a.rank,j)))
+                throw std::runtime_error("Dispatch payload mismatch");
         }
     }
     std::ofstream csv(o.at("--output")+"/rank"+std::to_string(a.rank)+".csv");
     if(!csv) throw std::runtime_error("Cannot write results");
     csv<<"iteration,kind,worker,peer,start_tick,end_tick,bytes\n";
     for(uint32_t round=warmup;round<rounds;++round) for(uint32_t worker=0;worker<recordCount;++worker) {
-        if(worker<28 && !a.l1Enable)continue;
-        const auto* p=hr.data()+(uint64_t(round)*recordCount+worker)*Demo::words;
-        if(p[1]<=p[0] || !p[2])throw std::runtime_error("Invalid timing record");
-        int peer=-1;if(worker>=28){peer=worker-28;if(peer>=int(a.rank))++peer;}
-        csv<<round-warmup<<','<<(worker<28?"l1":"combine")<<','<<worker<<','<<peer<<','<<p[0]<<','<<p[1]<<','<<p[2]<<'\n';
+        if(worker<56 && !a.computeEnable)continue;
+        const auto* v=hr.data()+(uint64_t(round)*recordCount+worker)*Demo::words;
+        if(v[1]<=v[0])throw std::runtime_error("Invalid timing record");
+        auto row=[&](const char* kind,int peer,uint64_t start,uint64_t end,uint64_t bytes) {
+            csv<<round-warmup<<','<<kind<<','<<worker<<','<<peer<<','<<start<<','<<end<<','<<bytes<<'\n';
+        };
+        if(worker<56) row(worker<28?"gmm":"dequant",-1,v[0],v[1],0);
+        else {
+            int peer=worker-56;if(peer>=int(a.rank))++peer;
+            row("total",peer,v[0],v[1],v[2]+v[3]);
+            row("dispatch_submit",peer,v[0],v[4],v[2]);
+            row("combine_shared_tail",peer,v[5],v[1],v[3]);
+        }
     }
-    csv.close();aclshmem_barrier_all();
-    guard.Close();CHECK(aclrtFree(l1Source));CHECK(aclrtFree(records));CHECK(aclrtFree(workspace));
-    aclshmem_free(flags);aclshmem_free(destination);aclshmem_free(source);
+    csv.close();aclshmem_barrier_all();guard.Close();
+    for(void* ptr:owned)CHECK(aclrtFree(ptr));
+    aclshmem_free(destination);aclshmem_free(dispatch);aclshmem_free(sourceScale);aclshmem_free(source);
     aclshmem_finalize();CHECK(aclrtDestroyStream(stream));CHECK(aclFinalize());
-    std::cout<<"[PASSED] payload+SO bitmap rank="<<a.rank<<std::endl;
+    std::cout<<"[PASSED] Dispatch/Combine payload (GMM numerical accuracy not checked) rank="<<a.rank<<std::endl;
     return 0;
   }catch(const std::exception& e){std::cerr<<"[FAILED] "<<e.what()<<std::endl;return 1;}
 }

@@ -1,4 +1,4 @@
-"""Fixed CV256 data+SO Combine, with optional simultaneous AIC GM->L1 read traffic."""
+"""CV256 data-only Dispatch then Combine, with optional real GMM1/GMM2 and coupled W4 dequant."""
 import argparse
 import csv
 import datetime
@@ -38,8 +38,7 @@ def launch(args,root,out,mode):
         for rank,device in enumerate(args.devices):
             log=(out/f'rank{rank}.log').open('w');logs.append(log)
             options={'rank':rank,'device':device,'ep-size':args.ep_size,'endpoint':endpoint,
-                     'output':str(out),'bs':args.bs,'l1-enable':int(mode=='on'),
-                     'l1-repeat':args.l1_repeat,'l1-gap-cycles':args.l1_gap_cycles,
+                     'output':str(out),'bs':args.bs,'compute-enable':int(mode=='on'),
                      'warmup':args.warmup,'iters':args.iters,'exp-repeat':args.exp_repeat,
                      'exp-rows':args.exp_shape[0],'exp-cols':args.exp_shape[1]}
             cmd=[str(root/'build/combine_l1')]
@@ -56,7 +55,7 @@ def launch(args,root,out,mode):
         stop_owned(procs)
         for f in logs:f.close()
     result=analyze(out,args.devices,args.iters,args.group_size,args.ticks_per_us,mode=='on')
-    result.update(l1_load=mode,l1_repeat=args.l1_repeat,l1_gap_cycles=args.l1_gap_cycles)
+    result.update(compute=mode,dequant=mode)
     (out/'summary.json').write_text(json.dumps(result,indent=2))
     display(result,mode)
     return result
@@ -67,9 +66,7 @@ def main():
     p.add_argument('--ep-size',type=int,choices=(4,8,16),default=16)
     p.add_argument('--bs',type=int,default=8192)
     p.add_argument('--devices',help='Comma-separated ACL device IDs; default 0..EP-1')
-    p.add_argument('--l1-load',default='off,on',help='off / on / off,on; ABBA also allowed: off,on,on,off')
-    p.add_argument('--l1-repeat',type=int,default=1)
-    p.add_argument('--l1-gap-cycles',type=int,default=0,help='Throttle after each 4x64KiB AIC copy batch; 0 = no inner wait')
+    p.add_argument('--compute',default='off,on',help='GMM1+GMM2+dequant together: off / on / off,on / off,on,on,off')
     p.add_argument('--warmup',type=int,default=10);p.add_argument('--iters',type=int,default=20)
     p.add_argument('--exp-repeat',type=int,default=50)
     p.add_argument('--exp-shape',type=int,nargs=2,default=(100000,20000))
@@ -79,10 +76,10 @@ def main():
     p.add_argument('--output',type=Path)
     args=p.parse_args()
     args.devices=[int(x) for x in args.devices.split(',')] if args.devices else list(range(args.ep_size))
-    modes=args.l1_load.split(',')
+    modes=args.compute.split(',')
     if (not 1024<=args.bs<=8192 or args.bs%128 or len(args.devices)!=args.ep_size or
         len(set(args.devices))!=len(args.devices) or min(args.devices)<0 or not all(m in ('off','on') for m in modes) or
-        not 1<=args.l1_repeat<=64 or not 0<=args.l1_gap_cycles<=10000000 or not 0<=args.warmup<=1000 or
+        not 0<=args.warmup<=1000 or
         not 1<=args.iters<=1000 or not 0<=args.exp_repeat<=1000 or min(args.exp_shape)<=0 or
         args.exp_shape[0]*args.exp_shape[1]>2000000000 or args.timeout<=0 or
         args.group_size<=0 or not 0<args.ticks_per_us<1000000):p.error('Invalid configuration')
@@ -95,23 +92,23 @@ def main():
     out=(args.output or root.parent.parent/f'benchmark-runs/combine_l1/{stamp}_{os.getpid()}').resolve()
     out.mkdir(parents=True,exist_ok=False)
     config=vars(args).copy();config['output']=str(out)
-    config.update(protocol='main QP0 RO data + SO bitmap; CV256; one final quiet',
+    config.update(protocol='QP0 RO data only; Dispatch X+scale then Combine Y; CV256; no SO; one final quiet',
                   h=3584,intermediate=1280,experts=384,topk=8,
-                  l1_base_bytes=args.bs*8*(3584*10+1280*14),
-                  l1_scope='GMM1/GMM2 A operand reads per N256 projection, unique bypass-L2 HBM stream; no B/scales/FIX',
-                  alignment='SHMEM device barrier -> exp50 -> (reset + device barrier + mixed kernel + device barrier)*rounds',
-                  timer='two timestamps per active worker; written after local completion join, no per-CV timer')
+                  compute_schedule='production GMM classes, tile ownership, batch boundaries; alternating GMM1/GMM2; independent prepared inputs',
+                  cache='production default L2; no artificial bypass',
+                  alignment='SHMEM device barrier -> Exp -> (device barrier + mixed kernel + device barrier)*rounds',
+                  timer='stage envelopes only; timestamp writes after local completion join')
     (out/'config.json').write_text(json.dumps(config,indent=2))
     snapshot=subprocess.run(['npu-smi','info'],text=True,capture_output=True,check=True)
     (out/'npu_smi.txt').write_text(snapshot.stdout+snapshot.stderr)
     print(f'[RESOURCE] Devices {args.devices} must be allocated and idle; snapshot: {out}/npu_smi.txt',flush=True)
     results=[]
     for index,mode in enumerate(modes):
-        print(f'[RUN] {index} l1={mode}',flush=True)
+        print(f'[RUN] {index} compute+dequant={mode}',flush=True)
         results.append(launch(args,root,out/f'{index:02d}_{mode}',mode))
     (out/'summary.json').write_text(json.dumps({'config':config,'runs':results},indent=2))
-    fields=['run','l1_load','combine_total_gbps','combine_intra_gbps','combine_cross_gbps',
-            'combine_round_max_mean_us','combine_round_min_mean_us','l1_gbps','aic_active_coverage_percent']
+    fields=['run','compute','total_gbps','intra_gbps','cross_gbps',
+            'total_round_max_mean_us','total_round_min_mean_us','gmm_round_max_mean_us','gmm_combine_coverage_percent']
     with (out/'comparison.csv').open('w',newline='') as f:
         writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader()
         for index,result in enumerate(results):
@@ -120,13 +117,13 @@ def main():
                 classes['INTRA']['mean_gbps'] if classes['INTRA'] else None,
                 classes['CROSS']['mean_gbps'] if classes['CROSS'] else None,
                 total['round_max_mean_us'],total['round_min_mean_us'],
-                classes['L1']['mean_gbps'] if classes['L1'] else None,
-                result['aic_active_coverage_mean']*100])))
+                classes['GMM']['round_max_mean_us'] if classes['GMM'] else None,
+                result['gmm_coverage_combine']*100])))
     baseline=next((r for m,r in zip(modes,results) if m=='off'),None)
     if baseline:
         for index,(mode,result) in enumerate(zip(modes,results)):
             if mode!='on':continue
-            for kind in ('TOTAL','INTRA','CROSS'):
+            for kind in ('TOTAL','INTRA','CROSS','COMBINE_TOTAL','COMBINE_CROSS'):
                 off=baseline['classes'][kind];on=result['classes'][kind]
                 if off and on:
                     change=100*(on['mean_gbps']/off['mean_gbps']-1)

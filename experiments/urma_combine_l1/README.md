@@ -1,120 +1,85 @@
-# Combine CV256 + AIC HBM→L1 contention demo
+# Data-only Dispatch/Combine + real GMM contention demo
 
-基于 `megamoe-urma` 的 `5f371d1`。直接包含该版本的 `transport.hpp`，生产算子不改。
+本分支现在是完整通信/计算并发对照，替换旧的纯HBM→L1压力循环。生产`megamoe-urma`分支不改。
 
-一个混合kernel启动28个AIC、56个AIV。AIV1前EP−1个核各负责一个peer，QP0、shared jetty关闭：
-
-```text
-所有Combine数据提前准备好
-每个通信核：
-    for 每个256行CV：
-        PUT(data, RO, QP0)
-        atomic_add(该CV的bit, SO, QP0)  // 主线的PublishCombineRange(..., count=1)
-    quiet(QP0)                        // 仅最后一次
-
-每个AIC（可关闭）：
-    从互不重叠的GM范围，连续DataCopy到L1的4个64KiB槽
-    全部提交后MTE2_S确认完成
-```
-
-SO flag沿用主线bitmap atomic-add，并非普通RO写flag。接收端在每轮启动前清零；前后设备全卡barrier防止下一轮清零与上一轮SO冲突。主线的数据生产、Pack、GMM、SwiGLU、Reduce均不运行，没有GMM ready等待。最终逐字节核对所有远端payload和SO位图，以及未触碰的self区域。
-
-## 数据量
-
-默认BS8192/H3584/I1280/E384/TopK8/EP16。通信按理想均衡的peer数据量，所有rank同时all-to-all，排除self。
-
-| 项目 | 数量 |
-|---|---:|
-| 每peer行数 | 4096 |
-| 每次data PUT | 256×3584×2 = 1,835,008 B = 1.75 MiB |
-| 每peer PUT / SO次数 | 16 / 16 |
-| 每peer发送量 | 28 MiB |
-| 每卡本组 / 跨组 / 总发送量 | 84 / 336 / 420 MiB |
-
-EP8/EP4也支持，每peer行数为 `BS×8/EP`，通信核数为EP−1；AIC始终28个。这里不加入dispatch、scale或元信息字节，不把收发相加，不发送self。
-
-## AIC搬运模型的边界
-
-当前主线W4权重由AIV0反量化送入L1，不能将整个右矩阵当作AIC直接从HBM读取的字节。首版选择**两次GMM左矩阵的FP8读取量**作为一份压力预算，包含N256投影之间的重复读取：
+## 执行内容
 
 ```text
-R = BS×TopK = 65,536
-GMM1 A读取 = R×3584×10 = 2,348,810,240 B
-GMM2 A读取 = R×1280×14 = 1,174,405,120 B
-合计 = 3,523,215,360 B = 3.28125 GiB / 卡 / pass
+设备全卡同步 → Exp前置 → 本轮混合kernel
+
+AIV1前EP−1个核（每核一个peer、QP0）：
+    for 每256行：PUT(X, RO)；PUT(scale, RO)
+    for 每256行：PUT(Combine BF16数据, RO)
+    quiet(QP0)       # 唯一一次，确认Dispatch+Combine都完成
+
+AIC + 配对AIV0（同一个compute开关）：
+    for 主线计算batch：
+        GMM1整批 / 对应W4反量化
+        GMM2整批 / 对应W4反量化
+
+本卡收尾同步 → 写计时记录 → 设备全卡同步
 ```
 
-没有计入scale、AIV0权重读取/反量化、FIXPIPE输出写入或实际L2命中。
-为了单独施加HBM压力，这些字节来自**独立、连续、每pass只读一次**的大缓冲区，并设置L2 bypass；没有复刻真实tile地址的复用和命中率。所以这是受控读压力实验，不是完整GMM的流量/性能模拟。
+通信只有data PUT，不发SO/ready flag。Dispatch全部下发后立即下发Combine，不等待计算，不在中间quiet。仍使用主线`Put()`的URMA RO接口和单peer单核独占QP0，shared jetty关闭。
 
-off/on都分配相同缓冲区，只切换AIC是否执行搬运。`--l1-repeat`改变总读取量；`--l1-gap-cycles`改变下发密度：大于0时每提交4×64KiB，等待该批MTE2完成再退避指定时钟周期。0时无内部Scalar完成等待，只在整个搬运结束时等待一次。
+GMM直接调用主线`UrmaGmm1`/`UrmaGmm2`：包含默认L2策略、GMM1分段Gather、MX scale、W4反量化、L1/L0搬运、MMAD、GMM1输出及GMM2 Scatter。**不设置L2 bypass**。保留AIC/AIV0必要的L1槽位交接和阶段收尾；没有额外通算ready检查或逐tile软件完成通知。
+
+使用主线balanced路由规则、真实M256分组、全局tile编号及每核归属。batch边界沿用主线（EP4为wave12，EP8/EP16为专家batch），每batch按GMM1→GMM2交替，不提前执行下一批GMM1。没有本核任务的batch自然跳过。
+
+删除Pack、SwiGLU、Reduce和这些阶段的协议。GMM1输入、GMM2输入、Dispatch接收区、Combine发送区、GMM输出区相互隔离，并在计时前准备：取消等待不会造成读取未完成结果的竞争。输入/权重使用有限常量，占用和布局依照当前H3584/I1280/E384/TopK8场景；这不构成真实MoE数值精度测试。
 
 ## 编译
 
-使用当前DeepEP的CANN和已安装SHMEM SDK，无需重编译MegaMoE、安装wheel或改第三方源码：
+先source当前CANN包，在仓库根目录运行：
 
 ```bash
-cd /home/t00953803/projects/DeepEP
-# 先source本机CANN环境，使ASCEND_HOME_PATH正确
 export SHMEM_ROOT="$PWD/third-party/shmem/install/shmem"
+export CATLASS_ROOT="$PWD/third-party/catlass"
 export LD_LIBRARY_PATH="$SHMEM_ROOT/lib:$ASCEND_HOME_PATH/lib64:${LD_LIBRARY_PATH:-}"
 bash experiments/urma_combine_l1/build.sh
 ```
 
-仅支持Ascend950，SDK需要提供主线使用的RO/SO UDMA接口（本分支锁定PR944）。CMake单独构建demo；不修改系统安装。
+现在需要与MegaMoE相同的CATLASS和CANN Tensor API头文件；复用已有依赖，不需要安装wheel或重编SHMEM。仅支持Ascend950，启动28 AIC/56 AIV。S920静态`tiling_api`位于`platform`之前的链接顺序修复保留。
 
-S920的`libtiling_api.a`需要在链接顺序上位于`platform`之前，本demo已适配。若旧版本出现`PlatformInfoManager::Instance`/`DSO missing from command line`，拉取更新后重跑上述build脚本即可；无需删除SHMEM SDK。前面的宏重定义、deprecated warning不是这次链接失败的原因。
+## 对照命令
 
-## 运行对照
-
-所选卡必须已分配且空闲。启动器保存npu-smi快照，只清理自己创建的进程组，不重置卡。不要与真实MegaMoE同时占卡：AIC负载已在同一个demo kernel内产生。
+`--compute`同时控制GMM1、GMM2和反量化；旧的`--l1-load`、`--l1-repeat`和`--l1-gap-cycles`不再适用。
 
 ```bash
 unset ASCEND_RT_VISIBLE_DEVICES
+# EP4，组内：先只通信，再通信+真实计算
 python3 experiments/urma_combine_l1/run.py \
-  --ep-size 16 --bs 8192 --l1-load off,on \
+  --ep-size 4 --devices 0,1,2,3 --bs 8192 --compute off,on \
+  --warmup 10 --iters 20 --exp-repeat 50
+
+# EP16
+python3 experiments/urma_combine_l1/run.py \
+  --ep-size 16 --bs 8192 --compute off,on \
   --warmup 10 --iters 20 --exp-repeat 50
 ```
 
-分别运行：
+只跑一组用`--compute off`或`--compute on`；ABBA顺序用`--compute off,on,on,off`。EP8同样支持。按实际设备组选择`--devices`：EP4选0,1,2,3只有组内；选0,4,8,12则全部是跨组（默认物理连续4卡一组）。启动器保存npu-smi快照，所选卡须已分配且空闲。
 
-```bash
-# 仅Combine
-python3 experiments/urma_combine_l1/run.py --ep-size 16 --bs 8192 --l1-load off
-# Combine + 28 AIC HBM→L1搬运
-python3 experiments/urma_combine_l1/run.py --ep-size 16 --bs 8192 --l1-load on
-# 同样读取量，更慢下发；与gap=0比较
-python3 experiments/urma_combine_l1/run.py --ep-size 16 --bs 8192 --l1-load on --l1-gap-cycles 10000
-# 读压力覆盖得不够长时，增加读取量；此时已不是单份8192预算
-python3 experiments/urma_combine_l1/run.py --ep-size 16 --bs 8192 --l1-load on --l1-repeat 2
-```
+BS8192每peer行数为`8192×8/EP`。Dispatch每CV的X/scale分别为256×3584和256×112字节，Combine每CV为256×3584×2字节。没有self通信。
 
-默认devices为0..EP−1，可用 `--devices 12,13,14,15 --ep-size 4` 指定所分配的卡。`--group-size 4`按实际device ID连续4卡统计拓扑。ABBA顺序可用 `--l1-load off,on,on,off` 检查顺序/频率影响。
+| EP | 每peer行数 | 每peer CV | 每peer Dispatch（含scale） | 每peer Combine |
+|---|---:|---:|---:|---:|
+| 4 | 16384 | 64 | 57.75 MiB | 112 MiB |
+| 8 | 8192 | 32 | 28.875 MiB | 56 MiB |
+| 16 | 4096 | 16 | 14.4375 MiB | 28 MiB |
 
-EP4示例：
+## 统计和限制
 
-```bash
-python3 experiments/urma_combine_l1/run.py \
-  --ep-size 4 --devices 0,1,2,3 --bs 8192 --l1-load off,on \
-  --warmup 10 --iters 20 --exp-repeat 50
-```
+每种模式使用新进程/通信域，分配相同的所有缓冲区。保留设备全卡同步、默认50次Exp、独立warmup/测量kernel。Exp默认两块FP32 `(100000,20000)` 缓冲区，合计14.90GiB/卡；计时不包含它。没有逐tile/per-CV timer，记录在本卡工作全部结束后写出。
 
-EP4每卡3个通信AIV1；每peer为16,384行、64次data+SO、112MiB，每卡总发送336MiB。AIC仍为28个，开启时每卡左矩阵读预算仍为3.28125GiB。0..3或12..15同属一个物理四卡组，CROSS显示N/A；如果选择0、4、8、12（分别来自四个物理组），这3条edge均统计为跨组。必须按实际物理拓扑选择device列表。
+- `TOTAL/INTRA/CROSS`：X+scale+Y发送量 / 从首个Dispatch PUT开始到最后quiet结束的同卡包络。这是有完成保证的整体有效带宽。
+- `COMBINE_TOTAL/INTRA/CROSS`：Y发送量 / 首个Combine PUT到最终quiet的包络。**包含尚在途Dispatch的排空影响，不是独立Combine服务带宽**；off/on保持同样规则，可作为对照。
+- `DISPATCH_SUBMIT_*`：仅下发跨度，不生成完成带宽。没有独立Dispatch完成探针。
+- `GMM/DEQUANT`：所有参与核的首尾包络；打印每轮跨rank最大/最小包络的均值，不计算伪HBM带宽。
+- `GMM active coverage`：各AIC活跃区间与通信包络的交集长度之和 / (28×通信包络)。查看计算是否覆盖了足够多的通信时间。
 
-## 拉齐和计时
+字节只算单向发送量，不将收发相加；不同rank绝对时钟不直接相减。结果在`benchmark-runs/combine_l1/...`，含rank日志/CSV、config.json、comparison.csv和summary.json。
 
-每种模式新进程/新通信域。设备全卡同步→50次Exp→连续10次warmup和20次测量，每轮都由Host启动一个新的混合kernel，前后有SHMEM设备全卡barrier，中间不做Host同步，最终统一回收数据。Exp默认FP32 `(100000,20000)`，两个缓冲区14.90GiB/卡；off/on同样分配。使用设备SHMEM barrier，不创建HCCL域，不等同于原测试器的HCCL all-reduce。
+最终逐字节验证Dispatch X/scale和Combine payload及未写self区域；不声称GMM数值精度通过。去掉生产者依赖和激活/Reduce后，此demo用于隔离资源竞争，不等价于MegaMoE端到端性能；输入就绪时序和缓存命中可能与融合算子不同。
 
-每个活动核仅记录开始/结束时间，所有核本轮工作结束后才写记录；没有逐CV打点或计时引入的PIPE_ALL。AIC结束必须等MTE2完成，通信结束必须quiet完成。时间戳默认1000tick/us，可用 `--ticks-per-us` 修改。
-
-```text
-每卡某类带宽 = 该类发送量 / mean_round(max(peer quiet end) − min(peer first PUT start))
-round-max-mean = mean_round(max_rank(该rank本轮通信包络))
-round-min-mean = mean_round(min_rank(该rank本轮通信包络))
-```
-
-TOTAL/INTRA/CROSS的包络各自计算，不能直接相加；L1是28核总读取字节/28核包络。不同rank绝对时间戳从不直接相减。另输出 `AIC active coverage of Combine`：28核搬运区间与通信包络的交集总长/(28×通信包络)。该值低说明读压力没有覆盖大部分通信，不能据“on没变慢”排除竞争。
-
-结果含每rank日志、CSV、`config.json`、`comparison.csv`和`summary.json`。若充分重叠时on显著低于off，且减小读压力后恢复，支持HBM/片上通路竞争的解释；不能仅由这个实验断言具体瓶颈就是HBM控制器，也不能把该结果直接当真实GMM带宽。
-
-2026-11-02：在177.22.25.1使用CANN `/home/pkg/b080/cann-9.2.0` 和已有隔离SHMEM SDK完成设备kernel及Host可执行程序编译/链接。3项离线统计与数据量检查通过。未运行NPU，不声称设备功能、数据正确性或性能已验证。
+2026-11-02：25机器CANN 9.2.0下完整设备kernel和Host程序编译链接通过；24组EP/BS纯CPU规划检查及3项统计/结构检查通过。未运行NPU，通信校验和GMM运行情况仍需设备实测。
