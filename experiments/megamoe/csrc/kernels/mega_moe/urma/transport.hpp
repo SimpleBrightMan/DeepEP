@@ -18,7 +18,7 @@ constexpr uint32_t kMaxPutBytes = 256U * 1024U * 1024U;
 constexpr uint32_t kDispatchQp = 0U;
 constexpr uint32_t kCombineQp = 0U;
 
-// Dispatch completes before Combine. Both use the same peer-owned QP0 because
+// Dispatch submission precedes Combine; completion can overlap. Both use QP0 because
 // the SO atomic API publishes on QP0. No second worker may touch that SQ/CQ.
 __aicore__ inline uint32_t PeerForOwner(uint32_t rank, uint32_t owner)
 {

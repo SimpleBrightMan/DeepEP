@@ -10,13 +10,13 @@
 
 例如EP4/BS2048/CV256，16份CV的实际Pack为 `2 | 2,2,3,5,2`，发送为 `0 | 1,1,2,4,8`。这是每轮新增Pack不超过本轮发送+1，不是累计未发送余量不超过1。第一笔PUT会比启动结束额外等待本核2轮Pack，这正是本实验的主动间隔。
 
-Pack只保证本核份额完成，仍须等所有生产者的PackReady。已下发源区在最终quiet前不覆盖，后续Pack写其它行。SO通知使用同一peer QP0的ordered atomic-add，接收端在每次PublishStart前清零Dispatch CV槽位，再等待对应epoch。每个原始CV只发布一次；合并一个数据PUT不代表只发布一个CV的flag。全部Dispatch提交后执行一次最终quiet，`DispatchSendComplete`及coarse结束点均位于该quiet之后，再进入Combine。
+Pack只保证本核份额完成，仍须等所有生产者的PackReady。已下发源区在最终quiet前不覆盖，后续Pack写其它行。SO通知使用同一peer QP0的ordered atomic-add，接收端在每次PublishStart前清零Dispatch CV槽位，再等待对应epoch。每个原始CV只发布一次；合并一个数据PUT不代表只发布一个CV的flag。全部Dispatch提交后不再quiet，本核补完原有剩余Pack配额后直接扫描Combine。最终Combine quiet统一收齐Dispatch和Combine的payload与SO flags。
 
 短peer/空peer原有的余量Pack循环保留，辅助激活核的静态Pack分工及优先级不变。Pack是提交间隔，不能保证上一批已经远端完成；正确性依赖SO发布而不是估算Pack耗时。
 
 ## Combine
 
-每个通信核完成自己对端的Dispatch与自己原有的Pack份额后，直接扫描Combine，不再等待本卡其它通信核或其它Pack worker。原Pack静态划分和短/空peer补完循环保持不变；通信核Pack按当前发送份数+1在PUT前准备；不提前Combine到本核Dispatch阶段。同一peer不交叠Dispatch和Combine，不同peer可以交叠。
+每个通信核提交完自己对端的Dispatch并完成自己原有的Pack份额后，直接扫描Combine，不再等待本卡其它通信核或其它Pack worker。原Pack静态划分和短/空peer补完循环保持不变；通信核Pack按当前发送份数+1在PUT前准备；不提前Combine到本核Dispatch阶段。同一peer的Dispatch仍在途时即可提交Combine，共用QP0；接收端仍由SO flag保护。
 
 每轮扫描未发送CV，跳过未ready者。相邻ready CV的source/destination行都连续时合并为一个PUT；遇空洞、已发送CV、64位bitmap word边界或256MiB PUT上限就另起一段。最后一个实际未发送的通信CV不并入其它PUT。
 
@@ -28,7 +28,7 @@ Combine中间没有每CV quiet，也不再通过MTE发布Combine ready。Reduce�
 
 ## 计时与使用
 
-- Dispatch从第一次X PUT计至通信核的最终QP quiet，新增可见事件 `DispatchSendComplete=43`。
+- Dispatch粗条使用新事件 `CoarseDispatchSubmit=53`，只计提交跨度；不再产生 `DispatchSendComplete=43`。不以提交时间计算完成带宽。
 - Combine从第一次PUT计至通信核的最终quiet，新增可见事件 `CombineSendComplete=42`。最终quiet在timer关闭时也执行。
 - 42/43仅画最终等待本身，不从首PUT画重叠条；总体带宽使用聚合timer首尾跨度和真实payload字节数。没有给Reduce加打点。
 - 本卡入站完成仍由通信owner轮询peer finished并更新incoming计数；它不是本卡出站带宽的终点。

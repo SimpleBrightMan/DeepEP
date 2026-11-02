@@ -51,9 +51,9 @@ entry and after the final context completes, so initial input waits ARE included
 Target compiler spill/register-pressure effects are not ruled out by CPU tests.
 
 Other envelopes: initial Pack only, startup/final LocalSync, first Dispatch PUT
-through last outgoing Dispatch completion, first Combine PUT through final
+through last Dispatch submission, first Combine PUT through final
 outbound quiet, helper Activation loop (including later Pack and ScaleGather),
-and Reduce. Main Dispatch completion is the final QP quiet covering X/scale and SO CV ready flags;
+and Reduce. Main has no independent Dispatch completion probe; final Combine quiet covers both phases;
 unitflag Dispatch completion is the last CV's quiet, which includes its SO flag.
 Unitflag Combine includes interleaved Reorder and may wait for self Reorder
 before its existing final quiet. No Reorder algorithm is changed by diagnostics.
@@ -111,3 +111,18 @@ Use Insight for coarse traces; detailed dashboards may not recognize coarse IDs.
 
 
 Pack now retains six slots across consecutive quotas and retires the old ready fence after five new row submissions. See [URMA_PACK_PIPELINE.md](URMA_PACK_PIPELINE.md) for stage boundaries and revised fine trace semantics.
+
+## Early Combine after Dispatch submission
+
+The main branch removes the Dispatch-to-Combine quiet. Each owner submits all
+Dispatch payloads/SO flags, completes its original remaining Pack quota if any,
+and immediately scans ready Combine CVs. QP0's final Combine quiet retires both
+phases and remains mandatory without timers. SO readiness and immutable source
+buffers preserve receive-side correctness; no second QP or new barrier is added.
+
+`CoarseDispatchSubmit` (ID53) now shows only the first-to-last Dispatch submission
+envelope. Old `CoarseDispatch`/`DispatchSendComplete` records remain decodable,
+but this version does not emit them. Aggregate Dispatch records set word5=1;
+the reporter returns null completion bandwidth instead of dividing by submission
+time. The final Combine completion remains observed. Existing dashboards must
+not use a last-PUT or Publish endpoint as an independent Dispatch completion.

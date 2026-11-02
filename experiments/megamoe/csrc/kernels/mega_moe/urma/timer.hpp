@@ -112,7 +112,10 @@ public:
                     if (coarseStart_[p] && (selected == count || coarseStart_[p] < coarseStart_[selected])) selected = p;
                 if (selected == count) break;
                 TraceMeta meta;
-                WriteTrace(static_cast<TraceEvent>(static_cast<uint32_t>(TraceEvent::CoarsePack) + selected), coarseStart_[selected], coarseEnd_[selected], meta);
+                const auto event = selected == static_cast<uint32_t>(CoarsePhase::Dispatch)
+                    ? TraceEvent::CoarseDispatchSubmit
+                    : static_cast<TraceEvent>(static_cast<uint32_t>(TraceEvent::CoarsePack) + selected);
+                WriteTrace(event, coarseStart_[selected], coarseEnd_[selected], meta);
                 coarseStart_[selected] = 0U;
             }
         }
@@ -132,7 +135,7 @@ public:
         if (count_[phase] == 0U) first_[phase] = start_[phase];
     }
 
-    __aicore__ inline void End(Phase phase, uint64_t bytes = 0U)
+    __aicore__ inline void End(Phase phase, uint64_t bytes = 0U, bool submissionOnly = false)
     {
         if (address_ == 0U) return;
         const uint64_t end = AscendC::GetSystemCycle();
@@ -146,7 +149,7 @@ public:
         record[2] = total_[phase];
         record[3] = bytes_[phase];
         record[4] = count_[phase];
-        record[5] = 0;
+        record[5] = submissionOnly ? 1U : 0U;
         record[6] = kProtocol;
         AscendC::GlobalTensor<uint64_t> tensor;
         tensor.SetGlobalBuffer(record);
