@@ -55,6 +55,7 @@ EVENTS = (
     "CoarsePack", "CoarseLocalSyncStart", "CoarseGMM", "CoarseDequant",
     "CoarseDispatch", "CoarseCombine", "CoarseActivation", "CoarseReduce", "CoarseLocalSyncEnd",
     "CoarseDispatchSubmit",
+    "PackRetire",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
 SYNC_STAGES = {0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
@@ -65,6 +66,10 @@ class TraceOverflowError(ValueError):
 
 
 def event_style(event):
+    if event == "Pack":
+        return event, "compute.copy", "rail_animation", "Pack submission; includes retirement of previous segment, current ready may be deferred"
+    if event == "PackRetire":
+        return event, "compute.drain", "thread_state_iowait", "wait captured Pack fence and publish pending ready; Close also releases six DMA credits"
     if event == "CoarseDispatchSubmit":
         return event, "coarse.envelope", "thread_state_runnable", "Dispatch submission envelope, not remote completion; final Combine quiet retires both phases"
     if event.startswith("Coarse"):
@@ -205,7 +210,7 @@ def decode_trace(raw, *, rank, clock_mhz):
         envelope_us=(last - origin) / clock_mhz,
         clock_alignment="each rank starts at its own earliest event; cross-rank clocks are not synchronized",
         scope="diagnostic invocation; excluded from formal performance samples",
-        instrumentation="coarse" if any(record[4][2] >= 44 for record in records) else "fine",
+        instrumentation="coarse" if any(44 <= record[4][2] <= 53 for record in records) else "fine",
         interpretation="PUT/Cube submit bars do not measure asynchronous completion; inspect quiet/drain/wait separately",
         events=dict(Counter(EVENTS[record[4][2]] for record in records)),
     )

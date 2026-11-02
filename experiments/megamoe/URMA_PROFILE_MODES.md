@@ -141,3 +141,6 @@ but this version does not emit them. Aggregate Dispatch records set word5=1;
 the reporter returns null completion bandwidth instead of dividing by submission
 time. The final Combine completion remains observed. Existing dashboards must
 not use a last-PUT or Publish endpoint as an independent Dispatch completion.
+
+
+Pack now retains six slots across consecutive quotas and retires the old ready fence after five new row submissions. See [URMA_PACK_PIPELINE.md](URMA_PACK_PIPELINE.md) for stage boundaries and revised fine trace semantics.

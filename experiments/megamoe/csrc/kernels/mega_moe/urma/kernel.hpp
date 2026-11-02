@@ -121,6 +121,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     const uint64_t rowBytes = h * sizeof(bfloat16_t);
     const uint32_t dispatchCvs = PeerDispatchCvCount(args, peer);
     uint32_t nextPackRound = kPackStartupRounds;
+    PackBatch pack(args, timer);
     uint32_t nextDispatch = 0U, step = 0U;
     uint64_t dispatchBytes = 0U;
     bool dispatchStarted = false;
@@ -142,7 +143,10 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         // quota; PackReady still certifies every row from all producers.
         const uint32_t packLimit = DispatchPackLimit(count, nextPackRound, args.config.packRoundCount);
         while (nextPackRound < packLimit)
-            PackOneRound(args, nextPackRound++, owner, kAic, timer);
+            PackOneRound(args, nextPackRound++, owner, kAic, pack);
+        // This batch may depend on our last pending quota: publish before
+        // polling PackReady. Keep the six event credits/cursor across scalar PUTs.
+        pack.FlushReady();
         TraceMeta meta = ChunkTraceMeta(first); meta.rows = rows;
         start = timer.TraceBegin();
         for (uint32_t cv = nextDispatch; cv < end; ++cv) {
@@ -186,7 +190,8 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     if (dispatchStarted) timer.End(Phase::Dispatch, dispatchBytes, true);
     // A short/empty peer still owns quotas belonging to other destinations.
     while (nextPackRound < args.config.packRoundCount)
-        PackOneRound(args, nextPackRound++, owner, kAic, timer);
+        PackOneRound(args, nextPackRound++, owner, kAic, pack);
+    pack.Close();
     MarkPackWorkerComplete(args);
     // This owner has completed its original static Pack quota. Do not wait
     // for other owners: each Combine CV is protected by GMM2 readiness.
@@ -293,9 +298,10 @@ __aicore__ inline void Process(const Arguments& args)
         }
         timer.CoarseBegin(CoarsePhase::Pack);
         const uint32_t worker = LocalWorkerIndex(block, GetSubBlockIdx());
-        for (uint32_t round = 0U; round < kPackStartupRounds; ++round) {
-            PackOneRound(args, round, worker, kLocalWorkers, timer);
-        }
+        PackBatch startupPack(args, timer);
+        for (uint32_t round = 0U; round < kPackStartupRounds; ++round)
+            PackOneRound(args, round, worker, kLocalWorkers, startupPack);
+        startupPack.Close();
     }
     if constexpr (g_coreType == AIV) timer.CoarseEnd(CoarsePhase::Pack);
     // No CV loop contains a rank-wide or local full-core synchronization.

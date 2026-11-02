@@ -36,7 +36,7 @@ def pack_pipeline_binary(tmp_path_factory):
 #define __aicore__
 #define __gm__
 namespace AscendC {
-enum class HardEvent { MTE3_MTE2, MTE2_MTE3, S_MTE2, MTE2_S };
+enum class HardEvent { MTE3_MTE2, MTE2_MTE3, S_MTE2, MTE2_S, MTE3_S };
 enum class TPosition { VECCALC };
 using TEventID = int;
 constexpr TEventID EVENT_ID0 = 0;
@@ -54,6 +54,9 @@ inline std::array<uint8_t, 192 * 1024> ub;
 inline std::array<Ptr, 3> tail;
 inline std::vector<Ptr> nodes;
 inline std::map<std::pair<HardEvent, int>, Ptr> flags;
+inline std::vector<uint32_t> usedSlots;
+inline std::map<uintptr_t,int32_t> readyCounts;
+inline std::map<uintptr_t,std::pair<uint64_t,uint64_t>> expectedQuotas;
 inline uint32_t scalarWaits = 0, indexCopies = 0, epoch = 0, hidden = 0, topk = 8;
 inline uint64_t totalRows = 0, selfBegin = 0, selfRows = 0, selfReceive = 0, scaleOffset = 0;
 inline std::vector<int64_t> order;
@@ -92,6 +95,7 @@ inline std::pair<Pipe, Pipe> Direction(HardEvent event) {
     case HardEvent::MTE2_MTE3: return {Mte2, Mte3};
     case HardEvent::S_MTE2: return {Scalar, Mte2};
     case HardEvent::MTE2_S: return {Mte2, Scalar};
+    case HardEvent::MTE3_S: return {Mte3, Scalar};
     }
     std::abort();
 }
@@ -116,11 +120,24 @@ template<int> void PipeBarrier() {
     for (auto& node : nodes) assert(node->done);
     assert(flags.empty());
 }
+inline uint64_t GetSystemCycle() { return 0; }
+enum class CacheLine { SINGLE_CACHE_LINE };
+enum class DcciDst { CACHELINE_OUT };
+inline void AtomicAdd(int32_t* p,int32_t n) {
+    const auto addr=reinterpret_cast<uintptr_t>(p);
+    const auto [begin,rows]=expectedQuotas.at(addr);
+    assert(n==rows);
+    for(uint64_t row=begin;row<begin+rows;++row) {
+        assert(tokenVisits[row]==1 && scaleVisits[row]==1); // never notify before BOTH stores
+    }
+    readyCounts[addr]+=n;assert(readyCounts[addr]==n); // exactly once
+}
 template<typename T> struct GlobalTensor {
     uintptr_t address = 0;
     void SetGlobalBuffer(T* ptr) { address = reinterpret_cast<uintptr_t>(ptr); }
     GlobalTensor operator[](uint64_t i) const { return {address + i * sizeof(T)}; }
 };
+template<class T,CacheLine,DcciDst> void DataCacheCleanAndInvalid(GlobalTensor<T>) {}
 template<typename T> struct LocalTensor {
     uint32_t offset, count;
     LocalTensor(TPosition, uint32_t start, uint32_t size) : offset(start), count(size) {
@@ -179,6 +196,7 @@ void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyExtParams p, D
     assert(rounded <= dst.count * sizeof(T));
     const bool indices = src.address >= orderBase && src.address < orderBase + order.size() * sizeof(int64_t);
     if (indices) ++indexCopies;
+    else if(src.address>=xBase && src.address<scaleBase) usedSlots.push_back((dst.offset-131072)/8448);
     Append(Mte2, 7 + p.blockLen / 32, [=] {
         Read(src.address, dst.offset, p.blockLen);
         std::fill(ub.begin() + dst.offset + p.blockLen, ub.begin() + dst.offset + rounded, 0);
@@ -212,11 +230,45 @@ inline void ResetWorker() {
     source = temporary / "pack_pipeline.cpp"
     source.write_text(
         r"""
-#include "pack_pipeline.hpp"
+#include "pack_round.hpp"
 #include <iostream>
 #include <string>
 using namespace MegaMoeUrma;
 int main(int argc, char** argv) {
+    if(argc==2 && std::string(argv[1])=="deferred") {
+        using namespace MegaMoeUrma; using namespace AscendC;
+        hidden=3584;totalRows=2048;epoch=1;selfBegin=0;selfRows=0;selfReceive=0;
+        order.resize(totalRows);for(uint64_t i=0;i<totalRows;++i)order[i]=(i*17)%totalRows;
+        tokenVisits.assign(totalRows,0);scaleVisits.assign(totalRows,0);
+        Arguments args{};args.config.bs=totalRows/8;args.config.topk=8;args.config.hidden=hidden;
+        args.config.maxPeerChunks=32;args.x=xBase;args.xScale=scaleBase;args.order=orderBase;
+        args.expandedX=expandedBase;args.expandedScale=expandedScaleBase;args.symmetric=symmetricBase;
+        args.packReady=0x700000000ULL;
+        Timer timer;PackBatch pack(args,timer);
+        auto key=[&](uint32_t peer,uint32_t cv){return uintptr_t(PackReadyFlag(args,peer,cv));};
+        uint64_t cursor=0;
+        auto submit=[&](uint32_t peer,uint32_t cv,uint64_t count) {
+            expectedQuotas[key(peer,cv)]={cursor,count};
+            pack.Submit(peer,cv,cursor,count);cursor+=count;
+        };
+        submit(0,0,8);assert(readyCounts[key(0,0)]==0);
+        submit(1,0,7);assert(readyCounts[key(0,0)]==8 && readyCounts[key(1,0)]==0);
+        assert((usedSlots==std::vector<uint32_t>{0,1,2,3,4,5,0,1,2,3,4,5,0,1,2}));
+        // The deferred fence consumed above was captured BEFORE the new stores.
+        assert(scaleVisits[14]==0);
+        submit(1,1,1);assert(readyCounts[key(1,0)]==7 && readyCounts[key(1,1)]==0);
+        pack.Submit(1,2,cursor,0);assert(readyCounts[key(1,1)]==0); // no fabricated quota
+        pack.FlushReady();assert(readyCounts[key(1,1)]==1);
+        assert(!flags.empty()); // scalar Dispatch can run without releasing ring credits
+        submit(2,0,1025);assert(readyCounts[key(2,0)]==0);
+        pack.Close();assert(readyCounts[key(2,0)]==1025 && flags.empty());
+        const auto size=usedSlots.size();
+        submit(2,1,5);assert(usedSlots[size]==0); // reopen after a DMA-stage transition
+        pack.Close();pack.Close();assert(readyCounts[key(2,1)]==5 && flags.empty());
+        for(uint64_t row=0;row<cursor;++row)assert(tokenVisits[row]==1 && scaleVisits[row]==1);
+        return 0;
+    }
+
     using namespace AscendC;
     assert(argc == 4);
     uint32_t bs = std::stoul(argv[1]);
@@ -246,7 +298,7 @@ int main(int argc, char** argv) {
             ResetWorker();
             Expand(args, worker); // Run the production function, not a duplicate algorithm.
             const auto batches = (count + kPackOrderRows - 1) / kPackOrderRows;
-            assert(scalarWaits == batches && indexCopies == batches && flags.empty());
+            assert(scalarWaits == batches + (count>0) && indexCopies == batches && flags.empty());
             if (count >= kPackPipelineSlots + 1) assert(Overlap());
             const auto begin = LocalRowBegin(totalRows, worker);
             for (uint64_t row = begin; row < begin + count; ++row) {
@@ -299,4 +351,9 @@ def test_pack_maximum_reserved_slot_size(pack_pipeline_binary):
     result = subprocess.run(
         [str(pack_pipeline_binary), "113", "8192", "mixed"], capture_output=True, text=True, timeout=30
     )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_deferred_ready_and_cross_segment_ring_lifetime(pack_pipeline_binary):
+    result = subprocess.run([str(pack_pipeline_binary), "deferred"], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
