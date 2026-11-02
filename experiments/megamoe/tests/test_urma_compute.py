@@ -271,11 +271,11 @@ int main() {
     for (const auto task : plan.computeTasks) {
         assert(task.batchIndex < batches.size());
         if (task.stage == Stage::Gmm1) {
-            assert(nextG1 == nextG2); // G1(w) directly precedes G2(w).
+            assert(nextG1 - nextG2 <= (AdvanceOneGmm1Wave(config) ? 1U : 0U));
             assert(task.batchIndex == nextG1++);
         } else {
             assert(task.stage == Stage::Gmm2 && task.batchIndex == nextG2);
-            assert(nextG1 == nextG2 + 1U);
+            assert(nextG1 == std::min(batchCount, nextG2 + (AdvanceOneGmm1Wave(config) ? 2U : 1U)));
             ++nextG2;
         }
         auto& batchVisits = task.stage == Stage::Gmm1 ? g1BatchVisits : g2BatchVisits;

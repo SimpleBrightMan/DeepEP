@@ -43,8 +43,8 @@ GMM1/GMM2都按tile完成发布。FIX_S1事件在目标tile全部计算/FIX指�
 
 同类型跨专家保持其原上下文和槽位状态；切换GMM类型才End、完成AIC/AIV0交接、再开启另一上下文。GMM1仍是UnitFlag输出、GMM2仍是普通NZ Scatter；没有引入跨阶段混用输出协议、M128、N512或新槽位。GMM2每完成一个tile增加一次组计数，Combine仍需等该组所有14个N方向结果完成。
 
-所有支持的EP/BS/routing场景，planner按专家顺序遍历真实M256 groups，每12组一个wave（尾wave允许不足12）：GMM1(w0)→GMM2(w0)→GMM1(w1)→GMM2(w1)…。不增加全卡或全核barrier，也不按“12个专家”假定稀疏/热点路由。所有场景均不再使用--gmm1-ahead-mgroups；该参数仅保留兼容校验，日志明确标记ignored。空目的rank不生成计算任务。
+所有支持的EP/BS/routing场景，planner按专家顺序遍历真实M256 groups，每12组一个wave（尾wave允许不足12）。EP4/BS1024保持GMM1(w0)→GMM2(w0)→GMM1(w1)→GMM2(w1)…；其它场景提前一波GMM1：GMM1(w0)→GMM1(w1)→GMM2(w0)→GMM1(w2)→GMM2(w1)…，最后补GMM2尾波。只有一波时执行GMM1(w0)→GMM2(w0)，没有任务的rank不生成虚假wave。不增加全卡或全核barrier，也不按“12个专家”假定稀疏/热点路由。所有场景均不再使用--gmm1-ahead-mgroups；该参数仅保留兼容校验，日志明确标记ignored。空目的rank不生成计算任务。
 
 以EP4/BS1024均衡或random-balanced为例，每卡96组、8个wave。GMM1总960 tile、GMM2总1344 tile不变；每核阶段切换15次，上下文开启/关闭16对。通知仍逐tile，不等整个wave结束才通知。
 
-打印新增 `[URMA WAVE]` 和报告字段compute_wave_mgroups/gmm1_ahead_mgroups_applied。不同type切换或依赖等待的Drain条对应上一tile，下一同type Submit可出现在该Drain之前；没有新增PIPE_ALL打点。需要重编译安装匹配新的compute schedule标记。
+打印新增 `[URMA WAVE]` 和报告字段compute_wave_mgroups/compute_gmm1_ahead_waves/gmm1_ahead_mgroups_applied。不同type切换或依赖等待的Drain条对应上一tile，下一同type Submit可出现在该Drain之前；没有新增PIPE_ALL打点。需要重编译安装匹配新的compute schedule标记。

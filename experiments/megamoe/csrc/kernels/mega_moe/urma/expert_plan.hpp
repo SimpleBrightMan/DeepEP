@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -52,6 +53,26 @@ inline std::vector<ComputeBatchTask> BuildComputeTasks(const std::vector<Compute
         }
         tasks.push_back({ComputeBatchStage::Gmm2, gmm2});
         pendingGroups -= batches[gmm2].fragmentCount;
+    }
+    return tasks;
+}
+
+inline constexpr bool AdvanceOneGmm1Wave(const Config& config)
+{
+    return !(config.world == 4U && config.bs == 1024U);
+}
+
+inline std::vector<ComputeBatchTask> BuildWaveComputeTasks(uint32_t waveCount, bool advanceOne)
+{
+    std::vector<ComputeBatchTask> tasks;
+    tasks.reserve(static_cast<std::size_t>(waveCount) * 2U);
+    uint32_t nextGmm1 = 0U;
+    for (uint32_t gmm2 = 0U; gmm2 < waveCount; ++gmm2) {
+        // At startup submit waves 0 and 1 (if present); thereafter submit
+        // one new GMM1 wave before retiring the oldest pending GMM2 wave.
+        const uint32_t limit = std::min(waveCount, gmm2 + (advanceOne ? 2U : 1U));
+        while (nextGmm1 < limit) tasks.push_back({ComputeBatchStage::Gmm1, nextGmm1++});
+        tasks.push_back({ComputeBatchStage::Gmm2, gmm2});
     }
     return tasks;
 }
@@ -218,14 +239,14 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
     // All EP/BS/routing cases: twelve REAL nonempty M-groups per wave.
     // Expert order is unchanged. A wave may cross experts or split a hot
     // expert; its final group can be short. Empty destinations create no tasks.
-    // Paired engines execute G1(w), G2(w), G1(w+1), ... without a wave barrier.
+    // Task ordering below adds one GMM1 wave of lookahead except EP4/BS1024.
+    // This changes only task order, not group ownership or synchronization.
     for (uint32_t first = 0U; first < config.fragmentCount; first += kComputeWaveMGroups) {
         const uint32_t count = std::min(kComputeWaveMGroups, config.fragmentCount - first);
-        const uint32_t wave = static_cast<uint32_t>(plan.computeBatches.size());
         plan.computeBatches.push_back({first, count});
-        plan.computeTasks.push_back({ComputeBatchStage::Gmm1, wave});
-        plan.computeTasks.push_back({ComputeBatchStage::Gmm2, wave});
     }
+    plan.computeTasks = BuildWaveComputeTasks(static_cast<uint32_t>(plan.computeBatches.size()),
+                                              AdvanceOneGmm1Wave(config));
     config.computeTaskCount = static_cast<uint32_t>(plan.computeTasks.size());
     config.sendChunkCount = static_cast<uint32_t>(plan.sendChunks.size());
     config.recvChunkCount = static_cast<uint32_t>(plan.recvChunks.size());

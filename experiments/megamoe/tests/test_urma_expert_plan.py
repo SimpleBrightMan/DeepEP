@@ -42,6 +42,29 @@ int main(int argc, char**) {
         c.bs = boundary;
         assert(!UseFusedGateUp(c) && Gmm1ComputeTileCount(85U, c) == 5U);
     }
+    for(uint32_t world : {4U, 8U, 16U}) for(uint32_t bs : {1U, 1023U, 1024U, 1025U, 2048U, 4096U, 8192U}) {
+        auto c = Dimensions(bs, 256U, world);
+        const bool advance = !(world == 4U && bs == 1024U);
+        assert(AdvanceOneGmm1Wave(c) == advance);
+        for(uint32_t groups : {0U,1U,11U,12U,13U,23U,24U,25U,144U,265U}) {
+            const uint32_t waves = (groups + 11U)/12U;
+            const auto tasks = BuildWaveComputeTasks(waves, advance);
+            assert(tasks.size() == 2U * waves);
+            uint32_t g1=0,g2=0,startGroups=0;
+            for(auto task : tasks) {
+                if(task.stage == ComputeBatchStage::Gmm1) {
+                    assert(task.batchIndex == g1++);
+                    if(g2==0) startGroups += std::min(12U, groups-task.batchIndex*12U);
+                } else {
+                    assert(task.stage == ComputeBatchStage::Gmm2 && task.batchIndex == g2);
+                    assert(g1 == std::min(waves,g2+(advance?2U:1U)));
+                    ++g2;
+                }
+            }
+            assert(g1==waves && g2==waves);
+            assert(startGroups == std::min(groups,advance?24U:12U));
+        }
+    }
     std::array<int64_t, 16 * 384> counts{};
     if (argc > 1) {
         auto c = Dimensions(1, 128);
@@ -188,7 +211,16 @@ def check_plans(ids, cv_rows, routes, plans):
         assert g1 == groups * g1_tiles and g2 == groups * 14
         expected_batches = [[first, min(12, groups - first)] for first in range(0, groups, 12)]
         assert plan["B"] == expected_batches
-        assert plan["A"] == [[stage, wave] for wave in range(len(expected_batches)) for stage in (1, 2)]
+        if world == 4 and len(ids[0]) == 1024:
+            expected_tasks = [[stage, wave] for wave in range(len(expected_batches)) for stage in (1, 2)]
+        else:
+            # Independent reference: start G1(0), then G1(next)/G2(previous), final G2.
+            expected_tasks = [[1, 0]] if expected_batches else []
+            for wave in range(1, len(expected_batches)):
+                expected_tasks.extend([[1, wave], [2, wave - 1]])
+            if expected_batches:
+                expected_tasks.append([2, len(expected_batches) - 1])
+        assert plan["A"] == expected_tasks
         covered = np.zeros(rows, dtype=np.int8)
         compact = np.zeros(rows, dtype=np.int8)
         used_segments = np.zeros(len(plan["S"]), dtype=np.int8)

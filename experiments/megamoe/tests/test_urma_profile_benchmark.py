@@ -128,7 +128,7 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
             bs = len(ids.data)
             calls.append(("prepare", bs))
             self.prepared = SimpleNamespace(
-                bs=bs, received_rows=bs * 8, native=SimpleNamespace(gmm1_startup_mgroups=12)
+                bs=bs, received_rows=bs * 8, native=SimpleNamespace(gmm1_startup_mgroups=24)
             )
             self.ordinal = 0
             return self.prepared
@@ -157,7 +157,7 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
 
     extension = SimpleNamespace(
         urma_api_protocol=1,
-        urma_compute_schedule="wave12-all-shapes-samestage-deferred-v4",
+        urma_compute_schedule="wave12-ahead1-except-ep4-bs1024-v5",
         urma_local_pipeline="multi-slot",
         urma_tail_schedule="combine-ready-scan-reduce-world-v1",
         urma_timer_schema=1,
@@ -252,6 +252,7 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
         case = tmp_path / "rank_0" / f"bs_{bs}"
         summary = json.loads((case / "summary.json").read_text())
         assert summary["compute_wave_mgroups"] == 12
+        assert summary["compute_gmm1_ahead_waves"] == 1
         assert summary["gmm1_ahead_mgroups_applied"] is False
         assert set(summary["profiles"]) == {"none"} | ({"coarse"} if coarse else set()) | ({"fine"} if fine else set())
         report = summary["profiles"]["none"]

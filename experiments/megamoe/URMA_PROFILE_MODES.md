@@ -112,13 +112,17 @@ Use Insight for coarse traces; detailed dashboards may not recognize coarse IDs.
 ## Main branch: fixed wave12 in every scenario
 
 `megamoe-urma` groups real nonempty M256 fragments in expert order into waves
-of 12, then schedules GMM1(w), GMM2(w), GMM1(w+1), GMM2(w+1). A wave may span
+of 12. EP4/BS1024 uses GMM1(w0), GMM2(w0), GMM1(w1), GMM2(w1). Other cases
+start GMM1(w0), GMM1(w1), GMM2(w0), then alternate GMM1(next), GMM2(previous),
+finally retiring the last GMM2 wave. Missing waves are skipped; a wave may span
 experts or split one hot expert. Short final waves and empty destinations are
 handled without padding the task count. No all-core or cross-rank wave barrier
 is added. This applies to EP4/EP8/EP16, all supported BS and routing patterns.
 
 The legacy `--gmm1-ahead-mgroups` option is accepted and validated but ignored
 on this branch. Logs and summaries set `compute_wave_mgroups=12` and
-`gmm1_ahead_mgroups_applied=false`. Unitflag's algorithm is not modified by this
+`gmm1_ahead_mgroups_applied=false`. Per-case `compute_gmm1_ahead_waves` is 0
+for EP4/BS1024, otherwise 1. Actual `gmm1_startup_mgroups_local` is at most
+12 or 24 respectively (0 for an empty destination). Unitflag's algorithm is not modified by this
 change. Rebuild the main-branch wheel: its native compute-schedule marker changes
-to `wave12-all-shapes-samestage-deferred-v4` to reject mismatched installations.
+to `wave12-ahead1-except-ep4-bs1024-v5` to reject mismatched installations.

@@ -37,7 +37,7 @@ def _extension():
         raise RuntimeError("URMA Python/native versions differ; rebuild and reinstall the complete wheel")
     if getattr(extension, "urma_tail_schedule", None) != "combine-ready-scan-reduce-world-v1":
         raise RuntimeError("URMA tailCover needs its matching native wheel; rebuild and reinstall the complete wheel")
-    if getattr(extension, "urma_compute_schedule", None) != "wave12-all-shapes-samestage-deferred-v4":
+    if getattr(extension, "urma_compute_schedule", None) != "wave12-ahead1-except-ep4-bs1024-v5":
         raise RuntimeError(
             "URMA fixed wave12 schedule needs its matching native wheel; rebuild and reinstall the complete wheel"
         )
@@ -95,7 +95,8 @@ class PreparedUrmaRoutes:
 class UrmaBuffer:
     """EP4/EP8/EP16 owner; multiple hosts require explicit opt-in on every rank.
 
-    All shapes use fixed waves of 12 actual M-groups. ``gmm1_ahead_mgroups``
+    All shapes use fixed waves of 12 actual M-groups, with one GMM1 wave
+    ahead except EP4/BS1024. ``gmm1_ahead_mgroups``
     remains accepted/validated for compatibility but does not change scheduling.
     """
 
@@ -154,7 +155,7 @@ class UrmaBuffer:
                 timeout,
                 allow_multi_host,
                 "combine-ready-scan-reduce-world-v1",
-                "wave12-all-shapes-samestage-deferred-v4",
+                "wave12-ahead1-except-ep4-bs1024-v5",
                 COMMUNICATION_PROTOCOL,
             ),
         )

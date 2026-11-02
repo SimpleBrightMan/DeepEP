@@ -26,7 +26,7 @@ def parse_args(argv=None):
         "--gmm1-ahead-mgroups",
         type=int,
         default=12,
-        help="Compatibility option (validated but ignored): all cases use fixed 12 actual M-groups per wave",
+        help="Compatibility only (ignored): wave12 with one GMM1 wave ahead, except EP4/BS1024",
     )
     parser.add_argument(
         "--exp-shape",
@@ -315,6 +315,7 @@ def run(args, config, group):
         cv_rows=args.cv_rows,
         gmm1_ahead_mgroups=args.gmm1_ahead_mgroups,
         compute_wave_mgroups=12, gmm1_ahead_mgroups_applied=False,
+        compute_wave_policy="one GMM1 wave ahead except EP4/BS1024",
         launch_guard=launch_guard.describe(),
         performance_timing=(
             "disabled for accuracy-only"
@@ -366,6 +367,7 @@ def run(args, config, group):
         case = rank_dir / f"bs_{bs}"
         case.mkdir()
         wave_mgroups = 12
+        ahead_waves = 0 if world == 4 and bs == 1024 else 1
         fused_gate_up = use_fused_gate_up(bs, world, model["num_topk"], model["num_experts"])
         if rank == 0:
             expected_rows = bs * world * model["num_topk"] / model["num_experts"]
@@ -375,7 +377,9 @@ def run(args, config, group):
                 flush=True,
             )
         if rank == 0:
-            print(f"[URMA WAVE] EP={world} BS={bs}: 12 real M-groups/wave; GMM1(wave)->GMM2(wave); ahead-mgroups ignored", flush=True)
+            order = "G1(w0)->G2(w0)->G1(w1)->G2(w1)" if not ahead_waves else "G1(w0)->G1(w1)->G2(w0)->G1(w2)->G2(w1)"
+            print(f"[URMA WAVE] EP={world} BS={bs}: 12 real M-groups/wave; ahead_waves={ahead_waves}; "
+                  f"{order}; missing waves skipped; legacy ahead-mgroups ignored", flush=True)
         host_x, host_ids, host_weights = inputs(config, rank, bs, args.routing, world=world)
         codes, scales = quantize_input(host_x)
         x = (
@@ -450,7 +454,8 @@ def run(args, config, group):
         reports = dict(
             bs=bs, received_rows_local=prepared.received_rows,
             gmm1_ahead_mgroups=args.gmm1_ahead_mgroups, gmm1_startup_mgroups_local=startup_mgroups,
-            compute_wave_mgroups=wave_mgroups, gmm1_ahead_mgroups_applied=False,
+            compute_wave_mgroups=wave_mgroups, compute_gmm1_ahead_waves=ahead_waves,
+            gmm1_ahead_mgroups_applied=False,
             profile=profile_report, profiles=mode_reports, profile_directory=capture["profile_dir"],
             diagnostic_sample=capture["diagnostic_sample"], diagnostics=capture["diagnostics"], validation="skipped",
         )
@@ -619,7 +624,7 @@ def run(args, config, group):
         if rank == 0:
             print(
                 f"[URMA LOOKAHEAD] BS={bs} requested_mgroups={args.gmm1_ahead_mgroups} "
-                f"rank0_startup_mgroups={startup_mgroups}; fixed wave12, requested lookahead ignored",
+                f"rank0_startup_mgroups={startup_mgroups}; wave12 ahead_waves={ahead_waves}; legacy requested lookahead ignored",
                 flush=True,
             )
             print(

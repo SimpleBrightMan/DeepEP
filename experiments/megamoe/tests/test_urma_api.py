@@ -323,7 +323,7 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
     assert created == [allow]
     assert checks[0][1][-4] is allow
     assert checks[0][1][-3] == "combine-ready-scan-reduce-world-v1"
-    assert checks[0][1][-2] == "wave12-all-shapes-samestage-deferred-v4"
+    assert checks[0][1][-2] == "wave12-ahead1-except-ep4-bs1024-v5"
     assert checks[0][1][-1] == urma.COMMUNICATION_PROTOCOL
     assert buffer.gmm1_ahead_mgroups == 12
 
@@ -334,7 +334,7 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
 def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, tail):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object(), megamoe_urma_communication_protocol=urma.COMMUNICATION_PROTOCOL))
     extension = SimpleNamespace(
-        urma_api_protocol=1, urma_tail_schedule=tail, urma_compute_schedule="wave12-all-shapes-samestage-deferred-v4",
+        urma_api_protocol=1, urma_tail_schedule=tail, urma_compute_schedule="wave12-ahead1-except-ep4-bs1024-v5",
         urma_communication_protocol=urma.COMMUNICATION_PROTOCOL
     )
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
@@ -349,7 +349,7 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
         urma._extension.cache_clear()
 
 
-@pytest.mark.parametrize("schedule", [None, "expert-m256", "expert-m384-n128", "expert-m256-mgroup-lookahead-v1", "wave12-ep4-bs1024-samestage-deferred-v3"])
+@pytest.mark.parametrize("schedule", [None, "expert-m256", "expert-m384-n128", "expert-m256-mgroup-lookahead-v1", "wave12-ep4-bs1024-samestage-deferred-v3", "wave12-all-shapes-samestage-deferred-v4"])
 def test_native_mgroup_schedule_must_match_before_runtime_creation(monkeypatch, schedule):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object(), megamoe_urma_communication_protocol=urma.COMMUNICATION_PROTOCOL))
     extension = SimpleNamespace(
@@ -378,7 +378,7 @@ def test_commfirst_protocol_rejects_old_native_modules(monkeypatch, old_module):
     extension = SimpleNamespace(
         urma_api_protocol=1,
         urma_tail_schedule="combine-ready-scan-reduce-world-v1",
-        urma_compute_schedule="wave12-all-shapes-samestage-deferred-v4",
+        urma_compute_schedule="wave12-ahead1-except-ep4-bs1024-v5",
         urma_communication_protocol=protocol,
     )
     if old_module == "core":
