@@ -129,9 +129,9 @@ to `wave12-ahead1-except-ep4-bs1024-v5` to reject mismatched installations.
 
 ## Early Combine after Dispatch submission
 
-The main branch removes the Dispatch-to-Combine quiet. Each owner submits all
-Dispatch payloads/SO flags, completes its original remaining Pack quota if any,
-and immediately scans ready Combine CVs. QP0's final Combine quiet retires both
+The main branch removes the Dispatch-to-Combine quiet. Each owner scans ready original CV pairs after each Pack round, during Dispatch
+readiness waits, and between Dispatch batches. It does not wait for all Dispatch
+submissions or all Pack quotas before scanning. QP0's final Combine quiet retires both
 phases and remains mandatory without timers. SO readiness and immutable source
 buffers preserve receive-side correctness; no second QP or new barrier is added.
 
@@ -144,3 +144,21 @@ not use a last-PUT or Publish endpoint as an independent Dispatch completion.
 
 
 Pack now retains six slots across consecutive quotas and retires the old ready fence after five new row submissions. See [URMA_PACK_PIPELINE.md](URMA_PACK_PIPELINE.md) for stage boundaries and revised fine trace semantics.
+
+
+## Combine after each Pack round, two original CVs per PUT
+
+Each original Pack round runs uninterrupted, retaining its six-slot state.
+After that round returns, the owner scans Combine; no new Pack drain is added.
+Scanning is also allowed while Dispatch waits and between Dispatch batches.
+
+The original CV and M-group dependency tables are unchanged. Scan fixed adjacent
+CV pairs (0,1), (2,3), etc.; require both ready and skip unavailable pairs. Never
+join nonadjacent CVs or arbitrary compute groups. This prevents orphaned CVs
+under out-of-order readiness. Full PUTs contain 2*cv_rows, and the final short
+pair/CV contains actual rows. The old last-CV isolation rule is removed.
+
+The existing single QP and SO bitmap protocol remain; only the final quiet
+certifies completion. Coarse D/C envelopes can overlap and fine waits are split
+before actual early Combine submission. Rebuild the wheel for native marker
+`commfirst-pack-first-combine2cv-v4`.

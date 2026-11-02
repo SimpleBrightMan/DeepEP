@@ -31,7 +31,9 @@ MTE3_MTE2 credit. Only completed rows are added to PackReady, exactly once.
 - Startup: close after both initial rounds, before the local join/dequant.
 - Communication workers: publish pending ready before polling PackReady for a
   PUT batch. Retain the free-slot credits/cursor across scalar UDMA PUT/SO calls.
-  Close after the remaining static Pack quota, before entering Combine.
+  Scalar Combine scans/PUTs can run after each Pack round while these credits
+  remain live. Close after the remaining static Pack quota, before the final
+  Combine completion loop/quiet.
 - Helpers: keep Pack state only across consecutive Pack work. Close before
   executing activation or ScaleGather because those stages reuse DMA event IDs.
   Close when Pack finishes and before exiting to Reduce.

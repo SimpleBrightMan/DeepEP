@@ -10,21 +10,19 @@
 
 例如EP4/BS2048/CV256，16份CV的实际Pack为 `2 | 2,2,3,5,2`，发送为 `0 | 1,1,2,4,8`。这是每轮新增Pack不超过本轮发送+1，不是累计未发送余量不超过1。第一笔PUT会比启动结束额外等待本核2轮Pack，这正是本实验的主动间隔。
 
-Pack只保证本核份额完成，仍须等所有生产者的PackReady。已下发源区在最终quiet前不覆盖，后续Pack写其它行。SO通知使用同一peer QP0的ordered atomic-add，接收端在每次PublishStart前清零Dispatch CV槽位，再等待对应epoch。每个原始CV只发布一次；合并一个数据PUT不代表只发布一个CV的flag。全部Dispatch提交后不再quiet，本核补完原有剩余Pack配额后直接扫描Combine。最终Combine quiet统一收齐Dispatch和Combine的payload与SO flags。
+Pack只保证本核份额完成，仍须等所有生产者的PackReady。已下发源区在最终quiet前不覆盖，后续Pack写其它行。SO通知使用同一peer QP0的ordered atomic-add，接收端在每次PublishStart前清零Dispatch CV槽位，再等待对应epoch。每个原始CV只发布一次；合并一个数据PUT不代表只发布一个CV的flag。每个Pack轮次提交结束后即可扫描Combine，不等待全部Dispatch提交；期间不新增quiet。最终Combine quiet统一收齐Dispatch和Combine的payload与SO flags。
 
 短peer/空peer原有的余量Pack循环保留，辅助激活核的静态Pack分工及优先级不变。Pack是提交间隔，不能保证上一批已经远端完成；正确性依赖SO发布而不是估算Pack耗时。
 
-## Combine
+## Combine：Pack轮次之后扫描，两CV一批
 
-每个通信核提交完自己对端的Dispatch并完成自己原有的Pack份额后，直接扫描Combine，不再等待本卡其它通信核或其它Pack worker。原Pack静态划分和短/空peer补完循环保持不变；通信核Pack按当前发送份数+1在PUT前准备；不提前Combine到本核Dispatch阶段。同一peer的Dispatch仍在途时即可提交Combine，共用QP0；接收端仍由SO flag保护。
+通信核每完成一个原始PackOneRound调用后扫描Combine；不在该轮Pack内部插入扫描，不强制排空或抢占Pack槽位。没有Pack任务时，仍可在Dispatch等待数据或批次间扫描。不是等整个Pack阶段或全部Dispatch提交完再扫描。
 
-每轮扫描未发送CV，跳过未ready者。相邻ready CV的source/destination行都连续时合并为一个PUT；遇空洞、已发送CV、64位bitmap word边界或256MiB PUT上限就另起一段。最后一个实际未发送的通信CV不并入其它PUT。
+保留原recvChunks、原CV→GMM2组依赖、原Reduce依赖表。按CV对0/1、2/3…扫描，仅相邻且源/目标连续、两份都ready时才发送；某对未ready则跳过，检查后面的对。不把非相邻CV或任意计算M-group拼成一个PUT，不建立独立512行任务表。固定配对避免乱序发送后留下两个互不相邻的孤立CV。
 
-这里沿用此前“末通信CV单独发送”的定义，不把专家计算M-group与CV视为同一对象。如果要求按最后计算M-group片段切分，需要另行处理跨CV部分完成，不能提前置整CV的ready bit。
+完整PUT大小为2×cv_rows：CV128发送256行，CV256发送512行，CV1024发送2048行。peer尾部不足两CV时按实际行数发，取消旧的最后一个CV强制单发。每个原CV仍对应自己的SO ready bit；发送两CV后一次SO发布两个bit，最后一个单CV只发布一个bit。
 
-payload使用QP0 RO，随后用同QP0的一次SO atomic-add提交一段CV的bit mask。所有bits只提交一次，disjoint mask相加等于OR；可乱序标记，不把未ready空洞误判完成。每次调用在Start前清零本卡Combine bitmap及finished标志，sender等待peer Start后才能写。最后SO finished之后执行最终quiet，覆盖所有数据和通知，保护下一次调用。
-
-Combine中间没有每CV quiet，也不再通过MTE发布Combine ready。Reduce仍检查每个token的原CV依赖，只将ready读取从epoch改为bit，所有正向缓存、本卡GMM2完成条件保持原逻辑。
+继续使用单QP。最终quiet只在本核Dispatch、剩余Pack和Combine都提交完后执行。早发扫描只做Scalar PUT/SO和低地址UB状态维护，不占用高地址Pack UB及DMA槽位事件。fine的外层等待条会在实际Combine下发前结束，避免嵌套；coarse的D/C逻辑包络允许同一lane重叠。
 
 ## 计时与使用
 

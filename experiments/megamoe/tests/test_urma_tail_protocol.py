@@ -905,23 +905,14 @@ def test_actual_finished_helpers_count_once_publish_first_and_require_28_aic(red
 def test_finished_observation_and_aic_publication_integration():
     root = Path(__file__).resolve().parents[3]
     source = (root / "experiments/megamoe/csrc/kernels/mega_moe/urma/kernel.hpp").read_text()
-    retire = source[
-        source.index("__aicore__ inline void RetireCombineBatch") : source.index(
-            "__aicore__ inline void CommunicatePeer"
-        )
-    ]
-    assert (
-        retire.index("ObserveIncomingCompletion(args, owner, peerCounted, selfCounted);")
-        < retire.index("Quiet(peer, kCombineQp);")
-        < retire.index("PublishDone(symmetric,")
-    )
-    combine = source[source.index("while (remaining != 0U)") : source.index("__aicore__ inline void Process")]
-    assert (
-        combine.index("Put(symmetric,")
-        < combine.index("if (pendingCount != 0U)")
-        < combine.index("timer.End(Phase::Combine, combineBytes)")
-        < combine.index("FinishCombinePeer(args, owner, signal, peerCounted, selfCounted);")
-    )
+    progress = source[source.index("class PeerCombine") : source.index("__aicore__ inline void CommunicatePeer")]
+    assert progress.index("Put(symmetric,") < progress.index("PublishCombineRange(symmetric,")
+    assert progress.index("PublishOrdered(") < progress.index("Quiet(peer_);")
+    dispatch = source[source.index("__aicore__ inline void CommunicatePeer") : source.index("__aicore__ inline void RunProfiledCompute")]
+    assert dispatch.index("PackOneRound(") < dispatch.index("combine.Scan();") < dispatch.index("Put(symmetric,")
+    assert "combine.Scan(&start, &meta, TraceEvent::WaitDispatch)" in dispatch
+    assert dispatch.index("pack.Close();") < dispatch.index("combine.Finish();")
+    assert "Quiet(" not in dispatch
     process = source[source.index("__aicore__ inline void Process") :]
-    assert process.index("RunCubeAndPrologue(args, block, timer);") < process.index("MarkCubeComplete(args);")
+    assert process.index("RunProfiledCompute(args, block, timer);") < process.index("MarkCubeComplete(args);")
     assert process.count("MarkCubeComplete(args);") == 1

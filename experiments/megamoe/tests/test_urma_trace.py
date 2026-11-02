@@ -25,6 +25,17 @@ def trace_buffer(capacity=4):
     return raw
 
 
+@pytest.mark.parametrize("order", [(53, 49), (49, 53)])
+def test_coarse_dispatch_combine_envelopes_can_overlap(order):
+    raw = trace_buffer()
+    add_record(raw, event=EVENTS[order[0]], start=1000, end=3000)
+    add_record(raw, event=EVENTS[order[1]], start=1500, end=2500)
+    add_record(raw, event="CoarseLocalSyncEnd", start=3000, end=3100)
+    result = decode_trace(raw, rank=0, clock_mhz=1000)
+    assert len(events(result)) == 3
+    assert result["metadata"]["instrumentation"] == "coarse"
+
+
 def test_pack_retire_is_fine_not_coarse_and_carries_no_duplicate_payload():
     raw = trace_buffer()
     add_record(raw, event="Pack", start=1000, end=2000, peer=1, cv=0, rows=8, bytes=29568)

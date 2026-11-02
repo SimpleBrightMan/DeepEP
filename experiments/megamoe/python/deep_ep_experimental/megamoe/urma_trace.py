@@ -173,6 +173,8 @@ def decode_trace(raw, *, rank, clock_mhz):
     records = []
     for engine, (data, count) in enumerate(zip(slices, counts)):
         previous_end = None
+        previous_start = None
+        previous_event = None
         for ordinal in range(count):
             offset = HEADER_WORDS + ordinal * RECORD_WORDS
             row = tuple(map(int, data[offset : offset + RECORD_WORDS]))
@@ -181,9 +183,12 @@ def decode_trace(raw, *, rank, clock_mhz):
                 raise ValueError(f"engine={engine} record={ordinal}: unknown event id={event_id}")
             if end < start or start == UNKNOWN or end == UNKNOWN:
                 raise ValueError(f"engine={engine} record={ordinal}: invalid ticks start={start} end={end}")
-            if previous_end is not None and start < previous_end:
+            overlap = previous_end is not None and start < previous_end
+            coarse_pair = previous_event in (48, 53) and event_id == 49 or previous_event == 49 and event_id in (48, 53)
+            if previous_start is not None and start < previous_start or overlap and not coarse_pair:
                 raise ValueError(f"engine={engine} record={ordinal}: overlapping or out-of-order event ticks")
-            previous_end = end
+            previous_end = max(previous_end or 0, end)
+            previous_start, previous_event = start, event_id
             if any(row[13:]):
                 raise ValueError(f"engine={engine} record={ordinal}: nonzero reserved record fields")
             if row[3] != UNKNOWN and row[3] >= 16:
