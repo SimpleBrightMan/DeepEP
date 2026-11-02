@@ -154,7 +154,7 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
 
     extension = SimpleNamespace(
         urma_api_protocol=1,
-        urma_compute_schedule="wave12-ep4-bs1024-samestage-deferred-v3",
+        urma_compute_schedule="wave12-ep4-all-bs-samestage-deferred-v6",
         urma_local_pipeline="multi-slot",
         urma_tail_schedule="combine-ready-scan-reduce-world-v1",
         urma_timer_schema=1,

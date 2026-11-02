@@ -186,7 +186,7 @@ def check_plans(ids, cv_rows, routes, plans):
         assert groups == len(plan["F"]) and sends == len(plan["T"]) and receives == len(plan["R"])
         g1_tiles = 10 if len(ids[0]) * world * 8 < 384 * 128 else 5
         assert g1 == groups * g1_tiles and g2 == groups * 14
-        wave12 = world == 4 and len(ids[0]) == 1024
+        wave12 = world == 4
         if wave12:
             expected_batches = [[first, min(12, groups - first)] for first in range(0, groups, 12)]
             assert plan["B"] == expected_batches
@@ -362,3 +362,13 @@ def test_sparse_skewed_ragged_and_empty_experts(expert_plan_binary, pattern, cv_
 def test_invalid_counts_and_capacities_are_rejected(expert_plan_binary):
     result = subprocess.run([str(expert_plan_binary), "invalid"], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("bs", [2048,4096,8192])
+def test_ep4_wave12_expands_to_large_bs_without_changing_routes(expert_plan_binary, bs):
+    ids=[]
+    for rank in range(4):
+        stream=np.arange(rank*bs*8,(rank+1)*bs*8)
+        ids.append(((stream%4)*96+(stream//4)%96).reshape(bs,8))
+    routes,plans=read_plans(expert_plan_binary,ids,256)
+    check_plans(ids,256,routes,plans)

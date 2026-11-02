@@ -216,7 +216,7 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
         throw std::logic_error("URMA Reduce dependencies do not cover all expanded rows");
     }
     config.fragmentCount = static_cast<uint32_t>(plan.fragments.size());
-    if (config.world == 4U && config.bs == 1024U) {
+    if (config.world == 4U) {
         // A wave is twelve REAL nonempty M-groups, not twelve expert IDs.
         // It may cross experts or split a hot expert. No device-wide barrier.
         plan.computeBatches.clear();
