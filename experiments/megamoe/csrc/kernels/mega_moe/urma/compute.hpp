@@ -489,6 +489,7 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
     uint32_t nextActivation = 0U;
     uint32_t activationTile = 0U;
     uint32_t nextPackRound = kPackStartupRounds;
+    PackBatch pack(args, timer);
     bool packFinished = false;
     bool activationPrepared = false;
     bool idle = false;
@@ -517,6 +518,7 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
                     timer.TraceEnd(idleEvent, idleStart, idleMeta);
                     idle = false;
                 }
+                pack.Close(); // Activation reuses DMA event IDs.
                 if (UseFusedGateUp(args.config)) {
                     RunReadyActivationTile<true>(args, worker, fragment, nextActivation, activationTile, epilogue, timer);
                 } else {
@@ -534,24 +536,26 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
                     timer.TraceEnd(idleEvent, idleStart, idleMeta);
                     idle = false;
                 }
+                pack.Close(); // Scale gather reuses DMA event IDs.
                 GatherInputScale(args, fragment, nextGather, timer);
                 nextGather += activationWorkers;
                 progress = true;
             }
         }
         // Only fall back to Pack when neither activation nor a scale gather
-        // ran. Keep the same fixed quota and close its events before returning
-        // to the activation check; never gate activation on another peer.
+        // ran. Consecutive Pack quotas retain events/cursor; close them only
+        // before actual activation/gather work or when all Pack is complete.
         if (!progress && nextPackRound < args.config.packRoundCount) {
             if (idle) {
                 timer.TraceEnd(idleEvent, idleStart, idleMeta);
                 idle = false;
             }
-            PackOneRound(args, nextPackRound, worker + communicationWorkers, kAic, timer);
+            PackOneRound(args, nextPackRound, worker + communicationWorkers, kAic, pack);
             ++nextPackRound;
             progress = true;
         }
         if (!packFinished && nextPackRound >= args.config.packRoundCount) {
+            pack.Close();
             MarkPackWorkerComplete(args);
             packFinished = true;
         }
@@ -570,6 +574,7 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
         }
     }
     if (idle) timer.TraceEnd(idleEvent, idleStart, idleMeta);
+    pack.Close();
     // Empty compute workloads and <=2 Pack rounds can skip the loop entirely.
     if (!packFinished) MarkPackWorkerComplete(args);
 }

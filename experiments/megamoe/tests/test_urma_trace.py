@@ -25,6 +25,26 @@ def trace_buffer(capacity=4):
     return raw
 
 
+def test_pack_retire_is_fine_not_coarse_and_carries_no_duplicate_payload():
+    raw = trace_buffer()
+    add_record(raw, event="Pack", start=1000, end=2000, peer=1, cv=0, rows=8, bytes=29568)
+    add_record(raw, event="PackRetire", start=2100, end=2300, peer=1, cv=0, rows=8, bytes=0)
+    trace = decode_trace(raw, rank=0, clock_mhz=1000)
+    assert trace["metadata"]["instrumentation"] == "fine"
+    assert sum(row["args"]["bytes"] for row in events(trace)) == 29568
+    assert events(trace)[1]["args"]["event_id"] == 54
+
+
+def test_new_dispatch_submission_envelope_is_distinct_from_legacy_completion():
+    raw = trace_buffer()
+    add_record(raw, event="CoarseDispatchSubmit", start=1000, end=2000)
+    add_record(raw, event="CoarseCombine", start=2100, end=4000)
+    result = decode_trace(raw, rank=0, clock_mhz=1000)
+    first = events(result)[0]
+    assert first["name"] == "CoarseDispatchSubmit"
+    assert "not remote completion" in first["args"]["meaning"]
+
+
 def test_coarse_envelopes_preserve_sync_and_initial_wait_scope(tmp_path):
     raw = trace_buffer(4)
     add_record(raw, engine=0, event="CoarseLocalSyncStart", start=10, end=20)
@@ -88,7 +108,7 @@ def test_every_event_id_has_a_name_and_no_fabricated_async_events():
             continue
         add_record(raw, engine=event_id, event=name)
     result = decode_trace(raw, rank=0, clock_mhz=1000)
-    assert len(events(result)) == sum(name is not None for name in EVENTS) == 44
+    assert len(events(result)) == sum(name is not None for name in EVENTS) == 46
     assert {row["ph"] for row in result["traceEvents"]} == {"M", "X"}
     assert {row["args"]["event_id"] for row in events(result)} == {index for index, name in enumerate(EVENTS) if name is not None}
 

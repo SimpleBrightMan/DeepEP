@@ -79,7 +79,9 @@ enum class TraceEvent : uint32_t {
     CombineSendComplete = 42U, // Final quiet: all outgoing Combine writes/flags complete.
     DispatchSendComplete,     // Final QP quiet: all Dispatch payloads and SO publications complete.
     CoarsePack, CoarseLocalSyncStart, CoarseGMM, CoarseDequant,
-    CoarseDispatch, CoarseCombine, CoarseActivation, CoarseReduce, CoarseLocalSyncEnd
+    CoarseDispatch, CoarseCombine, CoarseActivation, CoarseReduce, CoarseLocalSyncEnd,
+    CoarseDispatchSubmit, // Submission-only envelope; legacy CoarseDispatch retains its meaning.
+    PackRetire // Final pending ready publication and/or Pack event release.
 };
 
 struct TraceMeta {

@@ -48,3 +48,6 @@ GMM1/GMM2都按tile完成发布。FIX_S1事件在目标tile全部计算/FIX指�
 以EP4/BS1024均衡或random-balanced为例，每卡96组、8个wave。GMM1总960 tile、GMM2总1344 tile不变；每核阶段切换15次，上下文开启/关闭16对。通知仍逐tile，不等整个wave结束才通知。
 
 打印新增 `[URMA WAVE]` 和报告字段compute_wave_mgroups/gmm1_ahead_mgroups_applied。不同type切换或依赖等待的Drain条对应上一tile，下一同type Submit可出现在该Drain之前；没有新增PIPE_ALL打点。需要重编译安装匹配新的compute schedule标记。
+
+
+Pack now retains six slots across consecutive quotas and retires the old ready fence after five new row submissions. See [URMA_PACK_PIPELINE.md](URMA_PACK_PIPELINE.md) for stage boundaries and revised fine trace semantics.

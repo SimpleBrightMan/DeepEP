@@ -108,3 +108,6 @@ Only requested diagnostic directories exist. Compare each trace against the
 matching diagnostic profiler sample, not the formal average. Rank clocks are
 independently zeroed; cross-rank absolute timestamps cannot establish simultaneity.
 Use Insight for coarse traces; detailed dashboards may not recognize coarse IDs.
+
+
+Pack now retains six slots across consecutive quotas and retires the old ready fence after five new row submissions. See [URMA_PACK_PIPELINE.md](URMA_PACK_PIPELINE.md) for stage boundaries and revised fine trace semantics.
