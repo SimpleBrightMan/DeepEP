@@ -24,5 +24,7 @@ add_executable(combine_l1 main.cpp)
 target_compile_options(combine_l1 PRIVATE -O2 -Wall -Wextra)
 target_include_directories(combine_l1 PRIVATE ${inc})
 target_link_directories(combine_l1 PRIVATE "${ASCEND_HOME_PATH}/lib64" "${SHMEM_ROOT}/lib")
-target_link_libraries(combine_l1 PRIVATE device ascendcl runtime shmem platform tiling_api opapi nnopbase unified_dlog dl m)
+# S920 may ship tiling_api as a static archive. Its platform references must
+# appear BEFORE libplatform on the link line (especially with --as-needed).
+target_link_libraries(combine_l1 PRIVATE device ascendcl runtime shmem tiling_api platform opapi nnopbase unified_dlog dl m)
 set_target_properties(combine_l1 PROPERTIES BUILD_RPATH "$ORIGIN;${ASCEND_HOME_PATH}/lib64;${SHMEM_ROOT}/lib")

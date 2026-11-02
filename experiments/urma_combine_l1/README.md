@@ -63,6 +63,8 @@ bash experiments/urma_combine_l1/build.sh
 
 仅支持Ascend950，SDK需要提供主线使用的RO/SO UDMA接口（本分支锁定PR944）。CMake单独构建demo；不修改系统安装。
 
+S920的`libtiling_api.a`需要在链接顺序上位于`platform`之前，本demo已适配。若旧版本出现`PlatformInfoManager::Instance`/`DSO missing from command line`，拉取更新后重跑上述build脚本即可；无需删除SHMEM SDK。前面的宏重定义、deprecated warning不是这次链接失败的原因。
+
 ## 运行对照
 
 所选卡必须已分配且空闲。启动器保存npu-smi快照，只清理自己创建的进程组，不重置卡。不要与真实MegaMoE同时占卡：AIC负载已在同一个demo kernel内产生。
@@ -88,6 +90,16 @@ python3 experiments/urma_combine_l1/run.py --ep-size 16 --bs 8192 --l1-load on -
 ```
 
 默认devices为0..EP−1，可用 `--devices 12,13,14,15 --ep-size 4` 指定所分配的卡。`--group-size 4`按实际device ID连续4卡统计拓扑。ABBA顺序可用 `--l1-load off,on,on,off` 检查顺序/频率影响。
+
+EP4示例：
+
+```bash
+python3 experiments/urma_combine_l1/run.py \
+  --ep-size 4 --devices 0,1,2,3 --bs 8192 --l1-load off,on \
+  --warmup 10 --iters 20 --exp-repeat 50
+```
+
+EP4每卡3个通信AIV1；每peer为16,384行、64次data+SO、112MiB，每卡总发送336MiB。AIC仍为28个，开启时每卡左矩阵读预算仍为3.28125GiB。0..3或12..15同属一个物理四卡组，CROSS显示N/A；如果选择0、4、8、12（分别来自四个物理组），这3条edge均统计为跨组。必须按实际物理拓扑选择device列表。
 
 ## 拉齐和计时
 
