@@ -27,10 +27,10 @@ def expert_plan_binary(tmp_path_factory):
 #include <cassert>
 #include <iostream>
 using namespace MegaMoeUrma;
-Config Dimensions(uint32_t bs, uint32_t cv, uint32_t world = 16) {
+Config Dimensions(uint32_t bs, uint32_t cv, uint32_t world = 16, uint32_t topk = 8) {
     Config c{};
-    c.bs = bs; c.hidden = 3584; c.intermediate = 1280; c.topk = 8;
-    c.world = world; c.localExperts = 384 / world; c.cvRows = cv; c.maxPeerChunks = (bs * 8 + cv - 1) / cv;
+    c.bs = bs; c.hidden = 3584; c.intermediate = 1280; c.topk = topk;
+    c.world = world; c.localExperts = 384 / world; c.cvRows = cv; c.maxPeerChunks = (bs * topk + cv - 1) / cv;
     return c;
 }
 int main(int argc, char**) {
@@ -72,13 +72,13 @@ int main(int argc, char**) {
         reject(c, 16 * 257 * 8);
         return 0;
     }
-    uint32_t bs = 0, cv = 0, world = 0;
-    assert(std::cin >> bs >> cv >> world);
+    uint32_t bs = 0, cv = 0, world = 0, topk = 0;
+    assert(std::cin >> bs >> cv >> world >> topk);
     for (uint32_t index = 0; index < world * 384; ++index) assert(std::cin >> counts[index]);
     for (uint32_t rank = 0; rank < world; ++rank) {
-        auto config = Dimensions(bs, cv, world);
+        auto config = Dimensions(bs, cv, world, topk);
         config.rank = rank;
-        auto p = BuildExpertPlan(counts.data(), config, uint64_t(world) * bs * 8);
+        auto p = BuildExpertPlan(counts.data(), config, uint64_t(world) * bs * topk);
         const auto& c = p.config;
         std::cout << "P " << rank << ' ' << c.receiveRows << ' ' << c.gmm1Tiles << ' ' << c.gmm2Tiles
                   << ' ' << c.selfSendRow << ' ' << c.selfRecvRow << ' ' << c.selfRows << ' '
@@ -107,7 +107,7 @@ int main(int argc, char**) {
         std::cout << 'D';
         for (auto group : p.chunkGroupIndices) std::cout << ' ' << group;
         std::cout << '\n';
-        assert(p.reduceDependencies.size() == uint64_t(bs) * 8);
+        assert(p.reduceDependencies.size() == uint64_t(bs) * topk);
         for (uint64_t begin = 0; begin < p.reduceDependencies.size();) {
             uint64_t end = begin + 1;
             while (end < p.reduceDependencies.size() &&
@@ -145,7 +145,7 @@ def read_plans(binary, ids, cv_rows):
     counts = np.array([route.expert_counts for route in routes])
     result = subprocess.run(
         [str(binary)],
-        input=f"{len(ids[0])} {cv_rows} {world}\n" + " ".join(map(str, counts.reshape(-1))),
+        input=f"{len(ids[0])} {cv_rows} {world} {ids[0].shape[1]}\n" + " ".join(map(str, counts.reshape(-1))),
         capture_output=True,
         text=True,
         timeout=30,
@@ -184,7 +184,7 @@ def check_plans(ids, cv_rows, routes, plans):
         assert self_send == routes[rank].peer_offsets[rank]
         assert self_recv == receive_base[rank, rank] and self_rows == counts[rank, rank]
         assert groups == len(plan["F"]) and sends == len(plan["T"]) and receives == len(plan["R"])
-        g1_tiles = 10 if len(ids[0]) * world * 8 < 384 * 128 else 5
+        g1_tiles = 10 if len(ids[0]) * world * ids[0].shape[1] < 384 * 128 else 5
         assert g1 == groups * g1_tiles and g2 == groups * 14
         wave12 = world == 4
         if wave12:
@@ -372,3 +372,13 @@ def test_ep4_wave12_expands_to_large_bs_without_changing_routes(expert_plan_bina
         ids.append(((stream%4)*96+(stream//4)%96).reshape(bs,8))
     routes,plans=read_plans(expert_plan_binary,ids,256)
     check_plans(ids,256,routes,plans)
+
+
+@pytest.mark.parametrize("topk", range(1,9))
+@pytest.mark.parametrize("world", [4,8,16])
+def test_variable_topk_native_plan(expert_plan_binary,topk,world):
+    rng=np.random.default_rng(602+topk+world)
+    # Irregular loads, arbitrary source/peer and expert boundaries.
+    ids=[rng.integers(0,384,size=(137,topk)) for _ in range(world)]
+    routes,plans=read_plans(expert_plan_binary,ids,128)
+    check_plans(ids,128,routes,plans)

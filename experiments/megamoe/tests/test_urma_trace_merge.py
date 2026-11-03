@@ -192,3 +192,24 @@ def test_merge_error_reaches_all_ranks(tmp_path):
 
     together(groups(2), work)
     assert not (tmp_path / "allrank.json").exists()
+
+
+def test_model_metadata_survives_export_and_merge(tmp_path):
+    from deep_ep_experimental.megamoe.urma_benchmark import export_trace_collective
+    class Group:
+        def __init__(self,rank):self.r=rank
+        def rank(self):return self.r
+        def size(self):return 4
+        def all_gather(self,status,stage):return [status]
+    model=dict(hidden=5120,intermediate_hidden=2304,num_topk=6,num_experts=384,num_shared_experts=0)
+    paths=[]
+    for rank in range(4):
+        case=tmp_path/str(rank);case.mkdir()
+        record=export_trace_collective(Group(rank),make_trace(),case,bs=2048,clock_mhz=1000,model=model)[0]
+        doc=json.loads(Path(record["chrome_path"]).read_text())
+        assert doc["metadata"]["model"]==model
+        assert doc["metadata"]["bs"]==2048
+        paths.append(Path(record["chrome_path"]))
+    output=tmp_path/"allrank.json"
+    merge_trace_files(paths,output,world=4)
+    assert all(m["model"]["num_topk"]==6 for m in json.loads(output.read_text())["metadata"]["per_rank"])

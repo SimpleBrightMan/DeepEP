@@ -12,14 +12,14 @@ using namespace MegaMoeUrma;using namespace AscendC;
 struct Timer { uint64_t TraceBegin(){return 1;} void TraceEnd(TraceEvent,uint64_t,const TraceMeta&){} };
 int main(){
  unsigned cases=0;
- for(unsigned h:{256U,3584U,4096U,6144U,8192U})for(unsigned workers:{28U,41U,53U})for(unsigned pr:{0U,1U,2U}) {
+ for(unsigned h:{256U,3584U,5120U,4096U,6144U,8192U})for(unsigned workers:{28U,41U,53U})for(unsigned pr:{0U,1U,2U}) {
   unsigned bs=(h==8192 && workers==28 && pr==0)?8192:73;
-  for(unsigned worker:{0U,workers-1}) {
+  for(unsigned topk=1;topk<=8;++topk) for(unsigned worker:{0U,workers-1}) {
    physicalHidden=h;priority=pr;ub.fill(0xa5);
-   Arguments a{};a.config.bs=bs;a.config.hidden=h;a.config.topk=8;a.config.world=16;
+   Arguments a{};a.config.bs=bs;a.config.hidden=h;a.config.topk=topk;a.config.world=16;
    a.symmetric=returnedBase;a.localFlags=uintptr_t{1}<<43;
-   std::vector<int64_t> inverse(bs*8);std::vector<float> weights(bs*8);
-   for(unsigned i=0;i<bs*8;++i){inverse[i]=(i*17U)%(bs*8);weights[i]=float(int(i%7)-3)/8;}
+   std::vector<int64_t> inverse(bs*topk);std::vector<float> weights(bs*topk);
+   for(unsigned i=0;i<bs*topk;++i){inverse[i]=(i*17U)%(bs*topk);weights[i]=float(int(i%7)-3)/8;}
    std::vector<bfloat16_t> output(uint64_t(bs)*h);for(auto&v:output)v.bits=0x7fc1;
    a.output=uintptr_t(output.data());a.reduceIndex=uintptr_t(inverse.data());a.weights=uintptr_t(weights.data());
    beforePayload=[](uintptr_t){};executePayload={};submitOutput={};executeOutput={};
@@ -28,7 +28,7 @@ int main(){
    const unsigned begin=worker*(bs/workers)+std::min(worker,bs%workers),count=bs/workers+(worker<bs%workers);
    for(unsigned token=0;token<bs;++token)for(unsigned col=0;col<h;++col) {
     if(token<begin||token>=begin+count){assert(output[uint64_t(token)*h+col].bits==0x7fc1);continue;}
-    float sum=0;for(unsigned k=0;k<8;++k)sum+=float(Returned(inverse[token*8+k],col))*weights[token*8+k];
+    float sum=0;for(unsigned k=0;k<topk;++k)sum+=float(Returned(inverse[token*topk+k],col))*weights[token*topk+k];
     assert(output[uint64_t(token)*h+col].bits==bfloat16_t(sum).bits);
    }
    for(auto&q:queues)assert(q.empty());for(auto&kind:events)for(bool bit:kind)assert(!bit);

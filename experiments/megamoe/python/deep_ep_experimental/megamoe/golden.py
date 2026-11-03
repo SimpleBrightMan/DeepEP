@@ -273,6 +273,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="smoke")
     parser.add_argument("--bs-values")
+    parser.add_argument("--topk",type=int,choices=range(1,9))
     parser.add_argument("--hidden",type=int)
     parser.add_argument("--intermediate",type=int)
     parser.add_argument("--shared-experts",type=int,choices=(0,1))
@@ -298,6 +299,7 @@ def main():
     from .timer.__main__ import parse_ranks
 
     config, ranks = load_config(args.config, args.bs_values), parse_ranks(args.ranks)
+    if args.topk is not None:config["model"]["num_topk"]=args.topk
     if args.hidden is not None:config["model"]["hidden"]=args.hidden
     if args.intermediate is not None:config["model"]["intermediate_hidden"]=args.intermediate
     if args.shared_experts is not None:config["model"]["num_shared_experts"]=args.shared_experts

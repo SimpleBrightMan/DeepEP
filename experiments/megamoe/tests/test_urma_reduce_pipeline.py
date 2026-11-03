@@ -203,6 +203,13 @@ template <typename T> void DataCopy(GlobalTensor<T> destination, LocalTensor<T> 
         return true;
     });
 }
+struct DataCopyExtParams { uint16_t blockCount; uint32_t blockLen,srcStride,dstStride,rsv; };
+template<class T> struct DataCopyPadExtParams { bool isPad; uint8_t left,right; T value; };
+template<class T> void DataCopyPad(LocalTensor<T> dst,GlobalTensor<T> src,DataCopyExtParams params,DataCopyPadExtParams<T>) {
+    assert(params.blockCount==1 && params.srcStride==0 && params.dstStride==0);
+    assert(params.blockLen%sizeof(T)==0 && params.blockLen/sizeof(T)<=dst.count);
+    Enqueue(Mte2,[=]{std::copy_n(src.data,params.blockLen/sizeof(T),dst.Data());return true;});
+}
 template <typename D, typename S> void Cast(LocalTensor<D> destination, LocalTensor<S> source,
                                            RoundMode mode, uint32_t count) {
     assert(count <= source.count && count <= destination.count);

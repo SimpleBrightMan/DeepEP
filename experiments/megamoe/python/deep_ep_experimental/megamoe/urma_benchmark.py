@@ -23,6 +23,7 @@ def parse_args(argv=None):
     parser.add_argument("--routing", choices=("balanced", "random", "skewed", "random-balanced"), default="balanced")
     parser.add_argument("--shared-experts", type=int, choices=(0,1))
     parser.add_argument("--shared-intermediate", type=int)
+    parser.add_argument("--topk", type=int, choices=range(1,9), help="URMA routed experts per token (1..8)")
     parser.add_argument("--hidden", type=int)
     parser.add_argument("--intermediate", type=int)
     parser.add_argument("--cv-rows", type=int, default=256)
@@ -141,6 +142,7 @@ def format_profile_summary(reports, world):
 def main():
     args = parse_args()
     config = load_config(args.config, args.bs_values)
+    if args.topk is not None: config["model"]["num_topk"] = args.topk
     if args.hidden is not None: config["model"]["hidden"] = args.hidden
     if args.intermediate is not None: config["model"]["intermediate_hidden"] = args.intermediate
     if args.shared_experts is not None: config["model"]["num_shared_experts"] = args.shared_experts
@@ -175,7 +177,7 @@ def main():
         raise
 
 
-def export_trace_collective(group, raw, case, *, bs, clock_mhz, include_waits=False):
+def export_trace_collective(group, raw, case, *, bs, clock_mhz, include_waits=False, model=None):
     """All ranks exchange exporter errors before any rank raises on overflow."""
     from .urma_trace import export_trace
 
@@ -192,6 +194,12 @@ def export_trace_collective(group, raw, case, *, bs, clock_mhz, include_waits=Fa
         status["metadata"] = export_trace(
             raw, case / "urma_trace.json", rank=group.rank(), clock_mhz=clock_mhz, include_waits=include_waits
         )
+        if model is not None:
+            trace_path=case / "urma_trace.json"
+            trace_doc=json.loads(trace_path.read_text(encoding="utf-8"))
+            trace_doc["metadata"].update(bs=bs,world=group.size(),model=dict(model))
+            trace_path.write_text(json.dumps(trace_doc,separators=(",", ":")),encoding="utf-8")
+            status["metadata"]=trace_doc["metadata"]
     except Exception as error:
         status["error"] = f"{type(error).__name__}: {error}"
     try:
@@ -604,7 +612,7 @@ def run(args, config, group):
             coarse_case = case / "coarse"
             coarse_case.mkdir(exist_ok=True)
             records = export_trace_collective(group, coarse_trace.cpu().numpy(), coarse_case,
-                                              bs=bs, clock_mhz=args.timer_clock_mhz, include_waits=True)
+                                              bs=bs, clock_mhz=args.timer_clock_mhz, include_waits=True, model=model)
             reports["coarse_trace_per_rank"] = records
             reports["coarse_trace_allrank"] = merge_trace_collective(
                 group, records, args.output_dir / f"bs_{bs}" / "coarse" / "allrank.json", bs=bs, include_waits=True)
@@ -620,7 +628,7 @@ def run(args, config, group):
                 case / "fine",
                 bs=bs,
                 clock_mhz=args.timer_clock_mhz,
-                include_waits=args.trace_include_waits,
+                include_waits=args.trace_include_waits, model=model,
             )
             reports["trace_allrank"] = merge_trace_collective(
                 group,

@@ -16,19 +16,20 @@ struct Timer {
 };
 int main(){
  unsigned cases=0,differentRoundings=0;
- for(unsigned h:{256U,3584U,4096U,8192U})
- for(unsigned bs:{1U,73U,1024U})for(unsigned pr:{0U,1U,2U}){
+ for(unsigned h:{256U,3584U,5120U,4096U,8192U})
+ for(unsigned bs:{1U,73U})for(unsigned pr:{0U,1U,2U})for(unsigned topk=1;topk<=8;++topk){
   physicalHidden=h;priority=pr;
-  Arguments a{};a.config.bs=bs;a.config.hidden=h;a.config.topk=8;a.config.world=16;
-  a.symmetric=returnedBase;a.localFlags=uintptr_t{1}<<43;
-  std::vector<int64_t> inverse(bs*8);std::vector<float> weights(bs*8);
-  for(unsigned i=0;i<bs*8;++i){inverse[i]=(i*17U)%(bs*8);weights[i]=float(int(i%7)-3)/13;}
+  Arguments a{};a.config.bs=bs;a.config.hidden=h;a.config.topk=topk;a.config.world=16;
+  a.symmetric=returnedBase;a.localFlags=uintptr_t{1}<<43;a.config.maxPeerChunks=512;
+  std::vector<uint64_t> dependencies(bs*topk,0);a.reduceDependencies=uintptr_t(dependencies.data());
+  std::vector<int64_t> inverse(bs*topk);std::vector<float> weights(bs*topk);
+  for(unsigned i=0;i<bs*topk;++i){inverse[i]=(i*17U)%(bs*topk);weights[i]=float(int(i%7)-3)/13;}
   std::vector<float> route(uint64_t(bs)*h,12345.0f);
   std::vector<bfloat16_t> shared(route.size()),out(route.size());
   for(size_t i=0;i<route.size();++i){shared[i]=bfloat16_t(float(int(i%17)-8)/11);out[i].bits=0x7fc1;}
   a.output=uintptr_t(out.data());a.sharedRoutedOutput=uintptr_t(route.data());a.sharedOutput=uintptr_t(shared.data());
   a.reduceIndex=uintptr_t(inverse.data());a.weights=uintptr_t(weights.data());
-  beforePayload=[](uintptr_t){};readFlag=[](uintptr_t){return uint64_t{16};};
+  beforePayload=[](uintptr_t){};readFlag=[&](uintptr_t addr){return addr==a.localFlags+uint64_t(kLocalFlagIncomingDone)*kFlagBytes ? (pr==2?uint64_t{0}:uint64_t{16}) : ~uint64_t{0};};
   Timer timer;NoReduceObserver observer;
   for(unsigned worker=0;worker<28;++worker){
    ub.fill(0xa5);ReduceGeneric<true>(a,worker,28,timer,observer);
@@ -40,7 +41,7 @@ int main(){
   }
   for(unsigned token=0;token<bs;++token)for(unsigned col=0;col<h;++col){
    const auto index=uint64_t(token)*h+col;
-   float sum=0;for(unsigned k=0;k<8;++k)sum+=float(Returned(inverse[token*8+k],col))*weights[token*8+k];
+   float sum=0;for(unsigned k=0;k<topk;++k)sum+=float(Returned(inverse[token*topk+k],col))*weights[token*topk+k];
    assert(route[index]==sum);
    assert(out[index].bits==bfloat16_t(sum+float(shared[index])).bits);
    differentRoundings+=out[index].bits!=bfloat16_t(float(bfloat16_t(sum))+float(shared[index])).bits;

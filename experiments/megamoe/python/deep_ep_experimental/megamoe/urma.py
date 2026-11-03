@@ -46,7 +46,7 @@ def _extension():
         or getattr(extension, "urma_communication_protocol", None) != COMMUNICATION_PROTOCOL
     ):
         raise RuntimeError("URMA commfirst/SO requires matching core and experimental extensions; rebuild the complete wheel")
-    if getattr(extension, "urma_dimension_contract", None) != "h8192-i16384-aligned256-v1":
+    if getattr(extension, "urma_dimension_contract", None) != "h8192-i16384-aligned256-k1to8-v2":
         raise RuntimeError("Rebuild the generalized-dimension MegaMoE extension")
     if getattr(extension,"urma_shared_contract",None)!="shared1-unitflag-fp32-sum-v2":
         raise RuntimeError("Rebuild the shared-expert MegaMoE extension")
@@ -130,11 +130,12 @@ class UrmaBuffer:
                 raise TypeError("allow_multi_host must be bool")
             integer("hidden", hidden, 256, 8192)
             integer("intermediate_hidden", intermediate_hidden, 256, 16384)
+            integer("num_topk", num_topk, 1, 8)
             integer("num_shared_experts", num_shared_experts, 0, 1)
             if shared_intermediate_hidden is None: shared_intermediate_hidden=intermediate_hidden
             integer("shared_intermediate_hidden", shared_intermediate_hidden, 256, 16384)
-            if hidden % 256 or intermediate_hidden % 256 or shared_intermediate_hidden % 256 or (num_experts,num_topk)!=(384,8):
-                raise ValueError("URMA requires H/I aligned256, E384/topk8/S0 or S1")
+            if hidden % 256 or intermediate_hidden % 256 or shared_intermediate_hidden % 256 or num_experts != 384:
+                raise ValueError("URMA requires H/I aligned256, E384/topk1..8/S0 or S1")
             integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 8192)
             integer("cv_rows", cv_rows, 128, 4096)
             integer("gmm1_ahead_mgroups", gmm1_ahead_mgroups, 0, 65536)

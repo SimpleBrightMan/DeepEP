@@ -8,7 +8,7 @@ The production `megamoe-urma` branch is unchanged. Shared gating is not implemen
 - Hidden H: multiples of 256, 256..8192.
 - Routed intermediate I: multiples of 256, 256..16384.
 - Shared intermediate Is: independent multiples of 256, 256..16384.
-- Exactly S0 (disabled) or S1; EP4/8/16, E384, TopK8.
+- Exactly S0 (disabled) or S1; EP4/8/16, E384, TopK 1..8.
 
 Pass `num_shared_experts=1, shared_intermediate_hidden=Is` to `UrmaBuffer`.
 Transform shared weight pairs with `transform_weights_for_mega_moe(..., shared=True)`
@@ -133,3 +133,20 @@ schedules, partial tiles, empty workers and repeated slot reuse. Two additional
 independent Golden single-cast tests passed. The queued model detects cases where
 premature BF16 rounding changes the output. CANN device/native compilation passed;
 no NPU accuracy or performance execution was performed for this update.
+
+## Variable TopK
+
+`--topk 1..8` overrides routed TopK in both urma_benchmark and golden; default 8.
+The API accepts `num_topk=1..8`. Shared count/width are independent of TopK.
+Metadata DMA uses exact-byte DataCopyPad for K != 8; route indices, weights,
+readiness dependencies and output strides use the selected K. UB/flag capacities
+remain sized for K8; larger K is rejected. H3584/K8/S0 retains its original reducer.
+New traces carry BS/world/model metadata; the shared dashboard reads these values.
+Rebuild the wheel before using the new API/CLI; the dimension capability marker
+rejects older wheels. TopK changes require regenerating the corresponding Golden.
+
+TopK update validation: 170 Python API/Golden/trace/scheduling regression tests
+passed, and dashboard TopK6 metadata inference passed. Native planner and queued
+C++ model cases have been extended to K1..8, but their execution is currently
+blocked by the local compiler sandbox. Remote CANN upload approval timed out;
+CANN compilation and NPU validation for this TopK update remain outstanding.
