@@ -228,8 +228,8 @@ private:
     AscendC::LocalTensor<uint32_t> routes_;
 };
 
-template <typename TraceSink>
-__aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker,uint32_t workers,uint32_t column, TraceSink& timer)
+template <typename TraceSink,class Observer>
+__aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker,uint32_t workers,uint32_t column, TraceSink& timer,Observer& observer)
 {
     using namespace AscendC;
     using Ub = ReduceUbContract;
@@ -269,6 +269,7 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker,uint
     uint32_t admitted = 0U;
     uint32_t probes = 0U;
     while (admitted != owned) {
+        observer.Poll();
         bool progress = false;
         for (uint32_t token = 0U; token < owned; ++token) {
             if (GenericReduceBitSet(issued, token)) continue;
@@ -310,8 +311,12 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker,uint
 }  // namespace MegaMoeUrma
 
 namespace MegaMoeUrma {
-template<class T> __aicore__ inline void ReduceGeneric(const Arguments& a,uint32_t worker,uint32_t workers,T& timer) {
+struct NoReduceObserver { __aicore__ inline void Poll(){} };
+template<class T,class O> __aicore__ inline void ReduceGeneric(const Arguments& a,uint32_t worker,uint32_t workers,T& timer,O& observer) {
     for(uint32_t col=0;col<a.config.hidden;col+=GenericReduce::ReduceUbContract::hidden)
-        GenericReduce::ReduceColumns(a,worker,workers,col,timer);
+        GenericReduce::ReduceColumns(a,worker,workers,col,timer,observer);
+}
+template<class T> __aicore__ inline void ReduceGeneric(const Arguments& a,uint32_t worker,uint32_t workers,T& timer) {
+    NoReduceObserver observer;ReduceGeneric(a,worker,workers,timer,observer);
 }
 }

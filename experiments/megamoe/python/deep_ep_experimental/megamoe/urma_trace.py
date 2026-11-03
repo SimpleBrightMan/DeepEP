@@ -56,9 +56,10 @@ EVENTS = (
     "CoarseDispatch", "CoarseCombine", "CoarseActivation", "CoarseReduce", "CoarseLocalSyncEnd",
     "CoarseDispatchSubmit",
     "PackRetire",
+    "SharedGmm1Tile", "SharedGmm1Drain", "SharedActivation", "SharedGmm2Tile", "SharedGmm2Drain", "SharedAdd", "CoarseSharedCombineSubmit",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
-SYNC_STAGES = {0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
+SYNC_STAGES = {4: "shared addition complete", 0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
 
 
 class TraceOverflowError(ValueError):
@@ -70,6 +71,8 @@ def event_style(event):
         return event, "compute.copy", "rail_animation", "Pack submission; includes retirement of previous segment, current ready may be deferred"
     if event == "PackRetire":
         return event, "compute.drain", "thread_state_iowait", "wait captured Pack fence and publish pending ready; Close also releases six DMA credits"
+    if event == "CoarseSharedCombineSubmit":
+        return event, "coarse.envelope", "thread_state_runnable", "Combine submission envelope; final quiet is deferred until after routed Reduce"
     if event == "CoarseDispatchSubmit":
         return event, "coarse.envelope", "thread_state_runnable", "Dispatch submission envelope, not remote completion; final Combine quiet retires both phases"
     if event.startswith("Coarse"):

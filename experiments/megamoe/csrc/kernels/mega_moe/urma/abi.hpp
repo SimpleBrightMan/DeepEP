@@ -81,7 +81,8 @@ enum class TraceEvent : uint32_t {
     CoarsePack, CoarseLocalSyncStart, CoarseGMM, CoarseDequant,
     CoarseDispatch, CoarseCombine, CoarseActivation, CoarseReduce, CoarseLocalSyncEnd,
     CoarseDispatchSubmit, // Submission-only envelope; legacy CoarseDispatch retains its meaning.
-    PackRetire // Final pending ready publication and/or Pack event release.
+    PackRetire, // Pending Pack notification/event release.
+    SharedGmm1Tile, SharedGmm1Drain, SharedActivation, SharedGmm2Tile, SharedGmm2Drain, SharedAdd, CoarseSharedCombineSubmit
 };
 
 struct TraceMeta {
@@ -236,6 +237,11 @@ struct Arguments {
     uint64_t coarseTrace; // explicit per-invocation mode; zero keeps detailed tracing
     uint64_t systemWorkspace;
     uint64_t ffts;
+    // Append shared-only state: preserve every routed Config/Arguments field offset.
+    uint32_t sharedExperts, sharedIntermediate;
+    uint64_t sharedWeight1, sharedWeight2, sharedScale1, sharedScale2;
+    uint64_t sharedGmm1, sharedActivation, sharedActivationScale, sharedOutput;
+    uint64_t sharedGmm1Done, sharedActivationDone;
 };
 static_assert(sizeof(Fragment) == 40);
 static_assert(sizeof(RowSegment) == 40);

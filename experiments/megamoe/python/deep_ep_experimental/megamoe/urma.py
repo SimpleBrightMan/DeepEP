@@ -48,6 +48,8 @@ def _extension():
         raise RuntimeError("URMA commfirst/SO requires matching core and experimental extensions; rebuild the complete wheel")
     if getattr(extension, "urma_dimension_contract", None) != "h8192-i16384-aligned256-v1":
         raise RuntimeError("Rebuild the generalized-dimension MegaMoE extension")
+    if getattr(extension,"urma_shared_contract",None)!="shared1-unitflag-head-tail-v1":
+        raise RuntimeError("Rebuild the shared-expert MegaMoE extension")
     return extension
 
 
@@ -106,6 +108,7 @@ class UrmaBuffer:
         num_experts=384,
         num_topk=8,
         num_shared_experts=0,
+        shared_intermediate_hidden=None,
         num_max_tokens_per_rank=8192,
         cv_rows=256,
         gmm1_ahead_mgroups=12,
@@ -127,8 +130,11 @@ class UrmaBuffer:
                 raise TypeError("allow_multi_host must be bool")
             integer("hidden", hidden, 256, 8192)
             integer("intermediate_hidden", intermediate_hidden, 256, 16384)
-            if hidden % 256 or intermediate_hidden % 256 or (num_experts,num_topk,num_shared_experts)!=(384,8,0):
-                raise ValueError("URMA requires H/I aligned256, E384/topk8/S0")
+            integer("num_shared_experts", num_shared_experts, 0, 1)
+            if shared_intermediate_hidden is None: shared_intermediate_hidden=intermediate_hidden
+            integer("shared_intermediate_hidden", shared_intermediate_hidden, 256, 16384)
+            if hidden % 256 or intermediate_hidden % 256 or shared_intermediate_hidden % 256 or (num_experts,num_topk)!=(384,8):
+                raise ValueError("URMA requires H/I aligned256, E384/topk8/S0 or S1")
             integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 8192)
             integer("cv_rows", cv_rows, 128, 4096)
             integer("gmm1_ahead_mgroups", gmm1_ahead_mgroups, 0, 65536)
@@ -147,6 +153,7 @@ class UrmaBuffer:
                 num_experts,
                 num_topk,
                 num_shared_experts,
+                shared_intermediate_hidden,
                 num_max_tokens_per_rank,
                 cv_rows,
                 gmm1_ahead_mgroups,
@@ -161,6 +168,8 @@ class UrmaBuffer:
         self.group = group
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
         self.num_experts, self.num_topk = num_experts, num_topk
+        self.num_shared_experts=num_shared_experts
+        self.shared_intermediate_hidden=shared_intermediate_hidden
         self.num_max_tokens_per_rank, self.max_recv_rows = num_max_tokens_per_rank, max_recv_rows
         self.cv_rows = cv_rows
         self.gmm1_ahead_mgroups = gmm1_ahead_mgroups
@@ -332,6 +341,7 @@ class UrmaBuffer:
                     address,
                     self._runtime.native.capacity,
                     self.gmm1_ahead_mgroups,
+                    *((self.num_shared_experts,self.shared_intermediate_hidden) if self.num_shared_experts else ()),
                 )
                 self._bind_reduce_dependencies(plan, routing.reduce_index)
             except Exception as failure:
@@ -342,7 +352,7 @@ class UrmaBuffer:
                 self, plan, routing, bs, received_by_rank[self.group.rank()], tuple(value._version for value in tensors)
             )
 
-    def forward_prepared(self, x, topk_weights, l1_weights, l2_weights, prepared, *, timer=None, out=None, trace=None, coarse_trace=False):
+    def forward_prepared(self, x, topk_weights, l1_weights, l2_weights, prepared, *, timer=None, out=None, trace=None, coarse_trace=False, shared_l1_weights=None, shared_l2_weights=None):
         """Expand/Dispatch/GMM1/SwiGLU/GMM2/return PUT and flag-gated weighted reduction."""
         import torch
         from .api import _check_fp4_weight_format, _RoutedWeightPair
@@ -377,6 +387,17 @@ class UrmaBuffer:
                 if weight.dtype != torch.uint8:
                     raise TypeError("URMA first profile requires packed FP4 weights")
                 _check_fp4_weight_format(weight, name)
+            shared=()
+            if self.num_shared_experts:
+                if shared_l1_weights is None or shared_l2_weights is None:
+                    raise ValueError("S1 needs both shared weight pairs, transformed with shared=True")
+                sw1,ss1=shared_l1_weights;sw2,ss2=shared_l2_weights
+                if isinstance(shared_l1_weights,_RoutedWeightPair):
+                    raise ValueError("Shared GMM1 requires planar shared=True prepared weights")
+                _check_fp4_weight_format(sw1,"shared_l1_weights");_check_fp4_weight_format(sw2,"shared_l2_weights")
+                shared=(sw1,sw2,ss1,ss2)
+            elif shared_l1_weights is not None or shared_l2_weights is not None:
+                raise ValueError("S0 does not accept shared weights")
             if trace is not None:
                 extension = _trace_extension()
                 row_elements = extension.urma_trace_num_engines * extension.urma_trace_record_elements
@@ -393,7 +414,7 @@ class UrmaBuffer:
                     )
                 if trace.data_ptr() % 128:
                     raise ValueError("trace storage must be 128-byte aligned; use UrmaBuffer.allocate_trace()")
-            operands = (data, scales, topk_weights, weight1, weight2, scale1, scale2, timer, out, trace)
+            operands = (data, scales, topk_weights, weight1, weight2, scale1, scale2, timer, out, trace, *shared)
             if any(value is not None and value.device != self._device for value in operands):
                 raise ValueError("all tensors must reside on the creating NPU")
             if any(value is not None and value.requires_grad for value in operands):
@@ -420,17 +441,20 @@ class UrmaBuffer:
             # including older test doubles and wheels used without this feature.
             if coarse_trace and (trace is None or timer is not None):
                 raise ValueError("coarse_trace requires trace storage and no aggregate timer")
-            if trace is not None:
+            if self.num_shared_experts:
+                native_operands += (trace,coarse_trace,*shared)
+            elif trace is not None:
                 native_operands += (trace,)
                 if coarse_trace:
                     native_operands += (True,)
             return self._enqueue_forward(prepared, native_operands)
 
-    def forward(self, x, topk_idx, topk_weights, l1_weights, l2_weights, *, timer=None, out=None, trace=None, coarse_trace=False):
+    def forward(self, x, topk_idx, topk_weights, l1_weights, l2_weights, *, timer=None, out=None, trace=None, coarse_trace=False, shared_l1_weights=None, shared_l2_weights=None):
         """Complete invocation, including fresh real-input route preparation."""
         with self._lock:
             prepared = self.prepare_routes(topk_idx)
             options = dict(timer=timer, out=out)
+            if shared_l1_weights is not None or shared_l2_weights is not None: options.update(shared_l1_weights=shared_l1_weights,shared_l2_weights=shared_l2_weights)
             if coarse_trace:
                 options["coarse_trace"] = True
             if trace is not None:

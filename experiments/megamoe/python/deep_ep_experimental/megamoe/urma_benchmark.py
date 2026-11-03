@@ -21,6 +21,8 @@ def parse_args(argv=None):
         help="Comma-separated BS/rank sweep; each BS must be in [1, num_max_tokens_per_rank] (native capacity <= 8192)",
     )
     parser.add_argument("--routing", choices=("balanced", "random", "skewed", "random-balanced"), default="balanced")
+    parser.add_argument("--shared-experts", type=int, choices=(0,1))
+    parser.add_argument("--shared-intermediate", type=int)
     parser.add_argument("--hidden", type=int)
     parser.add_argument("--intermediate", type=int)
     parser.add_argument("--cv-rows", type=int, default=256)
@@ -141,6 +143,11 @@ def main():
     config = load_config(args.config, args.bs_values)
     if args.hidden is not None: config["model"]["hidden"] = args.hidden
     if args.intermediate is not None: config["model"]["intermediate_hidden"] = args.intermediate
+    if args.shared_experts is not None: config["model"]["num_shared_experts"] = args.shared_experts
+    if config["model"]["num_shared_experts"]:
+        config["model"]["shared_intermediate_hidden"] = args.shared_intermediate if args.shared_intermediate is not None else config["model"].get("shared_intermediate_hidden",config["model"]["intermediate_hidden"])
+        config["model"]["shared_output_rounding"] = "route_bf16_then_add"
+
     for key in ("warmup", "iters"):
         value = getattr(args, key)
         if value is not None:
@@ -255,7 +262,7 @@ def run(args, config, group):
     model = config["model"]
     owner = UrmaBuffer(
         group,
-        **model,
+        **{k:v for k,v in model.items() if k!="shared_output_rounding"},
         num_max_tokens_per_rank=max(config["bs_values"]),
         cv_rows=args.cv_rows,
         gmm1_ahead_mgroups=args.gmm1_ahead_mgroups,
@@ -278,6 +285,12 @@ def run(args, config, group):
 
         debug_weight_sources = source_weight_prefixes(raw)
     weights = transform_weights_for_mega_moe(*map(device_pair, raw))
+    shared_raw=None;shared_options={}
+    if model["num_shared_experts"]:
+        shared_raw=make_weights(1,model["hidden"],model["shared_intermediate_hidden"],config["seed"]+100000)
+        sw1,sw2=transform_weights_for_mega_moe(*map(device_pair,shared_raw),shared=True)
+        shared_options=dict(shared_l1_weights=sw1,shared_l2_weights=sw2)
+
     launch_guard = UrmaLaunchGuard(
         group, args.exp_shape, args.exp_repeat, args.launch_timeout, backend=args.guard_backend
     )
@@ -287,7 +300,7 @@ def run(args, config, group):
 
         error = None
         try:
-            cascade_reference = CascadeReference(model, raw, host_group=group)
+            cascade_reference = (CascadeReference(model,raw,shared_raw,host_group=group) if shared_raw is not None else CascadeReference(model, raw, host_group=group))
         except Exception as failure:
             error = f"{type(failure).__name__}: {failure}"
         collective_check(group, "URMA cascade preparation", error)
@@ -314,7 +327,10 @@ def run(args, config, group):
         communication_completion="only final Combine quiet, covering both phases; no independent Dispatch completion timestamp",
         remote_workers=world - 1,
         swiglu_workers=28 - (world - 1),
-        reduce_workers=56 - (world - 1),
+        reduce_workers=28 if model["num_shared_experts"] else 56 - (world - 1),
+        startup_pack_workers=28 if model["num_shared_experts"] else 56,
+        shared_activation_workers=28 if model["num_shared_experts"] else 0,
+        shared_schedule="shared GMM1 -> routed -> shared GMM2; one lowest-priority shared activation slice per turn; local join + add" if model["num_shared_experts"] else "disabled",
         routing=args.routing,
         cv_rows=args.cv_rows,
         gmm1_ahead_mgroups=args.gmm1_ahead_mgroups,
@@ -405,7 +421,7 @@ def run(args, config, group):
         collective_check(group, f"URMA diagnostic allocation BS={bs}", error)
         torch.npu.synchronize()
         startup_mgroups = int(prepared.native.gmm1_startup_mgroups)
-        forward = partial(owner.forward_prepared, x, topk_weights, *weights, prepared, out=output)
+        forward = partial(owner.forward_prepared, x, topk_weights, *weights, prepared, out=output, **shared_options)
         coarse_forward = partial(forward, trace=coarse_trace, coarse_trace=True) if args.timer else None
         fine_forward = partial(forward, timer=timer, trace=trace) if args.fine else None
         mode_reports = {}
@@ -564,6 +580,9 @@ def run(args, config, group):
             reports["bandwidth_per_rank"] = bandwidth_records
             reports["bandwidth_scope"] = timer_metadata["scope"]
             reports["dispatch_bandwidth_unavailable"] = "Dispatch submission end is not completion; no independent completion probe"
+            if model["num_shared_experts"]:
+                reports["combine_bandwidth_unavailable"] = "Shared mode defers final quiet until after routed Reduce; Combine timer is submission-only"
+
             if rank == 0:
                 print("[URMA BW] Dispatch completion bandwidth unavailable: no separate Dispatch quiet", flush=True)
             reports["bandwidth_with_trace"] = args.fine

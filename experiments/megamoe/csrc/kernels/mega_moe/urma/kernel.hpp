@@ -6,6 +6,7 @@
 #include "compute.hpp"
 #include "pack_reduce.hpp"
 #include "reduce_generic.hpp"
+#include "shared.hpp"
 #include "pack_round.hpp"
 #include "tail_completion.hpp"
 #include "timer.hpp"
@@ -274,6 +275,174 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     }
 }
 
+__aicore__ inline void CommunicatePeerShared(const Arguments& args, uint32_t owner, Timer& timer,SharedIncoming& incoming)
+{
+    const uint32_t peer = PeerForOwner(args.config.rank, owner);
+    auto* symmetric = reinterpret_cast<__gm__ uint8_t*>(args.symmetric);
+    TraceMeta peerMeta; peerMeta.peer = peer;
+    timer.Begin(Phase::Barrier);
+    uint64_t start = timer.TraceBegin();
+    WaitStartAtLeast(symmetric + PeerPhaseSlot(args, 0U, peer), args.config.epoch);
+    timer.TraceEnd(TraceEvent::WaitStartPeer, start, peerMeta);
+    timer.End(Phase::Barrier);
+    const uint64_t h = args.config.hidden;
+    const uint64_t scales = h / 32U;
+    const uint64_t rowBytes = h * sizeof(bfloat16_t);
+    const uint32_t dispatchCvs = PeerDispatchCvCount(args, peer);
+    uint32_t nextPackRound = kPackStartupRounds;
+    PackBatch pack(args, timer);
+    uint32_t nextDispatch = 0U, step = 0U;
+    uint64_t dispatchBytes = 0U;
+    bool dispatchStarted = false;
+    while (nextDispatch < dispatchCvs) {
+        const uint32_t target = DispatchBatchLimit(step, dispatchCvs - nextDispatch,
+                                                   nextPackRound >= args.config.packRoundCount);
+        const Chunk first = LoadPackChunk(args, nextDispatch, peer);
+        uint32_t count = 1U;
+        uint64_t rows = first.rows;
+        while (count < target) {
+            const Chunk next = LoadPackChunk(args, nextDispatch + count, peer);
+            if (!AdjacentChunks(first, rows, count, next) || (rows + next.rows) * h > kMaxPutBytes) break;
+            rows += next.rows;
+            ++count;
+        }
+        const uint32_t end = nextDispatch + count;
+        // Startup/the previous iteration already prepared our current quota.
+        // This batch may depend on the previous pending quota: publish before
+        // polling PackReady. Keep the six event credits/cursor across scalar PUTs.
+        pack.FlushReady();
+        TraceMeta meta = ChunkTraceMeta(first); meta.rows = rows;
+        start = timer.TraceBegin();
+        for (uint32_t cv = nextDispatch; cv < end; ++cv) {
+            const Chunk chunk = LoadPackChunk(args, cv, peer);
+            while (ReadGmByPassDCache(PackReadyFlag(args, peer, cv)) < static_cast<int32_t>(chunk.rows)) {
+                const uint64_t backoff = GetSystemCycle();
+                while (GetSystemCycle() - backoff < 64U) {}
+            }
+        }
+        timer.TraceEnd(TraceEvent::WaitDispatch, start, meta);
+        if (!dispatchStarted) { timer.CoarseBegin(CoarsePhase::Dispatch); timer.Begin(Phase::Dispatch); dispatchStarted = true; }
+        meta.bytes = rows * h;
+        start = timer.TraceBegin();
+        Put(symmetric, args.config.receiveXOffset + first.remoteRow * h,
+            reinterpret_cast<__gm__ uint8_t*>(args.expandedX + first.localRow * h),
+            static_cast<uint32_t>(meta.bytes), peer);
+        timer.TraceEnd(TraceEvent::DispatchPutX, start, meta);
+        meta.bytes = rows * scales;
+        start = timer.TraceBegin();
+        Put(symmetric, args.config.receiveScaleOffset + first.remoteRow * scales,
+            reinterpret_cast<__gm__ uint8_t*>(args.expandedScale + first.localRow * scales),
+            static_cast<uint32_t>(meta.bytes), peer);
+        timer.TraceEnd(TraceEvent::DispatchPutScale, start, meta);
+        meta.bytes = 0U;
+        start = timer.TraceBegin();
+        // Same-QP SO orders each CV epoch after both merged payload PUTs.
+        // No per-batch quiet and no MTE flag write; flags are zeroed by the
+        // receiver before its start handshake. Each slot is added exactly once.
+        for (uint32_t cv = nextDispatch; cv < end; ++cv) {
+            const uint64_t index = static_cast<uint64_t>(args.config.rank) * args.config.maxPeerChunks + cv;
+            PublishOrdered(symmetric, args.config.dispatchReadyOffset + index * kFlagBytes, peer, args.config.epoch);
+        }
+        timer.TraceEnd(TraceEvent::DispatchPublish, start, meta);
+        dispatchBytes += rows * (h + scales);
+        nextDispatch = end;
+        ++step;
+        if (nextDispatch == dispatchCvs) {
+            // Submission-only endpoint must precede the final post-PUT Pack.
+            timer.CoarseEnd(CoarsePhase::Dispatch);
+            timer.End(Phase::Dispatch, dispatchBytes, true);
+        }
+        // Issue this round FIRST, then prepare future data while it is in flight.
+        // Keep every original static quota, extending Pack when the next 8-CV
+        // batch would otherwise outrun this owner's prepared prefix.
+        const uint32_t packLimit = DispatchPackAfterLimit(count, nextDispatch, step, dispatchCvs,
+                                                         nextPackRound, args.config.packRoundCount);
+        while (nextPackRound < packLimit)
+            PackOneRound(args, nextPackRound++, owner, kAic, pack);
+    }
+    // Submission boundary only: Dispatch may still be in flight when this
+    // owner starts Combine on the same QP. Do not introduce a quiet here.
+    // A short/empty peer still owns quotas belonging to other destinations.
+    while (nextPackRound < args.config.packRoundCount)
+        PackOneRound(args, nextPackRound++, owner, kAic, pack);
+    pack.Close();
+    MarkPackWorkerComplete(args);
+    // This owner has completed its original static Pack quota. Do not wait
+    // for other owners: each Combine CV is protected by GMM2 readiness.
+
+    SharedActivationState shared(args,owner,timer);
+    bool posted=false;
+    constexpr uint32_t kSubmittedOffset = ActivationUbContract::inputEnd; // survives shared activation UB use
+    static_assert(kSubmittedOffset + kMaxPeerChunks * sizeof(uint32_t) <= kRequiredUbBytes);
+    LocalTensor<uint32_t> submitted(TPosition::VECCALC, kSubmittedOffset, kMaxPeerChunks);
+    const uint32_t begin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer);
+    const uint32_t end = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer + 1U);
+    const uint32_t total = end - begin;
+    for (uint32_t i = 0; i < total; ++i) submitted.SetValue(i, 0U);
+    uint32_t remaining = total;
+    uint64_t combineBytes = 0U, waitStart = 0U;
+    bool combineStarted = false, waiting = false;
+    while (remaining != 0U || !shared.Done()) {
+        bool progress = false;
+        const uint64_t scanStart = timer.TraceBegin();
+        for (uint32_t i = 0; i < total;) {
+            if (submitted.GetValue(i)) { ++i; continue; }
+            const Chunk first = LoadChunk(args.recvChunks, begin + i);
+            if (!IsChunkComputed(args, first)) { ++i; continue; }
+            uint32_t count = 1U;
+            uint64_t rows = first.rows;
+            // Never absorb the final actual unsent CV into another PUT.
+            const uint32_t limit = remaining > 1U ? remaining - 1U : 1U;
+            while (count < limit && i + count < total && CombineRangeFitsWord(first.cv, count + 1U)) {
+                if (submitted.GetValue(i + count)) break;
+                const Chunk next = LoadChunk(args.recvChunks, begin + i + count);
+                if (!AdjacentChunks(first, rows, count, next) ||
+                    (rows + next.rows) * rowBytes > kMaxPutBytes || !IsChunkComputed(args, next)) break;
+                rows += next.rows;
+                ++count;
+            }
+            if (waiting) {
+                timer.TraceEnd(TraceEvent::WaitCombineReady, waitStart, peerMeta);
+                waiting = false;
+            }
+            if (!combineStarted) { timer.CoarseBegin(CoarsePhase::Combine); timer.Begin(Phase::Combine); combineStarted = true; }
+            TraceMeta meta = ChunkTraceMeta(first); meta.rows = rows; meta.bytes = rows * rowBytes;
+            start = timer.TraceBegin();
+            Put(symmetric, args.config.returnYOffset + first.remoteRow * rowBytes,
+                reinterpret_cast<__gm__ uint8_t*>(args.gmm2Output + first.localRow * rowBytes),
+                static_cast<uint32_t>(meta.bytes), peer);
+            timer.TraceEnd(TraceEvent::CombinePut, start, meta);
+            start = timer.TraceBegin();
+            PublishCombineRange(symmetric, args.config.combineReadyOffset, args.config.maxPeerChunks,
+                                args.config.rank, peer, first.cv, count);
+            meta.bytes = 0U;
+            timer.TraceEnd(TraceEvent::CombinePublish, start, meta);
+            for (uint32_t j = 0; j < count; ++j) submitted.SetValue(i + j, 1U);
+            combineBytes += rows * rowBytes;
+            remaining -= count;
+            i += count;
+            progress = true;
+        }
+        if(remaining==0 && !posted) {
+            PublishOrdered(symmetric,PeerPhaseSlot(args,1U,args.config.rank),peer,args.config.epoch);
+            timer.CoarseEnd(CoarsePhase::Combine);
+            if(combineStarted)timer.End(Phase::Combine,combineBytes,true);
+            posted=true;
+        }
+        if(!shared.Done()) {
+            SharedWaitScope before{timer,waiting,waitStart,peerMeta,TraceEvent::WaitCombineReady};
+            progress=shared.TryOne(before)||progress;
+        }
+        incoming.Poll();
+        if (!progress && remaining != 0U) {
+            if (!waiting) { waitStart = scanStart; waiting = true; }
+            const uint64_t backoff = GetSystemCycle();
+            while (GetSystemCycle() - backoff < 200U) {}
+        }
+    }
+    if(!posted)PublishOrdered(symmetric,PeerPhaseSlot(args,1U,args.config.rank),peer,args.config.epoch);
+}
+
 __aicore__ inline void RunProfiledCompute(const Arguments& args, uint32_t block, Timer& timer)
 {
     // Select once, outside the loop. NoopTimer has no state, clocks, stores,
@@ -289,7 +458,7 @@ __aicore__ inline void RunProfiledCompute(const Arguments& args, uint32_t block,
     }
 }
 
-__aicore__ inline void Process(const Arguments& args)
+__aicore__ inline void ProcessRouted(const Arguments& args)
 {
     Timer timer;
     timer.Init(args.timer, args.trace, args.traceCapacity, args.coarseTrace != 0U);
@@ -345,6 +514,64 @@ __aicore__ inline void Process(const Arguments& args)
     TraceLocalSync(timer, 3U);
     timer.FinishTrace();
     SetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL, MegaMoeImpl::OVERFLOW_MODE_CTRL>(originalOverflow);
+}
+
+template<class T> __aicore__ inline void RunSharedComputeSequence(const Arguments& a,uint32_t block,T& timer) {
+    RunSharedGmm<true>(a,block,timer);
+    RunCubeAndPrologue(a,block,timer);
+    if constexpr(g_coreType==AIC)MarkCubeComplete(a); // routed self-return is ready before Shared GMM2
+    RunSharedGmm<false>(a,block,timer);
+}
+__aicore__ inline void ProcessShared(const Arguments& a) {
+    Timer timer;timer.Init(a.timer,a.trace,a.traceCapacity,a.coarseTrace!=0);timer.SharedMode();
+    const uint32_t block=GetBlockIdx()/GetTaskRation(),comm=CommunicationWorkers(a.config.world);
+    const int64_t overflow=GetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL,MegaMoeImpl::OVERFLOW_MODE_CTRL>();
+    SetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL,MegaMoeImpl::OVERFLOW_MODE_CTRL>(0);
+    if constexpr(g_coreType==AIC) {
+        timer.CoarseBegin(CoarsePhase::Gmm);
+        if(a.coarseTrace || (!a.trace&&!a.timer)){NoopTimer t;RunSharedComputeSequence(a,block,t);}
+        else RunSharedComputeSequence(a,block,timer);
+        timer.CoarseEnd(CoarsePhase::Gmm);
+    } else if(GetSubBlockIdx()==0) {
+        timer.CoarseBegin(CoarsePhase::Dequant);
+        if(a.coarseTrace || (!a.trace&&!a.timer)){NoopTimer t;RunSharedComputeSequence(a,block,t);}
+        else RunSharedComputeSequence(a,block,timer);
+        timer.CoarseEnd(CoarsePhase::Dequant);
+    } else {
+        if(block<comm)PublishPeerStart(a,block,timer);
+        timer.CoarseBegin(CoarsePhase::Pack);
+        PackBatch pack(a,timer);
+        for(uint32_t round=0;round<kPackStartupRounds;++round)PackOneRound(a,round,block,kAic,pack);
+        pack.Close();timer.CoarseEnd(CoarsePhase::Pack);
+        SharedIncoming incoming{a,block};
+        if(block<comm)CommunicatePeerShared(a,block,timer,incoming);
+        else {
+            timer.CoarseBegin(CoarsePhase::Activation);
+            RunActivationShared(a,block-comm,timer);
+            timer.CoarseEnd(CoarsePhase::Activation);
+        }
+        PipeBarrier<PIPE_ALL>();
+        timer.CoarseBegin(CoarsePhase::Reduce);
+        ReduceGeneric(a,block,kAic,timer,incoming);
+        timer.CoarseEnd(CoarsePhase::Reduce);
+        if(block<comm) {
+            const auto start=timer.TraceBegin();Quiet(PeerForOwner(a.config.rank,block));
+            TraceMeta completion;completion.peer=PeerForOwner(a.config.rank,block);
+            timer.TraceEnd(TraceEvent::CombineSendComplete,start,completion);
+            while(!ObserveIncomingCompletion(a,block,incoming.peer,incoming.self)) {
+                const auto t=GetSystemCycle();while(GetSystemCycle()-t<200U){}
+            }
+        }
+    }
+    TraceLocalSync(timer,3U);
+    if constexpr(g_coreType==AIV) {
+        timer.CoarseBegin(CoarsePhase::SharedSum);
+        SharedAdd(a,LocalWorkerIndex(block,GetSubBlockIdx()),timer);
+        timer.CoarseEnd(CoarsePhase::SharedSum);
+    }
+    const auto join=timer.TraceBegin();SyncAll<false>();
+    TraceMeta m;m.cv=4;timer.TraceEnd(TraceEvent::LocalSync,join,m);
+    timer.FinishTrace();SetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL,MegaMoeImpl::OVERFLOW_MODE_CTRL>(overflow);
 }
 
 }  // namespace MegaMoeUrma

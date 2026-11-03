@@ -62,6 +62,24 @@ def naive(config, world, source, bs, routing, check_tokens):
     return bf16(result), counts[source * local : (source + 1) * local], selected
 
 
+def test_urma_shared_width_and_two_stage_rounding(config):
+    routed = copy.deepcopy(config)
+    routed["model"]["num_shared_experts"] = 0
+    routed_spec = golden.contract(routed, 2, 7, "fp8", "balanced", 0)
+    route_results = golden.generate(routed, routed_spec, [0, 1], workers=1)
+    config["model"].update(shared_intermediate_hidden=128, shared_output_rounding="route_bf16_then_add")
+    spec = golden.contract(config, 2, 7, "fp8", "balanced", 0)
+    actual = golden.generate(config, spec, [0, 1], workers=2)
+    raw = make_weights(1, 64, 128, config["seed"] + 100000)
+    w1, w2 = map(unpack_weight, raw)
+    for rank in (0, 1):
+        x = inputs(config, rank, 7, "balanced", world=2)[0]
+        x = dequantize_input(*quantize_input(x))
+        shared = expert_forward(x, w1[0], w2[0])
+        expected = bf16(route_results[rank][0] + shared)
+        np.testing.assert_array_equal(actual[rank][0], expected)
+
+
 @pytest.mark.parametrize("routing", ["balanced", "random", "skewed", "random-balanced"])
 @pytest.mark.parametrize("check_tokens", [0, 3])
 @pytest.mark.parametrize("shared", [0, 1])

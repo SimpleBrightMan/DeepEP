@@ -15,6 +15,7 @@ PYBIND11_MODULE(_C, module)
     module.attr("api_protocol") = 4;
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.def("buffer_size", &deepep::megamoe::buffer_size);
+    module.attr("urma_shared_contract") = "shared1-unitflag-head-tail-v1";
     module.attr("urma_api_protocol") = MegaMoeUrma::kProtocol;
     module.attr("urma_dimension_contract") = "h8192-i16384-aligned256-v1";
     module.attr("urma_communication_protocol") = "commfirst-dispatch-so-pack-after-v6";
@@ -32,11 +33,13 @@ PYBIND11_MODULE(_C, module)
     py::class_<deepep::megamoe::UrmaPlan>(module, "UrmaPlan")
         .def(py::init<torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, uint64_t,
                       uint64_t, int64_t, int64_t>())
+        .def(py::init<torch::Tensor, torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, uint64_t,
+                      uint64_t, int64_t, int64_t, int64_t, int64_t>())
         .def("bind_reduce_dependencies", &deepep::megamoe::UrmaPlan::bind_reduce_dependencies, py::arg("reduce_index"))
         .def("forward", &deepep::megamoe::UrmaPlan::forward, py::arg("x"), py::arg("x_scales"), py::arg("order"),
              py::arg("reduce_index"), py::arg("topk_weights"), py::arg("weight1"), py::arg("weight2"),
              py::arg("weight_scales1"), py::arg("weight_scales2"), py::arg("timer"), py::arg("out"), py::arg("epoch"),
-             py::arg("trace") = py::none(), py::arg("coarse_trace") = false)
+             py::arg("trace") = py::none(), py::arg("coarse_trace") = false, py::arg("shared_w1")=py::none(), py::arg("shared_w2")=py::none(), py::arg("shared_s1")=py::none(), py::arg("shared_s2")=py::none())
         .def_property_readonly("workspace_bytes", &deepep::megamoe::UrmaPlan::workspace_bytes)
         .def("debug_snapshot", &deepep::megamoe::UrmaPlan::debug_snapshot)
         .def_property_readonly("gmm1_startup_mgroups", &deepep::megamoe::UrmaPlan::gmm1_startup_mgroups);
