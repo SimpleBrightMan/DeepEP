@@ -194,3 +194,22 @@ Start with one bad BS, include the exact command, git revision, formal profile
 result and both diagnostic files. Use `--fine --trace-include-waits` when collecting
 new diagnostics. Coarse and fine are different invocations, not interchangeable
 hardware timelines. PUT gaps alone do not distinguish readiness from scheduling.
+
+### Comment-size report (recommended first upload)
+
+Use `--compact --max-chars 60000` instead of `--detail` for comment fields limited
+to 65536 characters. The report is ASCII and hard-bounded in both bytes and
+characters; reserved footer space states omissions. It includes all-rank stage
+boundaries, per-peer submitted bytes/rows and maximum PUT gaps, the largest 12
+gaps with clipped same-lane operation breakdown and edge context, plus the slowest
+rank's lane endpoints. Coarse input gets lane summaries instead of invented peers.
+It does not dump all events, hide final synchronization, or imply gaps are hardware
+idle. `--compact` overrides `--detail`/rank/core filters for consistent global triage.
+
+```bash
+python3 experiments/megamoe/scripts/urma_shared_trace_to_text.py /path/fine/allrank.json --compact --output fine_brief.txt
+python3 experiments/megamoe/scripts/urma_shared_trace_to_text.py /path/coarse/allrank.json --compact --output coarse_brief.txt
+```
+
+The 60000-character default leaves space for a short comment heading. Keep the
+original JSON locally; further event extraction can target the identified gap.
