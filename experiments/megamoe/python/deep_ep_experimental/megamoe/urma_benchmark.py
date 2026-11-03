@@ -21,6 +21,8 @@ def parse_args(argv=None):
         help="Comma-separated BS/rank sweep; each BS must be in [1, num_max_tokens_per_rank] (native capacity <= 8192)",
     )
     parser.add_argument("--routing", choices=("balanced", "random", "skewed", "random-balanced"), default="balanced")
+    parser.add_argument("--hidden", type=int)
+    parser.add_argument("--intermediate", type=int)
     parser.add_argument("--cv-rows", type=int, default=256)
     parser.add_argument(
         "--gmm1-ahead-mgroups",
@@ -137,6 +139,8 @@ def format_profile_summary(reports, world):
 def main():
     args = parse_args()
     config = load_config(args.config, args.bs_values)
+    if args.hidden is not None: config["model"]["hidden"] = args.hidden
+    if args.intermediate is not None: config["model"]["intermediate_hidden"] = args.intermediate
     for key in ("warmup", "iters"):
         value = getattr(args, key)
         if value is not None:

@@ -46,6 +46,8 @@ def _extension():
         or getattr(extension, "urma_communication_protocol", None) != COMMUNICATION_PROTOCOL
     ):
         raise RuntimeError("URMA commfirst/SO requires matching core and experimental extensions; rebuild the complete wheel")
+    if getattr(extension, "urma_dimension_contract", None) != "h8192-i16384-aligned256-v1":
+        raise RuntimeError("Rebuild the generalized-dimension MegaMoE extension")
     return extension
 
 
@@ -123,8 +125,10 @@ class UrmaBuffer:
                 raise ValueError("URMA MegaMoE requires EP4/EP8/EP16")
             if type(allow_multi_host) is not bool:
                 raise TypeError("allow_multi_host must be bool")
-            if (hidden, intermediate_hidden, num_experts, num_topk, num_shared_experts) != (3584, 1280, 384, 8, 0):
-                raise ValueError("First URMA profile supports H3584/I1280/E384/topk8/S0 only")
+            integer("hidden", hidden, 256, 8192)
+            integer("intermediate_hidden", intermediate_hidden, 256, 16384)
+            if hidden % 256 or intermediate_hidden % 256 or (num_experts,num_topk,num_shared_experts)!=(384,8,0):
+                raise ValueError("URMA requires H/I aligned256, E384/topk8/S0")
             integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 8192)
             integer("cv_rows", cv_rows, 128, 4096)
             integer("gmm1_ahead_mgroups", gmm1_ahead_mgroups, 0, 65536)

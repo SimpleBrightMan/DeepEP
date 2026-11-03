@@ -402,29 +402,37 @@ __aicore__ inline bool AreGroupInputsReady(const Arguments& args, const Fragment
 // A single worker owns a whole group's scales. Arbitrary segment row offsets
 // cannot be represented safely by the MX zZ L1 copy, so gather just this small
 // plane in aligned UB rows, then store compact GM rows for the original loader.
-__aicore__ inline void GatherInputScale(const Arguments& args, const Fragment& fragment, uint32_t index, Timer& timer)
+template <uint32_t FixedBytes>
+__aicore__ inline void GatherInputScaleImpl(const Arguments& args, const Fragment& fragment, uint32_t index, Timer& timer)
 {
+    const uint32_t scaleBytes = FixedBytes ? FixedBytes : args.config.hidden / 32U;
+    const uint32_t scaleStride = (scaleBytes + 31U) / 32U * 32U;
     GlobalTensor<uint8_t> source, destination;
     source.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.symmetric + args.config.receiveScaleOffset));
     source.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
     destination.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.gatheredInputScale));
-    LocalTensor<uint8_t> scratch(TPosition::VECCALC, 0U, kInputScaleUbBytes);
+    LocalTensor<uint8_t> scratch(TPosition::VECCALC, 0U, kComputeTileM * scaleStride);
     const uint64_t start = timer.TraceBegin();
     for (uint32_t segmentIndex = 0U; segmentIndex < fragment.segmentCount; ++segmentIndex) {
         const auto segment = LoadRowSegment(args, fragment.segmentBegin + segmentIndex);
-        DataCopyPad(scratch[segment.tileRow * kInputScaleUbStride], source[segment.receiveRow * kInputScaleBytes],
-                    {static_cast<uint16_t>(segment.rows), kInputScaleBytes, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+        DataCopyPad(scratch[segment.tileRow * scaleStride], source[segment.receiveRow * scaleBytes],
+                    {static_cast<uint16_t>(segment.rows), scaleBytes, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
     }
     SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-    DataCopyPad(destination[fragment.rowBegin * kInputScaleBytes], scratch,
-                {static_cast<uint16_t>(fragment.rows), kInputScaleBytes, 0U, 0U, 0U});
+    DataCopyPad(destination[fragment.rowBegin * scaleBytes], scratch,
+                {static_cast<uint16_t>(fragment.rows), scaleBytes, 0U, 0U, 0U});
     SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
     WriteGmByPassDCache(ComputeFlag(args.inputScaleDone, index), 1);
     auto meta = FragmentTraceMeta(fragment, index);
-    meta.bytes = static_cast<uint64_t>(fragment.rows) * kInputScaleBytes;
+    meta.bytes = static_cast<uint64_t>(fragment.rows) * scaleBytes;
     timer.TraceEnd(TraceEvent::InputScaleGather, start, meta);
+}
+
+__aicore__ inline void GatherInputScale(const Arguments& a,const Fragment& f,uint32_t i,Timer& t) {
+    if(a.config.hidden==3584U) GatherInputScaleImpl<112U>(a,f,i,t);
+    else GatherInputScaleImpl<0U>(a,f,i,t);
 }
 
 template <bool FuseGateUp>

@@ -5,6 +5,7 @@
 #include "abi.hpp"
 #include "compute.hpp"
 #include "pack_reduce.hpp"
+#include "reduce_generic.hpp"
 #include "pack_round.hpp"
 #include "tail_completion.hpp"
 #include "timer.hpp"
@@ -331,7 +332,8 @@ __aicore__ inline void Process(const Arguments& args)
         if (worker < ReduceWorkers(args.config.world)) {
             timer.Begin(Phase::ReducePhase);
             timer.CoarseBegin(CoarsePhase::Reduce);
-            Reduce(args, worker, timer);
+            if(args.config.hidden==3584U) Reduce(args, worker, timer);
+            else ReduceGeneric(args,worker,ReduceWorkers(args.config.world),timer);
             timer.CoarseEnd(CoarsePhase::Reduce);
             const uint64_t owned = ReduceOwnedRows(args.config.bs, worker, args.config.world);
             timer.End(Phase::ReducePhase, owned * args.config.hidden * sizeof(bfloat16_t));
