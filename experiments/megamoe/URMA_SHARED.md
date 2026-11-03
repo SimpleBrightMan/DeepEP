@@ -39,6 +39,21 @@ Only the 28 AIV1 workers perform the first two Pack rounds in S1. No startup
 SyncAll blocks the AIC/AIV0 shared GMM1. Existing PackReady and input-scale-ready
 checks protect remote and self input rows before routed GMM1.
 
+For S1 with BS < 4096, each peer's communication owner may submit at most
+`max(1, floor(BS / 1024))` Dispatch batches before all 28 local AICs finish
+shared GMM1. A batch is one merged X PUT + Scale PUT + the covered CV's SO flags.
+While this gate is closed, batching follows the normal 1,1,2,... ramp even if
+Pack is already complete; it cannot take the send-all-remaining shortcut.
+Thus BS1024 admits one batch, BS2048 two, and BS3072 three (1+1+2 CVs).
+At its limit, the owner flushes pending Pack-ready notifications and polls one
+local completed-AIC counter with 200-cycle backoff. Every AIC increments it once
+after its shared GMM1 context finishes, including cores with no assigned tiles.
+The counter uses an existing reserved localFlags slot, reset before each call.
+It does not wait for shared activation/GMM2, which would depend on routed compute.
+No quiet or rank barrier is added. Pack task ownership and quotas are unchanged.
+BS >= 4096 and S0 retain the unrestricted Dispatch path. Fine traces show this
+throttle wait as WaitDispatch; coarse Dispatch includes the wait in its envelope.
+
 Shared activation tasks are static over all 28 AIV1 workers: worker, worker+28,
 worker+56, ... Each task is one M128 x N256 activation slice. Polling is bounded,
 skips unready tasks, and executes at most one actual shared slice per turn.

@@ -339,6 +339,7 @@ def run(args, config, group):
         reduce_assignment="static contiguous token ranges across AIV0+AIV1; worker=2*block+subblock; AIV0 joins after its own dequant contexts; incoming counters remain AIV1-owned" if model["num_shared_experts"] else "original routed schedule",
         startup_pack_workers=28 if model["num_shared_experts"] else 56,
         shared_activation_workers=28 if model["num_shared_experts"] else 0,
+        shared_dispatch_startup_limit="BS<4096: per-peer max(1,floor(BS/1024)) merged batches before all local shared GMM1 AICs finish; normal ramp only while gated; no limit for BS>=4096/S0",
         shared_schedule="shared GMM1 -> routed -> shared GMM2; one lowest-priority shared activation slice per turn; local join + add" if model["num_shared_experts"] else "disabled",
         routing=args.routing,
         cv_rows=args.cv_rows,

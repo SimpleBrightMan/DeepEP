@@ -23,6 +23,7 @@ constexpr uint32_t kLocalFlagDispatchDone = 0U;
 constexpr uint32_t kLocalFlagAicDone = 1U;
 constexpr uint32_t kLocalFlagIncomingDone = 2U;
 constexpr uint32_t kLocalFlagPackDone = 3U;
+constexpr uint32_t kLocalFlagSharedGmm1Done = 4U; // small-BS S1: completed AICs, once per core
 // Reduce dependency values are uint64 bit patterns stored in an int64 tensor.
 // Low values address a producer/CV completion flag; tagged values address a
 // local GMM2 group that writes its self return rows directly.

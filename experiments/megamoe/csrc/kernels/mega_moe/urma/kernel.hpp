@@ -294,9 +294,30 @@ __aicore__ inline void CommunicatePeerShared(const Arguments& args, uint32_t own
     uint32_t nextDispatch = 0U, step = 0U;
     uint64_t dispatchBytes = 0U;
     bool dispatchStarted = false;
+    // Small S1 cases must not flood the link while the shared head is running.
+    // A wave is one merged X+Scale submission, not one individual PUT or CV.
+    const uint32_t startupWaves = args.config.bs / 1024U > 0U ? args.config.bs / 1024U : 1U;
+    bool sharedHeadReady = args.config.bs >= 4096U;
     while (nextDispatch < dispatchCvs) {
+        if (!sharedHeadReady) {
+            sharedHeadReady = ReadGmByPassDCache(LocalCompletionFlag(args, kLocalFlagSharedGmm1Done)) ==
+                              static_cast<int32_t>(kAic);
+            if (!sharedHeadReady && step >= startupWaves) {
+                // Retire the preceding static Pack quota before parking this
+                // sender; do not withhold its ready notifications from others.
+                pack.FlushReady();
+                const uint64_t waitStart = timer.TraceBegin();
+                while (ReadGmByPassDCache(LocalCompletionFlag(args, kLocalFlagSharedGmm1Done)) !=
+                       static_cast<int32_t>(kAic)) {
+                    const uint64_t backoff = GetSystemCycle();
+                    while (GetSystemCycle() - backoff < 200U) {}
+                }
+                timer.TraceEnd(TraceEvent::WaitDispatch, waitStart, peerMeta);
+                sharedHeadReady = true;
+            }
+        }
         const uint32_t target = DispatchBatchLimit(step, dispatchCvs - nextDispatch,
-                                                   nextPackRound >= args.config.packRoundCount);
+                                                   sharedHeadReady && nextPackRound >= args.config.packRoundCount);
         const Chunk first = LoadPackChunk(args, nextDispatch, peer);
         uint32_t count = 1U;
         uint64_t rows = first.rows;
@@ -518,6 +539,14 @@ __aicore__ inline void ProcessRouted(const Arguments& args)
 
 template<class T> __aicore__ inline void RunSharedComputeSequence(const Arguments& a,uint32_t block,T& timer) {
     RunSharedGmm<true>(a,block,timer);
+    if constexpr(g_coreType==AIC) {
+        // RunSharedGmm has drained this core's shared GMM1 output and retired
+        // its context. Count also cores with zero assigned shared tiles.
+        // Do not wait for routed compute/shared GMM2: that would create a cycle
+        // with the remaining Dispatch data needed by the routed experts.
+        if(a.config.bs<4096U)
+            AtomicAdd(LocalCompletionFlag(a,kLocalFlagSharedGmm1Done),1);
+    }
     RunCubeAndPrologue(a,block,timer);
     if constexpr(g_coreType==AIC)MarkCubeComplete(a); // routed self-return is ready before Shared GMM2
     RunSharedGmm<false>(a,block,timer);
