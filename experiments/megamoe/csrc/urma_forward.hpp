@@ -43,7 +43,7 @@ private:
     torch::Tensor pack_rounds_, pack_ready_;
     torch::Tensor expanded_reduce_dependencies_, reduce_dependencies_, bound_reduce_index_;
     torch::Tensor system_workspace_;
-    torch::Tensor shared_gmm1_,shared_activation_,shared_scale_,shared_output_,shared_done1_,shared_done_act_;
+    torch::Tensor shared_gmm1_,shared_activation_,shared_scale_,shared_output_,shared_routed_output_,shared_done1_,shared_done_act_;
     int64_t bound_reduce_index_version_ = -1;
     int64_t last_epoch_ = 0;
     int64_t gmm1_startup_mgroups_ = 0;

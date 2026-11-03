@@ -303,7 +303,7 @@ def main():
     if args.shared_experts is not None:config["model"]["num_shared_experts"]=args.shared_experts
     if args.urma_shared:
         config["model"]["shared_intermediate_hidden"]=args.shared_intermediate if args.shared_intermediate is not None else config["model"].get("shared_intermediate_hidden",config["model"]["intermediate_hidden"])
-        config["model"]["shared_output_rounding"]="route_bf16_then_add"
+        config["model"]["shared_output_rounding"]="single_cast"
 
     if args.ep_size <= 0 or any(rank >= args.ep_size for rank in ranks):
         parser.error("ranks must be within EP size")

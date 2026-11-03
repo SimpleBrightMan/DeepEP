@@ -5,6 +5,7 @@
 #include "reduce_pipeline.hpp"
 #include "combine_ready.hpp"
 #include "kernel_operator.h"
+#include <type_traits>
 
 namespace MegaMoeUrma::GenericReduce {
 
@@ -110,7 +111,7 @@ __aicore__ inline void GenericGateReduceInputs()
 // slot metadata, not a queue waiting for a batch of ready tokens to accumulate.
 // Consumer commands are submitted before reusing a full slot; no token switch
 // resets events or drains any hardware engine.
-template <typename Element>
+template <typename Element, bool KeepFp32 = false>
 class ReduceRoutePipeline {
 public:
     __aicore__ inline void Init(const Arguments& args, uint64_t firstToken,uint32_t column,uint32_t columns)
@@ -120,11 +121,12 @@ public:
         stride_=args.config.hidden;column_=column;columns_=columns;
         returned_.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(args.symmetric + args.config.returnYOffset));
         returned_.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
-        output_.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(args.output));
+        output_.SetGlobalBuffer(reinterpret_cast<__gm__ Output*>(KeepFp32 ? args.sharedRoutedOutput : args.output));
         inputs_ = LocalTensor<Element>(TPosition::VECCALC, Ub::inputBf16Offset, Ub::inputs * Ub::hidden);
         terms_ = LocalTensor<float>(TPosition::VECCALC, Ub::inputFp32Offset, Ub::inputs * Ub::hidden);
         accumulator_ = LocalTensor<float>(TPosition::VECCALC, Ub::accumulatorOffset, Ub::hidden);
-        outputs_ = LocalTensor<Element>(TPosition::VECCALC, Ub::outputOffset, Ub::outputs * Ub::hidden);
+        outputs_ = LocalTensor<Output>(TPosition::VECCALC, KeepFp32 ? Ub::end : Ub::outputOffset, Ub::outputs * Ub::hidden);
+        static_assert(Ub::end + Ub::outputs * Ub::fp32RowBytes <= kRequiredUbBytes);
         inverse_ = LocalTensor<int64_t>(TPosition::VECCALC, Ub::inverseOffset, Ub::maxRoutes);
         weights_ = LocalTensor<float>(TPosition::VECCALC, Ub::weightsOffset, Ub::maxRoutes);
         routes_ = LocalTensor<uint32_t>(TPosition::VECCALC, Ub::routeRingOffset, Ub::inputs);
@@ -184,10 +186,11 @@ public:
         if (topk == Ub::topk - 1U) {
             const uint32_t outputSlot = (consumed_ / Ub::topk) % Ub::outputs;
             const auto outputEvent = static_cast<TEventID>(outputSlot);
-            LocalTensor<Element> result = outputs_[outputSlot * Ub::hidden];
+            LocalTensor<Output> result = outputs_[outputSlot * Ub::hidden];
             WaitFlag<HardEvent::MTE3_V>(outputEvent);
             PipeBarrier<PIPE_V>();
-            Cast(result, accumulator_, RoundMode::CAST_RINT, columns_);
+            if constexpr (KeepFp32) DataCopy(result, accumulator_, columns_);
+            else Cast(result, accumulator_, RoundMode::CAST_RINT, columns_);
             SetFlag<HardEvent::V_MTE3>(outputEvent);
             WaitFlag<HardEvent::V_MTE3>(outputEvent);
             DataCopy(output_[(firstToken_ + route / Ub::topk) * stride_ + column_], result, columns_);
@@ -217,18 +220,21 @@ public:
 
 private:
     using Ub = ReduceUbContract;
+    using Output = std::conditional_t<KeepFp32, float, Element>;
     uint64_t firstToken_ = 0U;
     uint32_t stride_=0,column_=0,columns_=0;
     uint32_t submitted_ = 0U;
     uint32_t consumed_ = 0U;
-    AscendC::GlobalTensor<Element> returned_, output_;
-    AscendC::LocalTensor<Element> inputs_, outputs_;
+    AscendC::GlobalTensor<Element> returned_;
+    AscendC::GlobalTensor<Output> output_;
+    AscendC::LocalTensor<Element> inputs_;
+    AscendC::LocalTensor<Output> outputs_;
     AscendC::LocalTensor<float> terms_, accumulator_, weights_;
     AscendC::LocalTensor<int64_t> inverse_;
     AscendC::LocalTensor<uint32_t> routes_;
 };
 
-template <typename TraceSink,class Observer>
+template <bool KeepFp32 = false, typename TraceSink,class Observer>
 __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker,uint32_t workers,uint32_t column, TraceSink& timer,Observer& observer)
 {
     using namespace AscendC;
@@ -250,7 +256,7 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker,uint
     LocalTensor<uint32_t> remoteCache(TPosition::VECCALC, Ub::remoteCacheOffset, Ub::remoteCacheBytes / 4U);
     LocalTensor<uint32_t> selfCache(TPosition::VECCALC, Ub::selfCacheOffset, Ub::selfCacheBytes / 4U);
     LocalTensor<uint32_t> issued(TPosition::VECCALC, Ub::issuedOffset, Ub::issuedBytes / 4U);
-    ReduceRoutePipeline<bfloat16_t> pipeline;
+    ReduceRoutePipeline<bfloat16_t, KeepFp32> pipeline;
     const uint32_t columns=args.config.hidden-column<Ub::hidden?args.config.hidden-column:Ub::hidden;
     pipeline.Init(args, firstToken,column,columns);
     bool allInputsReady = GenericAllReduceInputsReady(args);
@@ -304,7 +310,7 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker,uint
     TraceMeta meta;
     meta.row = firstToken;
     meta.rows = owned;
-    meta.bytes = static_cast<uint64_t>(owned) * Ub::bf16RowBytes;
+    meta.bytes = static_cast<uint64_t>(owned) * columns * (KeepFp32 ? 4U : 2U);
     timer.TraceEnd(TraceEvent::Reduce, reduceStart, meta);
 }
 
@@ -312,9 +318,9 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker,uint
 
 namespace MegaMoeUrma {
 struct NoReduceObserver { __aicore__ inline void Poll(){} };
-template<class T,class O> __aicore__ inline void ReduceGeneric(const Arguments& a,uint32_t worker,uint32_t workers,T& timer,O& observer) {
+template<bool KeepFp32 = false,class T,class O> __aicore__ inline void ReduceGeneric(const Arguments& a,uint32_t worker,uint32_t workers,T& timer,O& observer) {
     for(uint32_t col=0;col<a.config.hidden;col+=GenericReduce::ReduceUbContract::hidden)
-        GenericReduce::ReduceColumns(a,worker,workers,col,timer,observer);
+        GenericReduce::ReduceColumns<KeepFp32>(a,worker,workers,col,timer,observer);
 }
 template<class T> __aicore__ inline void ReduceGeneric(const Arguments& a,uint32_t worker,uint32_t workers,T& timer) {
     NoReduceObserver observer;ReduceGeneric(a,worker,workers,timer,observer);

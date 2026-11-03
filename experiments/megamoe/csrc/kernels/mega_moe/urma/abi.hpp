@@ -242,6 +242,7 @@ struct Arguments {
     uint64_t sharedWeight1, sharedWeight2, sharedScale1, sharedScale2;
     uint64_t sharedGmm1, sharedActivation, sharedActivationScale, sharedOutput;
     uint64_t sharedGmm1Done, sharedActivationDone;
+    uint64_t sharedRoutedOutput; // S1 FP32 routed sum; round only after adding shared result.
 };
 static_assert(sizeof(Fragment) == 40);
 static_assert(sizeof(RowSegment) == 40);

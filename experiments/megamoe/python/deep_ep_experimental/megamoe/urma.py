@@ -48,7 +48,7 @@ def _extension():
         raise RuntimeError("URMA commfirst/SO requires matching core and experimental extensions; rebuild the complete wheel")
     if getattr(extension, "urma_dimension_contract", None) != "h8192-i16384-aligned256-v1":
         raise RuntimeError("Rebuild the generalized-dimension MegaMoE extension")
-    if getattr(extension,"urma_shared_contract",None)!="shared1-unitflag-head-tail-v1":
+    if getattr(extension,"urma_shared_contract",None)!="shared1-unitflag-fp32-sum-v2":
         raise RuntimeError("Rebuild the shared-expert MegaMoE extension")
     return extension
 

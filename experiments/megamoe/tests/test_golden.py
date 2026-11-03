@@ -55,11 +55,21 @@ def naive(config, world, source, bs, routing, check_tokens):
         result += local_reference(x, ids[selected], weights[selected], *map(unpack_weight, raw), owner * local)
     if model["num_shared_experts"]:
         raw = make_weights(
-            model["num_shared_experts"], model["hidden"], model["intermediate_hidden"], config["seed"] + 100000
+            model["num_shared_experts"], model["hidden"], model.get("shared_intermediate_hidden", model["intermediate_hidden"]), config["seed"] + 100000
         )
         for w1, w2 in zip(*map(unpack_weight, raw)):
             result += expert_forward(x, w1, w2)
     return bf16(result), counts[source * local : (source + 1) * local], selected
+
+
+@pytest.mark.parametrize("shared_width", [64, 128])
+def test_urma_shared_single_cast_matches_main_precision(config, shared_width):
+    config["model"].update(shared_intermediate_hidden=shared_width, shared_output_rounding="single_cast")
+    spec = golden.contract(config, 2, 7, "fp8", "balanced", 0)
+    actual = golden.generate(config, spec, [0, 1], workers=2)
+    for rank in (0, 1):
+        expected = naive(config, 2, rank, 7, "balanced", 0)
+        np.testing.assert_array_equal(actual[rank][0], expected[0])
 
 
 def test_urma_shared_width_and_two_stage_rounding(config):

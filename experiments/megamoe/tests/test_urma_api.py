@@ -336,7 +336,7 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object(), megamoe_urma_communication_protocol=urma.COMMUNICATION_PROTOCOL))
     extension = SimpleNamespace(
         urma_api_protocol=1, urma_tail_schedule=tail, urma_compute_schedule="wave12-ep4-all-bs-samestage-deferred-v6",
-        urma_shared_contract="shared1-unitflag-head-tail-v1", urma_dimension_contract="h8192-i16384-aligned256-v1", urma_communication_protocol=urma.COMMUNICATION_PROTOCOL
+        urma_shared_contract="shared1-unitflag-fp32-sum-v2", urma_dimension_contract="h8192-i16384-aligned256-v1", urma_communication_protocol=urma.COMMUNICATION_PROTOCOL
     )
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
     urma._extension.cache_clear()
@@ -380,7 +380,7 @@ def test_commfirst_protocol_rejects_old_native_modules(monkeypatch, old_module):
         urma_api_protocol=1,
         urma_tail_schedule="combine-ready-scan-reduce-world-v1",
         urma_compute_schedule="wave12-ep4-all-bs-samestage-deferred-v6",
-        urma_shared_contract="shared1-unitflag-head-tail-v1", urma_dimension_contract="h8192-i16384-aligned256-v1", urma_communication_protocol=protocol,
+        urma_shared_contract="shared1-unitflag-fp32-sum-v2", urma_dimension_contract="h8192-i16384-aligned256-v1", urma_communication_protocol=protocol,
     )
     if old_module == "core":
         del core.megamoe_urma_communication_protocol

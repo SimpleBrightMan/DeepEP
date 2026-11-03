@@ -1,6 +1,6 @@
 # Comm-first shared expert (S0/S1)
 
-This branch has two commits: dimension generalization, then shared-expert support.
+This branch started with dimension generalization and shared-expert support.
 The production `megamoe-urma` branch is unchanged. Shared gating is not implemented.
 
 ## Dimensions and API
@@ -62,9 +62,15 @@ AIV0 stays with the shared GMM2 dequantization and does not perform routed Reduc
 
 After a local SyncAll, all 56 AIV workers add shared output to routed output,
 followed by the final local join. There is no added cross-rank barrier.
-The numerical contract is BF16(BF16(routed FP32 weighted sum) + shared BF16 output),
-with the final addition performed in FP32. Golden/cascade explicitly model this
-rounding and the independently configured shared intermediate width.
+The numerical contract matches main Unpermute: BF16(routed FP32 weighted sum +
+FP32(shared BF16 output)), with only one final BF16 rounding. S1 Reduce writes a
+separate BS*H*4-byte FP32 buffer; S0 still directly writes its original BF16 output.
+All 56 AIVs perform final summation using six 2048-element slots (144 KiB UB):
+MTE2 reads FP32 routed/BF16 shared, VEC casts shared/Add/casts output, MTE3 writes
+BF16. Slot reuse is guarded by V_MTE2/MTE3_V; no per-tile MTE3_S or PIPE_ALL.
+Only the terminal drain precedes the existing local join. Golden/cascade use
+single_cast; previous shared Golden caches must be regenerated. This trades
+2 additional routed bytes per write/read for matching main's FP32 precision.
 
 ## Build and run
 
@@ -120,3 +126,10 @@ CANN 9.2.0 device kernels and native extensions built successfully in the isolat
 cases, 40 shared-task ownership/tail cases, and original routed argument-prefix
 layout assertions passed. S0 Process/communication bodies are checked against the
 dimension commit. No NPU correctness or performance run has been performed.
+
+Shared sum pipeline update (2026-11-03): 105 selected CPU tests passed, including
+execution of the real FP32 Reduce + SharedAdd headers under three queued-engine
+schedules, partial tiles, empty workers and repeated slot reuse. Two additional
+independent Golden single-cast tests passed. The queued model detects cases where
+premature BF16 rounding changes the output. CANN device/native compilation passed;
+no NPU accuracy or performance execution was performed for this update.

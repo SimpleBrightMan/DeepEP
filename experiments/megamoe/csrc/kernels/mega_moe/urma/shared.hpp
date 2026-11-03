@@ -1,6 +1,7 @@
 #pragma once
 #include "compute.hpp"
 #include "shared_contract.hpp"
+#include "shared_add.hpp"
 #include "tail_completion.hpp"
 namespace MegaMoeUrma {
 using SharedGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig,false,MegaMoeImpl::GmmKernel::ContiguousRowIO>;
@@ -126,25 +127,6 @@ struct SharedIncoming {
     __aicore__ inline void Poll(){if(core<CommunicationWorkers(a.config.world))ObserveIncomingCompletion(a,core,peer,self);}
 };
 
-__aicore__ inline void SharedAdd(const Arguments& a,uint32_t worker,Timer& timer) {
-    constexpr uint32_t width=1024;
-    GlobalTensor<bfloat16_t> routed,shared;
-    routed.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(a.output));
-    shared.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(a.sharedOutput));
-    LocalTensor<bfloat16_t> x(TPosition::VECCALC,0,width),y(TPosition::VECCALC,width*2,width);
-    LocalTensor<float> fx(TPosition::VECCALC,width*4,width),fy(TPosition::VECCALC,width*8,width);
-    const auto start=timer.TraceBegin();const uint64_t total=uint64_t(a.config.bs)*a.config.hidden;
-    for(uint64_t offset=uint64_t(worker)*width;offset<total;offset+=kLocalWorkers*width) {
-        const uint32_t n=total-offset<width?total-offset:width;
-        DataCopy(x,routed[offset],n);DataCopy(y,shared[offset],n);
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        Cast(fx,x,RoundMode::CAST_NONE,n);Cast(fy,y,RoundMode::CAST_NONE,n);PipeBarrier<PIPE_V>();
-        Add(fx,fx,fy,n);PipeBarrier<PIPE_V>();Cast(x,fx,RoundMode::CAST_RINT,n);
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        DataCopy(routed[offset],x,n);SetFlag<HardEvent::MTE3_S>(EVENT_ID0);WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-    }
-    timer.TraceEnd(TraceEvent::SharedAdd,start);
-}
 __aicore__ inline void RunActivationShared(const Arguments& args, uint32_t worker, Timer& timer)
 {
     const uint32_t activationWorkers = ActivationWorkers(args.config.world);

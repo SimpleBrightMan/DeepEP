@@ -552,7 +552,7 @@ __aicore__ inline void ProcessShared(const Arguments& a) {
         }
         PipeBarrier<PIPE_ALL>();
         timer.CoarseBegin(CoarsePhase::Reduce);
-        ReduceGeneric(a,block,kAic,timer,incoming);
+        ReduceGeneric<true>(a,block,kAic,timer,incoming);
         timer.CoarseEnd(CoarsePhase::Reduce);
         if(block<comm) {
             const auto start=timer.TraceBegin();Quiet(PeerForOwner(a.config.rank,block));

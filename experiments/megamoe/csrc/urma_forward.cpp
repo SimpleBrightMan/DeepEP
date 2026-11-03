@@ -146,6 +146,8 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
         const uint64_t si=args_.sharedIntermediate,groups=(config.bs+255U)/256U;
         shared_gmm1_=allocate(config.bs*si*4);shared_activation_=allocate(config.bs*si);
         shared_scale_=allocate(config.bs*(si/32));shared_output_=allocate(uint64_t(config.bs)*config.hidden*2);
+        shared_routed_output_=allocate(uint64_t(config.bs)*config.hidden*4);
+        args_.sharedRoutedOutput=Address(shared_routed_output_);
         shared_done1_=allocate(groups*(si/256)*MegaMoeUrma::kFlagBytes);
         shared_done_act_=allocate(groups*MegaMoeUrma::kFlagBytes);
         args_.sharedGmm1=Address(shared_gmm1_);args_.sharedActivation=Address(shared_activation_);
@@ -411,7 +413,7 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }
     if(args_.sharedExperts) {
-        for(const auto* t:{&shared_gmm1_,&shared_activation_,&shared_scale_,&shared_output_,&shared_done1_,&shared_done_act_})
+        for(const auto* t:{&shared_gmm1_,&shared_activation_,&shared_scale_,&shared_output_,&shared_routed_output_,&shared_done1_,&shared_done_act_})
             c10_npu::NPUCachingAllocator::recordStream(t->storage().data_ptr(),stream);
         for(const auto* t:{&*shared_w1,&*shared_w2,&*shared_s1,&*shared_s2})
             c10_npu::NPUCachingAllocator::recordStream(t->storage().data_ptr(),stream);
@@ -462,6 +464,7 @@ std::map<std::string, torch::Tensor> UrmaPlan::debug_snapshot() const
         copy("shared_gmm1",args_.sharedGmm1,shared_gmm1_.nbytes());
         copy("shared_activation",args_.sharedActivation,shared_activation_.nbytes());
         copy("shared_output",args_.sharedOutput,shared_output_.nbytes());
+        copy("shared_routed_fp32",args_.sharedRoutedOutput,shared_routed_output_.nbytes());
     }
     return result;
 }
@@ -494,7 +497,7 @@ int64_t UrmaPlan::workspace_bytes() const
                                &local_flags_,
                                &system_workspace_})
         if (tensor->defined()) bytes += tensor->nbytes();
-    for(const auto* t:{&shared_gmm1_,&shared_activation_,&shared_scale_,&shared_output_,&shared_done1_,&shared_done_act_})
+    for(const auto* t:{&shared_gmm1_,&shared_activation_,&shared_scale_,&shared_output_,&shared_routed_output_,&shared_done1_,&shared_done_act_})
         if(t->defined())bytes+=t->nbytes();
     return bytes;
 }
