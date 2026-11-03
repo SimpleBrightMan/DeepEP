@@ -173,3 +173,24 @@ passed, and dashboard TopK6 metadata inference passed. Native planner and queued
 C++ model cases have been extended to K1..8, but their execution is currently
 blocked by the local compiler sandbox. Remote CANN upload approval timed out;
 CANN compilation and NPU validation for this TopK update remain outstanding.
+
+## Compact diagnostic export
+
+`urma_shared_trace_to_text.py` accepts single-rank and allrank Chrome JSON.
+It reports every rank's stage boundaries, then selected-rank lane/peer summaries.
+Default selection is the rank with the largest metadata diagnostic envelope.
+`--detail` preserves all available waits, quiet/drain and final synchronization;
+no gaps are removed or clocks aligned across ranks. Hidden source waits cannot
+be reconstructed. Event positions are rounded to two decimals for text only.
+
+```bash
+python3 experiments/megamoe/scripts/urma_shared_trace_to_text.py /path/coarse/allrank.json --detail --output coarse.txt
+python3 experiments/megamoe/scripts/urma_shared_trace_to_text.py /path/fine/allrank.json --detail --output fine.txt
+```
+
+Use `--ranks 0,7` to inspect specific ranks, or `--ranks all` for every rank.
+Optional `--cores 0,1,15-17` limits detail; the all-rank summary remains complete.
+Start with one bad BS, include the exact command, git revision, formal profile
+result and both diagnostic files. Use `--fine --trace-include-waits` when collecting
+new diagnostics. Coarse and fine are different invocations, not interchangeable
+hardware timelines. PUT gaps alone do not distinguish readiness from scheduling.
