@@ -537,6 +537,13 @@ __aicore__ inline void ProcessShared(const Arguments& a) {
         if(a.coarseTrace || (!a.trace&&!a.timer)){NoopTimer t;RunSharedComputeSequence(a,block,t);}
         else RunSharedComputeSequence(a,block,timer);
         timer.CoarseEnd(CoarsePhase::Dequant);
+        // This AIV0 has finished its own dequant contexts. Release its local
+        // UB/event use before Reduce; do not wait for other AIC/AIV workers.
+        PipeBarrier<PIPE_ALL>();
+        NoReduceObserver observer; // incoming counters remain AIV1-owned
+        timer.CoarseBegin(CoarsePhase::Reduce);
+        ReduceGeneric<true>(a,LocalWorkerIndex(block,0U),kLocalWorkers,timer,observer);
+        timer.CoarseEnd(CoarsePhase::Reduce);
     } else {
         if(block<comm)PublishPeerStart(a,block,timer);
         timer.CoarseBegin(CoarsePhase::Pack);
@@ -552,7 +559,7 @@ __aicore__ inline void ProcessShared(const Arguments& a) {
         }
         PipeBarrier<PIPE_ALL>();
         timer.CoarseBegin(CoarsePhase::Reduce);
-        ReduceGeneric<true>(a,block,kAic,timer,incoming);
+        ReduceGeneric<true>(a,LocalWorkerIndex(block,1U),kLocalWorkers,timer,incoming);
         timer.CoarseEnd(CoarsePhase::Reduce);
         if(block<comm) {
             const auto start=timer.TraceBegin();Quiet(PeerForOwner(a.config.rank,block));

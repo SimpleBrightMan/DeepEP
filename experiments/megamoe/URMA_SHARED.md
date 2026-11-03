@@ -54,11 +54,19 @@ skips unready tasks, and executes at most one actual shared slice per turn.
   activation cannot overwrite it between communication scans.
 - Every worker completes its static shared activation quota before entering Reduce.
 
-All 28 AIV1 workers perform routed Reduce. Incoming completion monitoring continues
-inside its scans. Communication owners defer their final QP quiet until their
-Reduce completes; no source buffer is reused before quiet. AIC completion used by
-the routed Reduce fast path is published after ROUTED GMM2, before shared GMM2.
-AIV0 stays with the shared GMM2 dequantization and does not perform routed Reduce.
+All 56 AIV0/AIV1 workers perform routed Reduce with static, disjoint, contiguous
+token ranges. Worker ID is `2 * block + subblock`; each worker owns `BS / 56`
+tokens plus one for the first `BS % 56` workers. No token or TopK sum is split
+between workers, and no work stealing or GM atomic accumulation is introduced.
+AIV0 enters Reduce immediately after its own shared GMM2 dequant context finishes
+and a local pipeline drain releases its UB/events. It does not wait for other
+workers or a global join. AIV1 enters after its existing communication/activation
+work. Incoming completion monitoring and counters remain solely with the original
+AIV1 communication owners; AIV0 reads readiness but never increments these counters.
+Communication owners defer their final QP quiet until their Reduce completes;
+no source buffer is reused before quiet. AIC completion used by the routed Reduce
+fast path is published after ROUTED GMM2, before shared GMM2. The existing local
+join after all workers finish Reduce/shared compute remains in place.
 
 After a local SyncAll, all 56 AIV workers add shared output to routed output,
 followed by the final local join. There is no added cross-rank barrier.
