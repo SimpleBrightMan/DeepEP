@@ -269,6 +269,9 @@ def compare(actual, expected, *, diff_thd=0.01, pct_thd=0.05, max_diff=0.1):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--hidden",type=int)
+    parser.add_argument("--intermediate",type=int)
+    parser.add_argument("--topk",type=int,choices=range(1,9))
     parser.add_argument("--config", default="smoke")
     parser.add_argument("--bs-values")
     parser.add_argument("--ep-size", type=int, required=True)
@@ -291,6 +294,9 @@ def main():
     from .timer.__main__ import parse_ranks
 
     config, ranks = load_config(args.config, args.bs_values), parse_ranks(args.ranks)
+    if args.hidden is not None:config["model"]["hidden"]=args.hidden
+    if args.intermediate is not None:config["model"]["intermediate_hidden"]=args.intermediate
+    if args.topk is not None:config["model"]["num_topk"]=args.topk
     if args.ep_size <= 0 or any(rank >= args.ep_size for rank in ranks):
         parser.error("ranks must be within EP size")
     print(f"[GOLDEN] workers={args.workers} BLAS_threads={threads} chunk_tokens={args.chunk_tokens}", flush=True)

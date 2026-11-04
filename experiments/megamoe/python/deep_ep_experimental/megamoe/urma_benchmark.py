@@ -14,6 +14,9 @@ from .benchmark import inputs, load_config
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--hidden",type=int)
+    parser.add_argument("--intermediate",type=int)
+    parser.add_argument("--topk",type=int,choices=range(1,9))
     parser.add_argument("--config", default="urma")
     parser.add_argument(
         "--bs-values",
@@ -137,6 +140,9 @@ def format_profile_summary(reports, world):
 def main():
     args = parse_args()
     config = load_config(args.config, args.bs_values)
+    if args.hidden is not None:config["model"]["hidden"]=args.hidden
+    if args.intermediate is not None:config["model"]["intermediate_hidden"]=args.intermediate
+    if args.topk is not None:config["model"]["num_topk"]=args.topk
     for key in ("warmup", "iters"):
         value = getattr(args, key)
         if value is not None:
