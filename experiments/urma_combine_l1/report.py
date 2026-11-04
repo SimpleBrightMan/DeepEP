@@ -94,7 +94,7 @@ def calculate_mfu(result,model,peak_tflops):
 
 
 def display(result,label):
-    print(f'\n[compute+dequant={label} communication={"on" if result.get("communication_enabled",True) else "off"}] prefilled independent GMM inputs')
+    print(f'\n[compute+dequant={label} notify={result.get("completion_notify","off")} communication={"on" if result.get("communication_enabled",True) else "off"}] prefilled independent GMM inputs')
     for kind,row in result['classes'].items():
         if row is None:print(f'{kind}: N/A');continue
         bw='' if row['mean_gbps'] is None else f"{row['mean_gbps']:.3f} GB/s/card rank-min/max={row['rank_min_gbps']:.3f}/{row['rank_max_gbps']:.3f}; "

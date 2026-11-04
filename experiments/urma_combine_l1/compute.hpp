@@ -1,5 +1,7 @@
 #pragma once
 #include "../megamoe/csrc/kernels/mega_moe/urma/compute.hpp"
+#include "../megamoe/csrc/kernels/mega_moe/urma/shared_completion.hpp"
+#include "completion_policy.hpp"
 namespace Demo {
 using namespace MegaMoeUrma;
 using SharedGmm1=MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig,false,MegaMoeImpl::GmmKernel::ContiguousRowIO>;
@@ -18,8 +20,8 @@ __aicore__ inline auto MakeConfig(const MegaMoeImpl::ProblemShape& shape,const M
     if constexpr(Gmm1)return UrmaGmmConfigFor<Fused>::BuildGmm1ProblemConfig(shape,job,kComputeTileM);
     else return UrmaGmmConfig::BuildGmm2ProblemConfig(shape,job,kComputeTileM);
 }
-template<bool Gmm1,bool Fused,class Gmm>
-__aicore__ inline void ComputeFragment(const Arguments& a,uint32_t block,uint32_t index,uint32_t first,Gmm& gmm) {
+template<bool Notify,bool Gmm1,bool Fused,class Gmm,class Pending>
+__aicore__ inline void ComputeFragment(const Arguments& a,uint32_t block,uint32_t index,uint32_t first,Gmm& gmm,Pending& pending) {
     const auto f=LoadFragment(a,index);
     const auto shape=FragmentShape(a,f);
     const MegaMoeImpl::BlockJobContext job{block,kAic};
@@ -41,14 +43,21 @@ __aicore__ inline void ComputeFragment(const Arguments& a,uint32_t block,uint32_
         const auto extent=scheduler.GetBlockShape(coord);
         const uint32_t m=Get<MegaMoeImpl::M_VALUE>(coord),n=Get<MegaMoeImpl::N_VALUE>(coord);
         const uint32_t rows=Get<MegaMoeImpl::M_VALUE>(extent),cols=Get<MegaMoeImpl::N_VALUE>(extent);
-        if constexpr(g_coreType==AscendC::AIC)gmm.Compute(m,n,rows,cols);
-        else gmm.Dequantize(n,rows,cols);
+        if constexpr(g_coreType==AscendC::AIC) {
+            TraceMeta meta;
+            if constexpr(Notify)meta=ComputeTileTraceMeta(FragmentTraceMeta(f,index),m,n,rows,cols);
+            gmm.Compute(m,n,rows,cols);
+            if constexpr(Notify)pending.AfterSubmit(Gmm1,(Gmm1?f.gmm1TileBegin:f.gmm2TileBegin)+tile,meta);
+        } else gmm.Dequantize(n,rows,cols);
     }
 }
-template<bool First>
+template<bool Notify,bool First>
 __aicore__ inline void RunIndependentShared(const Arguments& a,uint32_t block) {
     if(!a.sharedExperts)return;
     auto v=SharedView(a);std::conditional_t<First,SharedGmm1,SharedGmm2> gmm;bool active=false;
+    NoopTimer disabled;
+    SharedOutputBackend<NoopTimer> backend{a,disabled};
+    OptionalTileCompletion<Notify && First && g_coreType==AscendC::AIC,SharedOutputBackend<NoopTimer>> pending(backend);
     for(uint32_t group=0;group<(a.config.bs+255)/256;++group) {
         const auto f=SharedFragment(a,group);const uint32_t count=First?a.sharedIntermediate/256:a.config.hidden/256;
         const auto first=FirstOwnedComputeTile(uint64_t(group)*count,block,kAic);if(first>=count)continue;
@@ -59,15 +68,24 @@ __aicore__ inline void RunIndependentShared(const Arguments& a,uint32_t block) {
         else addr.gmm2OutGlobal=reinterpret_cast<GM_ADDR>(a.sharedOutput+f.rowBegin*a.config.hidden*2);
         gmm.UpdateProblem(config,addr);gmm.Begin();active=true;
         for(uint32_t tile=first;tile<count;tile+=kAic) {
-            if constexpr(g_coreType==AscendC::AIC)gmm.Compute(0,tile*256,f.rows,256);
-            else gmm.Dequantize(tile*256,f.rows,256);
+            if constexpr(g_coreType==AscendC::AIC) {
+                TraceMeta meta;
+                if constexpr(Notify && First){meta=FragmentTraceMeta(f,group);meta.expert=kExperts;meta.tileN=tile*256;meta.columns=256;}
+                gmm.Compute(0,tile*256,f.rows,256);
+                if constexpr(Notify && First)pending.AfterSubmit(true,f.gmm1TileBegin+tile,meta);
+            } else gmm.Dequantize(tile*256,f.rows,256);
         }
     }
-    if(active){gmm.End();CompleteComputeContext();}
+    if constexpr(Notify && First && g_coreType==AscendC::AIC)pending.Flush();
+    if(active){gmm.End(Notify && First && g_coreType==AscendC::AIC);CompleteComputeContext();}
 }
+template<bool Notify>
 __aicore__ inline void RunCompute(const Arguments& a,uint32_t block) {
-    RunIndependentShared<true>(a,block);
+    RunIndependentShared<Notify,true>(a,block);
     UrmaGmm1 g1;UrmaGmm2 g2;
+    NoopTimer disabled;
+    TileOutputBackend<NoopTimer> backend{a,disabled};
+    OptionalTileCompletion<Notify && g_coreType==AscendC::AIC,TileOutputBackend<NoopTimer>> pending(backend);
     bool active=false,first=false;
     for(uint32_t step=0;step<a.config.computeTaskCount;++step) {
         const auto task=LoadComputeTask(a,step);const auto range=LoadComputeBatch(a,task.batchIndex);
@@ -78,20 +96,22 @@ __aicore__ inline void RunCompute(const Arguments& a,uint32_t block) {
             const auto owned=FirstOwnedComputeTile(isG1?f.gmm1TileBegin:f.gmm2TileBegin,block,kAic);
             if(owned>=count)continue;
             if(active && first!=isG1) {
-                if(first)g1.End();else g2.End();
+                if constexpr(Notify && g_coreType==AscendC::AIC)pending.BeforeStage(isG1);
+                if(first)g1.End(Notify && g_coreType==AscendC::AIC);else g2.End(Notify && g_coreType==AscendC::AIC);
                 CompleteComputeContext();active=false;
             }
             if(isG1) {
-                if(UseFusedGateUp(a.config))ComputeFragment<true,true>(a,block,index,owned,g1);
-                else ComputeFragment<true,false>(a,block,index,owned,g1);
-            } else ComputeFragment<false,false>(a,block,index,owned,g2);
+                if(UseFusedGateUp(a.config))ComputeFragment<Notify,true,true>(a,block,index,owned,g1,pending);
+                else ComputeFragment<Notify,true,false>(a,block,index,owned,g1,pending);
+            } else ComputeFragment<Notify,false,false>(a,block,index,owned,g2,pending);
             first=isG1;active=true;
         }
     }
+    if constexpr(Notify && g_coreType==AscendC::AIC)pending.Flush();
     if(active) {
-        if(first)g1.End();else g2.End();
+        if(first)g1.End(Notify && g_coreType==AscendC::AIC);else g2.End(Notify && g_coreType==AscendC::AIC);
         CompleteComputeContext();
     }
-    RunIndependentShared<false>(a,block);
+    RunIndependentShared<Notify,false>(a,block);
 }
 }

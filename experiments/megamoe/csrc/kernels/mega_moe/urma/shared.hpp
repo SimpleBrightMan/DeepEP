@@ -1,5 +1,6 @@
 #pragma once
 #include "compute.hpp"
+#include "shared_completion.hpp"
 #include "shared_contract.hpp"
 #include "shared_add.hpp"
 #include "tail_completion.hpp"
@@ -17,15 +18,6 @@ __aicore__ inline Fragment SharedFragment(const Arguments& a,uint32_t group) {
     const uint32_t row=group*256U,rows=a.config.bs-row<256U?a.config.bs-row:256U;
     return {0,0,row,rows,0,uint64_t(group)*(a.sharedIntermediate/256),uint64_t(group)*(a.config.hidden/256)};
 }
-template<class T> struct SharedOutputBackend {
-    const Arguments& a;T& timer;
-    __aicore__ inline void Arm(){SetFlag<HardEvent::FIX_S>(EVENT_ID1);}
-    __aicore__ inline void Complete(bool,uint64_t tile,const TraceMeta& m){
-        const auto start=timer.TraceBegin();WaitFlag<HardEvent::FIX_S>(EVENT_ID1);
-        timer.TraceEnd(TraceEvent::SharedGmm1Drain,start,m);
-        WriteGmByPassDCache(ComputeFlag(a.sharedGmm1Done,tile),1);
-    }
-};
 template<bool First,class T>
 __aicore__ inline void RunSharedGmm(const Arguments& a,uint32_t core,T& timer) {
     auto v=SharedView(a);std::conditional_t<First,SharedGmm1,SharedGmm2> gmm;

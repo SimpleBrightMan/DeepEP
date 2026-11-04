@@ -5,7 +5,7 @@ namespace Demo {
 constexpr uint32_t cores=28, cvRows=256, words=16;
 struct Args {
     uint64_t source, sourceScale, dispatchDestination, destination, records, workspace, ffts;
-    uint32_t rank, world, bs, hidden, topk, intermediate, sharedIntermediate, sharedExperts, computeEnable, communicationEnable;
+    uint32_t rank, world, bs, hidden, topk, intermediate, sharedIntermediate, sharedExperts, computeEnable, communicationEnable, completionNotify;
     MegaMoeUrma::Arguments compute;
 };
 inline uint8_t Pattern(uint32_t src,uint32_t dst,uint64_t p) {

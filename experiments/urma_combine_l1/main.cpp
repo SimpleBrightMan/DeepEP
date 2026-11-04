@@ -34,9 +34,10 @@ int main(int argc,char** argv) {
     a.hidden=number("--hidden");a.topk=number("--topk");a.intermediate=number("--intermediate");
     a.sharedExperts=number("--shared-experts");a.sharedIntermediate=number("--shared-intermediate");a.computeEnable=number("--compute-enable");
     a.communicationEnable=number("--communication-enable");
+    a.completionNotify=number("--completion-notify");
     const uint32_t warmup=number("--warmup"),iters=number("--iters"),rounds=warmup+iters;
     if((a.world!=4 && a.world!=8 && a.world!=16) || a.rank>=a.world ||
-       a.bs<1024 || a.bs>MegaMoeUrma::kMaxTokensPerRank || a.bs%128 || a.computeEnable>1 || a.communicationEnable>1 || (!a.computeEnable && !a.communicationEnable) ||
+       a.bs<1024 || a.bs>MegaMoeUrma::kMaxTokensPerRank || a.bs%128 || a.computeEnable>1 || a.communicationEnable>1 || a.completionNotify>1 || (!a.computeEnable && !a.communicationEnable) ||
        !iters || iters>1000 || warmup>1000 || a.hidden<256 || a.hidden>8192 || a.hidden%256 ||
        a.intermediate<256 || a.intermediate>16384 || a.intermediate%256 || a.topk<1 || a.topk>8 ||
        a.sharedExperts>1 || a.sharedIntermediate<256 || a.sharedIntermediate>16384 || a.sharedIntermediate%256)
@@ -116,6 +117,11 @@ int main(int argc,char** argv) {
         g.sharedActivation=allocate(uint64_t(a.bs)*si,0x38);g.sharedActivationScale=allocate(uint64_t(a.bs)*(si/32),0x7f);
         g.sharedOutput=allocate(uint64_t(a.bs)*h*2,0);
     }
+    const uint64_t g1FlagBytes=uint64_t(c.gmm1Tiles)*MegaMoeUrma::kFlagBytes;
+    const uint64_t g2FlagBytes=uint64_t(c.fragmentCount)*MegaMoeUrma::kFlagBytes;
+    const uint64_t sharedFlagBytes=a.sharedExperts?uint64_t((a.bs+255)/256)*(a.sharedIntermediate/256)*MegaMoeUrma::kFlagBytes:0;
+    g.gmm1Done=allocate(g1FlagBytes,0);g.gmm2Done=allocate(g2FlagBytes,0);
+    if(sharedFlagBytes)g.sharedGmm1Done=allocate(sharedFlagBytes,0);
     g.fragments=upload(plan.fragments);g.segments=upload(plan.segments);
     g.computeBatches=upload(plan.computeBatches);g.computeTasks=upload(plan.computeTasks);
     auto* records=reinterpret_cast<void*>(allocate(recordBytes,0));
@@ -136,13 +142,17 @@ int main(int argc,char** argv) {
     CHECK(aclrtMemset(dispatch,dispatchStorage,0xCD,dispatchStorage));
     ExpGuard guard;guard.Init(number("--exp-rows"),number("--exp-cols"),number("--exp-repeat"));guard.Prepare();
     std::cout<<"[CONFIG] rank="<<a.rank<<" compute+dequant="<<(a.computeEnable?"on":"off")
-             <<" communication="<<(a.communicationEnable?"on":"off")<<" rows/peer="<<rows<<" CVs/peer="<<cvs<<" SO_flags=0"
+             <<" completion_notify="<<(a.completionNotify?"on":"off")<<" communication="<<(a.communicationEnable?"on":"off")<<" rows/peer="<<rows<<" CVs/peer="<<cvs<<" SO_flags=0"
              <<" dispatch_bytes/card="<<(a.world-1)*(slot/2+scaleSlot)
              <<" combine_bytes/card="<<(a.world-1)*slot
              <<" compute_input=independent-prepared L2=production-default"<<std::endl;
     aclshmem_barrier_all();launch_barrier(stream);guard.Enqueue(stream);
     for(uint32_t round=0;round<rounds;++round) {
-        // Device start/end joins protect the next invocation; no stage-ready flags.
+        // Completion flags are write-only to this benchmark: no consumer waits.
+        // Reset outside the measured kernel, identically in both variants.
+        CHECK(aclrtMemsetAsync(reinterpret_cast<void*>(g.gmm1Done),g1FlagBytes,0,g1FlagBytes,stream));
+        CHECK(aclrtMemsetAsync(reinterpret_cast<void*>(g.gmm2Done),g2FlagBytes,0,g2FlagBytes,stream));
+        if(sharedFlagBytes)CHECK(aclrtMemsetAsync(reinterpret_cast<void*>(g.sharedGmm1Done),sharedFlagBytes,0,sharedFlagBytes,stream));
         launch_barrier(stream);
         a.records=uintptr_t(records)+uint64_t(round)*recordCount*Demo::words*8;
         launch_demo(blocks,ub,stream,&a);
@@ -175,6 +185,21 @@ int main(int argc,char** argv) {
         if(a.sharedExperts){checkNonzero(g.sharedGmm1,uint64_t(a.bs)*2*a.sharedIntermediate*2,"shared GMM1");checkNonzero(g.sharedOutput,uint64_t(a.bs)*h*2,"shared GMM2");}
         std::cout<<"[NONZERO] FP8 input=0x38 W4 packed=0x11 scale=0x7f; all GMM outputs finite and nonzero (not Golden)\n";
     }
+    auto verifyFlags=[&](uint64_t address,uint64_t bytes,bool gmm2) {
+        if(!bytes)return;
+        std::vector<int32_t> values(bytes/sizeof(int32_t));
+        CHECK(aclrtMemcpy(values.data(),bytes,reinterpret_cast<void*>(address),bytes,ACL_MEMCPY_DEVICE_TO_HOST));
+        const uint64_t slots=bytes/MegaMoeUrma::kFlagBytes;
+        for(uint64_t j=0;j<slots;++j) {
+            const int32_t expected=a.computeEnable && a.completionNotify ?
+                (gmm2?static_cast<int32_t>(MegaMoeUrma::ComputeTileCount(plan.fragments[j].rows,a.hidden)):1):0;
+            if(values[j*(MegaMoeUrma::kFlagBytes/sizeof(int32_t))]!=expected)
+                throw std::runtime_error("Incorrect final GMM completion flag/count at slot="+std::to_string(j));
+        }
+    };
+    verifyFlags(g.gmm1Done,g1FlagBytes,false);verifyFlags(g.gmm2Done,g2FlagBytes,true);
+    verifyFlags(g.sharedGmm1Done,sharedFlagBytes,false);
+    std::cout<<"[FLAGS] last-round completion publications verified; consumers never wait on them"<<std::endl;
     std::ofstream csv(o.at("--output")+"/rank"+std::to_string(a.rank)+".csv");
     if(!csv) throw std::runtime_error("Cannot write results");
     csv<<"iteration,kind,worker,peer,start_tick,end_tick,bytes\n";

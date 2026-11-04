@@ -34,13 +34,15 @@ __schedmode__(1) __global__ __mix__(1,2) void combine_l1_kernel(Demo::Args a) {
     if constexpr(g_coreType==AIC) {
         if(a.computeEnable) {
             start=GetSystemCycle();
-            Demo::RunCompute(a.compute,block);
+            if(a.completionNotify)Demo::RunCompute<true>(a.compute,block);
+            else Demo::RunCompute<false>(a.compute,block);
             end=GetSystemCycle();record=block;
         }
     } else if(GetSubBlockIdx()==0) {
         if(a.computeEnable) {
             start=GetSystemCycle();
-            Demo::RunCompute(a.compute,block);
+            if(a.completionNotify)Demo::RunCompute<true>(a.compute,block);
+            else Demo::RunCompute<false>(a.compute,block);
             end=GetSystemCycle();record=Demo::cores+block;
         }
     } else if(a.communicationEnable && block<a.world-1) {

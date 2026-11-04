@@ -4,6 +4,7 @@ import csv
 import datetime
 import json
 import math
+from itertools import product
 import os
 from pathlib import Path
 import signal
@@ -27,7 +28,7 @@ def stop_owned(processes):
         p.wait()
 
 
-def launch(args,root,out,mode):
+def launch(args,root,out,mode,notify):
     out.mkdir()
     with socket.socket() as s:
         s.bind(('127.0.0.1',0));endpoint=f'tcp://127.0.0.1:{s.getsockname()[1]}'
@@ -39,7 +40,7 @@ def launch(args,root,out,mode):
         for rank,device in enumerate(args.devices):
             log=(out/f'rank{rank}.log').open('w');logs.append(log)
             options={'rank':rank,'device':device,'ep-size':args.ep_size,'endpoint':endpoint,
-                     'output':str(out),'bs':args.bs,'hidden':args.hidden,'intermediate':args.intermediate,'topk':args.topk,'shared-experts':args.shared_experts,'shared-intermediate':args.shared_intermediate,'compute-enable':int(mode=='on'),'communication-enable':int(args.communication=='on'),
+                     'output':str(out),'bs':args.bs,'hidden':args.hidden,'intermediate':args.intermediate,'topk':args.topk,'shared-experts':args.shared_experts,'shared-intermediate':args.shared_intermediate,'compute-enable':int(mode=='on'),'communication-enable':int(args.communication=='on'),'completion-notify':int(notify=='on'),
                      'warmup':args.warmup,'iters':args.iters,'exp-repeat':args.exp_repeat,
                      'exp-rows':args.exp_shape[0],'exp-cols':args.exp_shape[1]}
             cmd=[str(root/'build/combine_l1')]
@@ -57,7 +58,10 @@ def launch(args,root,out,mode):
         for f in logs:f.close()
     result=analyze(out,args.devices,args.iters,args.group_size,args.ticks_per_us,mode=='on',
                    communication_enable=args.communication=='on',model=dict(bs=args.bs,hidden=args.hidden,intermediate=args.intermediate,topk=args.topk,shared_experts=args.shared_experts,shared_intermediate=args.shared_intermediate),peak_tflops=args.peak_tflops)
-    result.update(compute=mode,dequant=mode,communication=args.communication)
+    result.update(compute=mode,dequant=mode,communication=args.communication,completion_notify=notify)
+    if result['mfu'] is not None:
+        result['mfu']['completion_notify']=notify
+        result['mfu']['scope']+=' Completion publications='+notify+'; no input/activation readiness waits.'
     (out/'summary.json').write_text(json.dumps(result,indent=2))
     display(result,mode)
     return result
@@ -74,6 +78,7 @@ def main():
     p.add_argument('--shared-intermediate',type=int,default=2304)
     p.add_argument('--devices',help='Comma-separated ACL device IDs; default 0..EP-1')
     p.add_argument('--compute',default='off,on',help='GMM1+GMM2+dequant together: off / on / off,on / off,on,on,off')
+    p.add_argument('--completion-notify',default='off',help='Production tile retirement/publication: off / on / off,on / off,on,on,off')
     p.add_argument('--communication',choices=('on','off'),default='on',help='off isolates GMM/dequant with all inputs prefilled; requires --compute on')
     p.add_argument('--peak-tflops',type=float,default=756.0,help='Dense FP8 peak per card for MFU, default756')
     p.add_argument('--warmup',type=int,default=10);p.add_argument('--iters',type=int,default=20)
@@ -86,6 +91,8 @@ def main():
     args=p.parse_args()
     args.devices=[int(x) for x in args.devices.split(',')] if args.devices else list(range(args.ep_size))
     modes=args.compute.split(',')
+    notifications=args.completion_notify.split(',')
+    if not notifications or not all(n in ('off','on') for n in notifications):p.error('Invalid --completion-notify')
     if (not 256<=args.hidden<=8192 or args.hidden%256 or not 256<=args.intermediate<=16384 or args.intermediate%256 or not 256<=args.shared_intermediate<=16384 or args.shared_intermediate%256 or not 1024<=args.bs<=16384 or args.bs%128 or len(args.devices)!=args.ep_size or
         len(set(args.devices))!=len(args.devices) or min(args.devices)<0 or not all(m in ('off','on') for m in modes) or
         not 0<=args.warmup<=1000 or
@@ -110,23 +117,24 @@ def main():
                   excluded='Pack/SwiGLU/Reduce/SO and stage-readiness gates; compute switch covers routed+shared GEMMs and coupled dequant',
                   operands='nonzero FP8/W4/scales; independent communication and GMM operands; post-run nonzero finite GMM check',
                   alignment='SHMEM device barrier -> Exp -> (device barrier + mixed kernel + device barrier)*rounds',
+                  completion='toggle restores production routed GMM1/GMM2 and shared GMM1 FIX_S retirement/publication; no consumer waits; identical reset/allocations off/on',
                   timer='stage envelopes only; timestamp writes after local completion join')
     (out/'config.json').write_text(json.dumps(config,indent=2))
     snapshot=subprocess.run(['npu-smi','info'],text=True,capture_output=True,check=True)
     (out/'npu_smi.txt').write_text(snapshot.stdout+snapshot.stderr)
     print(f'[RESOURCE] Devices {args.devices} must be allocated and idle; snapshot: {out}/npu_smi.txt',flush=True)
     results=[]
-    for index,mode in enumerate(modes):
-        print(f'[RUN] {index} compute+dequant={mode}',flush=True)
-        results.append(launch(args,root,out/f'{index:02d}_{mode}',mode))
+    for index,(mode,notify) in enumerate(product(modes,notifications)):
+        print(f'[RUN] {index} compute+dequant={mode} completion_notify={notify}',flush=True)
+        results.append(launch(args,root,out/f'{index:02d}_{mode}_notify_{notify}',mode,notify))
     (out/'summary.json').write_text(json.dumps({'config':config,'runs':results},indent=2))
     fields=['run','compute','total_gbps','intra_gbps','cross_gbps',
-            'total_round_max_mean_us','total_round_min_mean_us','gmm_round_max_mean_us','gmm_combine_coverage_percent','communication','peak_tflops','gmm_flops_per_card','mfu_percent']
+            'total_round_max_mean_us','total_round_min_mean_us','gmm_round_max_mean_us','gmm_combine_coverage_percent','communication','peak_tflops','gmm_flops_per_card','mfu_percent','completion_notify']
     with (out/'comparison.csv').open('w',newline='') as f:
         writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader()
         for index,result in enumerate(results):
             classes=result['classes'];total=classes['TOTAL']
-            writer.writerow(dict(zip(fields,[index,modes[index],total['mean_gbps'] if total else None,
+            writer.writerow(dict(zip(fields,[index,result['compute'],total['mean_gbps'] if total else None,
                 classes['INTRA']['mean_gbps'] if classes['INTRA'] else None,
                 classes['CROSS']['mean_gbps'] if classes['CROSS'] else None,
                 total['round_max_mean_us'] if total else None,total['round_min_mean_us'] if total else None,
@@ -134,16 +142,23 @@ def main():
                 result['gmm_coverage_combine']*100 if result['gmm_coverage_combine'] is not None else None,
                 args.communication,args.peak_tflops,
                 result['mfu']['flops_per_card'] if result['mfu'] else None,
-                result['mfu']['percent'] if result['mfu'] else None])))
-    baseline=next((r for m,r in zip(modes,results) if m=='off'),None)
+                result['mfu']['percent'] if result['mfu'] else None,result['completion_notify']])))
+    baseline=next((r for r in results if r['compute']=='off'),None)
     if baseline:
-        for index,(mode,result) in enumerate(zip(modes,results)):
-            if mode!='on':continue
+        for index,result in enumerate(results):
+            if result['compute']!='on':continue
             for kind in ('TOTAL','INTRA','CROSS','COMBINE_TOTAL','COMBINE_CROSS'):
                 off=baseline['classes'][kind];on=result['classes'][kind]
                 if off and on:
                     change=100*(on['mean_gbps']/off['mean_gbps']-1)
                     print(f'[COMPARE] run={index} {kind} bandwidth vs first off: {change:+.2f}%')
+    no_notify=next((r for r in results if r['compute']=='on' and r['completion_notify']=='off'),None)
+    if no_notify:
+        base=no_notify['mfu']
+        for index,r in enumerate(results):
+            if r['compute']!='on' or r['completion_notify']!='on':continue
+            m=r['mfu'];delta=m['aic_round_max_mean_us']-base['aic_round_max_mean_us']
+            print(f"[NOTIFY-COMPARE] run={index} vs first notify-off: AIC {delta:+.3f}us ({delta/base['aic_round_max_mean_us']*100:+.2f}%); MFU {m['percent']-base['percent']:+.3f} percentage points")
     print(f'[PASSED] {out}/summary.json')
 
 

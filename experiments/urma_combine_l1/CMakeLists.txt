@@ -34,7 +34,7 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/libcombine_l1.so"
     COMMAND "${BISHENG}" ${flags} "${CMAKE_CURRENT_SOURCE_DIR}/kernel.cpp"
     "-L${ASCEND_HOME_PATH}/lib64" "-L${SHMEM_ROOT}/lib" -lruntime -lascendcl -lshmem -lgraph_base -ltiling_api -lplatform -lregister -lstdc++ -ldl
     -o "${CMAKE_CURRENT_BINARY_DIR}/libcombine_l1.so"
-    DEPENDS kernel.cpp layout.hpp compute.hpp ${protocol_headers} VERBATIM)
+    DEPENDS kernel.cpp layout.hpp compute.hpp completion_policy.hpp ${protocol_headers} VERBATIM)
 add_custom_target(device_build DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/libcombine_l1.so")
 add_library(device SHARED IMPORTED)
 set_target_properties(device PROPERTIES IMPORTED_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/libcombine_l1.so")

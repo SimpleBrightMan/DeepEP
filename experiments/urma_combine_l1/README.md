@@ -107,3 +107,44 @@ Validation for MFU controls/report: five CPU report checks passed (rank-local
 envelopes, round-max then mean, shared width, missing lanes and compute-off),
 plus the native CPU planner cases including BS12288/16384. CANN compilation and
 NPU performance/accuracy have not been run for this update.
+
+
+## Completion publication A/B
+
+Rebuild the native demo, then add `--completion-notify off,on` (default off).
+The runner executes each compute mode with each notification mode and saves the
+mode in summary.json/comparison.csv. Use --compute on for this experiment.
+`[NOTIFY-COMPARE]` prints the AIC-envelope time delta and MFU percentage-point delta.
+Use off,on,on,off if you want an order-reversal check. Compare against notify-off
+from this rebuilt binary, not only old results: both modes allocate and clear the
+same flag arrays before each invocation, outside the kernel measurement.
+
+Notify-on uses production TileCompletion/TileOutputBackend with NoopTimer:
+- Routed GMM1: capture FIX_S1 per tile; after the next same-stage submission,
+  retire the previous fence and store gmm1Done=1.
+- Routed GMM2: same retirement, then atomic-add the corresponding M-group counter.
+- Stage switch/final exit flushes outstanding notifications before End(true).
+  AIV0 retains normal dequant/context handshakes.
+- Shared GMM1 uses the production SharedOutputBackend and the same delayed retirement.
+- Shared GMM2 has no per-tile notification in production; its terminal drain remains.
+
+Inputs and activations stay prefilled. There are no reads/waits on these completion
+flags and no restored input-scale/activation readiness gates, shared startup gate,
+AIC aggregate-done counters, Pack/SwiGLU/Reduce or per-tile trace. The communication
+mode is independent. Final flag contents/counts are verified on Host after all
+rounds (outside timing); this is not a numerical Golden check.
+
+```bash
+python3 experiments/urma_combine_l1/run.py \
+  --ep-size 16 --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+  --bs 8192 --hidden 5120 --intermediate 2304 --topk 6 \
+  --shared-experts 1 --shared-intermediate 2304 \
+  --compute on --communication on --completion-notify off,on --peak-tflops 756 \
+  --warmup 10 --iters 20 --exp-repeat 50
+```
+
+Notification A/B validation: five CPU report checks and a native CPU execution of
+the actual optional TileCompletion policy passed (off publishes nothing, on retires
+the previous tile after submission, stage switch and final flush publish once).
+No CANN compilation or NPU execution was performed for this update; rebuild before
+running. Device flag verification will execute outside timing on the user's run.
