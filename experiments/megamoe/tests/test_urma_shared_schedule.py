@@ -10,7 +10,7 @@ def body(source,name):
 def test_s0_keeps_legacy_pipeline_body():
     k=Path(__file__).resolve().parents[1]/"csrc/kernels/mega_moe/urma"
     source=(k/"kernel.hpp").read_text(encoding="utf-8")
-    assert hashlib.sha256(body(source,"ProcessRouted").replace("hidden==3584U && args.config.topk==8", "hidden==3584U").encode()).hexdigest()=="5fa6f9bcd8b9c33610bacf5bdf0e2bb7adcac68ad387b0572de5509abe427aea"
+    assert hashlib.sha256(body(source,"ProcessRouted").replace("UseLegacyReduce(args.config)", "args.config.hidden==3584U").encode()).hexdigest()=="5fa6f9bcd8b9c33610bacf5bdf0e2bb7adcac68ad387b0572de5509abe427aea"
     assert hashlib.sha256(body(source,"CommunicatePeer").encode()).hexdigest()=="5360707b9bdff990efef688b82394d830d77261e07863675287964a983e88d21"
 
 

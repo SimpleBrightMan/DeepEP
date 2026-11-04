@@ -17,7 +17,7 @@ PYBIND11_MODULE(_C, module)
     module.def("buffer_size", &deepep::megamoe::buffer_size);
     module.attr("urma_shared_contract") = "shared1-unitflag-fp32-sum-v2";
     module.attr("urma_api_protocol") = MegaMoeUrma::kProtocol;
-    module.attr("urma_dimension_contract") = "h8192-i16384-aligned256-k1to8-v2";
+    module.attr("urma_dimension_contract") = "h8192-i16384-aligned256-k1to8-v2-bs16384";
     module.attr("urma_communication_protocol") = "commfirst-dispatch-so-pack-after-v6";
     module.attr("urma_compute_schedule") = "wave12-ep4-all-bs-samestage-deferred-v6";
     module.attr("urma_local_pipeline") = "pack6-persistent-deferred5-reduce6-output2-v2";

@@ -18,7 +18,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--bs-values",
         default="1024,2048,3072,4096,5120,6144,7168,8192",
-        help="Comma-separated BS/rank sweep; each BS must be in [1, num_max_tokens_per_rank] (native capacity <= 8192)",
+        help="Comma-separated BS/rank sweep; each BS must be in [1, num_max_tokens_per_rank] (native capacity <= 16384)",
     )
     parser.add_argument("--routing", choices=("balanced", "random", "skewed", "random-balanced"), default="balanced")
     parser.add_argument("--shared-experts", type=int, choices=(0,1))

@@ -58,7 +58,7 @@ inline std::vector<ComputeBatchTask> BuildComputeTasks(const std::vector<Compute
 inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, uint64_t maxReceiveRows)
 {
     if (counts == nullptr || (input.world != 4U && input.world != 8U && input.world != 16U) ||
-        input.rank >= input.world || input.localExperts != 384U / input.world || input.bs == 0 || input.bs > 8192 ||
+        input.rank >= input.world || input.localExperts != 384U / input.world || input.bs == 0 || input.bs > kMaxTokensPerRank ||
         input.topk < 1 || input.topk > 8 || input.hidden < 256 || input.hidden > 8192 || input.hidden % 256 != 0 || input.intermediate < 256 || input.intermediate > 16384 || input.intermediate % 256 != 0 || input.cvRows < 128 ||
         input.cvRows > 4096 || input.cvRows % 128 != 0 || input.maxPeerChunks == 0 ||
         input.maxPeerChunks > kMaxPeerChunks || input.gmm1AheadMGroups > 65536U || maxReceiveRows == 0) {
