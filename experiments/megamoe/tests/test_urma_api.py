@@ -293,7 +293,7 @@ def test_modified_prepared_routes_abort_before_epoch_or_native_submission(monkey
 
 
 @pytest.mark.parametrize("topk", [1, 6, 8])
-@pytest.mark.parametrize("capacity", [1, 1024, 2048, 8192])
+@pytest.mark.parametrize("capacity", [1, 1024, 2048, 8192, 16384])
 @pytest.mark.parametrize("allow", [False, True])
 @pytest.mark.parametrize("world", [4, 8, 16])
 def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runtime(monkeypatch, allow, world, capacity, topk):
@@ -337,7 +337,7 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object(), megamoe_urma_communication_protocol=urma.COMMUNICATION_PROTOCOL))
     extension = SimpleNamespace(
         urma_api_protocol=1, urma_tail_schedule=tail, urma_compute_schedule="wave12-ep4-all-bs-samestage-deferred-v6",
-        urma_shared_contract="shared1-unitflag-fp32-sum-v2", urma_dimension_contract="h8192-i16384-aligned256-k1to8-v2", urma_communication_protocol=urma.COMMUNICATION_PROTOCOL
+        urma_shared_contract="shared1-unitflag-fp32-sum-v2", urma_dimension_contract="h8192-i16384-aligned256-k1to8-v2-bs16384", urma_communication_protocol=urma.COMMUNICATION_PROTOCOL
     )
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
     urma._extension.cache_clear()
@@ -381,7 +381,7 @@ def test_commfirst_protocol_rejects_old_native_modules(monkeypatch, old_module):
         urma_api_protocol=1,
         urma_tail_schedule="combine-ready-scan-reduce-world-v1",
         urma_compute_schedule="wave12-ep4-all-bs-samestage-deferred-v6",
-        urma_shared_contract="shared1-unitflag-fp32-sum-v2", urma_dimension_contract="h8192-i16384-aligned256-k1to8-v2", urma_communication_protocol=protocol,
+        urma_shared_contract="shared1-unitflag-fp32-sum-v2", urma_dimension_contract="h8192-i16384-aligned256-k1to8-v2-bs16384", urma_communication_protocol=protocol,
     )
     if old_module == "core":
         del core.megamoe_urma_communication_protocol
@@ -520,3 +520,16 @@ def test_untraced_forward_does_not_require_new_trace_extension_properties(monkey
     owner.forward_prepared(x, probs, w1, w2, make_plan())
     assert epochs == [1] and not aborts
     owner.destroy()
+
+
+@pytest.mark.parametrize("capacity", [16385, 32768])
+def test_buffer_rejects_capacity_above16384_before_allocation(monkeypatch, capacity):
+    from deep_ep._store import StoreGroup
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    def check(group, stage, error, signature=None):
+        assert "num_max_tokens_per_rank" in error and "16384" in error
+        raise ValueError(error)
+    monkeypatch.setattr(urma, "collective_check", check)
+    monkeypatch.setattr(urma, "_UrmaRuntime", lambda *a, **kw: pytest.fail("Must reject before runtime creation"))
+    with pytest.raises(ValueError, match="16384"):
+        urma.UrmaBuffer(StoreGroup(None, 0, 16, prefix="bad-capacity"),num_max_tokens_per_rank=capacity)

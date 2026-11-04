@@ -213,3 +213,34 @@ python3 experiments/megamoe/scripts/urma_shared_trace_to_text.py /path/coarse/al
 
 The 60000-character default leaves space for a short comment heading. Keep the
 original JSON locally; further event extraction can target the identified gap.
+
+
+## BS16384 capacity
+
+Both S0 and S1 accept BS/capacity1..16384. The benchmark passes max(bs-values)
+as capacity; the API default is16384. Hidden remains256..8192 and intermediate
+remains256..16384 (both aligned256); these are separate from the BS limit.
+Native/Python capability checks require a newly rebuilt matching wheel.
+
+- At K8/CV128 a source may contribute1024 CVs to one peer (not only balanced counts).
+- Generic Reduce covers400 tokens/worker at the production41-worker minimum,
+  16384 remote dependency bits and all worst-case local compute-group indices.
+  Including FP32 output slots its UB footprint is173696 bytes, below192KiB.
+- H3584/K8 legacy Reduce is selected only at BS<=8192 AND maxPeerChunks<=512.
+  A small actual BS in a large-capacity buffer can therefore use generic Reduce.
+- Shared activation completion bitmap grows from3 to5 uint64 words, covering293
+  tasks/core at BS16384 and shared I16384. Shared-disabled allocations stay disabled.
+- Unitflag additionally doubles peer Reorder span bitmaps to16KiB each; its two
+  bitmaps and per-CV counters use128..168KiB after Pack closes, outside low128KiB
+  activation/Reorder DMA slots and below the192KiB minimum.
+
+HBM allocations still depend on H/I/EP/route imbalance and may exceed available
+memory for extreme combinations. The existing max_recv_rows overflow check remains;
+BS16384 support does not promise every possible dimension combination fits HBM.
+Existing sweep defaults remain through8192; request --bs-values 16384 explicitly.
+
+BS16384 validation (2026-11-04): each branch passed324 native CPU planner cases,
+8192 shared-task ownership/bitmap entries, and48 generic-Reduce cases exercising
+BF16/FP32 output, dependency16383/self8287, metadata tails and asynchronous DMA
+slot reuse. Python accepted16384 and rejected larger capacities before runtime
+allocation. No CANN build or NPU run was performed for this capacity update.

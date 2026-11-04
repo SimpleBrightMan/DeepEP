@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include "abi.hpp"
 namespace MegaMoeUrma {
 #if defined(__NPU_DEVICE__)
 #define SHARED_INLINE __aicore__ inline
@@ -17,6 +18,8 @@ SHARED_INLINE constexpr SharedTask SharedTaskAt(uint32_t task,uint32_t intermedi
     const uint32_t n=intermediate/256U;
     return {task/(n*2U),(task/2U)%n,task%2U};
 }
-static_assert(SharedOwnedTasks(SharedTaskCount(8192,16384),0)<=3U*64U);
+constexpr uint32_t kSharedMaxOwnedTasks = SharedOwnedTasks(SharedTaskCount(kMaxTokensPerRank,16384U),0U);
+constexpr uint32_t kSharedDoneWords = (kSharedMaxOwnedTasks + 63U) / 64U;
+static_assert(kSharedMaxOwnedTasks == 293U && kSharedDoneWords == 5U);
 #undef SHARED_INLINE
 }
