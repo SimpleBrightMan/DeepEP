@@ -26,9 +26,9 @@ uint64_t Align(uint64_t value, uint64_t alignment = kAlignment)
 
 Config Layout(int64_t world, int64_t max_tokens, int64_t topk, int64_t hidden, int64_t max_recv_rows, int64_t cv_rows)
 {
-    TORCH_CHECK((world == 4 || world == 8 || world == 16) && max_tokens > 0 && max_tokens <= 8192 && topk >= 1 && topk <= 8 &&
+    TORCH_CHECK((world == 4 || world == 8 || world == 16) && max_tokens > 0 && max_tokens <= MegaMoeUrma::kMaxTokensPerRank && topk >= 1 && topk <= 8 &&
                     hidden >= 256 && hidden <= 8192 && hidden % 256 == 0,
-                "MegaMoE URMA v1 requires EP4/EP8/EP16, H256..8192 aligned256, K1..8 and max_tokens in [1,8192]");
+                "MegaMoE URMA v1 requires EP4/EP8/EP16, H256..8192 aligned256, K1..8 and max_tokens in [1,16384]");
     TORCH_CHECK(cv_rows >= 128 && cv_rows <= 4096 && cv_rows % 128 == 0,
                 "URMA CV rows must be a multiple of 128 in [128,4096]");
     TORCH_CHECK(max_recv_rows > 0 && max_recv_rows <= world * max_tokens * topk,

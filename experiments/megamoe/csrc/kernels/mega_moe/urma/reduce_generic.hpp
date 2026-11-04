@@ -9,7 +9,7 @@
 
 namespace MegaMoeUrma::GenericReduce {
 
-// H sliced at 2048 columns; TopK 1..8; BS8192 over at least 28 reducers. Every worker keeps all of its
+// H sliced at 2048 columns; TopK 1..8; BS16384 over at least 41 reducers. Every worker keeps all of its
 // metadata resident so a late token cannot block another metadata batch.
 struct ReduceUbContract {
     static constexpr uint32_t hidden = 2048U;
@@ -17,12 +17,12 @@ struct ReduceUbContract {
     static constexpr uint32_t inputs = 6U;
     static constexpr uint32_t outputs = 2U;
     static constexpr uint32_t readyGateEvent = 6U;
-    static constexpr uint32_t maxTokens = (8192U + 28U - 1U) / 28U;
+    static constexpr uint32_t maxTokens = (kMaxTokensPerRank + kReduceWorkers - 1U) / kReduceWorkers;
     static constexpr uint32_t maxRoutes = maxTokens * topk;
-    static constexpr uint32_t maxRemoteDependencies = kWorld * 512U;
-    // Conservative bound across EP4/8/16: at most 16*8192*8 received rows
+    static constexpr uint32_t maxRemoteDependencies = kWorld * kMaxPeerChunks;
+    // Conservative bound across EP4/8/16: at most 16*16384*8 received rows
     // and at most 96 local experts, each contributing one partial M256 group.
-    static constexpr uint32_t maxSelfDependencies = kWorld * 8192U * topk / kComputeTileM + kMaxLocalExperts;
+    static constexpr uint32_t maxSelfDependencies = kWorld * kMaxTokensPerRank * topk / kComputeTileM + kMaxLocalExperts;
     static constexpr uint32_t bf16RowBytes = hidden * sizeof(uint16_t);
     static constexpr uint32_t fp32RowBytes = hidden * sizeof(float);
     static constexpr uint32_t inputBf16Offset = 0U;
@@ -42,7 +42,7 @@ struct ReduceUbContract {
     static constexpr uint32_t routeRingBytes = (inputs * sizeof(uint32_t) + 31U) / 32U * 32U;
     static constexpr uint32_t end = routeRingOffset + routeRingBytes;
 };
-static_assert(ReduceUbContract::maxTokens == 293U);
+static_assert(ReduceUbContract::maxTokens == 400U);
 static_assert(ReduceUbContract::end <= kRequiredUbBytes);
 static_assert(ReduceUbContract::inputFp32Offset % 32U == 0U && ReduceUbContract::accumulatorOffset % 32U == 0U &&
               ReduceUbContract::outputOffset % 32U == 0U && ReduceUbContract::inverseOffset % 32U == 0U &&

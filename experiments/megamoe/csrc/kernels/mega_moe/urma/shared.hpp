@@ -119,7 +119,7 @@ public:
 private:
     __aicore__ inline void Mark(uint32_t i){done_[i/64]|=uint64_t{1}<<(i%64);++finished_;}
     const Arguments& a_;uint32_t worker_;Timer& timer_;
-    uint64_t done_[3]{}; // max ceil(32 groups * 64 N tiles * 2 slices / 28)=147
+    uint64_t done_[kSharedDoneWords]{}; // BS16384/I16384: at most293 tasks per AIV1
     uint32_t total_=0,owned_=0,finished_=0,cursor_=0;
 };
 

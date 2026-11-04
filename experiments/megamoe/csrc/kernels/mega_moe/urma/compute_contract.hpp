@@ -104,6 +104,12 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ReduceWorkerIndex(uint32_t block,
                : (block >= communicationWorkers ? kAic + block - communicationWorkers : ReduceWorkers(world));
 }
 
+MEGAMOE_URMA_COMPUTE_INLINE constexpr bool UseLegacyReduce(const Config& config)
+{
+    return config.hidden == 3584U && config.topk == 8U && config.bs <= 8192U &&
+           config.maxPeerChunks <= 512U;
+}
+
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t ReduceOwnedRows(uint64_t rows, uint32_t worker, uint32_t world = kWorld)
 {
     const uint32_t workers = ReduceWorkers(world);

@@ -262,7 +262,7 @@ def test_modified_prepared_routes_abort_before_epoch_or_native_submission(monkey
     owner._runtime.closed = True
 
 
-@pytest.mark.parametrize("capacity", [1, 1024, 2048, 8192])
+@pytest.mark.parametrize("capacity", [1, 1024, 2048, 8192, 16384])
 @pytest.mark.parametrize("allow", [False, True])
 @pytest.mark.parametrize("world", [4, 8, 16])
 def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runtime(monkeypatch, allow, world, capacity):
@@ -292,9 +292,10 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
     assert buffer.allow_multi_host is allow
     assert buffer.num_max_tokens_per_rank == capacity
     assert created == [allow]
-    assert checks[0][1][-3] is allow
-    assert checks[0][1][-2] == "combine-ready-scan-reduce-world-v1"
-    assert checks[0][1][-1] == "expert-m256-mgroup-lookahead-v1"
+    assert checks[0][1][-4] is allow
+    assert checks[0][1][-3] == "combine-ready-scan-reduce-world-v1"
+    assert checks[0][1][-2] == "unitflag-shared-wave12-ep4-v1"
+    assert checks[0][1][-1] == urma.COMMUNICATION_PROTOCOL
     assert buffer.gmm1_ahead_mgroups == 12
 
 
@@ -463,3 +464,16 @@ def test_untraced_forward_does_not_require_new_trace_extension_properties(monkey
     owner.forward_prepared(x, probs, w1, w2, make_plan())
     assert epochs == [1] and not aborts
     owner.destroy()
+
+
+@pytest.mark.parametrize("capacity", [16385, 32768])
+def test_buffer_rejects_capacity_above16384_before_allocation(monkeypatch, capacity):
+    from deep_ep._store import StoreGroup
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    def check(group, stage, error, signature=None):
+        assert "num_max_tokens_per_rank" in error and "16384" in error
+        raise ValueError(error)
+    monkeypatch.setattr(urma, "collective_check", check)
+    monkeypatch.setattr(urma, "_UrmaRuntime", lambda *a, **kw: pytest.fail("Must reject before runtime creation"))
+    with pytest.raises(ValueError, match="16384"):
+        urma.UrmaBuffer(StoreGroup(None, 0, 16, prefix="bad-capacity"),num_max_tokens_per_rank=capacity)

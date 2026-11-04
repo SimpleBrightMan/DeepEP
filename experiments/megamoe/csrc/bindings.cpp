@@ -15,7 +15,7 @@ PYBIND11_MODULE(_C, module)
     module.attr("api_protocol") = 4;
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.def("buffer_size", &deepep::megamoe::buffer_size);
-    module.attr("urma_dimension_contract") = "unitflag-h8192-i16384-k1to8-v1";
+    module.attr("urma_dimension_contract") = "unitflag-h8192-i16384-k1to8-v1-bs16384";
     module.attr("urma_api_protocol") = MegaMoeUrma::kProtocol;
     module.attr("urma_compute_schedule") = "unitflag-shared-wave12-ep4-v1";
     module.attr("urma_shared_contract") = "unitflag-shared-peer-reorder-v1";

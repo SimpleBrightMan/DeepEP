@@ -21,7 +21,9 @@ using namespace AscendC;
 // communication owner's persistent signal/CV metadata above BOTH regions:
 // reorder can execute with submitted Combine PUTs still in flight.
 constexpr uint32_t kCommunicationSignalOffset = kPackUbBase + kPackUbBytes;
-constexpr uint32_t kCommunicationSubmittedOffset = kCommunicationSignalOffset + kSignalCopyBytes;
+// Counters become live only after Pack closes. Reuse the region after both
+// span bitmaps, below the signal slot, so BS16384 also fits 192KiB UB.
+constexpr uint32_t kCommunicationSubmittedOffset = kPackUbBase + 2U * kPeerReorderBitmapBytes;
 constexpr uint32_t kCommunicationPendingOffset = kCommunicationSubmittedOffset + kMaxPeerChunks * sizeof(uint32_t);
 static_assert(kCommunicationSignalOffset % 32U == 0U);
 static_assert(kCommunicationPendingOffset + kMaxPeerChunks * sizeof(uint32_t) <= kRequiredUbBytes);
@@ -29,7 +31,8 @@ static_assert(kCommunicationPendingOffset + kMaxPeerChunks * sizeof(uint32_t) <=
 // of it for remote/self span bits, away from both DMA slots and CV counters.
 constexpr uint32_t kRemoteReorderBitmapOffset = kPackUbBase;
 constexpr uint32_t kSelfReorderBitmapOffset = kRemoteReorderBitmapOffset + kPeerReorderBitmapBytes;
-static_assert(kSelfReorderBitmapOffset + kPeerReorderBitmapBytes <= kCommunicationSignalOffset);
+static_assert(kSelfReorderBitmapOffset + kPeerReorderBitmapBytes <= kCommunicationSubmittedOffset);
+static_assert(kCommunicationPendingOffset + kMaxPeerChunks * sizeof(uint32_t) <= kCommunicationSignalOffset);
 
 template <typename T>
 __aicore__ inline void WaitProgressFlag(__gm__ T* flag, T expected, Timer& timer, TraceEvent event,
@@ -658,7 +661,7 @@ __aicore__ inline void ProcessRouted(const Arguments& args)
         if (worker < ReduceWorkers(args.config.world)) {
             timer.Begin(Phase::ReducePhase);
             timer.CoarseBegin(CoarsePhase::Reduce);
-            if(args.config.hidden==3584U && args.config.topk==8U) Reduce(args, worker, timer);
+            if(UseLegacyReduce(args.config)) Reduce(args, worker, timer);
             else ReduceGeneric(args, worker, ReduceWorkers(args.config.world), timer);
             timer.CoarseEnd(CoarsePhase::Reduce);
             const uint64_t owned = ReduceOwnedRows(args.config.bs, worker, args.config.world);

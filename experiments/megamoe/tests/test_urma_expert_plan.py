@@ -51,7 +51,7 @@ int main(int argc, char**) {
         bad = c; bad.cvRows = 0; reject(bad, 128);
         bad = c; bad.cvRows = 129; reject(bad, 128);
         bad = c; bad.maxPeerChunks = 0; reject(bad, 128);
-        bad = c; bad.maxPeerChunks = 513; reject(bad, 128);
+        bad = c; bad.maxPeerChunks = kMaxPeerChunks + 1U; reject(bad, 128);
         bad = c; bad.world = 3; reject(bad, 128);
         bad = c; bad.world = 0; reject(bad, 128);
         bad = c; bad.localExperts = 23; reject(bad, 128);
