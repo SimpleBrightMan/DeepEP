@@ -244,3 +244,21 @@ BS16384 validation (2026-11-04): each branch passed324 native CPU planner cases,
 BF16/FP32 output, dependency16383/self8287, metadata tails and asynchronous DMA
 slot reuse. Python accepted16384 and rejected larger capacities before runtime
 allocation. No CANN build or NPU run was performed for this capacity update.
+
+
+## Fastest / slowest rank comment export
+
+```bash
+python3 experiments/megamoe/scripts/urma_rank_compare.py /path/bs_16384/fine/allrank.json --output bs16384_pair.txt
+```
+
+Standard library only, no rebuild or NPU run. Selects the smallest/largest rank
+metadata diagnostic envelope, keeping rank clocks independent. Output is ASCII,
+<=60000 characters AND bytes (change with --max-chars4096..60000, using a space
+between flag/value). Both ranks are interleaved for core/expert/peer comparisons.
+It reports AIC input/activation waits, shared/routed stage boundaries, per-expert
+progress, limited group delays and PUT gaps, plus Reduce/shared Add tails. Composite
+GMM records are unpacked using original integer ticks when available. Hidden source
+waits remain unknown; missing rows are not interpreted as zero waits. Per-lane
+unrecorded gaps are not claimed to be hardware idle. Header/footer disclose source
+status and any budget omissions. Coarse and fine are different invocations.
