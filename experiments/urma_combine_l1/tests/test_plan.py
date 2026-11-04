@@ -11,7 +11,7 @@ SOURCE=r'''
 #include <iostream>
 int main() {
     unsigned cases=0;
-    for(unsigned world:{4U,8U,16U})for(unsigned bs:{1024U,2048U,4096U,8192U})for(unsigned rank:{0U,world-1}) {
+    for(unsigned world:{4U,8U,16U})for(unsigned bs:{1024U,2048U,4096U,8192U,12288U,16384U})for(unsigned rank:{0U,world-1}) {
         auto p=Demo::MakePlan(bs,world,rank);auto& c=p.config;
         assert(c.receiveRows==uint64_t(bs)*6);
         assert(p.computeTasks.size()==2*p.computeBatches.size());

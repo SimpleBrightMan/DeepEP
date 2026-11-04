@@ -43,7 +43,7 @@ __schedmode__(1) __global__ __mix__(1,2) void combine_l1_kernel(Demo::Args a) {
             Demo::RunCompute(a.compute,block);
             end=GetSystemCycle();record=Demo::cores+block;
         }
-    } else if(block<a.world-1) {
+    } else if(a.communicationEnable && block<a.world-1) {
         const uint32_t peer=MegaMoeUrma::PeerForOwner(a.rank,block);
         const uint32_t rows=a.bs*a.topk/a.world,scales=a.hidden/32;
         const uint64_t slot=uint64_t(rows)*a.hidden*2,slotX=slot/2,slotS=uint64_t(rows)*scales;

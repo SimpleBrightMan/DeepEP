@@ -33,9 +33,10 @@ int main(int argc,char** argv) {
     a.rank=number("--rank");a.world=number("--ep-size");a.bs=number("--bs");
     a.hidden=number("--hidden");a.topk=number("--topk");a.intermediate=number("--intermediate");
     a.sharedExperts=number("--shared-experts");a.sharedIntermediate=number("--shared-intermediate");a.computeEnable=number("--compute-enable");
+    a.communicationEnable=number("--communication-enable");
     const uint32_t warmup=number("--warmup"),iters=number("--iters"),rounds=warmup+iters;
     if((a.world!=4 && a.world!=8 && a.world!=16) || a.rank>=a.world ||
-       a.bs<1024 || a.bs>8192 || a.bs%128 || a.computeEnable>1 ||
+       a.bs<1024 || a.bs>MegaMoeUrma::kMaxTokensPerRank || a.bs%128 || a.computeEnable>1 || a.communicationEnable>1 || (!a.computeEnable && !a.communicationEnable) ||
        !iters || iters>1000 || warmup>1000 || a.hidden<256 || a.hidden>8192 || a.hidden%256 ||
        a.intermediate<256 || a.intermediate>16384 || a.intermediate%256 || a.topk<1 || a.topk>8 ||
        a.sharedExperts>1 || a.sharedIntermediate<256 || a.sharedIntermediate>16384 || a.sharedIntermediate%256)
@@ -47,6 +48,8 @@ int main(int argc,char** argv) {
     const uint32_t recordCount=2*Demo::cores+a.world-1;
     const uint64_t recordBytes=uint64_t(rounds)*recordCount*Demo::words*8;
     const auto plan=Demo::MakePlan(a.bs,a.world,a.rank,a.hidden,a.intermediate,a.topk);
+    if(plan.config.receiveRows!=uint64_t(a.bs)*a.topk)
+        throw std::runtime_error("MFU requires the balanced per-card receive-row count");
     a.compute.config=plan.config;
     CHECK(aclInit(nullptr));CHECK(aclrtSetDevice(number("--device")));
     const char* soc=aclrtGetSocName();
@@ -133,7 +136,7 @@ int main(int argc,char** argv) {
     CHECK(aclrtMemset(dispatch,dispatchStorage,0xCD,dispatchStorage));
     ExpGuard guard;guard.Init(number("--exp-rows"),number("--exp-cols"),number("--exp-repeat"));guard.Prepare();
     std::cout<<"[CONFIG] rank="<<a.rank<<" compute+dequant="<<(a.computeEnable?"on":"off")
-             <<" rows/peer="<<rows<<" CVs/peer="<<cvs<<" SO_flags=0"
+             <<" communication="<<(a.communicationEnable?"on":"off")<<" rows/peer="<<rows<<" CVs/peer="<<cvs<<" SO_flags=0"
              <<" dispatch_bytes/card="<<(a.world-1)*(slot/2+scaleSlot)
              <<" combine_bytes/card="<<(a.world-1)*slot
              <<" compute_input=independent-prepared L2=production-default"<<std::endl;
@@ -150,13 +153,13 @@ int main(int argc,char** argv) {
     CHECK(aclrtMemcpy(hr.data(),recordBytes,records,recordBytes,ACL_MEMCPY_DEVICE_TO_HOST));
     for(uint32_t peer=0;peer<a.world;++peer) {
         CHECK(aclrtMemcpy(host.data(),slot,destination+peer*slot,slot,ACL_MEMCPY_DEVICE_TO_HOST));
-        for(uint64_t i=0;i<slot;++i) if(host[i]!=(peer==a.rank?0xCD:Demo::Pattern(peer,a.rank,i)))
+        for(uint64_t i=0;i<slot;++i) if(host[i]!=((!a.communicationEnable || peer==a.rank)?0xCD:Demo::Pattern(peer,a.rank,i)))
             throw std::runtime_error("Payload mismatch peer="+std::to_string(peer)+" byte="+std::to_string(i));
         for(unsigned part=0;part<2;++part) {
             uint64_t n=part?scaleSlot:slot/2;
             uint8_t* ptr=dispatch+(part?storage/2:0)+peer*n;
             CHECK(aclrtMemcpy(host.data(),n,ptr,n,ACL_MEMCPY_DEVICE_TO_HOST));
-            for(uint64_t j=0;j<n;++j)if(host[j]!=(peer==a.rank?0xCD:Demo::Pattern(peer,a.rank,j)))
+            for(uint64_t j=0;j<n;++j)if(host[j]!=((!a.communicationEnable || peer==a.rank)?0xCD:Demo::Pattern(peer,a.rank,j)))
                 throw std::runtime_error("Dispatch payload mismatch");
         }
     }
@@ -177,6 +180,7 @@ int main(int argc,char** argv) {
     csv<<"iteration,kind,worker,peer,start_tick,end_tick,bytes\n";
     for(uint32_t round=warmup;round<rounds;++round) for(uint32_t worker=0;worker<recordCount;++worker) {
         if(worker<56 && !a.computeEnable)continue;
+        if(worker>=56 && !a.communicationEnable)continue;
         const auto* v=hr.data()+(uint64_t(round)*recordCount+worker)*Demo::words;
         if(v[1]<=v[0])throw std::runtime_error("Invalid timing record");
         auto row=[&](const char* kind,int peer,uint64_t start,uint64_t end,uint64_t bytes) {

@@ -2,7 +2,7 @@
 
 Based on megamoe-commfirst-shared 81377da. Standalone native executable; no wheel
 installation. Defaults EP16, BS8192, H5120, I2304, E384, TopK6, one shared expert
-Is2304. Supports EP4/8/16 and BS1024..8192 (multiples of128), K1..8.
+Is2304. Supports EP4/8/16 and BS1024..16384 (multiples of128), K1..8.
 
 Run on user-allocated idle devices only. The runner snapshots npu-smi; it does not
 reserve cards or automatically prove availability. No remote NPU run was performed.
@@ -63,3 +63,47 @@ Run the same command with --bs1024 (written as `--bs 1024`) for the small case.
 EP4/8: change --ep-size and --devices together. Compare TOTAL/CROSS and Combine
 bandwidth, GMM envelope, and overlap coverage in summary.json / comparison.csv.
 Implementation has not been compiled or run on NPU for this update.
+
+
+## No-supply-wait GMM ceiling and MFU
+
+`--compute on --communication off` runs only production comm-first routed/shared
+GMM classes and coupled W4 dequantization inside the timed mixed kernel. All
+GMM1 inputs and GMM2 activations remain prefilled/nonzero. The peer AIV1s do no PUT,
+Pack, activation, Reduce or Reorder work. Required intra-matmul buffer handshakes
+remain. This is a practical ceiling for this GMM implementation, not dense Cube
+hardware peak and not a unitflag continuous-context benchmark.
+
+`--communication on` adds the previous data-only communication workload with the
+same prepared compute inputs. Compare the MFU of these two runs to isolate resource
+contention. Off+off is rejected. In compute-only mode communication columns are N/A.
+The original per-round SHMEM device barriers, initial Exp50 guard, warmup and
+multiple invocations remain; final local join and report writes are outside the
+measured AIC interval. There is no new per-tile timer/fence.
+
+For each rank/round, `T_AIC = max_core(end) - min_core(start)`, including internal
+gaps and context drains. The printed primary MFU uses
+`T = mean_round(max_rank(T_AIC))`, not the maximum of rank means. Work is balanced,
+so per-card FLOPs = `6*BS*H*(TopK*I + S*Is)`; there is no further EP factor.
+Default `--peak-tflops 756` is per-card dense FP8 peak. Dequant operations and
+activation FLOPs are not added to the numerator. Additional rank MFU statistics
+are explicitly labeled and may differ from the primary ratio. Raw intervals,
+formula, model and MFU are saved in summary.json; comparison.csv includes MFU.
+
+```bash
+python3 experiments/urma_combine_l1/run.py \
+  --ep-size 16 --devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+  --bs 16384 --hidden 5120 --intermediate 2304 --topk 6 \
+  --shared-experts 1 --shared-intermediate 2304 \
+  --compute on --communication off --peak-tflops 756 \
+  --warmup 10 --iters 20 --exp-repeat 50
+```
+
+Rebuild this demo executable after updating (Args gained a communication switch).
+Do not reuse an older executable. No NPU ceiling/MFU result is claimed until this
+command is run on the target hardware. Nonzero finite-output checks are retained.
+
+Validation for MFU controls/report: five CPU report checks passed (rank-local
+envelopes, round-max then mean, shared width, missing lanes and compute-off),
+plus the native CPU planner cases including BS12288/16384. CANN compilation and
+NPU performance/accuracy have not been run for this update.
