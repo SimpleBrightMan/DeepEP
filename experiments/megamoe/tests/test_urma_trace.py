@@ -71,11 +71,39 @@ def test_every_event_id_has_a_name_and_no_fabricated_async_events():
             continue
         add_record(raw, engine=event_id, event=name)
     result = decode_trace(raw, rank=0, clock_mhz=1000)
-    assert len(events(result)) == sum(name is not None for name in EVENTS) == 46
+    assert len(events(result)) == sum(name is not None for name in EVENTS)
     assert {row["ph"] for row in result["traceEvents"]} == {"M", "X"}
     assert {row["args"]["event_id"] for row in events(result)} == {
         index for index, name in enumerate(EVENTS) if name is not None
     }
+
+
+def test_decoder_covers_native_enum_including_reorder_and_shared():
+    """Check the independent C++ producer ABI, not just the Python event list."""
+    import re
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "csrc/kernels/mega_moe/urma/abi.hpp").read_text(encoding="utf-8")
+    enum = source.split("enum class TraceEvent : uint32_t {", 1)[1].split("};", 1)[0]
+    enum = re.sub(r"//[^\n]*", "", enum)
+    native, value = {}, -1
+    for entry in enum.split(","):
+        if not entry.strip():
+            continue
+        parts = entry.strip().split("=")
+        value = int(parts[1].strip().rstrip("Uu"), 0) if len(parts) == 2 else value + 1
+        native[value] = parts[0].strip()
+    assert native[40] == "Gmm2Reorder" and native[41] == "WaitGmm2Reorder"
+    assert native[55] == "SharedGmm1Tile" and native[61] == "CoarseSharedCombineSubmit"
+    raw = trace_buffer(len(native))
+    for index, (event_id, name) in enumerate(native.items()):
+        assert EVENTS[event_id] == name
+        record = add_record(raw, engine=2, event=name, start=1000 + index * 100, end=1050 + index * 100)
+        record[2] = event_id
+    decoded = events(decode_trace(raw, rank=12, clock_mhz=1000))
+    assert {e["args"]["event_id"] for e in decoded} == set(native)
+    reorder = next(e for e in decoded if e["args"]["event_id"] == 40)
+    assert reorder["cat"] == "compute.copy"
 
 
 def test_historical_tail_cover_events_keep_completion_signal_and_hide_only_ready_wait():

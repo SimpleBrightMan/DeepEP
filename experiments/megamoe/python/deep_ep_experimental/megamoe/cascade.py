@@ -68,6 +68,8 @@ class CascadeReference:
         self.experts = int(model["num_experts"])
         self.topk = int(model["num_topk"])
         self.shared_experts = int(model["num_shared_experts"])
+        self.shared_intermediate = int(model.get("shared_intermediate_hidden", self.intermediate))
+        self.shared_output_rounding = model.get("shared_output_rounding", "single_cast")
         if self.experts <= 0 or self.experts % self.world:
             raise ValueError("Cascade requires global experts divisible by EP world size")
         if self.hidden <= 0 or self.intermediate <= 0 or self.hidden % 64 or self.intermediate % 64:
@@ -136,7 +138,8 @@ class CascadeReference:
         if not isinstance(raw, (tuple, list)) or len(raw) != 2:
             raise TypeError(f"{name} weights require raw GMM1 and GMM2 pairs")
         prepared = []
-        for layer, (n, k) in enumerate(((2 * self.intermediate, self.hidden), (self.hidden, self.intermediate))):
+        intermediate=self.shared_intermediate if name=="shared" else self.intermediate
+        for layer, (n, k) in enumerate(((2 * intermediate, self.hidden), (self.hidden, intermediate))):
             pair = raw[layer]
             if not isinstance(pair, (tuple, list)) or len(pair) != 2:
                 raise TypeError(f"{name} GMM{layer + 1} requires (packed_data, E8M0_scales)")
@@ -303,6 +306,7 @@ class CascadeReference:
             else:
                 output = routed
             if self.shared_weights is not None:
+                if self.shared_output_rounding=="route_bf16_then_add": output=output.to(torch.bfloat16).to(torch.float32)
                 shared_data = self._repeat_codes(data, self.shared_experts, 1)
                 shared_scale = self._repeat_codes(scale, self.shared_experts, 1, 1)
                 shared_counts = torch.full((self.shared_experts,), bs, device=data.device, dtype=torch.int64)

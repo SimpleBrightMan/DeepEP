@@ -92,4 +92,94 @@ __aicore__ inline void Expand(const Arguments& args, uint32_t worker)
     ExpandRows(args, LocalRowBegin(rows, worker), LocalOwnedRows(rows, worker));
 }
 
+class PackPipeline {
+public:
+    __aicore__ inline bool Active() const { return active_; }
+    template <class Completion>
+    __aicore__ inline void Submit(const Arguments& args, uint64_t begin, uint64_t count, Completion& completion)
+    {
+        if (count == 0U) return;
+        using namespace AscendC;
+        const uint32_t h = args.config.hidden;  // Host currently requires H=3584.
+        const uint32_t scales = h / 32U;
+        GlobalTensor<uint8_t> x, xScale, expandedX, expandedScale, selfX, selfScale;
+        GlobalTensor<int64_t> order;
+        x.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.x));
+        xScale.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.xScale));
+        expandedX.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.expandedX));
+        expandedScale.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.expandedScale));
+        selfX.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.symmetric + args.config.receiveXOffset));
+        selfScale.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.symmetric + args.config.receiveScaleOffset));
+        order.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(args.order));
+        LocalTensor<int64_t> routeIndices(TPosition::VECCALC, kPackUbBase + kPackOrderOffset, kPackOrderRows);
+        if (!active_) {
+            for (uint32_t slot = 0U; slot < kPackPipelineSlots; ++slot)
+                SetFlag<HardEvent::MTE3_MTE2>(static_cast<TEventID>(slot));
+            active_ = true;
+            nextSlot_ = 0U;
+        }
+        const uint64_t retireAfter = count < kPackPipelineSlots - 1U ? count : kPackPipelineSlots - 1U;
+        for (uint64_t batch = 0U; batch < count; batch += kPackOrderRows) {
+            const uint32_t batchRows =
+                static_cast<uint32_t>(count - batch < kPackOrderRows ? count - batch : kPackOrderRows);
+            // This dependency protects the preceding batch's scalar UB reads.
+            // The MTE2_S wait occurs once per index batch, never once per token.
+            SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+            DataCopyPad(routeIndices, order[begin + batch],
+                        {1U, static_cast<uint32_t>(batchRows * sizeof(int64_t)), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+            SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+            for (uint32_t index = 0U; index < batchRows; ++index) {
+                const uint64_t localRow = batch + index;
+                const uint64_t row = begin + localRow;
+                const uint32_t slot = nextSlot_;
+                const auto event = static_cast<TEventID>(slot);
+                LocalTensor<uint8_t> token(TPosition::VECCALC, kPackUbBase + slot * kPackSlotBytes, kPackTokenCapacity);
+                LocalTensor<uint8_t> scale(TPosition::VECCALC, kPackUbBase + slot * kPackSlotBytes + kPackTokenCapacity,
+                                           kPackScaleCapacity);
+                const uint64_t tokenRow = static_cast<uint64_t>(routeIndices.GetValue(index)) / args.config.topk;
+                WaitFlag<HardEvent::MTE3_MTE2>(event);
+                DataCopyPad(token, x[tokenRow * h], {1U, h, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+                DataCopyPad(scale, xScale[tokenRow * scales], {1U, scales, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+                SetFlag<HardEvent::MTE2_MTE3>(event);
+                WaitFlag<HardEvent::MTE2_MTE3>(event);
+                if (IsSelfExpandedRow(row, args.config)) {
+                    const uint64_t receiveRow = SelfReceiveRow(row, args.config);
+                    DataCopyPad(selfX[receiveRow * h], token, {1U, h, 0U, 0U, 0U});
+                    DataCopyPad(selfScale[receiveRow * scales], scale, {1U, scales, 0U, 0U, 0U});
+                } else {
+                    DataCopyPad(expandedX[row * h], token, {1U, h, 0U, 0U, 0U});
+                    DataCopyPad(expandedScale[row * scales], scale, {1U, scales, 0U, 0U, 0U});
+                }
+                SetFlag<HardEvent::MTE3_MTE2>(event);
+                nextSlot_ = (nextSlot_ + 1U) % kPackPipelineSlots;
+                // Retire only the PREVIOUS segment's captured fence, after this
+                // segment has submitted five rows (or its entire short tail).
+                if (localRow + 1U == retireAfter) completion.RetirePending();
+            }
+        }
+    }
+    __aicore__ inline void Close()
+    {
+        if (!active_) return;
+        using namespace AscendC;
+        for (uint32_t slot = 0U; slot < kPackPipelineSlots; ++slot)
+            WaitFlag<HardEvent::MTE3_MTE2>(static_cast<TEventID>(slot));
+        // Prove credit waits were consumed before another stage rearms them.
+        // This also certifies all six producer MTE3 stores, without PIPE_ALL.
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        active_ = false;
+    }
+private:
+    uint32_t nextSlot_ = 0U;
+    bool active_ = false;
+};
+
+struct NoPackCompletion {
+    __aicore__ inline void RetirePending() {}
+};
+
+// Blocking compatibility entry point, used by standalone full Expand callers.
 }  // namespace MegaMoeUrma

@@ -48,15 +48,19 @@ EVENTS = (
     "CombinePublish",
     "WaitReduceReady",
     "ReduceDrain",
-    # 33..41 are reserved, matching abi.hpp. JSON composites use 33/34.
+    # Only 33..39 are reserved (JSON composites use 33/34).
+    # Unitflag emits Reorder/WaitReorder at native IDs 40/41.
     None, None, None, None, None, None, None, "Gmm2Reorder", "WaitGmm2Reorder",
     "CombineSendComplete",
     "DispatchSendComplete",
     "CoarsePack", "CoarseLocalSyncStart", "CoarseGMM", "CoarseDequant",
     "CoarseDispatch", "CoarseCombine", "CoarseActivation", "CoarseReduce", "CoarseLocalSyncEnd",
+    "CoarseDispatchSubmit",
+    "PackRetire",
+    "SharedGmm1Tile", "SharedGmm1Drain", "SharedActivation", "SharedGmm2Tile", "SharedGmm2Drain", "SharedAdd", "CoarseSharedCombineSubmit",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
-SYNC_STAGES = {0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
+SYNC_STAGES = {4: "shared addition complete", 0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
 
 
 class TraceOverflowError(ValueError):
@@ -64,14 +68,29 @@ class TraceOverflowError(ValueError):
 
 
 def event_style(event):
+    if event == "Pack":
+        return event, "compute.copy", "rail_animation", "Pack submission; includes retirement of previous segment, current ready may be deferred"
+    if event == "PackRetire":
+        return event, "compute.drain", "thread_state_iowait", "wait captured Pack fence and publish pending ready; Close also releases six DMA credits"
+    if event == "CoarseSharedCombineSubmit":
+        return event, "coarse.envelope", "thread_state_runnable", "Combine submission envelope; final quiet is deferred until after routed Reduce"
+    if event == "CoarseDispatchSubmit":
+        return event, "coarse.envelope", "thread_state_runnable", "Dispatch submission envelope, not remote completion; final Combine quiet retires both phases"
     if event.startswith("Coarse"):
-        return event, "coarse.envelope", "good", "stage envelope including internal gaps; buffered until final join"
+        return event, "coarse.envelope", "good", "stage envelope including internal gaps; timestamps buffered until final local join"
     if event == "Reduce":
         return (
             event,
             "compute.copy",
             "rail_animation",
             "reduction scope; may include input readiness waits and final output drain",
+        )
+    if event == "Gmm2Reorder":
+        return (
+            event,
+            "compute.copy",
+            "rail_animation",
+            "ready-span batch with local store completion; rows/bytes cover only this batch, not the whole CV",
         )
     if event in ("DispatchPutX", "DispatchPutScale", "CombinePut"):
         return (
@@ -94,14 +113,14 @@ def event_style(event):
             event + " [outbound completion]",
             "transport.quiet",
             "thread_state_iowait",
-            "final outbound-peer quiet; end confirms all submitted Combine PUTs to this peer completed",
+            "final outbound-peer quiet; end confirms all prior Dispatch/Combine payload PUTs and SO flags to this peer completed",
         )
-    if event == "Gmm2Reorder":
+    if event == "DispatchSendComplete":
         return (
-            event,
-            "compute.copy",
-            "rail_animation",
-            "ready-span batch with local store completion; rows/bytes cover only this batch, not the whole CV",
+            event + " [outbound completion]",
+            "transport.quiet",
+            "thread_state_iowait",
+            "final owner QP quiet; end confirms all Dispatch payload PUTs and SO ready publications completed",
         )
     if event.endswith("Drain"):
         return event + " [drain]", "compute.drain", "thread_state_iowait", "explicit pipeline drain scope"
@@ -202,7 +221,7 @@ def decode_trace(raw, *, rank, clock_mhz):
         envelope_us=(last - origin) / clock_mhz,
         clock_alignment="each rank starts at its own earliest event; cross-rank clocks are not synchronized",
         scope="diagnostic invocation; excluded from formal performance samples",
-        instrumentation="coarse" if any(record[4][2] >= 44 for record in records) else "fine",
+        instrumentation="coarse" if any(44 <= record[4][2] <= 53 for record in records) else "fine",
         interpretation="PUT/Cube submit bars do not measure asynchronous completion; inspect quiet/drain/wait separately",
         events=dict(Counter(EVENTS[record[4][2]] for record in records)),
     )

@@ -163,7 +163,7 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
                 yield token, weights[token, slot], pair
         shared = model["num_shared_experts"]
         if shared:
-            raw = make_weights(shared, model["hidden"], model["intermediate_hidden"], config["seed"] + 100000)
+            raw = make_weights(shared, model["hidden"], model.get("shared_intermediate_hidden",model["intermediate_hidden"]), config["seed"] + 100000)
             for expert in range(shared):
                 yield np.arange(len(x)), None, tuple((data[expert], scale[expert]) for data, scale in raw)
 
@@ -176,7 +176,7 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
             result[start:stop] = expert_forward(x[token[start:stop]], w1, w2)
         if route_weight is not None:
             result *= route_weight[:, None]
-        return token, result
+        return token, result, route_weight is None
 
     # 有界提交、按专家顺序累加：避免一次展开全部专家，避免线程完成次序改变归约。
     pending, iterator, completed = deque(), iter(jobs()), 0
@@ -189,7 +189,9 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
                 pending.append(pool.submit(forward, job))
             if not pending:
                 break
-            token, result = pending.popleft().result()
+            token, result, is_shared = pending.popleft().result()
+            if is_shared and model.get("shared_output_rounding")=="route_bf16_then_add":
+                output[:] = bf16(output)
             np.add.at(output, token, result)
             completed += 1
             if completed == 1 or completed % 16 == 0:
@@ -269,11 +271,14 @@ def compare(actual, expected, *, diff_thd=0.01, pct_thd=0.05, max_diff=0.1):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hidden",type=int)
-    parser.add_argument("--intermediate",type=int)
-    parser.add_argument("--topk",type=int,choices=range(1,9))
     parser.add_argument("--config", default="smoke")
     parser.add_argument("--bs-values")
+    parser.add_argument("--topk",type=int,choices=range(1,9))
+    parser.add_argument("--hidden",type=int)
+    parser.add_argument("--intermediate",type=int)
+    parser.add_argument("--shared-experts",type=int,choices=(0,1))
+    parser.add_argument("--shared-intermediate",type=int)
+    parser.add_argument("--urma-shared",action="store_true")
     parser.add_argument("--ep-size", type=int, required=True)
     parser.add_argument("--ranks", required=True, help="Source ranks on this host, e.g. 0-7")
     parser.add_argument("--golden-dir", type=Path, default=Path("benchmark-golden"))
@@ -294,9 +299,14 @@ def main():
     from .timer.__main__ import parse_ranks
 
     config, ranks = load_config(args.config, args.bs_values), parse_ranks(args.ranks)
+    if args.topk is not None:config["model"]["num_topk"]=args.topk
     if args.hidden is not None:config["model"]["hidden"]=args.hidden
     if args.intermediate is not None:config["model"]["intermediate_hidden"]=args.intermediate
-    if args.topk is not None:config["model"]["num_topk"]=args.topk
+    if args.shared_experts is not None:config["model"]["num_shared_experts"]=args.shared_experts
+    if args.urma_shared:
+        config["model"]["shared_intermediate_hidden"]=args.shared_intermediate if args.shared_intermediate is not None else config["model"].get("shared_intermediate_hidden",config["model"]["intermediate_hidden"])
+        config["model"]["shared_output_rounding"]="single_cast"
+
     if args.ep_size <= 0 or any(rank >= args.ep_size for rank in ranks):
         parser.error("ranks must be within EP size")
     print(f"[GOLDEN] workers={args.workers} BLAS_threads={threads} chunk_tokens={args.chunk_tokens}", flush=True)

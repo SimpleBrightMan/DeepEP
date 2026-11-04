@@ -18,10 +18,11 @@ struct NoopTimer {
     __aicore__ inline void End(Phase, uint64_t = 0U) {}
 };
 
-enum class CoarsePhase : uint32_t { Pack, SyncStart, Gmm, Dequant, Dispatch, Combine, Activation, Reduce, SyncEnd, Count };
+enum class CoarsePhase : uint32_t { Pack, SyncStart, Gmm, Dequant, Dispatch, Combine, Activation, Reduce, SyncEnd, SharedSum, Count };
 
 class Timer {
 public:
+    __aicore__ inline void SharedMode(){shared_=true;}
     __aicore__ inline void Init(uint64_t address, uint64_t traceAddress = 0U, uint64_t traceCapacity = 0U, bool coarse = false)
     {
 #ifdef DEEPEP_MEGAMOE_TIMER
@@ -112,7 +113,11 @@ public:
                     if (coarseStart_[p] && (selected == count || coarseStart_[p] < coarseStart_[selected])) selected = p;
                 if (selected == count) break;
                 TraceMeta meta;
-                WriteTrace(static_cast<TraceEvent>(static_cast<uint32_t>(TraceEvent::CoarsePack) + selected), coarseStart_[selected], coarseEnd_[selected], meta);
+                const auto event = selected == static_cast<uint32_t>(CoarsePhase::SharedSum) ? TraceEvent::SharedAdd :
+                    shared_ && selected == static_cast<uint32_t>(CoarsePhase::Combine) ? TraceEvent::CoarseSharedCombineSubmit :
+                    shared_ && selected == static_cast<uint32_t>(CoarsePhase::Dispatch) ? TraceEvent::CoarseDispatchSubmit :
+                    static_cast<TraceEvent>(static_cast<uint32_t>(TraceEvent::CoarsePack) + selected);
+                WriteTrace(event, coarseStart_[selected], coarseEnd_[selected], meta);
                 coarseStart_[selected] = 0U;
             }
         }
@@ -164,6 +169,7 @@ public:
     }
 
 private:
+    bool shared_=false;
     __aicore__ inline __gm__ uint64_t* TraceHeader() const
     {
         return reinterpret_cast<__gm__ uint64_t*>(traceAddress_) +

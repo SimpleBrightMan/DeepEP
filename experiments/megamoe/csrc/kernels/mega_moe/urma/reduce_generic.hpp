@@ -123,7 +123,7 @@ public:
         stride_=args.config.hidden;column_=column;columns_=columns;
         returned_.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(args.symmetric + args.config.returnYOffset));
         returned_.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
-        output_.SetGlobalBuffer(reinterpret_cast<__gm__ Output*>(args.output));
+        output_.SetGlobalBuffer(reinterpret_cast<__gm__ Output*>(KeepFp32 ? args.sharedRoutedOutput : args.output));
         inputs_ = LocalTensor<Element>(TPosition::VECCALC, Ub::inputBf16Offset, Ub::inputs * Ub::hidden);
         terms_ = LocalTensor<float>(TPosition::VECCALC, Ub::inputFp32Offset, Ub::inputs * Ub::hidden);
         accumulator_ = LocalTensor<float>(TPosition::VECCALC, Ub::accumulatorOffset, Ub::hidden);

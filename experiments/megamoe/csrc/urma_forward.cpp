@@ -80,7 +80,7 @@ int64_t urma_buffer_size(int64_t world, int64_t max_tokens, int64_t topk, int64_
 
 UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t intermediate, int64_t topk, int64_t cv_rows,
                    int64_t max_recv_rows, int64_t max_tokens, int64_t rank, uint64_t ffts, uint64_t symmetric_address,
-                   int64_t symmetric_bytes, int64_t gmm1_ahead_mgroups)
+                   int64_t symmetric_bytes, int64_t gmm1_ahead_mgroups, int64_t shared_experts, int64_t shared_intermediate)
 {
     TORCH_CHECK(example.device().type() == c10::DeviceType::PrivateUse1 && example.dim() == 2 &&
                     example.is_contiguous() && example.size(0) > 0 && example.size(0) <= max_tokens,
@@ -94,6 +94,10 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     TORCH_CHECK(intermediate >= 256 && intermediate <= 16384 && intermediate % 256 == 0 && rank >= 0 && rank < world, "URMA requires I256..16384 aligned256 and rank in [0,EP)");
     args_.config = Layout(world, max_tokens, topk, example.size(1), max_recv_rows, cv_rows);
     auto& config = args_.config;
+    TORCH_CHECK(shared_experts==0 || shared_experts==1, "Shared experts must be 0 or 1");
+    TORCH_CHECK(shared_experts==0 || (shared_intermediate>=256 && shared_intermediate<=16384 && shared_intermediate%256==0),
+                "Shared I must be aligned256 in [256,16384]");
+    args_.sharedExperts=shared_experts;args_.sharedIntermediate=shared_experts?shared_intermediate:0;
     config.bs = example.size(0);
     config.intermediate = intermediate;
     config.localExperts = 384U / config.world;
@@ -131,14 +135,36 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
                     ". Multi-host testing requires one mutually accessible UB memory domain.");
     }
 
-    const auto plan =
+    auto plan =
         MegaMoeUrma::BuildExpertPlan(counts_cpu.data_ptr<int64_t>(), config, static_cast<uint64_t>(max_recv_rows));
+    if(shared_experts && world==4) {
+        plan.computeBatches.clear();plan.computeTasks.clear();
+        for(uint32_t first=0;first<plan.fragments.size();first+=12U) {
+            const auto wave=static_cast<uint32_t>(plan.computeBatches.size());
+            plan.computeBatches.push_back({first,std::min<uint32_t>(12U,plan.fragments.size()-first)});
+            plan.computeTasks.push_back({MegaMoeUrma::ComputeBatchStage::Gmm1,wave});
+            plan.computeTasks.push_back({MegaMoeUrma::ComputeBatchStage::Gmm2,wave});
+        }
+        plan.config.computeTaskCount=plan.computeTasks.size();
+    }
     config = plan.config;
     const auto options = example.options().dtype(torch::kUInt8);
     const uint64_t expanded_rows = static_cast<uint64_t>(config.bs) * topk;
     auto allocate = [&](uint64_t bytes) {
         return torch::empty({static_cast<int64_t>(std::max<uint64_t>(bytes, 512))}, options);
     };
+    if(args_.sharedExperts) {
+        const uint64_t si=args_.sharedIntermediate,groups=(config.bs+255U)/256U;
+        shared_gmm1_=allocate(config.bs*si*4);shared_activation_=allocate(config.bs*si);
+        shared_scale_=allocate(config.bs*(si/32));shared_output_=allocate(uint64_t(config.bs)*config.hidden*2);
+        shared_routed_output_=allocate(uint64_t(config.bs)*config.hidden*4);
+        args_.sharedRoutedOutput=Address(shared_routed_output_);
+        shared_done1_=allocate(groups*(si/256)*MegaMoeUrma::kFlagBytes);
+        shared_done_act_=allocate(groups*MegaMoeUrma::kFlagBytes);
+        args_.sharedGmm1=Address(shared_gmm1_);args_.sharedActivation=Address(shared_activation_);
+        args_.sharedActivationScale=Address(shared_scale_);args_.sharedOutput=Address(shared_output_);
+        args_.sharedGmm1Done=Address(shared_done1_);args_.sharedActivationDone=Address(shared_done_act_);
+    }
     expanded_x_ = allocate(expanded_rows * config.hidden);
     expanded_scale_ = allocate(expanded_rows * (config.hidden / 32));
     gathered_input_scale_ = allocate(config.receiveRows * (config.hidden / 32));
@@ -229,7 +255,9 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
                                 torch::Tensor reduce_index, torch::Tensor topk_weights, torch::Tensor weight1,
                                 torch::Tensor weight2, torch::Tensor weight_scales1, torch::Tensor weight_scales2,
                                 c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> out, int64_t epoch,
-                                c10::optional<torch::Tensor> trace, bool coarse_trace)
+                                c10::optional<torch::Tensor> trace, bool coarse_trace,
+                                c10::optional<torch::Tensor> shared_w1,c10::optional<torch::Tensor> shared_w2,
+                                c10::optional<torch::Tensor> shared_s1,c10::optional<torch::Tensor> shared_s2)
 {
     TORCH_CHECK(!coarse_trace || (trace && !timer), "coarse trace requires trace storage and no aggregate timer");
     const auto& c = args_.config;
@@ -271,6 +299,21 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
             weight_scales1.sizes() == torch::IntArrayRef({c.localExperts, c.intermediate * 2, c.hidden / 64, 2}) &&
             weight_scales2.sizes() == torch::IntArrayRef({c.localExperts, c.hidden, c.intermediate / 64, 2}),
         "Invalid FP4 weight scales");
+    TORCH_CHECK(bool(shared_w1)==bool(args_.sharedExperts) && bool(shared_w2)==bool(args_.sharedExperts) &&
+                bool(shared_s1)==bool(args_.sharedExperts) && bool(shared_s2)==bool(args_.sharedExperts),"Shared weight pairs must match S0/S1");
+    if(args_.sharedExperts) {
+        const int64_t si=args_.sharedIntermediate;
+        CheckTensor(*shared_w1,3,"shared_w1",device);CheckTensor(*shared_w2,3,"shared_w2",device);
+        CheckTensor(*shared_s1,4,"shared_s1",device);CheckTensor(*shared_s2,4,"shared_s2",device);
+        TORCH_CHECK(shared_w1->scalar_type()==torch::kUInt8 && shared_w2->scalar_type()==torch::kUInt8 &&
+                    shared_w1->sizes()==torch::IntArrayRef({1,2*si,c.hidden/2}) &&
+                    shared_w2->sizes()==torch::IntArrayRef({1,c.hidden,si/2}),"Invalid shared FP4 weights");
+        TORCH_CHECK(shared_s1->scalar_type()==c10::ScalarType::Float8_e8m0fnu && shared_s2->scalar_type()==c10::ScalarType::Float8_e8m0fnu &&
+                    shared_s1->sizes()==torch::IntArrayRef({1,2*si,c.hidden/64,2}) &&
+                    shared_s2->sizes()==torch::IntArrayRef({1,c.hidden,si/64,2}),"Invalid shared scales");
+        args_.sharedWeight1=Address(*shared_w1);args_.sharedWeight2=Address(*shared_w2);
+        args_.sharedScale1=Address(*shared_s1);args_.sharedScale2=Address(*shared_s2);
+    }
     TORCH_CHECK(epoch > last_epoch_ && epoch < (1LL << 60), "URMA epoch must increase across calls");
     if (timer) {
 #ifndef DEEPEP_MEGAMOE_TIMER
@@ -302,6 +345,8 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     CheckTensor(output, 2, "out", device);
     TORCH_CHECK(output.scalar_type() == torch::kBFloat16 && output.sizes() == x.sizes(), "out must be BF16 [BS,H]");
     auto stream = c10_npu::getCurrentNPUStream();
+    if(args_.sharedExperts)for(auto* tensor:{&shared_done1_,&shared_done_act_})
+        ASCEND_DEEPEP_CHECK_ACL(aclrtMemsetAsync(tensor->data_ptr(),tensor->numel(),0,tensor->numel(),stream.stream()));
     // The previous invocation has joined its reducers and all final QP quiets.
     // New remote writes cannot arrive before PublishStart in the kernel below.
     // Reset per-CV/finished slots so SO add(epoch) remains correct when a CV
@@ -387,6 +432,12 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
                                &system_workspace_}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }
+    if(args_.sharedExperts) {
+        for(const auto* t:{&shared_gmm1_,&shared_activation_,&shared_scale_,&shared_output_,&shared_routed_output_,&shared_done1_,&shared_done_act_})
+            c10_npu::NPUCachingAllocator::recordStream(t->storage().data_ptr(),stream);
+        for(const auto* t:{&*shared_w1,&*shared_w2,&*shared_s1,&*shared_s2})
+            c10_npu::NPUCachingAllocator::recordStream(t->storage().data_ptr(),stream);
+    }
     if (timer) c10_npu::NPUCachingAllocator::recordStream(timer->storage().data_ptr(), stream);
     if (trace) c10_npu::NPUCachingAllocator::recordStream(trace->storage().data_ptr(), stream);
     return output;
@@ -431,6 +482,12 @@ std::map<std::string, torch::Tensor> UrmaPlan::debug_snapshot() const
           std::make_pair("local_flags", &local_flags_)}) {
         copy(item.first, Address(*item.second), item.second->nbytes());
     }
+    if(args_.sharedExperts) {
+        copy("shared_gmm1",args_.sharedGmm1,shared_gmm1_.nbytes());
+        copy("shared_activation",args_.sharedActivation,shared_activation_.nbytes());
+        copy("shared_output",args_.sharedOutput,shared_output_.nbytes());
+        copy("shared_routed_fp32",args_.sharedRoutedOutput,shared_routed_output_.nbytes());
+    }
     return result;
 }
 
@@ -466,6 +523,8 @@ int64_t UrmaPlan::workspace_bytes() const
                                &local_flags_,
                                &system_workspace_})
         if (tensor->defined()) bytes += tensor->nbytes();
+    for(const auto* t:{&shared_gmm1_,&shared_activation_,&shared_scale_,&shared_output_,&shared_routed_output_,&shared_done1_,&shared_done_act_})
+        if(t->defined())bytes+=t->nbytes();
     return bytes;
 }
 }  // namespace deepep::megamoe

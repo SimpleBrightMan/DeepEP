@@ -27,6 +27,7 @@ constexpr uint32_t kLocalFlagAicDone = 1U;
 constexpr uint32_t kLocalFlagIncomingDone = 2U;
 constexpr uint32_t kLocalFlagPackDone = 3U;
 constexpr uint32_t kLocalFlagReorderDone = 4U;
+constexpr uint32_t kLocalFlagSharedGmm1Done = 5U;
 // Reduce dependency values are uint64 bit patterns stored in an int64 tensor.
 // Low values address a producer/CV completion flag; tagged values address a
 // local GMM2 group that writes its self return rows directly.
@@ -85,7 +86,9 @@ enum class TraceEvent : uint32_t {
     CombineSendComplete,
     DispatchSendComplete, // Reserved here, shared coarse event IDs start at 44.
     CoarsePack, CoarseLocalSyncStart, CoarseGMM, CoarseDequant,
-    CoarseDispatch, CoarseCombine, CoarseActivation, CoarseReduce, CoarseLocalSyncEnd
+    CoarseDispatch, CoarseCombine, CoarseActivation, CoarseReduce, CoarseLocalSyncEnd,
+    CoarseDispatchSubmit, PackRetire, SharedGmm1Tile, SharedGmm1Drain, SharedActivation,
+    SharedGmm2Tile, SharedGmm2Drain, SharedAdd, CoarseSharedCombineSubmit
 };
 
 struct TraceMeta {
@@ -256,6 +259,11 @@ struct Arguments {
     uint64_t coarseTrace;
     uint64_t systemWorkspace;
     uint64_t ffts;
+    uint32_t sharedExperts, sharedIntermediate;
+    uint64_t sharedWeight1, sharedWeight2, sharedScale1, sharedScale2;
+    uint64_t sharedGmm1, sharedActivation, sharedActivationScale, sharedOutput;
+    uint64_t sharedGmm1Done, sharedActivationDone;
+    uint64_t sharedRoutedOutput; // S1 FP32 routed sum; round only after adding shared result.
 };
 static_assert(sizeof(Fragment) == 40);
 static_assert(sizeof(RowSegment) == 40);

@@ -14,9 +14,6 @@ from .benchmark import inputs, load_config
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hidden",type=int)
-    parser.add_argument("--intermediate",type=int)
-    parser.add_argument("--topk",type=int,choices=range(1,9))
     parser.add_argument("--config", default="urma")
     parser.add_argument(
         "--bs-values",
@@ -24,12 +21,17 @@ def parse_args(argv=None):
         help="Comma-separated BS/rank sweep; each BS must be in [1, num_max_tokens_per_rank] (native capacity <= 8192)",
     )
     parser.add_argument("--routing", choices=("balanced", "random", "skewed", "random-balanced"), default="balanced")
+    parser.add_argument("--shared-experts", type=int, choices=(0,1))
+    parser.add_argument("--shared-intermediate", type=int)
+    parser.add_argument("--topk", type=int, choices=range(1,9), help="URMA routed experts per token (1..8)")
+    parser.add_argument("--hidden", type=int)
+    parser.add_argument("--intermediate", type=int)
     parser.add_argument("--cv-rows", type=int, default=256)
     parser.add_argument(
         "--gmm1-ahead-mgroups",
         type=int,
         default=12,
-        help="Sustained pending GMM1 M-group window; 0 preserves the two-expert baseline",
+        help="GMM1 M-group lookahead for EP8/EP16; ignored on EP4, which always uses wave12",
     )
     parser.add_argument(
         "--exp-shape",
@@ -140,9 +142,14 @@ def format_profile_summary(reports, world):
 def main():
     args = parse_args()
     config = load_config(args.config, args.bs_values)
-    if args.hidden is not None:config["model"]["hidden"]=args.hidden
-    if args.intermediate is not None:config["model"]["intermediate_hidden"]=args.intermediate
-    if args.topk is not None:config["model"]["num_topk"]=args.topk
+    if args.topk is not None: config["model"]["num_topk"] = args.topk
+    if args.hidden is not None: config["model"]["hidden"] = args.hidden
+    if args.intermediate is not None: config["model"]["intermediate_hidden"] = args.intermediate
+    if args.shared_experts is not None: config["model"]["num_shared_experts"] = args.shared_experts
+    if config["model"]["num_shared_experts"]:
+        config["model"]["shared_intermediate_hidden"] = args.shared_intermediate if args.shared_intermediate is not None else config["model"].get("shared_intermediate_hidden",config["model"]["intermediate_hidden"])
+        config["model"]["shared_output_rounding"] = "single_cast"
+
     for key in ("warmup", "iters"):
         value = getattr(args, key)
         if value is not None:
@@ -170,7 +177,7 @@ def main():
         raise
 
 
-def export_trace_collective(group, raw, case, *, bs, clock_mhz, include_waits=False):
+def export_trace_collective(group, raw, case, *, bs, clock_mhz, include_waits=False, model=None):
     """All ranks exchange exporter errors before any rank raises on overflow."""
     from .urma_trace import export_trace
 
@@ -187,6 +194,12 @@ def export_trace_collective(group, raw, case, *, bs, clock_mhz, include_waits=Fa
         status["metadata"] = export_trace(
             raw, case / "urma_trace.json", rank=group.rank(), clock_mhz=clock_mhz, include_waits=include_waits
         )
+        if model is not None:
+            trace_path=case / "urma_trace.json"
+            trace_doc=json.loads(trace_path.read_text(encoding="utf-8"))
+            trace_doc["metadata"].update(bs=bs,world=group.size(),model=dict(model))
+            trace_path.write_text(json.dumps(trace_doc,separators=(",", ":")),encoding="utf-8")
+            status["metadata"]=trace_doc["metadata"]
     except Exception as error:
         status["error"] = f"{type(error).__name__}: {error}"
     try:
@@ -204,7 +217,7 @@ def run(args, config, group):
     import torch
     from .api import transform_weights_for_mega_moe
     from .reference import make_weights, quantize_input
-    from .urma import UrmaBuffer, _extension
+    from .urma import COMMUNICATION_PROTOCOL, UrmaBuffer, _extension, use_fused_gate_up
     from .urma_timing import UrmaLaunchGuard, measure_profiled_forward, summarize_profile_rounds
     from .validation import collective_check
 
@@ -257,7 +270,7 @@ def run(args, config, group):
     model = config["model"]
     owner = UrmaBuffer(
         group,
-        **model,
+        **{k:v for k,v in model.items() if k!="shared_output_rounding"},
         num_max_tokens_per_rank=max(config["bs_values"]),
         cv_rows=args.cv_rows,
         gmm1_ahead_mgroups=args.gmm1_ahead_mgroups,
@@ -265,7 +278,7 @@ def run(args, config, group):
         allow_multi_host=args.allow_multi_host,
     )
     if args.timer and not owner.timer_enabled:
-        raise RuntimeError("--timer requires native URMA timer support in the installed wheel")
+        raise RuntimeError("coarse/fine diagnostics require native URMA timer support in the installed wheel")
 
     def device_pair(pair):
         data, scales = pair
@@ -280,6 +293,12 @@ def run(args, config, group):
 
         debug_weight_sources = source_weight_prefixes(raw)
     weights = transform_weights_for_mega_moe(*map(device_pair, raw))
+    shared_raw=None;shared_options={}
+    if model["num_shared_experts"]:
+        shared_raw=make_weights(1,model["hidden"],model["shared_intermediate_hidden"],config["seed"]+100000)
+        sw1,sw2=transform_weights_for_mega_moe(*map(device_pair,shared_raw),shared=True)
+        shared_options=dict(shared_l1_weights=sw1,shared_l2_weights=sw2)
+
     launch_guard = UrmaLaunchGuard(
         group, args.exp_shape, args.exp_repeat, args.launch_timeout, backend=args.guard_backend
     )
@@ -289,7 +308,7 @@ def run(args, config, group):
 
         error = None
         try:
-            cascade_reference = CascadeReference(model, raw, host_group=group)
+            cascade_reference = (CascadeReference(model,raw,shared_raw,host_group=group) if shared_raw is not None else CascadeReference(model, raw, host_group=group))
         except Exception as failure:
             error = f"{type(failure).__name__}: {failure}"
         collective_check(group, "URMA cascade preparation", error)
@@ -303,10 +322,25 @@ def run(args, config, group):
         ranks_per_node=ranks_per_node,
         allow_multi_host=args.allow_multi_host,
         bandwidth_topology="logical contiguous rank groups of four; multi-host validation is not UBX bandwidth equivalence",
-        transport="URMA PUT-only",
+        transport="URMA QP0 RO PUT + per-CV SO Dispatch epochs + SO Combine bitmap publication",
+        communication_protocol=COMMUNICATION_PROTOCOL,
+        communication_qps_per_peer=1,
+        dispatch_combine_overlap="in-flight Dispatch and Combine on each peer QP",
+        same_peer_dispatch_combine_overlap=True,
+        dispatch_combine_transition="own Dispatch submission -> remaining own Pack quota -> ready Combine scan; no Dispatch quiet or local join",
+        dispatch_batch_cvs="1,1,2,4,8,8,...; ready remainder after Pack completes",
+        dispatch_pack_cvs="startup2; after PUT+SO: max(send-count+1, next-batch prefix deficit); full ramp 2,2,3,7,9,...; capped by remaining quota",
+        dispatch_publication="one SO epoch per covered original CV; no per-batch quiet",
+        combine_publication="unitflag: 128-row data PUT; one SO epoch after every complete original CV; self CV ready after Reorder",
+        communication_completion="S1: final quiet after Reduce; S0: per-CV Dispatch quiet and original final Combine quiet",
         remote_workers=world - 1,
         swiglu_workers=28 - (world - 1),
-        reduce_workers=56 - (world - 1),
+        reduce_workers=56 if model["num_shared_experts"] else 56 - (world - 1),
+        reduce_assignment="static contiguous token ranges across AIV0+AIV1; worker=2*block+subblock; AIV0 joins after its own dequant contexts; incoming counters remain AIV1-owned" if model["num_shared_experts"] else "original routed schedule",
+        startup_pack_workers=28 if model["num_shared_experts"] else 56,
+        shared_activation_workers=28 if model["num_shared_experts"] else 0,
+        shared_dispatch_startup_limit="BS<4096: per-peer max(1,floor(BS/1024)) merged batches before all local shared GMM1 AICs finish; normal ramp only while gated; no limit for BS>=4096/S0",
+        shared_schedule="shared GMM1 -> routed -> shared GMM2; one lowest-priority shared activation slice per turn; local join + add" if model["num_shared_experts"] else "disabled",
         routing=args.routing,
         cv_rows=args.cv_rows,
         gmm1_ahead_mgroups=args.gmm1_ahead_mgroups,
@@ -318,6 +352,7 @@ def run(args, config, group):
         ),
         performance_scope="mega_moe_urma_kernel only; routes prepared once before profiling",
         performance_rounds="formal iterations only; optional one-shot diagnostics excluded",
+        profile_modes=["none"] + (["coarse"] if args.timer else []) + (["fine"] if args.fine else []),
         profile_config="Level0/AiCoreNone/Text; shapes/memory/stack/FLOPs/modules disabled",
         max_recv_rows=owner.max_recv_rows,
         symmetric_buffer_bytes=owner.symmetric_buffer_bytes,
@@ -337,13 +372,15 @@ def run(args, config, group):
         trace_include_waits=args.trace_include_waits,
         trace_clock_alignment="per-rank independent zero; no synchronized cross-rank timeline",
         trace_scope="one optional coarse and one optional fine invocation, after formal rounds in the same profiler",
+        coarse_compute_scope="stage entry through final output drain; includes initial input wait and all internal gaps",
     )
     (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     if rank == 0:
         print(
             f"[URMA SCHEDULE] compute={manifest['compute_schedule']} communication_cv_rows={args.cv_rows} "
             f"gmm1_ahead_mgroups={args.gmm1_ahead_mgroups} "
-            f"local_pipeline={manifest['local_pipeline']} tail={manifest['tail_schedule']}",
+            f"local_pipeline={manifest['local_pipeline']} tail={manifest['tail_schedule']} "
+            f"communication={COMMUNICATION_PROTOCOL}",
             flush=True,
         )
         print(
@@ -357,6 +394,17 @@ def run(args, config, group):
     for bs in config["bs_values"]:
         case = rank_dir / f"bs_{bs}"
         case.mkdir()
+        wave_mgroups = 12 if world == 4 else 0
+        fused_gate_up = use_fused_gate_up(bs, world, model["num_topk"], model["num_experts"])
+        if rank == 0:
+            expected_rows = bs * world * model["num_topk"] / model["num_experts"]
+            print(
+                f"[URMA GMM1] BS={bs} EP={world} expected-rows/expert={expected_rows:.3f} "
+                f"gate_up={'fused128+128' if fused_gate_up else 'planar256+256'}",
+                flush=True,
+            )
+        if rank == 0 and wave_mgroups:
+            print(f"[URMA WAVE] EP4 BS={bs}: 12 real M-groups/wave; GMM1(wave)->GMM2(wave); ahead-mgroups not applied", flush=True)
         host_x, host_ids, host_weights = inputs(config, rank, bs, args.routing, world=world)
         codes, scales = quantize_input(host_x)
         x = (
@@ -383,7 +431,7 @@ def run(args, config, group):
         collective_check(group, f"URMA diagnostic allocation BS={bs}", error)
         torch.npu.synchronize()
         startup_mgroups = int(prepared.native.gmm1_startup_mgroups)
-        forward = partial(owner.forward_prepared, x, topk_weights, *weights, prepared, out=output)
+        forward = partial(owner.forward_prepared, x, topk_weights, *weights, prepared, out=output, **shared_options)
         coarse_forward = partial(forward, trace=coarse_trace, coarse_trace=True) if args.timer else None
         fine_forward = partial(forward, timer=timer, trace=trace) if args.fine else None
         mode_reports = {}
@@ -431,6 +479,7 @@ def run(args, config, group):
         reports = dict(
             bs=bs, received_rows_local=prepared.received_rows,
             gmm1_ahead_mgroups=args.gmm1_ahead_mgroups, gmm1_startup_mgroups_local=startup_mgroups,
+            compute_wave_mgroups=wave_mgroups, gmm1_ahead_mgroups_applied=not bool(wave_mgroups),
             profile=profile_report, profiles=mode_reports, profile_directory=capture["profile_dir"],
             diagnostic_sample=capture["diagnostic_sample"], diagnostics=capture["diagnostics"], validation="skipped",
         )
@@ -476,6 +525,7 @@ def run(args, config, group):
                     topk=model["num_topk"],
                     received_rows=prepared.received_rows,
                     rank=rank,
+                    fused_gate_up=fused_gate_up,
                 )
                 del debug_raw
             source_counts = group.all_gather(
@@ -539,6 +589,12 @@ def run(args, config, group):
             reports["bandwidth"] = summarize_bandwidth(bandwidth_records)
             reports["bandwidth_per_rank"] = bandwidth_records
             reports["bandwidth_scope"] = timer_metadata["scope"]
+            reports["dispatch_bandwidth_unavailable"] = "Dispatch submission end is not completion; no independent completion probe"
+            if model["num_shared_experts"]:
+                reports["combine_bandwidth_unavailable"] = "Shared mode defers final quiet until after routed Reduce; Combine timer is submission-only"
+
+            if rank == 0:
+                print("[URMA BW] Dispatch completion bandwidth unavailable: no separate Dispatch quiet", flush=True)
             reports["bandwidth_with_trace"] = args.fine
             if rank == 0:
                 for row in reports["bandwidth"]:
@@ -558,15 +614,14 @@ def run(args, config, group):
             coarse_case = case / "coarse"
             coarse_case.mkdir(exist_ok=True)
             records = export_trace_collective(group, coarse_trace.cpu().numpy(), coarse_case,
-                                              bs=bs, clock_mhz=args.timer_clock_mhz, include_waits=True)
+                                              bs=bs, clock_mhz=args.timer_clock_mhz, include_waits=True, model=model)
             reports["coarse_trace_per_rank"] = records
             reports["coarse_trace_allrank"] = merge_trace_collective(
                 group, records, args.output_dir / f"bs_{bs}" / "coarse" / "allrank.json", bs=bs, include_waits=True)
         if args.fine:
             from .urma_trace_merge import merge_trace_collective
 
-            # The only detailed trace is the final extra invocation already
-            # enqueued above. No second run, launch guard, or profiled sample.
+            # One final detailed diagnostic, excluded from formal samples.
             (case / "fine").mkdir(exist_ok=True)
             raw_trace = trace.cpu().numpy()
             reports["trace_per_rank"] = export_trace_collective(
@@ -575,7 +630,7 @@ def run(args, config, group):
                 case / "fine",
                 bs=bs,
                 clock_mhz=args.timer_clock_mhz,
-                include_waits=args.trace_include_waits,
+                include_waits=args.trace_include_waits, model=model,
             )
             reports["trace_allrank"] = merge_trace_collective(
                 group,
@@ -588,7 +643,7 @@ def run(args, config, group):
                 print(
                     f"[URMA TRACE] BS={bs} all {world} ranks exported; "
                     f"capacity={args.trace_capacity}/engine; rank-local clocks; "
-                    f"{args.output_dir}/rank_*/bs_{bs}/urma_trace.json",
+                    f"{args.output_dir}/rank_*/bs_{bs}/fine/urma_trace.json",
                     flush=True,
                 )
                 print(f"[URMA ALLRANK] BS={bs}; {reports['trace_allrank']['path']}", flush=True)
