@@ -17,7 +17,7 @@
 #endif
 
 namespace MegaMoeUrma {
-constexpr uint32_t kRouteMailboxBytes = 512U;
+constexpr uint32_t kRouteMailboxBytes = 1024U;
 constexpr uint32_t kRouteHistogramBytes = kLocalWorkers * kExperts * sizeof(uint32_t);
 struct DeviceRouteInfo {
     uint32_t outgoing[kExperts + 1U]; // local expert-exclusive prefix, final entry BS*K

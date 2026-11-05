@@ -71,7 +71,7 @@ def event_style(event):
     if event == "RoutePrepare":
         return event, "routing.device", "rail_animation", "Route preparation; protocol6 covers local buckets/prefix/send only, older versions also include incoming summary"
     if event == "RouteSummary":
-        return event, "routing.device", "rail_animation", "Activation helper0 builds and publishes the incoming summary after all source epochs arrive"
+        return event, "routing.device", "rail_animation", "AIV0 source/expert phases and leader prefix; includes phase waits while AIV1 Pack/Dispatch progress"
     if event == "WaitRouteSummary":
         return event, "wait.sync", "thread_state_iowait", "Wait/acquire local incoming summary; does not include helper Pack work while polling"
     if event == "Pack":

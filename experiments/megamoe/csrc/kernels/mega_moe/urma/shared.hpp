@@ -105,7 +105,7 @@ public:
             op.UpdateNextProblem({config.m,config.outputN,config.k,0});config.tileM=128;
             const uint32_t m=slice*128,rows=f.rows-m<128?f.rows-m:128;
             const MegaMoeImpl::GmmKernel::BlockScheduler::BlockShape shape{rows,256,config.k};
-            auto meta=ComputeTileTraceMeta(FragmentTraceMeta(f,group),m,tile*256,rows,256);meta.expert=a.config.world*a.config.localExperts;
+            auto meta=ComputeTileTraceMeta(FragmentTraceMeta(f,group),m,tile*256,rows,256);meta.expert=a_.config.world*a_.config.localExperts;
             const auto start=timer_.TraceBegin();
             MegaMoeImpl::GmmKernel::Gmm1Aiv1EpilogueTileA8W4<bfloat16_t,UrmaGmmConfig::MakeLayoutC,true>(
                 op,gmC,addr,config,shape,m,tile*256);

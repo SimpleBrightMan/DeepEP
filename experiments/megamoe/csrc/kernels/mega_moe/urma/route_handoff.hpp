@@ -3,6 +3,7 @@
 #pragma once
 #include "device_routes.hpp"
 #include "pack_round.hpp"
+#include "route_summary_aiv0.hpp"
 
 namespace MegaMoeUrma {
 __aicore__ inline __gm__ int32_t* RouteSummaryFlag(const Arguments& a) {
@@ -31,41 +32,15 @@ __aicore__ inline void WaitRouteSummary(Arguments& a,Timer& timer) {
     timer.CoarseEnd(CoarsePhase::RouteWait);
 }
 
-// Only helper0 calls this. Cache positive observations and return immediately
-// at the first missing source so it can resume its static Pack quota.
-__aicore__ inline bool TryRouteInboxReady(const Arguments& a,uint32_t& readyMask) {
-    for(uint32_t peer=0;peer<a.config.world;++peer) {
-        const uint32_t bit=uint32_t{1}<<peer;
-        if(readyMask&bit)continue;
-        auto* flag=reinterpret_cast<__gm__ uint64_t*>(a.symmetric+a.config.routeReadyOffset+peer*kFlagBytes);
-        if(AscendC::ReadGmByPassDCache(flag)!=a.config.epoch)return false;
-        readyMask|=bit;
-    }
-    return true;
-}
-
 // Called after the existing startup quotas. Pack assignments never change:
 // this loop advances the SAME nextPackRound cursor used by normal activation.
-// It releases low UB and all Pack events before the owner builds the summary.
+// AIV0 builds the summary; helpers never wait for a remote source while they
+// still have local Pack work. No low-UB ownership is transferred to this loop.
 __aicore__ inline void PrepareActivationRoutes(Arguments& a,uint32_t helper,
     uint32_t& nextPackRound,PackBatch& pack,Timer& timer)
 {
     const uint32_t packOwner=helper+CommunicationWorkers(a.config.world);
-    uint32_t readyMask=0U;
     while(!RouteSummaryReady(a)) {
-        if(helper==0U && TryRouteInboxReady(a,readyMask)) {
-            pack.Close();
-            timer.CoarseBegin(CoarsePhase::RouteSummary);
-            const uint64_t start=timer.TraceBegin();
-            RouteSummary(a);
-            // Complete table DMA and Config publication before the local
-            // release flag. No all-core synchronization is introduced.
-            AscendC::PipeBarrier<PIPE_ALL>();
-            AscendC::WriteGmByPassDCache(RouteSummaryFlag(a),int32_t{1});
-            timer.TraceEnd(TraceEvent::RouteSummary,start);
-            timer.CoarseEnd(CoarsePhase::RouteSummary);
-            break;
-        }
         if(nextPackRound<a.config.packRoundCount) {
             PackOneRound(a,nextPackRound++,packOwner,kAic,pack);
         } else {

@@ -5,7 +5,10 @@
 #include "kernel_operator.h"
 
 namespace MegaMoeUrma {
-constexpr uint32_t kExpertRouteBatch = 4096U;
+constexpr uint32_t kExpertRouteBatch = 4096U; // preserve the E<=384 path
+constexpr uint32_t kExpertWideBatch = 3072U;
+constexpr uint32_t kExpertRouteStorageItems = 10U * kExpertWideBatch;
+static_assert(7U*kExpertRouteBatch<=kExpertRouteStorageItems);
 constexpr uint32_t kExpertRoutesPerWorker = (kExperts+kLocalWorkers-1U)/kLocalWorkers;
 
 // A worker owns complete experts. Each output slot can hold the entire input
@@ -13,7 +16,7 @@ constexpr uint32_t kExpertRoutesPerWorker = (kExperts+kLocalWorkers-1U)/kLocalWo
 // IDs retain the top-k slot; only Pack divides by top-k to read X.
 __simd_vf__ inline void CompactOwnedExpertsVF(__ubuf__ int32_t* ids,
     __ubuf__ int32_t* routes,__ubuf__ int32_t* counts,uint32_t valid,
-    uint32_t flatBegin,uint32_t expertBegin,uint32_t expertCount)
+    uint32_t flatBegin,uint32_t expertBegin,uint32_t expertCount,uint32_t outputStride)
 {
     constexpr uint32_t lanes=AscendC::GetVecLen()/sizeof(int32_t);
     static_assert(kExpertRoutesPerWorker<=lanes);
@@ -26,7 +29,7 @@ __simd_vf__ inline void CompactOwnedExpertsVF(__ubuf__ int32_t* ids,
     AscendC::Reg::Arange(laneIndex,0);
     for(uint32_t e=0;e<expertCount;++e) {
         AscendC::Reg::Duplicate(totals,0,full);
-        auto* dst=routes+e*kExpertRouteBatch;
+        auto* dst=routes+e*outputStride;
         AscendC::Reg::UnalignRegForStore tail;
         AscendC::Reg::ClearSpr<AscendC::SpecialPurposeReg::AR>();
         for(uint32_t offset=0;offset<valid;offset+=lanes) {

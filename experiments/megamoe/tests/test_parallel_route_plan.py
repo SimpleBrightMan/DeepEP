@@ -13,4 +13,4 @@ def test_parallel_descriptor_order_reorder_and_shared_schedule(tmp_path):
     exe=tmp_path/("parallel_routes.exe" if os.name=="nt" else "parallel_routes")
     subprocess.run(compiler+["-std=c++17","-O2","-I",str(root/"csrc/kernels/mega_moe/urma"),str(root/"tests/parallel_route_plan_test.cpp"),"-o",str(exe)],check=True)
     result=subprocess.run([str(exe)],check=True,text=True,capture_output=True)
-    assert "cases passed=1800" in result.stdout
+    assert "cases passed=7200" in result.stdout

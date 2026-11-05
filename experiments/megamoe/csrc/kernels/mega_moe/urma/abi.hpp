@@ -8,7 +8,7 @@ namespace MegaMoeUrma {
 // Fixed descriptor/cache capacity. The active communicator is Config::world.
 constexpr uint32_t kWorld = 16;
 constexpr uint32_t kMinWorld = 4;
-constexpr uint32_t kExperts = 384; // capacity only; active E = world * localExperts
+constexpr uint32_t kExperts = 512; // capacity only; active E = world * localExperts
 constexpr uint32_t kMaxLocalExperts = kExperts / kMinWorld;
 constexpr uint32_t kAic = 28;
 constexpr uint32_t kLocalWorkers = 2U * kAic;
@@ -26,12 +26,14 @@ constexpr uint32_t kLocalFlagIncomingDone = 2U;
 constexpr uint32_t kLocalFlagPackDone = 3U;
 constexpr uint32_t kLocalFlagSharedGmm1Done = 4U; // small-BS S1: completed AICs, once per core
 constexpr uint32_t kLocalFlagRouteSummaryDone = 5U; // local immutable receive summary publication
+constexpr uint32_t kLocalFlagRouteSourcesDone = 7U; // committed AIV0 source snapshots
+constexpr uint32_t kLocalFlagRouteExpertsDone = 8U; // committed AIV0 expert shards
 // Reduce dependency values are uint64 bit patterns stored in an int64 tensor.
 // Low values address a producer/CV completion flag; tagged values address a
 // local GMM2 group that writes its self return rows directly.
 constexpr uint64_t kReduceSelfDependency = uint64_t{1} << 63U;
 constexpr uint32_t kProtocol = 1;
-constexpr uint32_t kDeviceRoutingProtocol = 7;
+constexpr uint32_t kDeviceRoutingProtocol = 8;
 #define MEGAMOE_URMA_ROUTE_REORDER 0
 constexpr uint32_t kTimerCores = kAic * 3U;
 constexpr uint32_t kTimerPhases = 8U;
