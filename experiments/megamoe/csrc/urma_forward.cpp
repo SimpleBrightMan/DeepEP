@@ -173,7 +173,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, i
     route_counts_ = torch::empty({384}, example.options().dtype(torch::kInt64));
     route_offsets_ = torch::empty({385}, example.options().dtype(torch::kInt64));
     route_histogram_ = allocate(MegaMoeUrma::kRouteHistogramBytes);
-    route_info_ = allocate(Align(sizeof(MegaMoeUrma::DeviceRouteInfo)));
+    route_info_ = allocate(MegaMoeUrma::RouteInfoAllocationBytes(groups, chunks));
     route_config_ = allocate(Align(sizeof(Config)));
     args_.order=Address(order_); args_.reduceIndex=Address(inverse_);
     args_.reduceDependencies=Address(reduce_dependencies_);
