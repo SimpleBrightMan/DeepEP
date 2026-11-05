@@ -1,8 +1,9 @@
 """Experimental fixed-CV, PUT-only URMA MegaMoE API.
 
-Routes are rebuilt inside every MegaMoE kernel, before Pack. ``prepare_routes``
-binds the Device input and reuses capacity-sized storage; it does not compute
-or copy routing values. Both public forward paths use Device routing only.
+Local route buckets are rebuilt inside every MegaMoE kernel before Pack;
+incoming summaries are published separately while Pack/Dispatch progress.
+``prepare_routes`` only binds Device input and capacity-sized storage. Both
+public forward paths use Device routing only.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ def _extension():
         raise RuntimeError("Rebuild the generalized-dimension MegaMoE extension")
     if getattr(extension,"urma_shared_contract",None)!="shared1-unitflag-fp32-sum-v2":
         raise RuntimeError("Rebuild the shared-expert MegaMoE extension")
-    if getattr(extension,"urma_routing_protocol",None)!=5:
+    if getattr(extension,"urma_routing_protocol",None)!=6:
         raise RuntimeError("Device routing requires matching Python/native wheel; rebuild and reinstall")
     return extension
 

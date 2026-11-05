@@ -5,8 +5,8 @@
 #include "kernel_operator.h"
 
 namespace MegaMoeUrma {
-// RoutePrepare invalidates every consumer's old cache lines before publishing
-// this invocation's immutable summary. Consumers derive only the current work.
+// Outgoing prefixes are immutable after local preparation. The receive portion
+// is published later on separate cache lines and must be acquired before use.
 __aicore__ inline const volatile __gm__ DeviceRouteInfo* RouteInfo(const Arguments& a) {
     return reinterpret_cast<const volatile __gm__ DeviceRouteInfo*>(a.routeInfo);
 }

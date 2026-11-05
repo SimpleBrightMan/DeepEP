@@ -98,7 +98,7 @@ __aicore__ inline bool IsChunkComputed(const Arguments& args, const Chunk& chunk
 
 // One owner per peer, QP0 only. After Dispatch submission and its original
 // Pack quota, this owner scans Combine without waiting for Dispatch completion.
-__aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Timer& timer)
+__aicore__ inline void CommunicatePeer(Arguments& args, uint32_t owner, Timer& timer)
 {
     const uint32_t peer = PeerForOwner(args.config.rank, owner);
     auto* symmetric = reinterpret_cast<__gm__ uint8_t*>(args.symmetric);
@@ -190,6 +190,9 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         PackOneRound(args, nextPackRound++, owner, kAic, pack);
     pack.Close();
     MarkPackWorkerComplete(args);
+    // Dispatch depended only on local prefixes. Combine needs incoming CVs;
+    // acquire them here, also protecting empty-stream finished publication.
+    WaitRouteSummary(args,timer);
     // This owner has completed its original static Pack quota. Do not wait
     // for other owners: each Combine CV is protected by GMM2 readiness.
 
@@ -265,7 +268,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     }
 }
 
-__aicore__ inline void CommunicatePeerShared(const Arguments& args, uint32_t owner, Timer& timer,SharedIncoming& incoming)
+__aicore__ inline void CommunicatePeerShared(Arguments& args, uint32_t owner, Timer& timer,SharedIncoming& incoming)
 {
     const uint32_t peer = PeerForOwner(args.config.rank, owner);
     auto* symmetric = reinterpret_cast<__gm__ uint8_t*>(args.symmetric);
@@ -378,6 +381,7 @@ __aicore__ inline void CommunicatePeerShared(const Arguments& args, uint32_t own
         PackOneRound(args, nextPackRound++, owner, kAic, pack);
     pack.Close();
     MarkPackWorkerComplete(args);
+    WaitRouteSummary(args,timer);
     // This owner has completed its original static Pack quota. Do not wait
     // for other owners: each Combine CV is protected by GMM2 readiness.
 
@@ -493,16 +497,16 @@ __aicore__ inline void ProcessRouted(Arguments& args)
     // No CV loop contains a rank-wide or local full-core synchronization.
     TraceLocalSync(timer, 0U);
     if constexpr (g_coreType == AIC) {
+        WaitRouteSummary(args,timer);
         RunProfiledCompute(args, block, timer);
         MarkCubeComplete(args);
     } else if (GetSubBlockIdx() == 0U) {
+        WaitRouteSummary(args,timer);
         RunProfiledCompute(args, block, timer);
     } else if (block < communicationWorkers) {
         CommunicatePeer(args, block, timer);
     } else {
-        timer.CoarseBegin(CoarsePhase::Activation);
         RunActivation(args, block - communicationWorkers, timer);
-        timer.CoarseEnd(CoarsePhase::Activation);
     }
     if constexpr (g_coreType == AIV) {
         // Only this engine releases its phase-private UB/events. Other
@@ -548,11 +552,13 @@ __aicore__ inline void ProcessShared(Arguments& a) {
     const int64_t overflow=GetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL,MegaMoeImpl::OVERFLOW_MODE_CTRL>();
     SetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL,MegaMoeImpl::OVERFLOW_MODE_CTRL>(0);
     if constexpr(g_coreType==AIC) {
+        WaitRouteSummary(a,timer);
         timer.CoarseBegin(CoarsePhase::Gmm);
         if(a.coarseTrace || (!a.trace&&!a.timer)){NoopTimer t;RunSharedComputeSequence(a,block,t);}
         else RunSharedComputeSequence(a,block,timer);
         timer.CoarseEnd(CoarsePhase::Gmm);
     } else if(GetSubBlockIdx()==0) {
+        WaitRouteSummary(a,timer);
         timer.CoarseBegin(CoarsePhase::Dequant);
         if(a.coarseTrace || (!a.trace&&!a.timer)){NoopTimer t;RunSharedComputeSequence(a,block,t);}
         else RunSharedComputeSequence(a,block,timer);
@@ -573,9 +579,7 @@ __aicore__ inline void ProcessShared(Arguments& a) {
         SharedIncoming incoming{a,block};
         if(block<comm)CommunicatePeerShared(a,block,timer,incoming);
         else {
-            timer.CoarseBegin(CoarsePhase::Activation);
             RunActivationShared(a,block-comm,timer);
-            timer.CoarseEnd(CoarsePhase::Activation);
         }
         PipeBarrier<PIPE_ALL>();
         timer.CoarseBegin(CoarsePhase::Reduce);

@@ -8,6 +8,7 @@
 #include "compute_contract.hpp"
 #include "lazy_compute_routes.hpp"
 #include "pack_round.hpp"
+#include "route_handoff.hpp"
 #include "transport.hpp"
 #include "timer.hpp"
 #include "tile_completion.hpp"
@@ -478,10 +479,14 @@ __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t wo
 // its fixed Pack quota. A ready activation always wins; otherwise gather one
 // ready scale group or pack one quota. Recheck activation after each task.
 // Readiness checks never block another cursor. No dynamic task claims.
-__aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Timer& timer)
+__aicore__ inline void RunActivation(Arguments& args, uint32_t worker, Timer& timer)
 {
     const uint32_t activationWorkers = ActivationWorkers(args.config.world);
     const uint32_t communicationWorkers = CommunicationWorkers(args.config.world);
+    uint32_t nextPackRound = kPackStartupRounds;
+    PackBatch pack(args, timer);
+    PrepareActivationRoutes(args,worker,nextPackRound,pack,timer);
+    timer.CoarseBegin(CoarsePhase::Activation);
     UrmaActivation epilogue;
     // Match main MegaMoE's unclamped SwiGLU. The epilogue default is zero,
     // which clamps every up value to zero and makes the entire FFN zero.
@@ -491,8 +496,6 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
     uint32_t nextGather = worker;
     uint32_t nextActivation = 0U;
     uint32_t activationTile = 0U;
-    uint32_t nextPackRound = kPackStartupRounds;
-    PackBatch pack(args, timer);
     bool packFinished = false;
     bool activationPrepared = false;
     bool idle = false;
@@ -580,6 +583,7 @@ __aicore__ inline void RunActivation(const Arguments& args, uint32_t worker, Tim
     pack.Close();
     // Empty compute workloads and <=2 Pack rounds can skip the loop entirely.
     if (!packFinished) MarkPackWorkerComplete(args);
+    timer.CoarseEnd(CoarsePhase::Activation);
 }
 
 }  // namespace MegaMoeUrma

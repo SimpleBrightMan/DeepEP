@@ -239,7 +239,9 @@ __aicore__ inline void RouteSummary(Arguments& a) {
     BuildRouteSummary(a.config,*r,wave12);
     // There is no materialized Segment/Link table in this protocol.
     a.config.routeSegmentCount=0U;a.config.routeLinkCount=0U;
-    RouteSave(a.routeInfo,kRouteInfoUb,sizeof(DeviceRouteInfo));
+    // Never rewrite the prefix/cache lines used by concurrent Pack/Dispatch.
+    constexpr uint32_t receiveOffset=offsetof(DeviceRouteInfo,incoming);
+    RouteSave(a.routeInfo+receiveOffset,kRouteInfoUb+receiveOffset,sizeof(DeviceRouteInfo)-receiveOffset);
     RouteScheduleOutput out(a);EmitRouteTasks(a.config,*r,out,wave12);out.Finish();
     RouteStore(a.routeConfig,0U,a.config);RouteFlush(a.routeConfig,sizeof(Config));
 }
@@ -249,6 +251,27 @@ __aicore__ inline void RouteReloadConfig(Arguments& a) {
     auto* dst=reinterpret_cast<uint32_t*>(&a.config);
     const volatile __gm__ uint32_t* src=reinterpret_cast<const volatile __gm__ uint32_t*>(a.routeConfig);
     for(uint32_t i=0;i<sizeof(Config)/sizeof(uint32_t);++i)dst[i]=src[i];
+}
+
+// Only local counts are required to issue Pack/Dispatch, including self rows.
+// Keep these values in each engine's Arguments until it acquires the receive
+// summary. RouteConfig GM is published only once, by the summary owner.
+__aicore__ inline void RouteLocalConfig(Arguments& a) {
+    const auto* info=RouteInfo(a);
+    a.config.packRoundCount=0U;a.config.sendChunkCount=0U;
+    for(uint32_t peer=0;peer<a.config.world;++peer) {
+        const uint32_t begin=peer*a.config.localExperts;
+        const uint32_t rows=info->outgoing[begin+a.config.localExperts]-info->outgoing[begin];
+        const uint32_t cvs=(rows+a.config.cvRows-1U)/a.config.cvRows;
+        a.config.packRoundCount=RouteMax(a.config.packRoundCount,cvs);
+        a.config.sendChunkCount+=cvs;
+    }
+    const uint32_t own=a.config.rank*a.config.localExperts;
+    a.config.selfSendRow=info->outgoing[own];
+    a.config.selfRows=info->outgoing[own+a.config.localExperts]-info->outgoing[own];
+    a.config.selfRecvRow=uint64_t(a.config.rank)*a.config.sourceRowCapacity;
+    a.config.fragmentCount=a.config.recvChunkCount=a.config.computeTaskCount=0U;
+    a.config.receiveRows=a.config.gmm1Tiles=a.config.gmm2Tiles=0U;
 }
 
 __aicore__ inline void PrepareDeviceRoutes(Arguments& a,Timer& timer) {
@@ -270,20 +293,12 @@ __aicore__ inline void PrepareDeviceRoutes(Arguments& a,Timer& timer) {
     // #2: count prefixes are immutable and ready for the exchange senders.
     SyncAll<false>();
     if constexpr(g_coreType==AIV)RouteExchange(a,LocalWorkerIndex(block,GetSubBlockIdx()));
-    if constexpr(g_coreType==AIV)if(block==0U&&GetSubBlockIdx()==0U) {
-        // Wait for this exact epoch's metadata, including zero-count peers.
-        // A future epoch cannot overwrite this inbox before our own finished
-        // publication, which occurs only after this snapshot has been copied.
-        for(uint32_t s=0;s<a.config.world;++s)
-            WaitLocalDone(reinterpret_cast<__gm__ uint8_t*>(a.symmetric+a.config.routeReadyOffset+s*kFlagBytes),a.config.epoch);
-        RouteSummary(a);
-    }
-    // #3: leader publication and all local exchange DMA lifetimes are joined.
-    SyncAll<false>();
-    RouteReloadConfig(a);
+    // The first activation helper will build the incoming summary while other
+    // engines progress independently. No receiver wait or full-core join here.
+    RouteLocalConfig(a);
     PipeBarrier<PIPE_ALL>();
-    // Each core consumes its own Config copy; there is no new inter-core
-    // producer to join after the reload. Preserve the local pipeline fence.
+    // Incoming metadata is acquired later, per role. This fence only releases
+    // this core's route-exchange UB/events before its Pack/compute path.
     timer.TraceEnd(TraceEvent::RoutePrepare,start);
     timer.CoarseEnd(CoarsePhase::Route);
 }

@@ -1,6 +1,6 @@
 # MegaMoE 内核内 Device 路由
 
-> 当前 commfirst 分支已升级为实验性的 protocol5：见
+> 当前 commfirst 分支已升级为实验性的 protocol6：见
 > [专家唯一 owner 与按需描述符](URMA_EXPERT_OWNER_ROUTING.md)。
 > 下文保留 protocol3 的设计和已执行验证记录；这些编译/EP8结果不适用于当前实验版本。
 

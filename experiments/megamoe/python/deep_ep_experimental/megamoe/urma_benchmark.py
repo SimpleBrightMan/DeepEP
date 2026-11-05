@@ -356,7 +356,7 @@ def run(args, config, group):
         profile_config="Level0/AiCoreNone/Text; shapes/memory/stack/FLOPs/modules disabled",
         max_recv_rows=owner.max_recv_rows,
         symmetric_buffer_bytes=owner.symmetric_buffer_bytes,
-        route_preparation="Device expert-owner buckets/counts; MTE count exchange; lazy wave/CV descriptors; Pack inverse",
+        route_preparation="Device local buckets/prefix -> Pack/Dispatch; helper polls incoming epochs while packing, then publishes receive summary; lazy wave/CV descriptors; Pack inverse",
         numerical_validation="cpu_golden_and_npu_cascade_error_budget" if args.golden_dir else "skipped",
         accuracy_policy_source="local DeepEP 5a9d6ffad7474137fa134cd7a60aebb2c8ee3089",
         accuracy_only=args.accuracy_only,

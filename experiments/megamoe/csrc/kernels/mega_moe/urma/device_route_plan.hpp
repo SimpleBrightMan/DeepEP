@@ -1,6 +1,7 @@
 // Copyright (c) 2026, Lu Lu
 // Modified by SimpleBright_Man 2026
 #pragma once
+#include <cstddef>
 #include "abi.hpp"
 #include "compute_contract.hpp"
 
@@ -20,6 +21,9 @@ constexpr uint32_t kRouteMailboxBytes = 512U;
 constexpr uint32_t kRouteHistogramBytes = kLocalWorkers * kExperts * sizeof(uint32_t);
 struct DeviceRouteInfo {
     uint32_t outgoing[kExperts + 1U]; // local expert-exclusive prefix, final entry BS*K
+    // Keep the early Pack-only prefix on separate cache lines from the late
+    // receive summary, which is published while Pack/Dispatch are running.
+    uint32_t outgoingPadding[15U];
     uint32_t incoming[kWorld][kMaxLocalExperts + 1U]; // source-local expert prefix
     uint32_t sources[kMaxLocalExperts][kWorld + 1U]; // expert-local source prefix
     uint32_t groupBase[kMaxLocalExperts + 1U];
@@ -29,6 +33,7 @@ struct DeviceRouteInfo {
     uint32_t sendCvBase[kWorld + 1U], recvCvBase[kWorld + 1U];
 };
 static_assert(sizeof(DeviceRouteInfo) < 24U * 1024U);
+static_assert(offsetof(DeviceRouteInfo,incoming)%64U==0U);
 
 URMA_ROUTE_INLINE uint32_t RouteMin(uint32_t a, uint32_t b) { return a < b ? a : b; }
 URMA_ROUTE_INLINE uint32_t RouteMax(uint32_t a, uint32_t b) { return a > b ? a : b; }

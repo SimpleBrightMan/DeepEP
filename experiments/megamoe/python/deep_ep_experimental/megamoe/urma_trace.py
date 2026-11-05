@@ -57,6 +57,7 @@ EVENTS = (
     "CoarseDispatchSubmit",
     "PackRetire",
     "SharedGmm1Tile", "SharedGmm1Drain", "SharedActivation", "SharedGmm2Tile", "SharedGmm2Drain", "SharedAdd", "CoarseSharedCombineSubmit", "RoutePrepare",
+    "RouteSummary", "WaitRouteSummary",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
 SYNC_STAGES = {4: "shared addition complete", 0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
@@ -68,7 +69,11 @@ class TraceOverflowError(ValueError):
 
 def event_style(event):
     if event == "RoutePrepare":
-        return event, "routing.device", "rail_animation", "Device histogram, count exchange, descriptor generation and inverse permutation before Pack"
+        return event, "routing.device", "rail_animation", "Route preparation; protocol6 covers local buckets/prefix/send only, older versions also include incoming summary"
+    if event == "RouteSummary":
+        return event, "routing.device", "rail_animation", "Activation helper0 builds and publishes the incoming summary after all source epochs arrive"
+    if event == "WaitRouteSummary":
+        return event, "wait.sync", "thread_state_iowait", "Wait/acquire local incoming summary; does not include helper Pack work while polling"
     if event == "Pack":
         return event, "compute.copy", "rail_animation", "Pack submission; includes retirement of previous segment, current ready may be deferred"
     if event == "PackRetire":
@@ -231,6 +236,7 @@ def decode_trace(raw, *, rank, clock_mhz):
         metadata["interpretation"] = (
             "Stage envelopes include internal idle time. GMM/Dequant start at task-loop entry, "
             "including initial readiness wait, and end after final context drain. "
+            "Protocol6 incoming route-summary wait is a separate WaitRouteSummary stage. "
             "All records are written after final LocalSync; record writeback is outside the raw envelope."
         )
     for engine in range(ENGINE_COUNT):

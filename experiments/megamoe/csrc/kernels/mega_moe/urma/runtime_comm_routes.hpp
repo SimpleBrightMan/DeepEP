@@ -6,13 +6,15 @@
 
 namespace MegaMoeUrma {
 
-// RouteInfo is immutable after RoutePrepare's local publication. These small
-// prefixes replace the materialized per-CV and per-Pack-round tables; transport
-// addresses and the peer/CV traversal order remain unchanged.
+// Send/Pack read only the early outgoing prefix. Receive helpers require the
+// late summary handoff. Both parts are immutable once individually published;
+// transport addresses and peer/CV traversal order remain unchanged.
 __aicore__ inline uint32_t RuntimeSendCvCount(const Arguments& args, uint32_t peer)
 {
     const auto* routes = RouteInfo(args);
-    return routes->sendCvBase[peer + 1U] - routes->sendCvBase[peer];
+    const uint32_t le=args.config.localExperts;
+    const uint32_t rows=routes->outgoing[(peer+1U)*le]-routes->outgoing[peer*le];
+    return (rows+args.config.cvRows-1U)/args.config.cvRows;
 }
 
 __aicore__ inline uint32_t RuntimeReceiveCvCount(const Arguments& args, uint32_t peer)

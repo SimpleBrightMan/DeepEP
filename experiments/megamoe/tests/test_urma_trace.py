@@ -108,7 +108,7 @@ def test_every_event_id_has_a_name_and_no_fabricated_async_events():
             continue
         add_record(raw, engine=event_id, event=name)
     result = decode_trace(raw, rank=0, clock_mhz=1000)
-    assert len(events(result)) == sum(name is not None for name in EVENTS) == 54
+    assert len(events(result)) == sum(name is not None for name in EVENTS)
     assert {row["ph"] for row in result["traceEvents"]} == {"M", "X"}
     assert {row["args"]["event_id"] for row in events(result)} == {index for index, name in enumerate(EVENTS) if name is not None}
 

@@ -127,10 +127,14 @@ struct SharedIncoming {
     __aicore__ inline void Poll(){if(core<CommunicationWorkers(a.config.world))ObserveIncomingCompletion(a,core,peer,self);}
 };
 
-__aicore__ inline void RunActivationShared(const Arguments& args, uint32_t worker, Timer& timer)
+__aicore__ inline void RunActivationShared(Arguments& args, uint32_t worker, Timer& timer)
 {
     const uint32_t activationWorkers = ActivationWorkers(args.config.world);
     const uint32_t communicationWorkers = CommunicationWorkers(args.config.world);
+    uint32_t nextPackRound = kPackStartupRounds;
+    PackBatch pack(args,timer);
+    PrepareActivationRoutes(args,worker,nextPackRound,pack,timer);
+    timer.CoarseBegin(CoarsePhase::Activation);
     SharedActivationState shared(args,worker+communicationWorkers,timer);
     UrmaActivation epilogue;
     // Match main MegaMoE's unclamped SwiGLU. The epilogue default is zero,
@@ -141,8 +145,6 @@ __aicore__ inline void RunActivationShared(const Arguments& args, uint32_t worke
     uint32_t nextGather = worker;
     uint32_t nextActivation = 0U;
     uint32_t activationTile = 0U;
-    uint32_t nextPackRound = kPackStartupRounds;
-    PackBatch pack(args, timer);
     bool packFinished = false;
     bool activationPrepared = false;
     bool idle = false;
@@ -238,6 +240,7 @@ __aicore__ inline void RunActivationShared(const Arguments& args, uint32_t worke
     pack.Close();
     // Empty compute workloads and <=2 Pack rounds can skip the loop entirely.
     if (!packFinished) MarkPackWorkerComplete(args);
+    timer.CoarseEnd(CoarsePhase::Activation);
 }
 
 } // namespace MegaMoeUrma
