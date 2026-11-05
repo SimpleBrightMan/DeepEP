@@ -35,9 +35,15 @@ template<class T> __aicore__ inline void RouteStore(uint64_t address,uint32_t in
     for(uint32_t i=0;i<sizeof(T)/4U;++i)dst[i]=src[i];
 }
 __aicore__ inline void RouteFlush(uint64_t address,uint64_t bytes) {
-    GlobalTensor<uint32_t> gm;gm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(address));
-    for(uint64_t p=0;p<bytes;p+=128U)
-        DataCacheCleanAndInvalid<uint32_t,CacheLine::SINGLE_CACHE_LINE,DcciDst::CACHELINE_OUT>(gm[p/4U]);
+    // DCache lines are 64B on Ascend 950; a 128B signal/mailbox slot is NOT
+    // the cache-line size. Missing alternate lines leaves dirty count stores
+    // alive across the DMA rewrite to prefixes and corrupts route addresses.
+    if(bytes==0U)return;
+    constexpr uint64_t lineBytes=64U;
+    for(uint64_t p=address&~(lineBytes-1U);p<address+bytes;p+=lineBytes) {
+        GlobalTensor<uint32_t> line;line.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(p));
+        DataCacheCleanAndInvalid<uint32_t,CacheLine::SINGLE_CACHE_LINE,DcciDst::CACHELINE_OUT>(line);
+    }
 }
 struct DeviceRouteOutput {
     const Arguments& a;
