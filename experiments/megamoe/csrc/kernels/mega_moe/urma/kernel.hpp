@@ -14,6 +14,7 @@
 #include "timer.hpp"
 #include "device_routes.hpp"
 #include "transport.hpp"
+#include "cooperative_aiv1.hpp"
 
 namespace MegaMoeUrma {
 using namespace AscendC;
@@ -618,10 +619,9 @@ __aicore__ inline void ProcessRouted(Arguments& args)
         RunAiv0RouteSummary(args,block,timer);
         WaitRouteSummary(args,timer);
         RunProfiledCompute(args, block, timer);
-    } else if (block < communicationWorkers) {
-        CommunicatePeer(args, block, timer);
     } else {
-        RunActivation(args, block - communicationWorkers, timer);
+        SharedIncoming incoming{args,block};
+        RunCooperativeAiv1(args,block,timer,incoming);
     }
     if constexpr (g_coreType == AIV) {
         // Only this engine releases its phase-private UB/events. Other
@@ -693,10 +693,7 @@ __aicore__ inline void ProcessShared(Arguments& a) {
         for(uint32_t round=0;round<kPackStartupRounds;++round)PackOneRound(a,round,block,kAic,pack);
         pack.Close();timer.CoarseEnd(CoarsePhase::Pack);
         SharedIncoming incoming{a,block};
-        if(block<comm)CommunicatePeerShared(a,block,timer,incoming);
-        else {
-            RunActivationShared(a,block-comm,timer);
-        }
+        RunCooperativeAiv1(a,block,timer,incoming);
         PipeBarrier<PIPE_ALL>();
         timer.CoarseBegin(CoarsePhase::Reduce);
         ReduceGeneric<true>(a,LocalWorkerIndex(block,1U),kLocalWorkers,timer,incoming);

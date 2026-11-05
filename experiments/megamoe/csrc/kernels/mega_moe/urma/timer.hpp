@@ -117,7 +117,7 @@ public:
                     selected == static_cast<uint32_t>(CoarsePhase::RouteWait) ? TraceEvent::WaitRouteSummary :
                     selected == static_cast<uint32_t>(CoarsePhase::Route) ? TraceEvent::RoutePrepare : selected == static_cast<uint32_t>(CoarsePhase::SharedSum) ? TraceEvent::SharedAdd :
                     shared_ && selected == static_cast<uint32_t>(CoarsePhase::Combine) ? TraceEvent::CoarseSharedCombineSubmit :
-                    shared_ && selected == static_cast<uint32_t>(CoarsePhase::Dispatch) ? TraceEvent::CoarseDispatchSubmit :
+                    selected == static_cast<uint32_t>(CoarsePhase::Dispatch) ? TraceEvent::CoarseDispatchSubmit :
                     static_cast<TraceEvent>(static_cast<uint32_t>(TraceEvent::CoarsePack) + selected);
                 WriteTrace(event, coarseStart_[selected], coarseEnd_[selected], meta);
                 coarseStart_[selected] = 0U;
