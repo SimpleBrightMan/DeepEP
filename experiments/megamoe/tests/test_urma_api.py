@@ -276,7 +276,7 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
     assert created == [allow]
     assert checks[0][1][-4] is allow
     assert checks[0][1][-3] == "combine-ready-scan-reduce-world-v1"
-    assert checks[0][1][-2] == "unitflag-shared-wave12-ep4-v1"
+    assert checks[0][1][-2] == "unitflag-shared-consumer-fix-v1"
     assert checks[0][1][-1] == urma.COMMUNICATION_PROTOCOL
     assert buffer.gmm1_ahead_mgroups == 12
 
@@ -288,7 +288,7 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
     extension = SimpleNamespace(
         urma_api_protocol=1, urma_routing_protocol=8, urma_tail_schedule=tail,
-        urma_compute_schedule="unitflag-shared-wave12-ep4-v1",
+        urma_compute_schedule="unitflag-shared-consumer-fix-v1",
         urma_dimension_contract="unitflag-h8192-i16384-k1to8-v1-bs16384",
         urma_shared_contract="unitflag-shared-peer-reorder-v1",
     )
@@ -304,7 +304,7 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
         urma._extension.cache_clear()
 
 
-@pytest.mark.parametrize("schedule", [None, "expert-m256", "expert-m384-n128"])
+@pytest.mark.parametrize("schedule", [None, "expert-m256", "expert-m384-n128", "unitflag-shared-wave12-ep4-v1"])
 def test_native_mgroup_schedule_must_match_before_runtime_creation(monkeypatch, schedule):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
     extension = SimpleNamespace(
