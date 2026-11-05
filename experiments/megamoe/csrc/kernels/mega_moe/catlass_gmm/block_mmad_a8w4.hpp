@@ -430,16 +430,16 @@ public:
             // 当前窗的完成通知先排入MTE1，再获取下一A槽。这样下一槽
             // empty等待不会挡住当前窗消费；源属于当前已ready的M-group。
             // 仅预取下一KA窗口，跨tile/专家的资源游标仍由原上下文管理。
-            const uint32_t nextK=kOffset+kL1Actual;
-            if(nextK<kBlockActual && nextK%ka==0U) {
+            const uint32_t prefetchNextK=kOffset+kL1Actual;
+            if(prefetchNextK<kBlockActual && prefetchNextK%ka==0U) {
                 const uint32_t nextSlot=(l1AListId+1U)%L1A_STAGES;
-                const uint32_t nextActual=Min(ka,kBlockActual-nextK);
+                const uint32_t nextActual=Min(ka,kBlockActual-prefetchNextK);
                 auto nextA=tla::MakeTensor(l1ATensorList[nextSlot],
                     tla::MakeLayout<ElementA,LayoutTagL1A>(mL1Actual,RoundUp<MX_BASEK_FACTOR>(nextActual)),
                     Arch::PositionL1{});
-                auto nextTile=GetTile(tensorA,tla::MakeCoord(0,nextK),tla::MakeShape(mBlockActual,nextActual));
+                auto nextTile=GetTile(tensorA,tla::MakeCoord(0,prefetchNextK),tla::MakeShape(mBlockActual,nextActual));
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[nextSlot]);
-                if constexpr(RowIO::kGatherInput)rowIO.Gather(nextA,rowBegin,mBlockActual,nextK,nextActual);
+                if constexpr(RowIO::kGatherInput)rowIO.Gather(nextA,rowBegin,mBlockActual,prefetchNextK,nextActual);
                 else copyGmToL1A(nextA,nextTile);
                 InitZeroInL1A(nextA,tla::MakeShape(mL1Actual,nextActual));
             }
