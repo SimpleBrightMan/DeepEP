@@ -154,10 +154,10 @@ __aicore__ inline TraceMeta ComputeTileTraceMeta(const TraceMeta& fragmentMeta, 
 // A new context must not republish the initial 8/9 free-slot credits until
 // AIV0 has consumed the old context's final credits. The acknowledgement is
 // ordered on those same MTE pipelines; it needs neither a scalar fence nor a
-// full-core barrier. Only this AIC and its paired AIV0 use flag 10.
+// full-core barrier. Only this AIC and its paired AIV0 use the context-end flag beyond the four B slots.
 __aicore__ inline void CompleteComputeContext()
 {
-    constexpr uint16_t kContextEndFlag = 10U;
+    constexpr uint16_t kContextEndFlag = MegaMoeImpl::GmmKernel::A8W4BDeepResources::ContextEnd;
     if constexpr (g_coreType == AIC) {
         CrossCoreWaitFlag<4, PIPE_MTE1>(kContextEndFlag);
     } else {

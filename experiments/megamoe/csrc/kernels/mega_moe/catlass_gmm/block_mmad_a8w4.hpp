@@ -78,6 +78,8 @@ public:
     static constexpr bool ENABLE_UNIT_FLAG = DispatchPolicy::ENABLE_UNIT_FLAG;
     static constexpr uint32_t STAGES = DispatchPolicy::STAGES;
     static constexpr bool ENABLE_L1_RESIDENT = DispatchPolicy::ENABLE_L1_RESIDENT;
+    using Buffers=MegaMoeImpl::GmmKernel::A8W4BDeepResources;
+    static constexpr uint32_t SCALE_STAGES=Buffers::ScaleStages;
     static constexpr uint32_t L1A_STAGES = DispatchPolicy::L1A_STAGES;
     static constexpr uint32_t L1B_STAGES = DispatchPolicy::L1B_STAGES;
     static constexpr uint32_t L0A_STAGES = DispatchPolicy::L0A_STAGES;
@@ -94,24 +96,24 @@ public:
     static constexpr uint32_t L0_TILE_K = tla::get<2>(L0TileShape{});
 
     // L1 tile size
-    // Two 128-KiB A slots provide an independent kaL1 window.
-    static constexpr uint32_t L1A_TILE_SIZE = 128U * 1024U;
+    // A shrinks to two64KiB slots to give four64KiB slots to B.
+    static constexpr uint32_t L1A_TILE_SIZE = Buffers::ABytes;
     static constexpr uint32_t L1B_TILE_SIZE = L1_TILE_N * L1_TILE_K * SizeOfBits<ElementB>::value / 8;
     static constexpr uint32_t L1SCALEA_TILE_SIZE =
         L1_TILE_M * L1_TILE_K / MX_SCALE_GROUP_NUM * sizeof(ElementMxScaleA) * L1_SCALE_FACTOR_K;
     static constexpr uint32_t L1SCALEB_TILE_SIZE =
         L1_TILE_N * L1_TILE_K / MX_SCALE_GROUP_NUM * sizeof(ElementMxScaleB) * L1_SCALE_FACTOR_K;
     static constexpr uint32_t L1_USED_SIZE = L1A_TILE_SIZE * L1A_STAGES + L1B_TILE_SIZE * L1B_STAGES +
-                                             L1SCALEA_TILE_SIZE * L1A_STAGES + L1SCALEB_TILE_SIZE * L1B_STAGES;
+                                             L1SCALEA_TILE_SIZE * SCALE_STAGES + L1SCALEB_TILE_SIZE * SCALE_STAGES;
     // L0 tile size
     static constexpr uint32_t L0A_TILE_SIZE = L0_TILE_M * L0_TILE_K * SizeOfBits<ElementL0A>::value / 8;
     static constexpr uint32_t L0B_TILE_SIZE = L0_TILE_K * L0_TILE_N * SizeOfBits<ElementL0B>::value / 8;
     static constexpr uint32_t L0C_TILE_SIZE = L1_TILE_M * L1_TILE_N * sizeof(ElementAccumulator);
 
-    static_assert(L1_TILE_M == 256 && L1_TILE_N == 256 && L1_TILE_K == 256 && L1A_STAGES == 2 && L1B_STAGES == 2 &&
+    static_assert(L1_TILE_M == 256 && L1_TILE_N == 256 && L1_TILE_K == 256 && L1A_STAGES == 2 && L1B_STAGES == Buffers::BStages &&
                       L1_SCALE_FACTOR_K == 16 && SizeOfBits<ElementA>::value == 8 && SizeOfBits<ElementB>::value == 8 &&
                       !HAS_BIAS,
-                  "Adaptive A8W4 requires two A128KiB/B64KiB/scale32KiB slots and no bias");
+                  "B-deep A8W4 requires A2/B4/scale2 and no bias");
 
     // Check L0C_STAGES
     static_assert(!(ENABLE_UNIT_FLAG && L0C_STAGES != 1), "L0C_STAGES must be 1 when UnitFlag is true!");
@@ -178,11 +180,11 @@ public:
     CATLASS_DEVICE
     MegaMoeBlockMmadA8W4(MegaMoeResource& resource, uint32_t l1BufAddrStart = 0, bool activate = true)
     {
-        // L1 map: B=0/384KiB, A=128/256KiB, SA=64/448KiB, SB=96/480KiB.
+        // L1 map: A[0,128), B[128,384), SA[384,448), SB[448,512) KiB.
         uint32_t l1Offset = l1BufAddrStart;
         for (uint32_t i = 0; i < L1B_STAGES; i++) {
             // Assign L1/L0A/L0B space for each stages
-            l1BTensorList[i] = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart + i * 384U * 1024U);
+            l1BTensorList[i] = resource.l1Buf.template GetBufferByByte<ElementB>(l1BufAddrStart + Buffers::BBase + i * Buffers::BBytes);
             l1Offset += L1B_TILE_SIZE;
             // Assign event ID for each stages
             l1BEventList[i] = i + L1A_STAGES;
@@ -190,7 +192,7 @@ public:
         for (uint32_t i = 0; i < L1A_STAGES; i++) {
             // Assign L1/L0A/L0B space for each stages
             l1ATensorList[i] =
-                resource.l1Buf.template GetBufferByByte<ElementA>(l1BufAddrStart + 128U * 1024U + i * L1A_TILE_SIZE);
+                resource.l1Buf.template GetBufferByByte<ElementA>(l1BufAddrStart + Buffers::ABase + i * L1A_TILE_SIZE);
             l1Offset += L1A_TILE_SIZE;
             // Assign event ID for each stages
             l1AEventList[i] = i;
@@ -221,14 +223,14 @@ public:
             l1Offset += L1_TILE_N * sizeof(ElementBias);
             l0BiasTensor = resource.btBuf.template GetBufferByByte<ElementAccumulator>(0);
         }
-        for (uint32_t i = 0; i < L1A_STAGES; i++) {
+        for (uint32_t i = 0; i < SCALE_STAGES; i++) {
             l1MxScaleATensorList[i] = resource.l1Buf.template GetBufferByByte<ElementMxScaleA>(
-                l1BufAddrStart + 64U * 1024U + i * 384U * 1024U);
+                l1BufAddrStart + Buffers::ScaleABase + i * Buffers::ScaleBytes);
             l1Offset += L1SCALEA_TILE_SIZE;
         }
-        for (uint32_t i = 0; i < L1B_STAGES; i++) {
+        for (uint32_t i = 0; i < SCALE_STAGES; i++) {
             l1MxScaleBTensorList[i] = resource.l1Buf.template GetBufferByByte<ElementMxScaleB>(
-                l1BufAddrStart + 96U * 1024U + i * 384U * 1024U);
+                l1BufAddrStart + Buffers::ScaleBBase + i * Buffers::ScaleBytes);
             l1Offset += L1SCALEB_TILE_SIZE;
         }
 
@@ -526,8 +528,8 @@ public:
             l1BListId = (l1BListId + 1) % L1B_STAGES;
             if (nextK == kBlockActual || nextK % l1ScaleTileK == 0U) {
                 AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[l1MxScaleAListId]);
-                l1MxScaleAListId = (l1MxScaleAListId + 1) % L1A_STAGES;
-                l1MxScaleBListId = (l1MxScaleBListId + 1) % L1B_STAGES;
+                l1MxScaleAListId = (l1MxScaleAListId + 1) % SCALE_STAGES;
+                l1MxScaleBListId = (l1MxScaleBListId + 1) % SCALE_STAGES;
             }
         }
         // copy block out
@@ -626,8 +628,8 @@ protected:
     // Multi-stage tensors list
     AscendC::LocalTensor<ElementA> l1ATensorList[L1A_STAGES];
     AscendC::LocalTensor<ElementB> l1BTensorList[L1B_STAGES];
-    AscendC::LocalTensor<ElementMxScaleA> l1MxScaleATensorList[L1A_STAGES];
-    AscendC::LocalTensor<ElementMxScaleB> l1MxScaleBTensorList[L1B_STAGES];
+    AscendC::LocalTensor<ElementMxScaleA> l1MxScaleATensorList[SCALE_STAGES];
+    AscendC::LocalTensor<ElementMxScaleB> l1MxScaleBTensorList[SCALE_STAGES];
     AscendC::LocalTensor<ElementL0A> l0ATensorList[L0A_STAGES];
     AscendC::LocalTensor<ElementL0B> l0BTensorList[L0B_STAGES];
     AscendC::LocalTensor<ElementAccumulator> l0CTensorList[L0C_STAGES];
@@ -659,8 +661,8 @@ protected:
     uint32_t l1MxScaleBListId{0};
 
     constexpr static uint8_t AIC_SYNC_AIV_MODE = 4;
-    constexpr static uint16_t AIV_SYNC_AIC_FLAG = 6;
-    constexpr static uint16_t AIC_SYNC_AIV_FLAG = 8;
+    constexpr static uint16_t AIV_SYNC_AIC_FLAG = Buffers::BFull;
+    constexpr static uint16_t AIC_SYNC_AIV_FLAG = Buffers::BEmpty;
 
     TileMmad tileMmad;
     CopyL1ToL0A copyL1ToL0A;
