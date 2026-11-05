@@ -188,6 +188,8 @@ UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, i
     peer_reorder_ranges_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
     peer_reorder_spans_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
     local_flags_ = allocate(16 * MegaMoeUrma::kFlagBytes);
+    gmm_issued_=allocate(MegaMoeUrma::kAic*MegaMoeUrma::kFlagBytes);
+    args_.gmmIssued=Address(gmm_issued_);
     system_workspace_ = allocate(platform_.system_workspace + (2ULL << 20));
 
     args_.expandedX = Address(expanded_x_);
@@ -336,7 +338,7 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     ASCEND_DEEPEP_CHECK_ACL(
         aclrtMemsetAsync(reinterpret_cast<void*>(args_.symmetric + c.barrierOffset + finished_bytes), finished_bytes, 0,
                          finished_bytes, stream.stream()));
-    for (auto* tensor : {&gmm1_done_, &input_scale_done_, &activation_done_, &gmm2_done_, &gmm2_matmul_done_,
+    for (auto* tensor : {&gmm1_done_, &input_scale_done_, &activation_done_, &gmm2_done_, &gmm2_matmul_done_, &gmm_issued_,
                          &local_flags_, &pack_ready_}) {
         ASCEND_DEEPEP_CHECK_ACL(
             aclrtMemsetAsync(tensor->data_ptr(), tensor->numel(), 0, tensor->numel(), stream.stream()));
@@ -383,7 +385,7 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
                                &activation_scale_,
                                &gmm2_,
                                &gmm2_contiguous_,
-                               &gmm2_matmul_done_,
+                               &gmm2_matmul_done_, &gmm_issued_,
                                &fragments_,
                                &segments_,
                                &compute_batches_,
@@ -485,7 +487,7 @@ int64_t UrmaPlan::workspace_bytes() const
                                &activation_scale_,
                                &gmm2_,
                                &gmm2_contiguous_,
-                               &gmm2_matmul_done_,
+                               &gmm2_matmul_done_, &gmm_issued_,
                                &fragments_,
                                &segments_,
                                &compute_batches_,

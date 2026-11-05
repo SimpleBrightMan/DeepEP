@@ -10,6 +10,7 @@
 #include "route_handoff.hpp"
 #include "continuous_matmul.hpp"
 #include "deferred_output.hpp"
+#include "consumer_completion.hpp"
 #include "pack_round.hpp"
 #include "tail_completion.hpp"
 #include "transport.hpp"
@@ -165,31 +166,14 @@ __aicore__ inline void CompleteComputeContext()
     }
 }
 
-// Completion fences are distinct from the CATLASS FIX_S0 context teardown.
-template <class TimerT>
-struct ComputeOutputBackend {
-    const Arguments& args;
-    TimerT& timer;
-    __aicore__ inline void Arm()
-    {
-        SetFlag<HardEvent::FIX_S>(EVENT_ID1);
-    }
-    __aicore__ inline void Complete(bool gmm1, uint64_t tile, const TraceMeta& meta)
-    {
-        const uint64_t start = timer.TraceBegin();
-        WaitFlag<HardEvent::FIX_S>(EVENT_ID1);
-        timer.TraceEnd(gmm1 ? TraceEvent::Gmm1TileDrain : TraceEvent::Gmm2Drain, start, meta);
-        WriteGmByPassDCache(ComputeFlag(gmm1 ? args.gmm1Done : args.gmm2MatmulDone, tile), 1);
-        if (!gmm1) AtomicAdd(ComputeFlag(args.gmm2Done, meta.fragment), 1);
-    }
-};
-
+// Routed FIX completion is owned by paired AIV1 consumers. Shared GMMs keep
+// their independent completion backend and do not consume these two channels.
 using UrmaContinuousGmm = ContinuousMatmul<UrmaProblemConfig>;
 
 template <class TimerT>
 __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
                                           uint32_t firstTile, bool gmm1, UrmaContinuousGmm& pipeline,
-                                          DeferredOutput<ComputeOutputBackend<TimerT>>& pending, TimerT& timer)
+                                          RoutedCompletionProducer& completion, TimerT& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
@@ -207,7 +191,7 @@ __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block,
         const bool ready = ReadGmByPassDCache(ComputeFlag(flags, fragmentIndex)) >= static_cast<int32_t>(expected);
         // In particular, never retain the last GMM1 flag while blocking on
         // its activation: that would prevent the helper from making progress.
-        pending.BeforeDependency(ready);
+        // Earlier ready publications are progressed independently by paired AIV1.
         const uint64_t wait = timer.TraceBegin();
         if (!ready) WaitComputeFlag(flags, fragmentIndex, expected);
         timer.TraceEnd(gmm1 ? TraceEvent::WaitInputScale : TraceEvent::WaitActivation, wait, fragmentMeta);
@@ -236,16 +220,12 @@ __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block,
         const auto tileMeta = ComputeTileTraceMeta(fragmentMeta, m, n, rows, columns);
         if constexpr (g_coreType == AIC) {
             const uint64_t start = timer.TraceBegin();
+            completion.Acquire();
             pipeline.Compute(m, n, rows, columns);
             timer.TraceEnd(gmm1 ? TraceEvent::Gmm1Tile : TraceEvent::Gmm2Tile, start, tileMeta);
-            // Retire a previous GMM2 fence after submitting this tile. The
-            // old fence was captured before this submission, so it cannot
-            // release the new tile's output early.
-            pending.AfterSubmit(gmm1, (gmm1 ? fragment.gmm1TileBegin : fragment.gmm2TileBegin) + tile, tileMeta);
-            // SwiGLU consumes GMM1 tile-by-tile: publish this tile as soon as
-            // its FIX writes complete, without waiting for another AIC task.
-            // This uses FIX_S1 only; keep the context open and GMM2 deferred.
-            if (gmm1) pending.Flush();
+            // Enqueue actual FIX completion, then announce issue. Scalar does
+            // not wait for the output and cannot publish compute-ready here.
+            completion.Commit();
         } else {
             const uint64_t start = timer.TraceBegin();
             pipeline.Dequantize(n, rows, columns);
@@ -275,8 +255,7 @@ template <class TimerT>
 __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block, TimerT& timer)
 {
     UrmaContinuousGmm pipeline;
-    ComputeOutputBackend<TimerT> backend{args, timer};
-    DeferredOutput<ComputeOutputBackend<TimerT>> pending(backend);
+    RoutedCompletionProducer completion(args,block);
     bool hasWork = false;
     for (uint32_t step = 0U; step < args.config.computeTaskCount; ++step) {
         const auto task = LoadComputeTask(args, step);
@@ -294,12 +273,12 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
             const auto owned = OwnedComputeGroupAt(tile, tilesPerGroup, kAic);
             const uint64_t nextTile = tile + static_cast<uint64_t>(owned.tileCount) * kAic;
             const uint32_t fragmentIndex = range.begin + owned.group;
-            RunComputeFragment(args, block, fragmentIndex, owned.firstTile, isGmm1, pipeline, pending, timer);
+            RunComputeFragment(args, block, fragmentIndex, owned.firstTile, isGmm1, pipeline, completion, timer);
             hasWork = true;
             tile = nextTile;
         }
     }
-    if constexpr (g_coreType == AIC) pending.Flush();
+    if constexpr (g_coreType == AIC) completion.Finish(timer);
     if (hasWork) {
         pipeline.End(g_coreType == AIC);
         CompleteComputeContext();
@@ -366,9 +345,9 @@ __aicore__ inline void GatherInputScale(const Arguments& a,const Fragment& f,uin
 
 __aicore__ inline void RunReadyActivationTile(const Arguments& args, uint32_t worker, const Fragment& fragment,
                                               uint32_t fragmentIndex, uint32_t tile, UrmaActivation& epilogue,
-                                              Timer& timer)
+                                              Timer& timer, uint32_t workers = 0U)
 {
-    const MegaMoeImpl::BlockJobContext job{worker, ActivationWorkers(args.config.world)};
+    const MegaMoeImpl::BlockJobContext job{worker, workers ? workers : ActivationWorkers(args.config.world)};
     const auto fragmentMeta = FragmentTraceMeta(fragment, fragmentIndex);
     auto addr = Gmm1Addresses(args, fragment);
     addr.activationToGmm2Flag = nullptr;

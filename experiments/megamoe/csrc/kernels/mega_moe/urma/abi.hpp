@@ -275,6 +275,7 @@ struct Arguments {
     uint64_t topkIds, routeHistogram, routeInfo, routeConfig, routeCounts, routeOffsets;
     uint32_t topkIdBytes;
     uint64_t sharedRoutedOutput; // S1 FP32 routed sum; round only after adding shared result.
+    uint64_t gmmIssued; // per-AIC monotonic routed output submission count
     uint64_t expertRoutes; // int32 [384, sourceRowCapacity], one owner per expert
 };
 static_assert(sizeof(Fragment) == 40);
