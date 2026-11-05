@@ -4,6 +4,7 @@
 
 #include "pack_pipeline.hpp"
 #include "timer.hpp"
+#include "runtime_comm_routes.hpp"
 
 namespace MegaMoeUrma {
 
@@ -17,9 +18,7 @@ __aicore__ inline __gm__ int32_t* PackReadyFlag(const Arguments& args, uint32_t 
 
 __aicore__ inline Chunk LoadPackChunk(const Arguments& args, uint32_t round, uint32_t peer)
 {
-    const auto* gm = &reinterpret_cast<const __gm__ PackRound*>(args.packRounds)[round].chunks[peer];
-    return {gm->peer,          gm->cv,      gm->localRow, gm->remoteRow, gm->rows, gm->fragmentBegin,
-            gm->fragmentCount, gm->reserved};
+    return RuntimeSendChunk(args,peer,round);
 }
 
 __aicore__ inline uint64_t PackPartitionBegin(uint64_t rows, uint32_t worker, uint32_t workers)
@@ -36,8 +35,7 @@ __aicore__ inline void PackOneRound(const Arguments& args, uint32_t round, uint3
                                     Timer& timer)
 {
     if (round >= args.config.packRoundCount) return;
-    const auto* gm = reinterpret_cast<const __gm__ PackRound*>(args.packRounds) + round;
-    const uint64_t rows = gm->rows;
+    const uint64_t rows = RuntimePackRoundRows(args,round);
     const uint64_t begin = PackPartitionBegin(rows, worker, workers);
     const uint64_t end = PackPartitionBegin(rows, worker + 1U, workers);
     if (begin == end) return;
@@ -133,8 +131,7 @@ __aicore__ inline void PackOneRound(const Arguments& args, uint32_t round, uint3
                                     PackBatch& pack)
 {
     if (round >= args.config.packRoundCount) return;
-    const auto* gm = reinterpret_cast<const __gm__ PackRound*>(args.packRounds) + round;
-    const uint64_t rows = gm->rows;
+    const uint64_t rows = RuntimePackRoundRows(args,round);
     const uint64_t begin = PackPartitionBegin(rows, worker, workers);
     const uint64_t end = PackPartitionBegin(rows, worker + 1U, workers);
     if (begin == end) return;

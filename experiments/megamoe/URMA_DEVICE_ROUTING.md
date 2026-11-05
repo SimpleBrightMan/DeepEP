@@ -1,5 +1,9 @@
 # MegaMoE 内核内 Device 路由
 
+> 当前 unitflag shared 已移植 protocol6 专家owner与异步接收摘要方案，见
+> [URMA_EXPERT_OWNER_ROUTING.md](URMA_EXPERT_OWNER_ROUTING.md)。下文为protocol3
+> 基线说明与验证记录，不能当作新版本的编译、精度或性能验证。
+
 本修改适用于 `megamoe-commfirst-shared` 和 `megamoe-unitflag-shared`。
 生产接口只有 Device 路由，不提供 Host 后端或自动回退。
 

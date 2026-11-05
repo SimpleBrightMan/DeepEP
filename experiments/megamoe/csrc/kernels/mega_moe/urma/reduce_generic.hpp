@@ -248,10 +248,8 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker,uint
     const uint64_t firstRoute = firstToken * TopK;
     GlobalTensor<int64_t> inverse;
     GlobalTensor<float> weights;
-    GlobalTensor<uint64_t> dependencies;
     inverse.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(args.reduceIndex));
     weights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(args.weights));
-    dependencies.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(args.reduceDependencies));
     LocalTensor<int64_t> inverseUb(TPosition::VECCALC, Ub::inverseOffset, Ub::maxRoutes);
     LocalTensor<float> weightsUb(TPosition::VECCALC, Ub::weightsOffset, Ub::maxRoutes);
     LocalTensor<uint64_t> dependenciesUb(TPosition::VECCALC, Ub::dependenciesOffset, Ub::maxRoutes);
@@ -264,20 +262,23 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker,uint
     bool allInputsReady = GenericAllReduceInputsReady(args);
     if (allInputsReady) GenericGateReduceInputs();
     static_assert(TopK >= 1U && TopK <= ReduceUbContract::topk);
-    if constexpr (TopK == 8U) {
-        // Preserve the original aligned K8 transfers/instruction sequence.
-        DataCopy(inverseUb, inverse[firstRoute], owned * TopK);
-        DataCopy(weightsUb, weights[firstRoute], owned * TopK);
-        if (!allInputsReady) DataCopy(dependenciesUb, dependencies[firstRoute], owned * TopK);
-    } else {
-        const uint32_t routes = owned * TopK;
-        DataCopyPad(inverseUb, inverse[firstRoute], {1U, routes * 8U, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-        DataCopyPad(weightsUb, weights[firstRoute], {1U, routes * 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0.0F});
-        if (!allInputsReady)
-            DataCopyPad(dependenciesUb, dependencies[firstRoute], {1U, routes * 8U, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+    if (column == 0U) {
+        // These three arrays are outside the column payload scratch and remain
+        // resident across all H slices. Build readiness exactly once per entry,
+        // never once per polling pass or once per 2048-column slice.
+        WaitPackInverseReady(args);
+        if constexpr (TopK == 8U) {
+            DataCopy(inverseUb, inverse[firstRoute], owned * TopK);
+            DataCopy(weightsUb, weights[firstRoute], owned * TopK);
+        } else {
+            const uint32_t routes = owned * TopK;
+            DataCopyPad(inverseUb, inverse[firstRoute], {1U, routes * 8U, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+            DataCopyPad(weightsUb, weights[firstRoute], {1U, routes * 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0.0F});
+        }
+        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+        if (!allInputsReady) BuildReduceDependencies(args, firstRoute, owned * TopK, inverseUb, dependenciesUb);
     }
-    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
     for (uint32_t word = 0U; word < Ub::issuedBytes / 4U; ++word) issued.SetValue(word, 0U);
     if (!allInputsReady) {
         for (uint32_t word = 0U; word < Ub::remoteCacheBytes / 4U; ++word) remoteCache.SetValue(word, 0U);

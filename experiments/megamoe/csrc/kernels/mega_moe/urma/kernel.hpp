@@ -28,8 +28,8 @@ constexpr uint32_t kCommunicationSubmittedOffset = kPackUbBase + 2U * kPeerReord
 constexpr uint32_t kCommunicationPendingOffset = kCommunicationSubmittedOffset + kMaxPeerChunks * sizeof(uint32_t);
 static_assert(kCommunicationSignalOffset % 32U == 0U);
 static_assert(kCommunicationPendingOffset + kMaxPeerChunks * sizeof(uint32_t) <= kRequiredUbBytes);
-// After the local Dispatch join, this owner's Pack UB is dead. Reuse 16KiB
-// of it for remote/self span bits, away from both DMA slots and CV counters.
+// After the local Dispatch join, this owner's Pack UB is dead. Reuse the
+// remote/self first-row bitmaps, away from both DMA slots and CV counters.
 constexpr uint32_t kRemoteReorderBitmapOffset = kPackUbBase;
 constexpr uint32_t kSelfReorderBitmapOffset = kRemoteReorderBitmapOffset + kPeerReorderBitmapBytes;
 static_assert(kSelfReorderBitmapOffset + kPeerReorderBitmapBytes <= kCommunicationSubmittedOffset);
@@ -48,13 +48,6 @@ __aicore__ inline void WaitProgressFlag(__gm__ T* flag, T expected, Timer& timer
     timer.TraceEnd(event, start, meta);
 }
 
-__aicore__ inline Chunk LoadChunk(uint64_t address, uint32_t index)
-{
-    const auto* gm = reinterpret_cast<__gm__ Chunk*>(address) + index;
-    return {gm->peer,          gm->cv,      gm->localRow, gm->remoteRow, gm->rows, gm->fragmentBegin,
-            gm->fragmentCount, gm->reserved};
-}
-
 __aicore__ inline TraceMeta ChunkTraceMeta(const Chunk& chunk)
 {
     TraceMeta meta;
@@ -65,30 +58,8 @@ __aicore__ inline TraceMeta ChunkTraceMeta(const Chunk& chunk)
     return meta;
 }
 
-// Host descriptors are peer-major and CV-major within each peer. Locate the
-// actual ranges once without scanning unrelated peers in the payload loop.
-__aicore__ inline uint32_t ChunkPeerLowerBound(uint64_t address, uint32_t count, uint32_t peer)
-{
-    const auto* chunks = reinterpret_cast<__gm__ Chunk*>(address);
-    uint32_t begin = 0U;
-    uint32_t end = count;
-    while (begin < end) {
-        const uint32_t middle = begin + (end - begin) / 2U;
-        if (chunks[middle].peer < peer) {
-            begin = middle + 1U;
-        } else {
-            end = middle;
-        }
-    }
-    return begin;
-}
-
-__aicore__ inline uint32_t PeerDispatchCvCount(const Arguments& args, uint32_t peer)
-{
-    const uint32_t end = ChunkPeerLowerBound(args.sendChunks, args.config.sendChunkCount, peer + 1U);
-    if (end == 0U) return 0U;
-    const auto* last = reinterpret_cast<__gm__ Chunk*>(args.sendChunks) + end - 1U;
-    return last->peer == peer ? last->cv + 1U : 0U;
+__aicore__ inline uint32_t PeerDispatchCvCount(const Arguments& args,uint32_t peer) {
+    return RuntimeSendCvCount(args,peer);
 }
 
 __aicore__ inline void TraceLocalSync(Timer& timer, uint32_t stage)
@@ -127,7 +98,7 @@ __aicore__ inline void PublishPeerStart(const Arguments& args, uint32_t owner, T
 
 
 
-__aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Timer& timer)
+__aicore__ inline void CommunicatePeer(Arguments& args, uint32_t owner, Timer& timer)
 {
     const uint32_t peer = PeerForOwner(args.config.rank, owner);
     const uint32_t workers = CommunicationWorkers(args.config.world);
@@ -142,14 +113,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     const uint64_t h = args.config.hidden;
     const uint64_t scales = h / 32U;
     const uint64_t rowBytes = h * sizeof(bfloat16_t);
-    uint32_t dispatchCvs = 0U;
-    if (args.coarseTrace != 0U) {
-        const uint32_t last = ChunkPeerLowerBound(args.sendChunks, args.config.sendChunkCount, peer + 1U);
-        if (last != 0U) {
-            const auto chunk = LoadChunk(args.sendChunks, last - 1U);
-            if (chunk.peer == peer) dispatchCvs = chunk.cv + 1U;
-        }
-    }
+    const uint32_t dispatchCvs=PeerDispatchCvCount(args,peer);
     for (uint32_t round = 0U; round < args.config.packRoundCount; ++round) {
         const Chunk chunk = LoadPackChunk(args, round, peer);
         if (chunk.rows != 0U) {
@@ -192,6 +156,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         }
     }
     MarkPackWorkerComplete(args);
+    WaitRouteSummary(args,timer);
     AtomicAdd(LocalCompletionFlag(args, kLocalFlagDispatchDone), 1);
     if (owner == 0U) {
         WaitProgressFlag(LocalCompletionFlag(args, kLocalFlagPackDone), static_cast<int32_t>(kAic), timer,
@@ -203,10 +168,10 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     WaitProgressFlag(LocalCompletionFlag(args, kLocalFlagDispatchDone), static_cast<int32_t>(args.config.world), timer,
                      TraceEvent::WaitLocalDispatch, peerMeta);
 
-    const uint32_t begin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer);
-    const uint32_t end = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer + 1U);
-    const uint32_t selfBegin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, args.config.rank);
-    const uint32_t selfEnd = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, args.config.rank + 1U);
+    const uint32_t begin = RouteInfo(args)->recvCvBase[peer];
+    const uint32_t end = RouteInfo(args)->recvCvBase[peer + 1U];
+    const uint32_t selfBegin = RouteInfo(args)->recvCvBase[args.config.rank];
+    const uint32_t selfEnd = RouteInfo(args)->recvCvBase[args.config.rank + 1U];
     // Remote CVs hold submitted ROW counts; self CVs hold copied SPAN counts.
     // Both become the submitted sentinel only after the full CV ready flag.
     // Each row is written once, with no GM reuse before final quiet.
@@ -237,8 +202,9 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         for (uint32_t j = 0U; j < end - begin; ++j) {
             uint32_t sentRows = submitted.GetValue(j);
             if (sentRows == kReorderCvSubmitted) continue;
-            const Chunk chunk = LoadChunk(args.recvChunks, begin + j);
-            const auto range = LoadPeerReorderRange(args, begin + j);
+            const Chunk chunk = RuntimeReceiveChunkByIndex(args, begin + j);
+            // Remote progress only needs the CV key; avoid a separate count pass.
+            const PeerReorderRange range{begin+j,0U};
             const uint32_t advanced = ReorderReadyPeerSpans(args, range, chunk, remoteSpans.spanBegin,
                                                            remoteSpanCopied, timer, waiting, waitStart, peerMeta);
             if (advanced == 0U) continue;
@@ -295,7 +261,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         for (uint32_t j = owner; j < selfEnd - selfBegin; j += workers) {
             const uint32_t copied = selfCopied.GetValue(j);
             if (copied == kReorderCvSubmitted) continue;
-            const Chunk chunk = LoadChunk(args.recvChunks, selfBegin + j);
+            const Chunk chunk = RuntimeReceiveChunkByIndex(args, selfBegin + j);
             const auto range = LoadPeerReorderRange(args, selfBegin + j);
             const uint32_t advanced = ReorderReadyPeerSpans(args, range, chunk, selfSpans.spanBegin,
                                                            selfSpanCopied, timer, waiting, waitStart, peerMeta);
@@ -348,7 +314,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     FinishCombinePeer(args, owner, peerCounted, selfCounted);
 }
 
-__aicore__ inline void CommunicatePeerShared(const Arguments& args, uint32_t owner, Timer& timer,SharedIncoming& incoming)
+__aicore__ inline void CommunicatePeerShared(Arguments& args, uint32_t owner, Timer& timer,SharedIncoming& incoming)
 {
     const uint32_t peer = PeerForOwner(args.config.rank, owner);
     auto* symmetric = reinterpret_cast<__gm__ uint8_t*>(args.symmetric);
@@ -461,15 +427,16 @@ __aicore__ inline void CommunicatePeerShared(const Arguments& args, uint32_t own
         PackOneRound(args, nextPackRound++, owner, kAic, pack);
     pack.Close();
     MarkPackWorkerComplete(args);
+    WaitRouteSummary(args,timer);
     // This owner has completed its original static Pack quota. Do not wait
     // for other owners: each Combine CV is protected by GMM2 readiness.
 
     const uint32_t workers=CommunicationWorkers(args.config.world);
     SharedActivationState shared(args,owner,timer);
-    const uint32_t begin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer);
-    const uint32_t end = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer + 1U);
-    const uint32_t selfBegin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, args.config.rank);
-    const uint32_t selfEnd = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, args.config.rank + 1U);
+    const uint32_t begin = RouteInfo(args)->recvCvBase[peer];
+    const uint32_t end = RouteInfo(args)->recvCvBase[peer + 1U];
+    const uint32_t selfBegin = RouteInfo(args)->recvCvBase[args.config.rank];
+    const uint32_t selfEnd = RouteInfo(args)->recvCvBase[args.config.rank + 1U];
     // Remote CVs hold submitted ROW counts; self CVs hold copied SPAN counts.
     // Both become the submitted sentinel only after the full CV ready flag.
     // Each row is written once, with no GM reuse before final quiet.
@@ -498,8 +465,8 @@ __aicore__ inline void CommunicatePeerShared(const Arguments& args, uint32_t own
         for (uint32_t j = 0U; j < end - begin; ++j) {
             uint32_t sentRows = submitted.GetValue(j);
             if (sentRows == kReorderCvSubmitted) continue;
-            const Chunk chunk = LoadChunk(args.recvChunks, begin + j);
-            const auto range = LoadPeerReorderRange(args, begin + j);
+            const Chunk chunk = RuntimeReceiveChunkByIndex(args, begin + j);
+            const PeerReorderRange range{begin+j,0U};
             const uint32_t advanced = ReorderReadyPeerSpans(args, range, chunk, remoteSpans.spanBegin,
                                                            remoteSpanCopied, timer, waiting, waitStart, peerMeta);
             if (advanced == 0U) continue;
@@ -556,7 +523,7 @@ __aicore__ inline void CommunicatePeerShared(const Arguments& args, uint32_t own
         for (uint32_t j = owner; j < selfEnd - selfBegin; j += workers) {
             const uint32_t copied = selfCopied.GetValue(j);
             if (copied == kReorderCvSubmitted) continue;
-            const Chunk chunk = LoadChunk(args.recvChunks, selfBegin + j);
+            const Chunk chunk = RuntimeReceiveChunkByIndex(args, selfBegin + j);
             const auto range = LoadPeerReorderRange(args, selfBegin + j);
             const uint32_t advanced = ReorderReadyPeerSpans(args, range, chunk, selfSpans.spanBegin,
                                                            selfSpanCopied, timer, waiting, waitStart, peerMeta);
@@ -644,16 +611,16 @@ __aicore__ inline void ProcessRouted(Arguments& args)
     // No CV loop contains a rank-wide or local full-core synchronization.
     TraceLocalSync(timer, 0U);
     if constexpr (g_coreType == AIC) {
+        WaitRouteSummary(args,timer);
         RunProfiledCompute(args, block, timer);
         MarkCubeComplete(args);
     } else if (GetSubBlockIdx() == 0U) {
+        WaitRouteSummary(args,timer);
         RunProfiledCompute(args, block, timer);
     } else if (block < communicationWorkers) {
         CommunicatePeer(args, block, timer);
     } else {
-        timer.CoarseBegin(CoarsePhase::Activation);
         RunActivation(args, block - communicationWorkers, timer);
-        timer.CoarseEnd(CoarsePhase::Activation);
     }
     if constexpr (g_coreType == AIV) {
         // Only this engine releases its phase-private UB/events. Other
@@ -699,11 +666,13 @@ __aicore__ inline void ProcessShared(Arguments& a) {
     const int64_t overflow=GetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL,MegaMoeImpl::OVERFLOW_MODE_CTRL>();
     SetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL,MegaMoeImpl::OVERFLOW_MODE_CTRL>(0);
     if constexpr(g_coreType==AIC) {
+        WaitRouteSummary(a,timer);
         timer.CoarseBegin(CoarsePhase::Gmm);
         if(a.coarseTrace || (!a.trace&&!a.timer)){NoopTimer t;RunSharedComputeSequence(a,block,t);}
         else RunSharedComputeSequence(a,block,timer);
         timer.CoarseEnd(CoarsePhase::Gmm);
     } else if(GetSubBlockIdx()==0) {
+        WaitRouteSummary(a,timer);
         timer.CoarseBegin(CoarsePhase::Dequant);
         if(a.coarseTrace || (!a.trace&&!a.timer)){NoopTimer t;RunSharedComputeSequence(a,block,t);}
         else RunSharedComputeSequence(a,block,timer);
@@ -724,9 +693,7 @@ __aicore__ inline void ProcessShared(Arguments& a) {
         SharedIncoming incoming{a,block};
         if(block<comm)CommunicatePeerShared(a,block,timer,incoming);
         else {
-            timer.CoarseBegin(CoarsePhase::Activation);
             RunActivationShared(a,block-comm,timer);
-            timer.CoarseEnd(CoarsePhase::Activation);
         }
         PipeBarrier<PIPE_ALL>();
         timer.CoarseBegin(CoarsePhase::Reduce);

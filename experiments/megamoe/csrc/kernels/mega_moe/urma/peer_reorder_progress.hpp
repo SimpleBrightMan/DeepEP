@@ -13,39 +13,43 @@ constexpr uint32_t kCombinePutRows = 128U;
 
 __aicore__ inline PeerReorderRange LoadPeerReorderRange(const Arguments& args, uint32_t chunkIndex)
 {
-    const auto* gm = reinterpret_cast<const __gm__ PeerReorderRange*>(args.peerReorderRanges) + chunkIndex;
-    return {gm->spanBegin, gm->spanCount};
+    return RuntimePeerReorderRange(args,chunkIndex);
 }
 
-// Each peer owns a contiguous slice of the host span table. Self owners have
-// separate bitmaps and only touch their statically assigned CVs in that slice.
+// Each peer owns a first-row-addressed bitmap. Self owners have
+// separate bitmaps and only touch their statically assigned CVs.
 __aicore__ inline PeerReorderRange PeerReorderSpanRange(const Arguments& args, uint32_t begin, uint32_t end)
 {
     if (begin == end) return {0U, 0U};
-    const auto first = LoadPeerReorderRange(args, begin);
-    const auto last = LoadPeerReorderRange(args, end - 1U);
-    return {first.spanBegin, last.spanBegin + last.spanCount - first.spanBegin};
+    const auto first=RuntimeReceiveChunkByIndex(args,begin);
+    const uint32_t rows=RouteInfo(args)->incoming[first.peer][args.config.localExperts];
+    return {0U,rows}; // sparse span bits use peer-local first row, not dense span ordinal
+
 }
 
 __aicore__ inline void ClearReorderBitmap(AscendC::LocalTensor<uint32_t> copied, uint32_t spans)
 {
-    for (uint32_t word = 0U; word < (spans + 31U) / 32U; ++word) copied.SetValue(word, 0U);
+    const uint32_t words=(spans+31U)/32U;
+    if(words==0U)return;
+    AscendC::Duplicate(copied,uint32_t{0},words);
+    AscendC::SetFlag<AscendC::HardEvent::V_S>(static_cast<AscendC::TEventID>(0U));
+    AscendC::WaitFlag<AscendC::HardEvent::V_S>(static_cast<AscendC::TEventID>(0U));
 }
 
-// The host plan partitions a CV in destination-row order. Bits are consumed
+// The lazy cursor partitions a CV in destination-row order. Bits are consumed
 // only after ReorderReadyPeerSpans has drained its MTE3 writes. A count of
 // ready rows is insufficient: an unready hole must never enter a payload PUT.
 __aicore__ inline uint32_t ReorderedPeerPrefixRows(
     const Arguments& args, const PeerReorderRange& range, uint32_t peerSpanBegin,
     AscendC::LocalTensor<uint32_t> copied)
 {
-    uint32_t rows = 0U;
-    for (uint32_t j = 0U; j < range.spanCount; ++j) {
-        const uint32_t spanIndex = range.spanBegin + j;
-        const uint32_t bitIndex = spanIndex - peerSpanBegin;
-        if ((copied.GetValue(bitIndex / 32U) & (1U << (bitIndex % 32U))) == 0U) break;
-        const auto* span = reinterpret_cast<const __gm__ PeerReorderSpan*>(args.peerReorderSpans) + spanIndex;
-        rows += span->rows;
+    (void)peerSpanBegin;
+    uint32_t rows=0U,bit;
+    RuntimePeerSpans cursor(args,RuntimeReceiveChunkByIndex(args,range.spanBegin));
+    PeerReorderSpan span{};
+    while(cursor.Next(span,bit)) {
+        if((copied.GetValue(bit/32U)&(1U<<(bit%32U)))==0U)break;
+        rows+=span.rows;
     }
     return rows;
 }
@@ -66,14 +70,14 @@ __aicore__ inline uint32_t ReorderReadyPeerSpans(
     uint32_t copiedRows = 0U;
     uint64_t start = 0U;
     uint64_t onlyFragment = kTraceUnknown;
-    for (uint32_t j = 0U; j < range.spanCount; ++j) {
-        const uint32_t spanIndex = range.spanBegin + j;
-        const uint32_t bitIndex = spanIndex - peerSpanBegin;
-        const uint32_t mask = 1U << (bitIndex % 32U);
-        const uint32_t word = copied.GetValue(bitIndex / 32U);
-        if ((word & mask) != 0U) continue;
-        const auto* gm = reinterpret_cast<const __gm__ PeerReorderSpan*>(args.peerReorderSpans) + spanIndex;
-        const uint32_t group = gm->fragmentIndex;
+    (void)range;(void)peerSpanBegin;
+    RuntimePeerSpans cursor(args,chunk);
+    PeerReorderSpan span{};uint32_t bitIndex;
+    while(cursor.Next(span,bitIndex)) {
+        const uint32_t mask=1U<<(bitIndex%32U);
+        const uint32_t word=copied.GetValue(bitIndex/32U);
+        if(word&mask)continue;
+        const uint32_t group=span.fragmentIndex;
         auto* done = reinterpret_cast<__gm__ int32_t*>(args.gmm2Done + static_cast<uint64_t>(group) * kFlagBytes);
         if (ReadGmByPassDCache(done) < required) continue;
         if (copiedSpans == 0U) {
@@ -87,7 +91,6 @@ __aicore__ inline uint32_t ReorderReadyPeerSpans(
         } else if (onlyFragment != group) {
             onlyFragment = kTraceUnknown;
         }
-        const PeerReorderSpan span{gm->sourceRow, gm->destinationRow, group, gm->rows};
         pipeline.Copy(span);
         copied.SetValue(bitIndex / 32U, word | mask);
         copiedRows += span.rows;

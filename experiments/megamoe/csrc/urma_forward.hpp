@@ -40,7 +40,7 @@ private:
     torch::Tensor segments_, compute_batches_, compute_tasks_, chunk_group_indices_;
     torch::Tensor pack_rounds_, pack_ready_;
     torch::Tensor reduce_dependencies_, order_, inverse_, route_counts_, route_offsets_;
-    torch::Tensor route_histogram_, route_info_, route_config_;
+    torch::Tensor route_histogram_, route_info_, route_config_, expert_routes_;
     torch::Tensor system_workspace_;
     torch::Tensor shared_gmm1_,shared_activation_,shared_scale_,shared_output_,shared_routed_output_,shared_done1_,shared_done_act_;
     int64_t last_epoch_ = 0;

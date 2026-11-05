@@ -4,6 +4,7 @@
 
 #include "abi.hpp"
 #include "compute_contract.hpp"
+#include "lazy_peer_reorder.hpp"
 #include "timer.hpp"
 
 namespace MegaMoeUrma {
@@ -65,15 +66,13 @@ private:
 // loop uses ReorderReadyPeerSpans to prepare partial CVs before all groups finish.
 __aicore__ inline void ReorderPeerChunk(const Arguments& args, uint32_t chunkIndex, const Chunk& chunk, Timer& timer)
 {
-    const auto* rangeGm = reinterpret_cast<const __gm__ PeerReorderRange*>(args.peerReorderRanges) + chunkIndex;
-    const PeerReorderRange range{rangeGm->spanBegin, rangeGm->spanCount};
+    (void)chunkIndex;
     const uint64_t start = timer.TraceBegin();
     PeerReorderPipeline pipeline;
     pipeline.Init(args, chunk);
-    for (uint32_t j = 0U; j < range.spanCount; ++j) {
-        const auto* gm = reinterpret_cast<const __gm__ PeerReorderSpan*>(args.peerReorderSpans) + range.spanBegin + j;
-        pipeline.Copy({gm->sourceRow, gm->destinationRow, gm->fragmentIndex, gm->rows});
-    }
+    RuntimePeerSpans cursor(args,chunk);
+    PeerReorderSpan span{};uint32_t bit;
+    while(cursor.Next(span,bit))pipeline.Copy(span);
     pipeline.Finish();
     TraceMeta meta;
     meta.peer = chunk.peer;

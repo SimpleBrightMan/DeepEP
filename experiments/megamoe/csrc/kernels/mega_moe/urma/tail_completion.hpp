@@ -34,6 +34,9 @@ __aicore__ inline void MarkReorderComplete(const Arguments& args)
 // Each peer has exactly one local observer. Once counted, it never reads that
 // flag again in this invocation. Outbound completion alone is NOT incoming
 // completion: inspect the peer-owned slot in this rank's symmetric window.
+// These observations also permit single-slot route-inbox reuse: all peers
+// publish finished only after acquiring their incoming summary, even for
+// empty streams. Keep the observers and final local join before returning.
 __aicore__ inline bool ObserveIncomingCompletion(const Arguments& args, uint32_t owner, bool& peerCounted,
                                                  bool& selfCounted)
 {

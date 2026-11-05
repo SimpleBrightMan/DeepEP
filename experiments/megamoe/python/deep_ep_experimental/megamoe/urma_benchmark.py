@@ -356,7 +356,7 @@ def run(args, config, group):
         profile_config="Level0/AiCoreNone/Text; shapes/memory/stack/FLOPs/modules disabled",
         max_recv_rows=owner.max_recv_rows,
         symmetric_buffer_bytes=owner.symmetric_buffer_bytes,
-        route_preparation="NPU sort/count/inverse + D2H counts + Store count exchange + native descriptors",
+        route_preparation="Device expert buckets; local Pack/Dispatch overlaps incoming summary; lazy GMM/Reorder descriptors; Pack inverse",
         numerical_validation="cpu_golden_and_npu_cascade_error_budget" if args.golden_dir else "skipped",
         accuracy_policy_source="local DeepEP 5a9d6ffad7474137fa134cd7a60aebb2c8ee3089",
         accuracy_only=args.accuracy_only,
@@ -509,6 +509,8 @@ def run(args, config, group):
                     ("reduce_index", prepared.routing.reduce_index),
                     ("order", prepared.routing.order),
                 ):
+                    if value is None:  # compact order is reconstructed by explicit debug_snapshot
+                        continue
                     try:
                         debug_raw[name] = value.view(torch.uint8).reshape(-1).cpu()
                     except RuntimeError as error:

@@ -1,50 +1,23 @@
 // Copyright (c) 2026, Lu Lu
 // Modified by SimpleBright_Man 2026
 #pragma once
-#include "device_route_plan.hpp"
 #include "parallel_route_plan.hpp"
+#include "route_runtime.hpp"
+#include "route_expert_vf.hpp"
 #include "transport.hpp"
 #include "timer.hpp"
 #include "kernel_operator.h"
-#include "route_compact_vf.hpp"
-#include "route_emit_vf.hpp"
 
 namespace MegaMoeUrma {
 using namespace AscendC;
-constexpr uint32_t kRouteBlockItems = ((kMaxTokensPerRank * 8U + kLocalWorkers - 1U) / kLocalWorkers + 63U) / 64U * 64U;
-constexpr uint32_t kRouteInfoUb = 96U * 1024U;
-static_assert(kRouteInfoUb + sizeof(DeviceRouteInfo) < kRequiredUbBytes);
-
-// This region survives Prefix (low 85.5KiB), Exchange (low 1KiB), and
-// Compile (low inbox plus RouteInfo at 96KiB). It is released before Pack.
-// For n=2368: CSR 128..137.25KiB, counts 137.25..138.75KiB,
-// begin 138.75..140.254KiB, padded order64 140.28125..167.78125KiB.
-struct RouteCsrUb {
-    static constexpr uint32_t n = kRouteBlockItems;
-    static constexpr uint32_t csrAt = 128U * 1024U;
-    static constexpr uint32_t countsAt = csrAt + n * sizeof(uint32_t);
-    static constexpr uint32_t beginAt = countsAt + kExperts * sizeof(uint32_t);
-    static constexpr uint32_t orderAt = (beginAt + (kExperts + 1U) * sizeof(uint32_t) + 31U) / 32U * 32U;
-    // Each expert's int64 source starts on a 32B boundary. At most three
-    // padding entries per expert, even for fully skewed/duplicate routing.
-    static constexpr uint32_t orderItems = n + 3U * kExperts;
-    static constexpr uint32_t end = orderAt + orderItems * sizeof(uint64_t);
-    static constexpr uint32_t inverseAt = 0U;
-    static constexpr uint32_t dependenciesAt = n * sizeof(uint64_t);
-    static constexpr uint32_t workerBaseAt = 2U * n * sizeof(uint64_t);
+constexpr uint32_t kRouteInfoUb=96U*1024U;
+struct ExpertRouteUb {
+    static constexpr uint32_t ids=0U,raw=16U*1024U,counts=48U*1024U;
+    static constexpr uint32_t mask=50U*1024U,totals=52U*1024U,routes=64U*1024U;
+    static constexpr uint32_t end=routes+kExpertRoutesPerWorker*kExpertRouteBatch*4U;
 };
-static_assert(kRouteInfoUb + sizeof(DeviceRouteInfo) <= RouteCsrUb::csrAt);
-static_assert(RouteCsrUb::end <= kRequiredUbBytes);
-static_assert(RouteCsrUb::workerBaseAt + kExperts * sizeof(uint32_t) <= kRouteInfoUb);
-
-struct RouteEmitUb {
-    static constexpr uint32_t keptIdsAt=RouteCsrUb::end; // 167.78125KiB
-    static constexpr uint32_t paddedBeginAt=(keptIdsAt+kRouteBlockItems*sizeof(uint32_t)+31U)/32U*32U;
-    static constexpr uint32_t end=paddedBeginAt+kExperts*sizeof(uint32_t); // 178.53125KiB
-};
-static_assert(kExperts==kRouteEmitExperts);
-static_assert(RouteEmitUb::keptIdsAt%32U==0U && RouteEmitUb::paddedBeginAt%32U==0U);
-static_assert(RouteEmitUb::end<=kRequiredUbBytes);
+static_assert(ExpertRouteUb::end<=kRequiredUbBytes);
+static_assert(kRouteInfoUb+sizeof(DeviceRouteInfo)<=kRequiredUbBytes);
 
 template<HardEvent E> __aicore__ inline void RouteFence() { SetFlag<E>(EVENT_ID0); WaitFlag<E>(EVENT_ID0); }
 __aicore__ inline void RouteLoad(uint64_t gm, uint32_t ub, uint32_t bytes) {
@@ -149,263 +122,110 @@ private:
     uint32_t usedBytes_ = 0U;
 };
 
-struct DeviceRouteOutput {
-    const Arguments& a;
-    RouteDescriptorDmaStream<0U * RouteDescriptorUb::stride> fragments;
-    RouteDescriptorDmaStream<1U * RouteDescriptorUb::stride> segments;
-    RouteDescriptorDmaStream<2U * RouteDescriptorUb::stride> sends;
-    RouteDescriptorDmaStream<3U * RouteDescriptorUb::stride> receives;
-    RouteDescriptorDmaStream<4U * RouteDescriptorUb::stride> links;
-    RouteDescriptorDmaStream<5U * RouteDescriptorUb::stride> batches;
-    RouteDescriptorDmaStream<6U * RouteDescriptorUb::stride> tasks;
-    RouteDescriptorDmaStream<7U * RouteDescriptorUb::stride,RouteDescriptorUb::packBatchBytes> pack;
-#if MEGAMOE_URMA_ROUTE_REORDER
-    RouteDescriptorDmaStream<8U * RouteDescriptorUb::stride> reorderRanges;
-    RouteDescriptorDmaStream<9U * RouteDescriptorUb::stride> reorderSpans;
-#endif
 
-    __aicore__ explicit DeviceRouteOutput(const Arguments& args)
-        : a(args), fragments(args.fragments), segments(args.segments),
-          sends(args.sendChunks), receives(args.recvChunks), links(args.chunkGroupIndices),
-          batches(args.computeBatches), tasks(args.computeTasks), pack(args.packRounds)
-#if MEGAMOE_URMA_ROUTE_REORDER
-          , reorderRanges(args.peerReorderRanges), reorderSpans(args.peerReorderSpans)
-#endif
-    {}
-
-    __aicore__ inline uint32_t Gmm1Tiles(uint32_t rows,const Config& c) {
-#if MEGAMOE_URMA_ROUTE_REORDER
-        return c.intermediate/256U;
-#else
-        return Gmm1ComputeTileCount(rows,c);
-#endif
-    }
-    __aicore__ inline void FragmentAt(uint32_t i,const Fragment& v){fragments.Append(uint64_t(i)*sizeof(v),v);}
-    __aicore__ inline void Segment(uint32_t i,const RowSegment& v){segments.Append(uint64_t(i)*sizeof(v),v);}
-    __aicore__ inline void Send(uint32_t i,const Chunk& v){sends.Append(uint64_t(i)*sizeof(v),v);}
-    __aicore__ inline void Receive(uint32_t i,const Chunk& v){receives.Append(uint64_t(i)*sizeof(v),v);}
-    __aicore__ inline void Link(uint32_t i,uint32_t v){links.Append(uint64_t(i)*sizeof(v),v);}
-    __aicore__ inline void Batch(uint32_t i,const ComputeBatch& v){batches.Append(uint64_t(i)*sizeof(v),v);}
-    __aicore__ inline void Task(uint32_t i,const ComputeBatchTask& v){tasks.Append(uint64_t(i)*sizeof(v),v);}
-    __aicore__ inline void PackChunk(uint32_t cv,uint32_t peer,const Chunk& v){
-        pack.Append(uint64_t(cv)*sizeof(PackRound)+uint64_t(peer)*sizeof(Chunk),v);
-    }
-    __aicore__ inline void PackRows(uint32_t cv,uint64_t v){
-        pack.Append(uint64_t(cv)*sizeof(PackRound)+kWorld*sizeof(Chunk),v);
-    }
-    __aicore__ inline void ReorderSpan(uint32_t i,uint64_t src,uint64_t dst,uint32_t group,uint32_t rows){
-#if MEGAMOE_URMA_ROUTE_REORDER
-        const PeerReorderSpan value{src,dst,group,rows};
-        reorderSpans.Append(uint64_t(i)*sizeof(value),value);
-#endif
-    }
-    __aicore__ inline void ReorderRange(uint32_t i,uint32_t first,uint32_t count){
-#if MEGAMOE_URMA_ROUTE_REORDER
-        const PeerReorderRange value{first,count};
-        reorderRanges.Append(uint64_t(i)*sizeof(value),value);
-#endif
-    }
-    __aicore__ inline void FlushTables() {
-        fragments.Flush();segments.Flush();sends.Flush();receives.Flush();
-        links.Flush();batches.Flush();tasks.Flush();pack.Flush();
-#if MEGAMOE_URMA_ROUTE_REORDER
-        reorderRanges.Flush();reorderSpans.Flush();
-#endif
-    }
-    __aicore__ inline void Finish(const Config& c,bool wave12) {
-        (void)wave12;FlushTables();
-        // Publish the dynamic config only after every descriptor DMA has
-        // completed. Config itself retains the established Scalar/DCCI path.
-        RouteStore(a.routeConfig,0,c);RouteFlush(a.routeConfig,sizeof(Config));
-    }
-};
-
-// One input load and one VF expert-filtering pass. The first invocation leaves
-// a compact stable expert list in high UB; the emit invocation consumes that
-// list after worker prefixes and incoming metadata have been prepared.
-__aicore__ inline void RouteLocalPermutation(const Arguments& a,uint32_t worker,bool emit) {
-    constexpr uint32_t n=kRouteBlockItems;
-    const uint32_t total=a.config.bs*a.config.topk;
-    const uint32_t begin=uint64_t(total)*worker/kLocalWorkers;
-    const uint32_t end=uint64_t(total)*(worker+1U)/kLocalWorkers,valid=end-begin;
-    const bool vectorEmit=a.config.cvRows!=0U && (a.config.cvRows&(a.config.cvRows-1U))==0U;
-    LocalTensor<uint32_t> csr(TPosition::VECCALC,RouteCsrUb::csrAt,n);
-    LocalTensor<uint32_t> counts(TPosition::VECCALC,RouteCsrUb::countsAt,kExperts);
-    LocalTensor<uint32_t> starts(TPosition::VECCALC,RouteCsrUb::beginAt,kExperts+1U);
-    if(!emit) {
-        constexpr uint32_t idsAt=0U,maskAt=12U*n,rawAt=24U*n;
-        static_assert(rawAt+8U*n<=kRouteInfoUb);
-        LocalTensor<int32_t> ids(TPosition::VECCALC,idsAt,n);
-        LocalTensor<uint8_t> mask(TPosition::VECCALC,maskAt,n*4U);
-        if(valid) {
-            if(a.topkIdBytes==4U)RouteLoad(a.topkIds+uint64_t(begin)*4U,idsAt,valid*4U);
-            else {
-                RouteLoad(a.topkIds+uint64_t(begin)*8U,rawAt,valid*8U);
-                LocalTensor<int32_t> raw(TPosition::VECCALC,rawAt,2U*n);
-                auto bits=mask.ReinterpretCast<uint32_t>();
-                for(uint32_t i=0;i<(2U*valid+31U)/32U;++i)bits.SetValue(i,0x55555555U);
-                RouteFence<HardEvent::S_V>();
-                uint64_t count=0U;
-                GatherMask(ids,raw,bits,true,2U*valid,{1,1,0,0},count);
-                RouteFence<HardEvent::V_S>();
-            }
-        }
-        // The VF creates global flat indices internally and appends exactly
-        // 'valid' entries across all expert buckets. Even empty input invokes
-        // it so all 384 counts are defined as zero for this invocation.
-        RouteFence<HardEvent::S_V>();
-        if(vectorEmit && valid) {
-            LocalTensor<int32_t> keptIds(TPosition::VECCALC,RouteEmitUb::keptIdsAt,n);
-            Adds(keptIds,ids,int32_t{0},valid);
-        }
-        asc_vf_call<RouteCompactCsrVF>(
-            reinterpret_cast<__ubuf__ int32_t*>(ids.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ int32_t*>(csr.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ int32_t*>(counts.GetPhyAddr()),valid,begin);
-        RouteFence<HardEvent::V_S>();
-        uint32_t cursor=0U;
-        if(vectorEmit) {
-            LocalTensor<uint32_t> paddedBegin(TPosition::VECCALC,RouteEmitUb::paddedBeginAt,kExperts);
-            uint32_t paddedCursor=0U;
-            for(uint32_t e=0;e<kExperts;++e) {
-                paddedCursor=(paddedCursor+3U)&~3U;
-                starts.SetValue(e,cursor);paddedBegin.SetValue(e,paddedCursor);
-                const uint32_t count=counts.GetValue(e);
-                cursor+=count;paddedCursor+=count;
-            }
-        } else {
-            for(uint32_t e=0;e<kExperts;++e) {
-                starts.SetValue(e,cursor);
-                cursor+=counts.GetValue(e);
-            }
-        }
-        starts.SetValue(kExperts,cursor);
-        // One aligned DMA publishes the whole count row. No dirty Scalar GM
-        // histogram lines survive into the coordinator's prefix rewrite.
-        RouteSave(a.routeHistogram+uint64_t(worker)*kExperts*sizeof(uint32_t),
-                  RouteCsrUb::countsAt,kExperts*sizeof(uint32_t));
-        return;
-    }
-
-    RouteLoad(a.routeInfo,kRouteInfoUb,sizeof(DeviceRouteInfo));
-    RouteLoad(a.routeHistogram+uint64_t(worker)*kExperts*sizeof(uint32_t),
-              RouteCsrUb::workerBaseAt,kExperts*sizeof(uint32_t));
-    auto* info=reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
-    LocalTensor<uint32_t> workerBase(TPosition::VECCALC,RouteCsrUb::workerBaseAt,kExperts);
-    LocalTensor<uint64_t> ordered(TPosition::VECCALC,RouteCsrUb::orderAt,RouteCsrUb::orderItems);
-    LocalTensor<uint64_t> inverse(TPosition::VECCALC,RouteCsrUb::inverseAt,n);
-    LocalTensor<uint64_t> dependencies(TPosition::VECCALC,RouteCsrUb::dependenciesAt,n);
-    uint32_t orderCursor=0U;
-    if(vectorEmit) {
-        uint32_t cvShift=0U;
-        for(uint32_t rows=a.config.cvRows;rows>1U;rows>>=1U)++cvShift;
-        LocalTensor<uint32_t> keptIds(TPosition::VECCALC,RouteEmitUb::keptIdsAt,n);
-        LocalTensor<uint32_t> paddedBegin(TPosition::VECCALC,RouteEmitUb::paddedBeginAt,kExperts);
-        LocalTensor<uint32_t> routeInfo(TPosition::VECCALC,kRouteInfoUb,sizeof(DeviceRouteInfo)/sizeof(uint32_t));
-        RouteFence<HardEvent::S_V>();
-        asc_vf_call<RouteEmitCsrVF>(
-            reinterpret_cast<__ubuf__ uint32_t*>(csr.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t*>(keptIds.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t*>(starts.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t*>(paddedBegin.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t*>(workerBase.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t*>(routeInfo.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t*>(ordered.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t*>(inverse.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t*>(dependencies.GetPhyAddr()),valid,begin,cvShift,
-            a.config.world,a.config.localExperts,a.config.rank,a.config.maxPeerChunks);
-        RouteFence<HardEvent::V_S>();
-    } else {
-    // Non-power-of-two CV retains the established exact Scalar division path.
-    for(uint32_t e=0;e<kExperts;++e) {
-        // Padded expert segments keep every MTE3 UB source 32B-aligned.
-        orderCursor=(orderCursor+3U)&~3U;
-        const uint32_t count=counts.GetValue(e);
-        if(count) {
-            const uint32_t localBegin=starts.GetValue(e),offset=workerBase.GetValue(e);
-            const uint32_t peer=e/a.config.localExperts;
-            const uint32_t peerBase=info->outgoing[peer*a.config.localExperts];
-            for(uint32_t i=0;i<count;++i) {
-                const uint32_t flat=csr.GetValue(localBegin+i),expanded=offset+i;
-                ordered.SetValue(orderCursor+i,flat);inverse.SetValue(flat-begin,expanded);
-                uint64_t dep=uint64_t(peer)*a.config.maxPeerChunks+(expanded-peerBase)/a.config.cvRows;
-#if !MEGAMOE_URMA_ROUTE_REORDER
-                if(peer==a.config.rank) {
-                    const uint32_t local=e%a.config.localExperts;
-                    const uint32_t expertRow=info->sources[local][peer]+expanded-info->outgoing[e];
-                    dep=kReduceSelfDependency|(info->groupBase[local]+expertRow/256U);
-                }
-#endif
-                dependencies.SetValue(flat-begin,dep);
-            }
-        }
-        orderCursor+=count;
-    }
-    }
-    // Finish every producer before starting this batch. Do not modify any of
-    // these buffers again until the one final MTE3_S completes all writes.
-    RouteFence<HardEvent::S_MTE3>();
-    orderCursor=0U;
-    for(uint32_t e=0;e<kExperts;++e) {
-        orderCursor=(orderCursor+3U)&~3U;
-        const uint32_t count=counts.GetValue(e);
-        if(count)RouteEnqueueSave(a.order+uint64_t(workerBase.GetValue(e))*sizeof(uint64_t),
-            RouteCsrUb::orderAt+orderCursor*sizeof(uint64_t),count*sizeof(uint64_t));
-        orderCursor+=count;
-    }
-    RouteEnqueueSave(a.reduceIndex+uint64_t(begin)*sizeof(uint64_t),RouteCsrUb::inverseAt,valid*sizeof(uint64_t));
-    RouteEnqueueSave(a.reduceDependencies+uint64_t(begin)*sizeof(uint64_t),RouteCsrUb::dependenciesAt,valid*sizeof(uint64_t));
-    RouteFence<HardEvent::MTE3_S>();
+// Prefix data becomes immutable after the final local join. Invalidating at
+// entry avoids retaining last launch's summary in consumers' scalar caches.
+__aicore__ inline void InvalidateRouteSummary(const Arguments& a) {
+    RouteFlush(a.routeInfo,sizeof(DeviceRouteInfo));
+    RouteFlush(a.routeConfig,sizeof(Config));
 }
 
-__aicore__ inline void RoutePrefix(const Arguments& a) {
-    // The 56 block histograms fit in UB. No scalar token loop or GM atomic
-    // histogram contention; only small count/prefix metadata is processed here.
-    RouteLoad(a.routeHistogram,0U,kRouteHistogramBytes);
-    LocalTensor<int32_t> histogram(TPosition::VECCALC,0U,kLocalWorkers*kExperts);
+__aicore__ inline void RouteOwnedExperts(const Arguments& a,uint32_t worker) {
+    const uint32_t each=kExperts/kLocalWorkers,extra=kExperts%kLocalWorkers;
+    const uint32_t first=worker*each+(worker<extra?worker:extra);
+    const uint32_t owned=each+(worker<extra?1U:0U);
+    const uint32_t total=a.config.bs*a.config.topk;
+    LocalTensor<int32_t> ids(TPosition::VECCALC,ExpertRouteUb::ids,kExpertRouteBatch);
+    LocalTensor<int32_t> routes(TPosition::VECCALC,ExpertRouteUb::routes,kExpertRoutesPerWorker*kExpertRouteBatch);
+    LocalTensor<uint32_t> counts(TPosition::VECCALC,ExpertRouteUb::counts,64U);
+    LocalTensor<uint32_t> totals(TPosition::VECCALC,ExpertRouteUb::totals,kExpertRoutesPerWorker);
+    for(uint32_t e=0;e<owned;++e)totals.SetValue(e,0U);
+    for(uint32_t start=0;start<total;start+=kExpertRouteBatch) {
+        const uint32_t valid=RouteMin(kExpertRouteBatch,total-start);
+        if(a.topkIdBytes==4U)RouteLoad(a.topkIds+uint64_t(start)*4U,ExpertRouteUb::ids,valid*4U);
+        else {
+            RouteLoad(a.topkIds+uint64_t(start)*8U,ExpertRouteUb::raw,valid*8U);
+            LocalTensor<int32_t> raw(TPosition::VECCALC,ExpertRouteUb::raw,2U*kExpertRouteBatch);
+            LocalTensor<uint32_t> mask(TPosition::VECCALC,ExpertRouteUb::mask,kExpertRouteBatch/16U);
+            for(uint32_t i=0;i<(2U*valid+31U)/32U;++i)mask.SetValue(i,0x55555555U);
+            RouteFence<HardEvent::S_V>();
+            uint64_t selected=0U;
+            GatherMask(ids,raw,mask,true,2U*valid,{1,1,0,0},selected);
+            RouteFence<HardEvent::V_S>();
+        }
+        RouteFence<HardEvent::S_V>();
+        asc_vf_call<CompactOwnedExpertsVF>(reinterpret_cast<__ubuf__ int32_t*>(ids.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ int32_t*>(routes.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ int32_t*>(counts.GetPhyAddr()),valid,start,first,owned);
+        RouteFence<HardEvent::V_S>();
+        RouteFence<HardEvent::S_MTE3>();
+        for(uint32_t e=0;e<owned;++e) {
+            const uint32_t n=counts.GetValue(e),written=totals.GetValue(e);
+            RouteEnqueueSave(a.expertRoutes+(uint64_t(first+e)*a.config.sourceRowCapacity+written)*4U,
+                ExpertRouteUb::routes+e*kExpertRouteBatch*4U,n*4U);
+            totals.SetValue(e,written+n);
+        }
+        // All bucket sources stay untouched until this one batch completion.
+        RouteFence<HardEvent::MTE3_S>();
+    }
+    // Different owners may share a GM line: publish exact ranges with MTE,
+    // never scalar cached writes or per-line DCCI from concurrent writers.
+    RouteSave(a.routeHistogram+uint64_t(first)*4U,ExpertRouteUb::totals,owned*4U);
+}
+
+__aicore__ inline void RouteExpertPrefix(const Arguments& a) {
+    RouteLoad(a.routeHistogram,0U,kExperts*4U);
+    LocalTensor<uint32_t> counts(TPosition::VECCALC,0U,kExperts);
+    LocalTensor<uint64_t> exportCounts(TPosition::VECCALC,4096U,kExperts);
+    LocalTensor<uint64_t> exportOffsets(TPosition::VECCALC,8192U,kExperts+1U);
     auto* r=reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
-    RouteFence<HardEvent::S_V>();
-    for(uint32_t w=1U;w<kLocalWorkers;++w)
-        Add(histogram[w*kExperts],histogram[w*kExperts],histogram[(w-1U)*kExperts],kExperts);
-    RouteFence<HardEvent::V_S>();
-    LocalTensor<int32_t> prefix(TPosition::VECCALC,kRouteHistogramBytes,kExperts);
     uint32_t total=0U;
     for(uint32_t e=0;e<kExperts;++e) {
+        const uint32_t n=counts.GetValue(e);
         r->outgoing[e]=total;
-        const uint32_t first=total;
-        prefix.SetValue(e,total);
-        total+=histogram.GetValue((kLocalWorkers-1U)*kExperts+e);
-        RouteStore(a.routeCounts,e,uint64_t(total-first));
-        RouteStore(a.routeOffsets,e,uint64_t(first));
+        exportOffsets.SetValue(e,uint64_t(total));exportCounts.SetValue(e,uint64_t(n));
+        total+=n;
     }
-    r->outgoing[kExperts]=total;RouteStore(a.routeOffsets,kExperts,uint64_t(total));
-    RouteFlush(a.routeCounts,kExperts*8U);RouteFlush(a.routeOffsets,(kExperts+1U)*8U);
-    RouteFence<HardEvent::S_V>();
-    for(uint32_t w=kLocalWorkers-1U;w>0U;--w)
-        Add(histogram[w*kExperts],histogram[(w-1U)*kExperts],prefix,kExperts);
-    Adds(histogram,prefix,int32_t{0},kExperts);
-    RouteFence<HardEvent::V_S>();
-    RouteSave(a.routeHistogram,0U,kRouteHistogramBytes);
+    r->outgoing[kExperts]=total;exportOffsets.SetValue(kExperts,uint64_t(total));
+    RouteSave(a.routeCounts,4096U,kExperts*8U);
+    RouteSave(a.routeOffsets,8192U,(kExperts+1U)*8U);
     RouteSave(a.routeInfo,kRouteInfoUb,(kExperts+1U)*4U);
 }
 
 __aicore__ inline void RouteExchange(const Arguments& a,uint32_t worker) {
     if(worker>=a.config.world)return;
-    RouteLoad(a.routeInfo,kRouteInfoUb,(kExperts+1U)*4U);
-    const auto* r=reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
-    const uint32_t le=a.config.localExperts,base=r->outgoing[worker*le];
+    const uint32_t le=a.config.localExperts;
+    // The leader may build RouteInfo while a slower local sender is still
+    // publishing. Read the immutable, separately stored outgoing prefix here;
+    // no sender races a DMA overwrite of the shared RouteInfo snapshot.
+    RouteLoad(a.routeOffsets+uint64_t(worker)*le*8U,2048U,(le+1U)*8U);
+    LocalTensor<uint64_t> prefix(TPosition::VECCALC,2048U,le+1U);
+    const uint32_t base=static_cast<uint32_t>(prefix.GetValue(0U));
     LocalTensor<uint64_t> ret(TPosition::VECCALC,0U,4U);ret.SetValue(0,base);
     LocalTensor<uint32_t> counts(TPosition::VECCALC,8U,le+1U);
-    for(uint32_t e=0;e<=le;++e)counts.SetValue(e,r->outgoing[worker*le+e]-base);
+    for(uint32_t e=0;e<=le;++e)counts.SetValue(e,static_cast<uint32_t>(prefix.GetValue(e))-base);
     auto* sym=reinterpret_cast<__gm__ uint8_t*>(a.symmetric);
     const uint64_t target=reinterpret_cast<uint64_t>(aclshmem_ptr(
         sym+a.config.routeInboxOffset+uint64_t(a.config.rank)*kRouteMailboxBytes,worker));
     RouteSave(target,0U,8U+(le+1U)*4U);
     LocalTensor<uint64_t> flag(TPosition::VECCALC,1024U,4U);
+    // RouteSave has completed the payload MTE before publishing its exact
+    // epoch into the single ready slot. Do not use an additive SO flag.
     PublishDone(sym,a.config.routeReadyOffset+uint64_t(a.config.rank)*kFlagBytes,worker,a.config.epoch,flag,EVENT_ID0);
 }
 
-__aicore__ inline void RouteCompile(Arguments& a) {
+// The small stage order remains explicit to preserve the existing lookahead
+// and EP4 wave12 policies. Per-row and per-CV descriptors are not generated.
+struct RouteScheduleOutput {
+    RouteDescriptorDmaStream<0U> batches;
+    RouteDescriptorDmaStream<4096U> tasks;
+    __aicore__ explicit RouteScheduleOutput(const Arguments& a):batches(a.computeBatches),tasks(a.computeTasks){}
+    __aicore__ inline void Batch(uint32_t i,const ComputeBatch& x){batches.Append(uint64_t(i)*sizeof(x),x);}
+    __aicore__ inline void Task(uint32_t i,const ComputeBatchTask& x){tasks.Append(uint64_t(i)*sizeof(x),x);}
+    __aicore__ inline void Finish(){batches.Flush();tasks.Flush();}
+};
+
+__aicore__ inline void RouteSummary(Arguments& a) {
     RouteLoad(a.routeInfo,kRouteInfoUb,(kExperts+1U)*4U);
     RouteLoad(a.symmetric+a.config.routeInboxOffset,0U,a.config.world*kRouteMailboxBytes);
     auto* r=reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
@@ -415,145 +235,70 @@ __aicore__ inline void RouteCompile(Arguments& a) {
         r->returnBase[s]=uint64_t(inbox.GetValue(at))|(uint64_t(inbox.GetValue(at+1U))<<32U);
         for(uint32_t e=0;e<=a.config.localExperts;++e)r->incoming[s][e]=inbox.GetValue(at+2U+e);
     }
-    DeviceRouteOutput out{a};
-    const bool wave12=a.config.world==4U && (!MEGAMOE_URMA_ROUTE_REORDER || a.sharedExperts!=0U);
-    CompileDeviceRoutes(a.config,*r,out,wave12,MEGAMOE_URMA_ROUTE_REORDER);
-    RouteSave(a.routeInfo,kRouteInfoUb,sizeof(DeviceRouteInfo));
-    out.Finish(a.config,wave12);
+    const bool wave12=a.config.world==4U && a.sharedExperts!=0U;
+    BuildRouteSummary(a.config,*r,wave12);
+    // There is no materialized Segment/Link table in this protocol.
+    a.config.routeSegmentCount=0U;a.config.routeLinkCount=0U;
+    // Never rewrite the prefix/cache lines used by concurrent Pack/Dispatch.
+    constexpr uint32_t receiveOffset=offsetof(DeviceRouteInfo,incoming);
+    RouteSave(a.routeInfo+receiveOffset,kRouteInfoUb+receiveOffset,sizeof(DeviceRouteInfo)-receiveOffset);
+    RouteScheduleOutput out(a);EmitRouteTasks(a.config,*r,out,wave12);out.Finish();
+    RouteStore(a.routeConfig,0U,a.config);RouteFlush(a.routeConfig,sizeof(Config));
 }
 
-// Prefix/count workspace is allocated after the public RouteInfo payload.
-// One writer per 64B line is NOT assumed: parallel writers below use only DMA.
-__aicore__ inline uint64_t RouteGroupPrefixAddress(const Arguments& a) {
-    return a.routeInfo+RouteGroupPrefixOffset();
-}
-__aicore__ inline uint64_t RouteLinkPrefixAddress(const Arguments& a) {
-    return a.routeInfo+RouteLinkPrefixOffset(RouteGroupCapacity(a.config.world*a.config.sourceRowCapacity,a.config.localExperts));
-}
 __aicore__ inline void RouteReloadConfig(Arguments& a) {
-    // All callers are AFTER the corresponding existing local join. The sole
-    // writer has completed its 64B clean/invalidate before that join. Invalidate
-    // each consumer's old clean cache lines ONCE, then read the immutable
-    // snapshot normally. Per-word ReadGmByPassDCache prevents adjacent words
-    // from benefiting from this ordinary cached read path.
-    // Consumers never Scalar-write routeConfig, so this clean cannot write
-    // stale consumer data over the leader's publication.
     RouteFlush(a.routeConfig,sizeof(Config));
     auto* dst=reinterpret_cast<uint32_t*>(&a.config);
     const volatile __gm__ uint32_t* src=reinterpret_cast<const volatile __gm__ uint32_t*>(a.routeConfig);
-    static_assert(sizeof(Config)%sizeof(uint32_t)==0U);
     for(uint32_t i=0;i<sizeof(Config)/sizeof(uint32_t);++i)dst[i]=src[i];
 }
-__aicore__ inline bool RouteWave12(const Arguments& a) {
-    return a.config.world==4U && (!MEGAMOE_URMA_ROUTE_REORDER || a.sharedExperts!=0U);
-}
-__aicore__ inline void RouteParallelSummary(Arguments& a) {
-    RouteLoad(a.routeInfo,kRouteInfoUb,(kExperts+1U)*4U);
-    RouteLoad(a.symmetric+a.config.routeInboxOffset,0U,a.config.world*kRouteMailboxBytes);
-    auto* r=reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
-    LocalTensor<uint32_t> inbox(TPosition::VECCALC,0U,a.config.world*kRouteMailboxBytes/4U);
-    for(uint32_t source=0;source<a.config.world;++source) {
-        const uint32_t at=source*kRouteMailboxBytes/4U;
-        r->returnBase[source]=uint64_t(inbox.GetValue(at))|(uint64_t(inbox.GetValue(at+1U))<<32U);
-        for(uint32_t e=0;e<=a.config.localExperts;++e)r->incoming[source][e]=inbox.GetValue(at+2U+e);
+
+// Only local counts are required to issue Pack/Dispatch, including self rows.
+// Keep these values in each engine's Arguments until it acquires the receive
+// summary. RouteConfig GM is published only once, by the summary owner.
+__aicore__ inline void RouteLocalConfig(Arguments& a) {
+    const auto* info=RouteInfo(a);
+    a.config.packRoundCount=0U;a.config.sendChunkCount=0U;
+    for(uint32_t peer=0;peer<a.config.world;++peer) {
+        const uint32_t begin=peer*a.config.localExperts;
+        const uint32_t rows=info->outgoing[begin+a.config.localExperts]-info->outgoing[begin];
+        const uint32_t cvs=(rows+a.config.cvRows-1U)/a.config.cvRows;
+        a.config.packRoundCount=RouteMax(a.config.packRoundCount,cvs);
+        a.config.sendChunkCount+=cvs;
     }
-    BuildRouteSummary(a.config,*r,RouteWave12(a));
-    RouteSave(a.routeInfo,kRouteInfoUb,sizeof(DeviceRouteInfo));
-    RouteStore(a.routeConfig,0,a.config);RouteFlush(a.routeConfig,sizeof(Config));
-}
-__aicore__ inline void RouteParallelCounts(const Arguments& a,uint32_t worker) {
-    RouteLoad(a.routeInfo,kRouteInfoUb,sizeof(DeviceRouteInfo));
-    auto* r=reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
-    LocalTensor<uint32_t> counts(TPosition::VECCALC,0U,2048U);
-    const auto groups=RouteWork(a.config.fragmentCount,worker);
-    for(uint32_t g=groups.first;g<groups.last;++g)counts.SetValue(g-groups.first,CountGroupSegments(a.config,*r,g));
-    RouteSave(RouteGroupPrefixAddress(a)+uint64_t(groups.first)*4U,0U,(groups.last-groups.first)*4U);
-    const auto cvs=RouteWork(a.config.recvChunkCount,worker);
-    for(uint32_t cv=cvs.first;cv<cvs.last;++cv)counts.SetValue(cv-cvs.first,CountCvLinks(a.config,*r,cv));
-    RouteSave(RouteLinkPrefixAddress(a)+uint64_t(cvs.first)*4U,0U,(cvs.last-cvs.first)*4U);
-}
-__aicore__ inline uint32_t RouteCountPrefix(uint64_t gm,uint32_t count) {
-    // At most 16*1024 words=64KiB. This bounded coordinator scan is a
-    // metadata-only first version; workers perform the expensive descriptor
-    // generation. It never accesses or rescans topk inputs.
-    LocalTensor<uint32_t> values(TPosition::VECCALC,0U,16384U);
-    if(count)RouteLoad(gm,0U,count*4U);
-    uint32_t total=0U;
-    for(uint32_t i=0;i<count;++i){total+=values.GetValue(i);values.SetValue(i,total);}
-    RouteSave(gm+4U,0U,count*4U);
-    values.SetValue(0U,0U);RouteSave(gm,0U,4U);
-    return total;
-}
-__aicore__ inline void RouteParallelPrefix(Arguments& a) {
-    a.config.routeSegmentCount=RouteCountPrefix(RouteGroupPrefixAddress(a),a.config.fragmentCount);
-    a.config.routeLinkCount=RouteCountPrefix(RouteLinkPrefixAddress(a),a.config.recvChunkCount);
-    RouteStore(a.routeConfig,0,a.config);RouteFlush(a.routeConfig,sizeof(Config));
-}
-struct RouteParallelPrefixView {
-    uint32_t firstGroup,firstCv;
-    LocalTensor<uint32_t> groups,cvs;
-    __aicore__ RouteParallelPrefixView(uint32_t g,uint32_t cv)
-        : firstGroup(g),firstCv(cv),groups(TPosition::VECCALC,48U*1024U,2048U),cvs(TPosition::VECCALC,56U*1024U,2048U){}
-    __aicore__ inline uint32_t Group(uint32_t i){return groups.GetValue(i-firstGroup);}
-    __aicore__ inline uint32_t Link(uint32_t i){return cvs.GetValue(i-firstCv);}
-};
-__aicore__ inline void RouteParallelEmit(const Arguments& a,uint32_t worker) {
-    const auto groups=RouteWork(a.config.fragmentCount,worker),cvs=RouteWork(a.config.recvChunkCount,worker);
-    RouteLoad(RouteGroupPrefixAddress(a)+uint64_t(groups.first)*4U,48U*1024U,(groups.last-groups.first+1U)*4U);
-    RouteLoad(RouteLinkPrefixAddress(a)+uint64_t(cvs.first)*4U,56U*1024U,(cvs.last-cvs.first+1U)*4U);
-    // The coordinator's prefix scan used only low UB. RouteInfo remains
-    // live at 96KiB on every worker from Summary/Counts, including worker0.
-    auto* r=reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
-    RouteParallelPrefixView prefix(groups.first,cvs.first);DeviceRouteOutput out{a};
-    EmitRouteGroups(a.config,*r,prefix,out,groups);
-    EmitRouteReceives(a.config,*r,prefix,out,cvs,MEGAMOE_URMA_ROUTE_REORDER!=0);
-    EmitRouteSends(a.config,*r,out,RouteWork(a.config.sendChunkCount,worker));
-    EmitRoutePack(a.config,*r,out,RouteWork(a.config.packRoundCount,worker));
-    if(worker==0U)EmitRouteTasks(a.config,*r,out,RouteWave12(a));
-    out.FlushTables(); // no concurrent Scalar Config publication
+    const uint32_t own=a.config.rank*a.config.localExperts;
+    a.config.selfSendRow=info->outgoing[own];
+    a.config.selfRows=info->outgoing[own+a.config.localExperts]-info->outgoing[own];
+    a.config.selfRecvRow=uint64_t(a.config.rank)*a.config.sourceRowCapacity;
+    a.config.fragmentCount=a.config.recvChunkCount=a.config.computeTaskCount=0U;
+    a.config.receiveRows=a.config.gmm1Tiles=a.config.gmm2Tiles=0U;
 }
 
 __aicore__ inline void PrepareDeviceRoutes(Arguments& a,Timer& timer) {
     timer.CoarseBegin(CoarsePhase::Route);
     const uint64_t start=timer.TraceBegin();
     const uint32_t block=GetBlockIdx()/GetTaskRation();
-    if constexpr(g_coreType==AIV) {
-        const uint32_t worker=LocalWorkerIndex(block,GetSubBlockIdx());
-        // A next invocation may overwrite mailboxes only after every rank has
-        // left its previous invocation. Separate monotonic epoch slots survive
-        // the data-path's per-invocation SO resets, including empty peer edges.
-        if(worker==0U) {
-            LocalTensor<uint64_t> flag(TPosition::VECCALC,0U,4U);
-            RankBarrier(reinterpret_cast<__gm__ uint8_t*>(a.symmetric),a.config.routeEntryOffset,
-                        a.config.rank,a.config.epoch,flag,EVENT_ID0,a.config.world);
-        }
-    }
+    InvalidateRouteSummary(a);
+    // No entry rank barrier: before this owner's previous invocation returned,
+    // every peer owner observed that peer's finished epoch, including empty
+    // edges. A peer publishes finished only AFTER RouteSummary copied all
+    // inboxes to its private RouteInfo. The next serialized invocation can
+    // therefore reuse even a single remote mailbox; no benchmark collective
+    // or double buffer is part of this argument. Keep the tail observers/join.
+    if constexpr(g_coreType==AIV)RouteOwnedExperts(a,LocalWorkerIndex(block,GetSubBlockIdx()));
+    // #1: all count DMA stores AND all consumers' cache invalidations precede
+    // the leader's first RouteInfo/Config update.
     SyncAll<false>();
-    if constexpr(g_coreType==AIV)RouteLocalPermutation(a,LocalWorkerIndex(block,GetSubBlockIdx()),false);
-    SyncAll<false>();
-    if constexpr(g_coreType==AIV)if(block==0U&&GetSubBlockIdx()==0U)RoutePrefix(a);
+    if constexpr(g_coreType==AIV)if(block==0U&&GetSubBlockIdx()==0U)RouteExpertPrefix(a);
+    // #2: count prefixes are immutable and ready for the exchange senders.
     SyncAll<false>();
     if constexpr(g_coreType==AIV)RouteExchange(a,LocalWorkerIndex(block,GetSubBlockIdx()));
-    SyncAll<false>();
-    if constexpr(g_coreType==AIV)if(block==0U&&GetSubBlockIdx()==0U) {
-        for(uint32_t s=0;s<a.config.world;++s)
-            WaitStartAtLeast(reinterpret_cast<__gm__ uint8_t*>(a.symmetric+a.config.routeReadyOffset+s*kFlagBytes),a.config.epoch);
-        RouteParallelSummary(a);
-    }
-    SyncAll<false>(); // summary ready
-    RouteReloadConfig(a);
-    if constexpr(g_coreType==AIV)RouteParallelCounts(a,LocalWorkerIndex(block,GetSubBlockIdx()));
-    SyncAll<false>(); // independently counted table lengths ready
-    if constexpr(g_coreType==AIV)if(block==0U&&GetSubBlockIdx()==0U)RouteParallelPrefix(a);
-    SyncAll<false>(); // disjoint output offsets ready
-    RouteReloadConfig(a);
-    if constexpr(g_coreType==AIV)RouteParallelEmit(a,LocalWorkerIndex(block,GetSubBlockIdx()));
-    SyncAll<false>();
-    // AIC also consumes the exact same Device-generated descriptor bounds.
-    RouteReloadConfig(a);
-    if constexpr(g_coreType==AIV)RouteLocalPermutation(a,LocalWorkerIndex(block,GetSubBlockIdx()),true);
+    // The first activation helper will build the incoming summary while other
+    // engines progress independently. No receiver wait or full-core join here.
+    RouteLocalConfig(a);
     PipeBarrier<PIPE_ALL>();
-    SyncAll<false>();
+    // Incoming metadata is acquired later, per role. This fence only releases
+    // this core's route-exchange UB/events before its Pack/compute path.
     timer.TraceEnd(TraceEvent::RoutePrepare,start);
     timer.CoarseEnd(CoarsePhase::Route);
 }

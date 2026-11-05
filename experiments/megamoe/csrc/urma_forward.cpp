@@ -130,7 +130,6 @@ UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, i
     const auto options = example.options().dtype(torch::kUInt8);
     const uint64_t expanded_rows = static_cast<uint64_t>(max_tokens) * topk;
     const uint64_t groups = MegaMoeUrma::RouteGroupCapacity(max_recv_rows, config.localExperts);
-    const uint64_t segments = MegaMoeUrma::RouteSegmentCapacity(max_recv_rows, world, cv_rows);
     const uint64_t chunks = uint64_t(world) * config.maxPeerChunks;
     auto allocate = [&](uint64_t bytes) {
         return torch::empty({static_cast<int64_t>(std::max<uint64_t>(bytes, 512))}, options);
@@ -154,36 +153,38 @@ UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, i
     activation_ = allocate(max_recv_rows * intermediate);
     activation_scale_ = allocate(max_recv_rows * (intermediate / 32));
     gmm2_ = allocate(max_recv_rows * config.hidden * 2);
-    fragments_ = allocate(groups * sizeof(MegaMoeUrma::Fragment));
-    segments_ = allocate(segments * sizeof(MegaMoeUrma::RowSegment));
+    fragments_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
+    segments_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
     compute_batches_ = allocate(groups * sizeof(MegaMoeUrma::ComputeBatch));
     compute_tasks_ = allocate(2 * groups * sizeof(MegaMoeUrma::ComputeBatchTask));
-    chunk_group_indices_ = allocate(segments * sizeof(uint32_t));
-    send_chunks_ = allocate(chunks * sizeof(MegaMoeUrma::Chunk));
-    recv_chunks_ = allocate(chunks * sizeof(MegaMoeUrma::Chunk));
-    pack_rounds_ = allocate(config.maxPeerChunks * sizeof(MegaMoeUrma::PackRound));
+    chunk_group_indices_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
+    send_chunks_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
+    recv_chunks_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
+    pack_rounds_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
     pack_ready_ = allocate(chunks * MegaMoeUrma::kFlagBytes);
     gmm1_done_ = allocate(groups * (intermediate / 128U) * MegaMoeUrma::kFlagBytes);
     input_scale_done_ = allocate(groups * MegaMoeUrma::kFlagBytes);
     activation_done_ = allocate(groups * MegaMoeUrma::kFlagBytes);
     gmm2_done_ = allocate(groups * MegaMoeUrma::kFlagBytes);
-    order_ = torch::empty({int64_t(expanded_rows)}, example.options().dtype(torch::kInt64));
-    inverse_ = torch::empty_like(order_);
-    reduce_dependencies_ = torch::empty_like(order_);
+    order_ = allocate(0); // compact order exists only in explicit post-run diagnostics
+    inverse_ = torch::empty({int64_t(expanded_rows)}, example.options().dtype(torch::kInt64));
+    reduce_dependencies_ = allocate(0); // Reduce constructs its own UB dependency cache
+    expert_routes_ = torch::empty({384,int64_t(expanded_rows)},example.options().dtype(torch::kInt32));
     route_counts_ = torch::empty({384}, example.options().dtype(torch::kInt64));
     route_offsets_ = torch::empty({385}, example.options().dtype(torch::kInt64));
-    route_histogram_ = allocate(MegaMoeUrma::kRouteHistogramBytes);
-    route_info_ = allocate(MegaMoeUrma::RouteInfoAllocationBytes(groups, chunks));
+    route_histogram_ = allocate(384U * sizeof(uint32_t));
+    route_info_ = allocate(Align(sizeof(MegaMoeUrma::DeviceRouteInfo)));
     route_config_ = allocate(Align(sizeof(Config)));
     args_.order=Address(order_); args_.reduceIndex=Address(inverse_);
+    args_.expertRoutes=Address(expert_routes_);
     args_.reduceDependencies=Address(reduce_dependencies_);
     args_.routeCounts=Address(route_counts_);args_.routeOffsets=Address(route_offsets_);
     args_.routeHistogram=Address(route_histogram_);args_.routeInfo=Address(route_info_);
     args_.routeConfig=Address(route_config_);
     gmm2_contiguous_ = allocate(max_recv_rows * config.hidden * 2);
     gmm2_matmul_done_ = allocate(groups * (config.hidden / 256U) * MegaMoeUrma::kFlagBytes);
-    peer_reorder_ranges_ = allocate(chunks * sizeof(MegaMoeUrma::PeerReorderRange));
-    peer_reorder_spans_ = allocate(segments * sizeof(MegaMoeUrma::PeerReorderSpan));
+    peer_reorder_ranges_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
+    peer_reorder_spans_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
     local_flags_ = allocate(16 * MegaMoeUrma::kFlagBytes);
     system_workspace_ = allocate(platform_.system_workspace + (2ULL << 20));
 
@@ -219,7 +220,7 @@ std::vector<torch::Tensor> UrmaPlan::routing_tensors(int64_t bs) const
 {
     TORCH_CHECK(bs > 0 && bs <= max_tokens_, "BS outside allocated capacity");
     const int64_t n = bs * args_.config.topk;
-    return {order_.narrow(0,0,n), inverse_.narrow(0,0,n).reshape({bs,args_.config.topk}), route_counts_, route_offsets_};
+    return {torch::Tensor(), inverse_.narrow(0,0,n).reshape({bs,args_.config.topk}), route_counts_, route_offsets_};
 }
 
 std::vector<int64_t> UrmaPlan::route_stats() const
@@ -228,7 +229,7 @@ std::vector<int64_t> UrmaPlan::route_stats() const
     ASCEND_DEEPEP_CHECK_ACL(aclrtSynchronizeDevice());
     Config c{};
     ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(&c,sizeof(c),route_config_.data_ptr(),sizeof(c),ACL_MEMCPY_DEVICE_TO_HOST));
-    return {int64_t(c.receiveRows),c.fragmentCount,c.routeSegmentCount,c.routeLinkCount};
+    return {int64_t(c.receiveRows),c.fragmentCount,-1,-1};
 }
 
 torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::Tensor topk_idx, torch::Tensor topk_weights, torch::Tensor weight1,
@@ -389,7 +390,7 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
                                &peer_reorder_ranges_,
                                &peer_reorder_spans_,
                                &order_, &inverse_, &route_counts_, &route_offsets_,
-                               &route_histogram_, &route_info_, &route_config_,
+                               &route_histogram_, &route_info_, &route_config_, &expert_routes_,
                                &reduce_dependencies_,
                                &send_chunks_,
                                &recv_chunks_,
@@ -445,11 +446,17 @@ std::map<std::string, torch::Tensor> UrmaPlan::debug_snapshot() const
     copy("gmm2_contiguous", Address(gmm2_contiguous_), c.receiveRows * c.hidden * 2);
     copy("gmm2_remote", Address(gmm2_), c.world * c.sourceRowCapacity * c.hidden * 2);
     copy("returned", args_.symmetric + c.returnYOffset, expanded * c.hidden * 2);
-    copy("fragments",args_.fragments,c.fragmentCount*sizeof(MegaMoeUrma::Fragment));
-    copy("segments",args_.segments,c.routeSegmentCount*sizeof(MegaMoeUrma::RowSegment));
+    copy("route_info",args_.routeInfo,sizeof(MegaMoeUrma::DeviceRouteInfo));
     copy("compute_tasks",args_.computeTasks,c.computeTaskCount*sizeof(MegaMoeUrma::ComputeBatchTask));
-    copy("send_chunks",args_.sendChunks,c.sendChunkCount*sizeof(MegaMoeUrma::Chunk));
-    copy("recv_chunks",args_.recvChunks,c.recvChunkCount*sizeof(MegaMoeUrma::Chunk));
+    copy("reduce_index",args_.reduceIndex,expanded*sizeof(int64_t));
+    auto compact_order=torch::empty({int64_t(expanded*sizeof(int64_t))},torch::TensorOptions().device(torch::kCPU).dtype(torch::kUInt8));
+    const auto* inverse=reinterpret_cast<const int64_t*>(result.at("reduce_index").data_ptr());
+    auto* order=reinterpret_cast<int64_t*>(compact_order.data_ptr());
+    for(uint64_t flat=0;flat<expanded;++flat) {
+        TORCH_CHECK(inverse[flat]>=0 && uint64_t(inverse[flat])<expanded,"Invalid inverse in post-run route snapshot");
+        order[inverse[flat]]=static_cast<int64_t>(flat);
+    }
+    result.emplace("order",compact_order);
     copy("gmm1_done",args_.gmm1Done,c.gmm1Tiles*MegaMoeUrma::kFlagBytes);
     copy("gmm2_done",args_.gmm2Done,c.fragmentCount*MegaMoeUrma::kFlagBytes);
     copy("input_scale_done",args_.inputScaleDone,c.fragmentCount*MegaMoeUrma::kFlagBytes);
@@ -485,7 +492,7 @@ int64_t UrmaPlan::workspace_bytes() const
                                &peer_reorder_ranges_,
                                &peer_reorder_spans_,
                                &order_, &inverse_, &route_counts_, &route_offsets_,
-                               &route_histogram_, &route_info_, &route_config_,
+                               &route_histogram_, &route_info_, &route_config_, &expert_routes_,
                                &reduce_dependencies_,
                                &send_chunks_,
                                &recv_chunks_,

@@ -29,12 +29,13 @@ constexpr uint32_t kLocalFlagIncomingDone = 2U;
 constexpr uint32_t kLocalFlagPackDone = 3U;
 constexpr uint32_t kLocalFlagReorderDone = 4U;
 constexpr uint32_t kLocalFlagSharedGmm1Done = 5U;
+constexpr uint32_t kLocalFlagRouteSummaryDone = 6U;
 // Reduce dependency values are uint64 bit patterns stored in an int64 tensor.
 // Low values address a producer/CV completion flag; tagged values address a
 // local GMM2 group that writes its self return rows directly.
 constexpr uint64_t kReduceSelfDependency = uint64_t{1} << 63U;
 constexpr uint32_t kProtocol = 1;
-constexpr uint32_t kDeviceRoutingProtocol = 3;
+constexpr uint32_t kDeviceRoutingProtocol = 6;
 #define MEGAMOE_URMA_ROUTE_REORDER 1
 constexpr uint32_t kTimerCores = kAic * 3U;
 constexpr uint32_t kTimerPhases = 8U;
@@ -91,7 +92,7 @@ enum class TraceEvent : uint32_t {
     CoarsePack, CoarseLocalSyncStart, CoarseGMM, CoarseDequant,
     CoarseDispatch, CoarseCombine, CoarseActivation, CoarseReduce, CoarseLocalSyncEnd,
     CoarseDispatchSubmit, PackRetire, SharedGmm1Tile, SharedGmm1Drain, SharedActivation,
-    SharedGmm2Tile, SharedGmm2Drain, SharedAdd, CoarseSharedCombineSubmit, RoutePrepare
+    SharedGmm2Tile, SharedGmm2Drain, SharedAdd, CoarseSharedCombineSubmit, RoutePrepare, RouteSummary, WaitRouteSummary
 };
 
 struct TraceMeta {
@@ -272,6 +273,7 @@ struct Arguments {
     uint64_t topkIds, routeHistogram, routeInfo, routeConfig, routeCounts, routeOffsets;
     uint32_t topkIdBytes;
     uint64_t sharedRoutedOutput; // S1 FP32 routed sum; round only after adding shared result.
+    uint64_t expertRoutes; // int32 [384, sourceRowCapacity], one owner per expert
 };
 static_assert(sizeof(Fragment) == 40);
 static_assert(sizeof(RowSegment) == 40);

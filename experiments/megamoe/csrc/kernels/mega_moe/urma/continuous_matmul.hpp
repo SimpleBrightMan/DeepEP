@@ -3,13 +3,14 @@
 #pragma once
 
 #include "../catlass_gmm/mega_moe_grouped_matmul.hpp"
+#include "lazy_compute_routes.hpp"
 
 namespace MegaMoeUrma {
 
 // One physical pipeline owns every L1/L0 slot and AIC/AIV0 credit for both
 // projections. Updating the expert or stage must never reset those indices.
 // Only GMM1 gathers A; both stages use one continuous Unit Flag output.
-struct ContinuousComputeRows : MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false> {
+struct ContinuousComputeRows : MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false, RuntimeGroupSegments> {
     bool gather = true;
 
     template <class TensorL1>
@@ -17,7 +18,7 @@ struct ContinuousComputeRows : MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment
                                   uint32_t columns) const
     {
         if (gather) {
-            MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false>::Gather(dst, tileBegin, tileRows,
+            MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false, RuntimeGroupSegments>::Gather(dst, tileBegin, tileRows,
                                                                                     columnBegin, columns);
             return;
         }

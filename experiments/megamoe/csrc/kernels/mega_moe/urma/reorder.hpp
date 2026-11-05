@@ -4,6 +4,7 @@
 
 #include "reorder_plan.hpp"
 #include "compute_contract.hpp"
+#include "lazy_compute_routes.hpp"
 #include "timer.hpp"
 
 namespace MegaMoeUrma {
@@ -35,10 +36,9 @@ __aicore__ inline void ReorderGmm2Tile(const Arguments& args, const Fragment& fr
                     {static_cast<uint16_t>(rows), columns * 2U, (h - columns) * 2U, 0U, 0U}, {false, 0U, 0U, 0U});
         SetFlag<HardEvent::MTE2_MTE3>(event);
         WaitFlag<HardEvent::MTE2_MTE3>(event);
-        for (uint32_t index = 0U; index < fragment.segmentCount; ++index) {
-            const auto* gm = reinterpret_cast<const __gm__ RowSegment*>(args.segments) + fragment.segmentBegin + index;
-            const RowSegment segment{gm->sourceRank, gm->cv,   gm->receiveRow,      gm->returnRow,
-                                     gm->tileRow,    gm->rows, gm->inputReadyIndex, gm->reserved};
+        auto cursor=RuntimeSegments(args,fragment).MakeCursor();
+        RowSegment segment{};
+        while(cursor.Next(segment)) {
             const auto span = PlanReorderSpan(segment, args.config.rank, m, rows);
             if (span.rows == 0U) continue;
             // H=3584 and N256 imply full-width N tiles; each UB row is 512B.
