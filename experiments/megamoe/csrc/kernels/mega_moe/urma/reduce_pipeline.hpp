@@ -4,6 +4,7 @@
 
 #include "compute_contract.hpp"
 #include "combine_ready.hpp"
+#include "reduce_route_metadata.hpp"
 #include "kernel_operator.h"
 
 namespace MegaMoeUrma {
@@ -238,10 +239,8 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
     const uint64_t firstRoute = firstToken * Ub::topk;
     GlobalTensor<int64_t> inverse;
     GlobalTensor<float> weights;
-    GlobalTensor<uint64_t> dependencies;
     inverse.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(args.reduceIndex));
     weights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(args.weights));
-    dependencies.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(args.reduceDependencies));
     LocalTensor<int64_t> inverseUb(TPosition::VECCALC, Ub::inverseOffset, Ub::maxRoutes);
     LocalTensor<float> weightsUb(TPosition::VECCALC, Ub::weightsOffset, Ub::maxRoutes);
     LocalTensor<uint64_t> dependenciesUb(TPosition::VECCALC, Ub::dependenciesOffset, Ub::maxRoutes);
@@ -252,11 +251,12 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
     pipeline.Init(args, firstToken);
     bool allInputsReady = AllReduceInputsReady(args);
     if (allInputsReady) GateReduceInputs();
+    WaitPackInverseReady(args);
     DataCopy(inverseUb, inverse[firstRoute], owned * Ub::topk);
     DataCopy(weightsUb, weights[firstRoute], owned * Ub::topk);
-    if (!allInputsReady) DataCopy(dependenciesUb, dependencies[firstRoute], owned * Ub::topk);
     SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
     WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    if (!allInputsReady) BuildReduceDependencies(args, firstRoute, owned * Ub::topk, inverseUb, dependenciesUb);
     for (uint32_t word = 0U; word < Ub::issuedBytes / 4U; ++word) issued.SetValue(word, 0U);
     if (!allInputsReady) {
         for (uint32_t word = 0U; word < Ub::remoteCacheBytes / 4U; ++word) remoteCache.SetValue(word, 0U);

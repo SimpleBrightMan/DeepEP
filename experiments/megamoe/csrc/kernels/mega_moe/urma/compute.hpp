@@ -6,6 +6,7 @@
 
 #include "abi.hpp"
 #include "compute_contract.hpp"
+#include "lazy_compute_routes.hpp"
 #include "pack_round.hpp"
 #include "transport.hpp"
 #include "timer.hpp"
@@ -21,16 +22,7 @@ using MegaMoeImpl::Get;
 // input/output correspondence with the original source-major communication CVs.
 __aicore__ inline Fragment LoadFragment(const Arguments& args, uint32_t index)
 {
-    const auto* gm = reinterpret_cast<__gm__ Fragment*>(args.fragments) + index;
-    return {gm->expert,       gm->segmentBegin,  gm->rowBegin,     gm->rows,
-            gm->segmentCount, gm->gmm1TileBegin, gm->gmm2TileBegin};
-}
-
-__aicore__ inline RowSegment LoadRowSegment(const Arguments& args, uint32_t index)
-{
-    const auto* gm = reinterpret_cast<__gm__ RowSegment*>(args.segments) + index;
-    return {gm->sourceRank, gm->cv,   gm->receiveRow,      gm->returnRow,
-            gm->tileRow,    gm->rows, gm->inputReadyIndex, gm->reserved};
+    return RuntimeFragment(args, index);
 }
 
 __aicore__ inline __gm__ int32_t* ComputeFlag(uint64_t base, uint64_t index)
@@ -94,8 +86,8 @@ using UrmaGmmConfigFor = MegaMoeImpl::GmmKernel::Config<true, 0, fp8_e4m3fn_t, f
                                                      fp8_e8m0_t, false, false, false, false, false, false, FuseGateUp>;
 using UrmaGmmConfig = UrmaGmmConfigFor<false>;
 using UrmaProblemConfig = UrmaGmmConfig::ProblemConfig;
-using UrmaInputRows = MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false>;
-using UrmaOutputRows = MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, false, true>;
+using UrmaInputRows = MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false, RuntimeGroupSegments>;
+using UrmaOutputRows = MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, false, true, RuntimeGroupSegments>;
 // Only URMA uses a separate FP32 sigmoid, matching the NPU cascade's operation order.
 using UrmaActivation = MegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, kActivationTileM,
                                                                    kComputeTileN, false, false, true>;
@@ -117,7 +109,7 @@ static_assert(kActualActivationUb.firstInputOffsetBytes == ActivationUbContract:
 template <typename RowIO>
 __aicore__ inline RowIO FragmentRowIO(const Arguments& args, const Fragment& fragment)
 {
-    return {reinterpret_cast<const __gm__ RowSegment*>(args.segments) + fragment.segmentBegin,
+    return {nullptr,
             fragment.segmentCount,
             args.config.rank,
             reinterpret_cast<GM_ADDR>(args.symmetric + args.config.receiveXOffset),
@@ -126,7 +118,8 @@ __aicore__ inline RowIO FragmentRowIO(const Arguments& args, const Fragment& fra
             args.config.hidden / 32U,
             reinterpret_cast<GM_ADDR>(args.gmm2Output),
             reinterpret_cast<GM_ADDR>(args.symmetric + args.config.returnYOffset),
-            args.config.hidden};
+            args.config.hidden,
+            RuntimeSegments(args, fragment)};
 }
 
 __aicore__ inline MegaMoeImpl::ProblemShape FragmentShape(const Arguments& args, const Fragment& fragment)
@@ -381,8 +374,9 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
 
 __aicore__ inline bool AreGroupInputsReady(const Arguments& args, const Fragment& fragment)
 {
-    for (uint32_t index = 0U; index < fragment.segmentCount; ++index) {
-        const auto segment = LoadRowSegment(args, fragment.segmentBegin + index);
+    auto cursor = RuntimeSegments(args, fragment).MakeCursor();
+    RowSegment segment{};
+    while (cursor.Next(segment)) {
         if (segment.sourceRank == args.config.rank) {
             const uint64_t begin = static_cast<uint64_t>(segment.cv) * args.config.cvRows;
             if (begin >= args.config.selfRows) return false;
@@ -413,8 +407,9 @@ __aicore__ inline void GatherInputScaleImpl(const Arguments& args, const Fragmen
     destination.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.gatheredInputScale));
     LocalTensor<uint8_t> scratch(TPosition::VECCALC, 0U, kComputeTileM * scaleStride);
     const uint64_t start = timer.TraceBegin();
-    for (uint32_t segmentIndex = 0U; segmentIndex < fragment.segmentCount; ++segmentIndex) {
-        const auto segment = LoadRowSegment(args, fragment.segmentBegin + segmentIndex);
+    auto cursor = RuntimeSegments(args, fragment).MakeCursor();
+    RowSegment segment{};
+    while (cursor.Next(segment)) {
         DataCopyPad(scratch[segment.tileRow * scaleStride], source[segment.receiveRow * scaleBytes],
                     {static_cast<uint16_t>(segment.rows), scaleBytes, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
     }

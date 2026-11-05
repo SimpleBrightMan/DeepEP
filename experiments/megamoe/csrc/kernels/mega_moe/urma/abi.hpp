@@ -30,7 +30,7 @@ constexpr uint32_t kLocalFlagSharedGmm1Done = 4U; // small-BS S1: completed AICs
 // local GMM2 group that writes its self return rows directly.
 constexpr uint64_t kReduceSelfDependency = uint64_t{1} << 63U;
 constexpr uint32_t kProtocol = 1;
-constexpr uint32_t kDeviceRoutingProtocol = 3;
+constexpr uint32_t kDeviceRoutingProtocol = 4;
 #define MEGAMOE_URMA_ROUTE_REORDER 0
 constexpr uint32_t kTimerCores = kAic * 3U;
 constexpr uint32_t kTimerPhases = 8U;
@@ -135,7 +135,7 @@ struct ComputeBatch {
 
 enum class ComputeBatchStage : uint32_t { None = 0U, Gmm1 = 1U, Gmm2 = 2U };
 
-// Host-planned order shared by each AIC and its paired AIV0. Whole expert
+// Device-generated stage order shared by each AIC and its paired AIV0. Whole expert
 // batches retain their existing context and global tile ownership boundaries.
 struct ComputeBatchTask {
     ComputeBatchStage stage;
@@ -210,7 +210,7 @@ struct Arguments {
     uint64_t xScale;
     uint64_t order;
     uint64_t reduceIndex;
-    uint64_t reduceDependencies;  // Cached token-major [BS,K] ready descriptors.
+    uint64_t reduceDependencies;  // Reserved; protocol4 builds dependencies in Reduce UB.
     uint64_t weights;
     uint64_t weight1;
     uint64_t weight2;
@@ -252,6 +252,7 @@ struct Arguments {
     uint64_t topkIds, routeHistogram, routeInfo, routeConfig, routeCounts, routeOffsets;
     uint32_t topkIdBytes;
     uint64_t sharedRoutedOutput; // S1 FP32 routed sum; round only after adding shared result.
+    uint64_t expertRoutes; // int32 [384, sourceRowCapacity], one writer per expert.
 };
 static_assert(sizeof(Fragment) == 40);
 static_assert(sizeof(RowSegment) == 40);

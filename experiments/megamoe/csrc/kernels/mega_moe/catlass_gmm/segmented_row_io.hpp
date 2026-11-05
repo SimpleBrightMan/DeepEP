@@ -18,7 +18,31 @@ struct ContiguousRowIO {
 
 // Segment is a caller-owned descriptor with sourceRank, receiveRow, returnRow,
 // tileRow and rows fields. This layer has no dependency on the URMA wire ABI.
-template <class Segment, bool GatherInput, bool ScatterOutput>
+template <class Segment>
+struct GmSegmentSource {
+    struct Cursor {
+        const __gm__ Segment* segments;
+        uint32_t count;
+        uint32_t index = 0U;
+        __aicore__ inline bool Next(Segment& value) {
+            if (index == count) return false;
+            const auto* segment = segments + index++;
+            value.sourceRank = segment->sourceRank;
+            value.receiveRow = segment->receiveRow;
+            value.returnRow = segment->returnRow;
+            value.tileRow = segment->tileRow;
+            value.rows = segment->rows;
+            return true;
+        }
+    };
+    __aicore__ inline Cursor MakeCursor(const __gm__ Segment* segments, uint32_t count) const {
+        return {segments, count, 0U};
+    }
+};
+
+// A provider may instead derive the current group's segments from immutable
+// count prefixes. The default provider retains the original GM-table policy.
+template <class Segment, bool GatherInput, bool ScatterOutput, class SegmentSource = GmSegmentSource<Segment>>
 struct SegmentedRowIO {
     static constexpr bool kGatherInput = GatherInput;
     static constexpr bool kScatterOutput = ScatterOutput;
@@ -38,6 +62,7 @@ struct SegmentedRowIO {
     GM_ADDR remoteOutput = nullptr;
     GM_ADDR selfReturn = nullptr;
     uint32_t outputStride = 0;
+    SegmentSource source{};
 
     template <class TensorL1>
     __aicore__ inline void Gather(TensorL1& dst, uint32_t tileBegin, uint32_t tileRows, uint32_t columnBegin,
@@ -48,9 +73,10 @@ struct SegmentedRowIO {
         input.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(inputX));
         auto output = dst.data().template ReinterpretCast<uint8_t>();
         const uint32_t c0Stride = tla::get<1, 1>(dst.stride()) / 32U;
-        for (uint32_t index = 0; index < count; ++index) {
-            const auto* segment = segments + index;
-            const auto part = SegmentedRows::Intersect(segment->tileRow, segment->rows, tileBegin, tileRows);
+        auto cursor = source.MakeCursor(segments, count);
+        Segment segment{};
+        while (cursor.Next(segment)) {
+            const auto part = SegmentedRows::Intersect(segment.tileRow, segment.rows, tileBegin, tileRows);
             if (part.rows == 0) {
                 continue;
             }
@@ -70,7 +96,7 @@ struct SegmentedRowIO {
             // overlapping writes being ordered: that is explicitly forbidden.
             // CANN API: DataCopy_GMToL1_ND2NZ.md (Nd2NzParams/Constraints).
             const auto offset = SegmentedRows::AOffset(part.tileRow, 0U, tileRows);
-            const uint64_t sourceRow = segment->receiveRow + part.segmentRow;
+            const uint64_t sourceRow = segment.receiveRow + part.segmentRow;
             AscendC::DataCopy(output[offset], input[sourceRow * inputStride + columnBegin], params);
         }
     }
@@ -80,14 +106,15 @@ struct SegmentedRowIO {
                                    uint32_t tileRows, uint32_t columnBegin, uint32_t columns) const
     {
         using Element = typename TensorC::Element;
-        for (uint32_t index = 0; index < count; ++index) {
-            const auto* segment = segments + index;
-            const auto part = SegmentedRows::Intersect(segment->tileRow, segment->rows, tileBegin, tileRows);
+        auto cursor = source.MakeCursor(segments, count);
+        Segment segment{};
+        while (cursor.Next(segment)) {
+            const auto part = SegmentedRows::Intersect(segment.tileRow, segment.rows, tileBegin, tileRows);
             if (part.rows == 0) {
                 continue;
             }
-            const bool self = segment->sourceRank == rank;
-            const uint64_t row = (self ? segment->returnRow : segment->receiveRow) + part.segmentRow;
+            const bool self = segment.sourceRank == rank;
+            const uint64_t row = (self ? segment.returnRow : segment.receiveRow) + part.segmentRow;
             AscendC::GlobalTensor<Element> output;
             output.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(self ? selfReturn : remoteOutput) +
                                    SegmentedRows::OutputOffset(row, columnBegin, outputStride));

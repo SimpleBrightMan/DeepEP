@@ -50,7 +50,7 @@ def _extension():
         raise RuntimeError("Rebuild the generalized-dimension MegaMoE extension")
     if getattr(extension,"urma_shared_contract",None)!="shared1-unitflag-fp32-sum-v2":
         raise RuntimeError("Rebuild the shared-expert MegaMoE extension")
-    if getattr(extension,"urma_routing_protocol",None)!=3:
+    if getattr(extension,"urma_routing_protocol",None)!=4:
         raise RuntimeError("Device routing requires matching Python/native wheel; rebuild and reinstall")
     return extension
 

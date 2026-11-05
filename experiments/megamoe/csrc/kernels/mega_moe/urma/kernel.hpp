@@ -17,13 +17,6 @@
 namespace MegaMoeUrma {
 using namespace AscendC;
 
-__aicore__ inline Chunk LoadChunk(uint64_t address, uint32_t index)
-{
-    const auto* gm = reinterpret_cast<__gm__ Chunk*>(address) + index;
-    return {gm->peer,          gm->cv,      gm->localRow, gm->remoteRow, gm->rows, gm->fragmentBegin,
-            gm->fragmentCount, gm->reserved};
-}
-
 __aicore__ inline TraceMeta ChunkTraceMeta(const Chunk& chunk)
 {
     TraceMeta meta;
@@ -34,30 +27,9 @@ __aicore__ inline TraceMeta ChunkTraceMeta(const Chunk& chunk)
     return meta;
 }
 
-// Host descriptors are peer-major and CV-major within each peer. Locate the
-// actual ranges once without scanning unrelated peers in the payload loop.
-__aicore__ inline uint32_t ChunkPeerLowerBound(uint64_t address, uint32_t count, uint32_t peer)
-{
-    const auto* chunks = reinterpret_cast<__gm__ Chunk*>(address);
-    uint32_t begin = 0U;
-    uint32_t end = count;
-    while (begin < end) {
-        const uint32_t middle = begin + (end - begin) / 2U;
-        if (chunks[middle].peer < peer) {
-            begin = middle + 1U;
-        } else {
-            end = middle;
-        }
-    }
-    return begin;
-}
-
 __aicore__ inline uint32_t PeerDispatchCvCount(const Arguments& args, uint32_t peer)
 {
-    const uint32_t end = ChunkPeerLowerBound(args.sendChunks, args.config.sendChunkCount, peer + 1U);
-    if (end == 0U) return 0U;
-    const auto* last = reinterpret_cast<__gm__ Chunk*>(args.sendChunks) + end - 1U;
-    return last->peer == peer ? last->cv + 1U : 0U;
+    return RuntimeSendCvCount(args, peer);
 }
 
 __aicore__ inline void TraceLocalSync(Timer& timer, uint32_t stage)
@@ -96,13 +68,30 @@ __aicore__ inline void PublishPeerStart(const Arguments& args, uint32_t owner, T
 // Inspect once and return at the first incomplete compute group.
 __aicore__ inline bool IsChunkComputed(const Arguments& args, const Chunk& chunk)
 {
-    for (uint32_t j = 0U; j < chunk.fragmentCount; ++j) {
-        const uint32_t index = reinterpret_cast<__gm__ uint32_t*>(args.chunkGroupIndices)[chunk.fragmentBegin + j];
-        const uint32_t rows = reinterpret_cast<__gm__ Fragment*>(args.fragments)[index].rows;
+    const auto* routes = RouteInfo(args);
+    uint32_t row = chunk.cv * args.config.cvRows;
+    const uint32_t end = row + chunk.rows;
+    uint32_t expert = RuntimePeerRowExpert(args, chunk.peer, row);
+    while (row < end) {
+        while (routes->incoming[chunk.peer][expert + 1U] <= row) ++expert;
+        const uint32_t expertRow = routes->sources[expert][chunk.peer] +
+                                   row - routes->incoming[chunk.peer][expert];
+        const uint32_t groupInExpert = expertRow / 256U;
+        const uint32_t index = routes->groupBase[expert] + groupInExpert;
+        const uint32_t remainingRows = routes->sources[expert][args.config.world] - groupInExpert * 256U;
+        const uint32_t rows = remainingRows < 256U ? remainingRows : 256U;
         if (ReadGmByPassDCache(ComputeFlag(args.gmm2Done, index)) <
             static_cast<int32_t>(ComputeTileCount(rows, args.config.hidden))) {
             return false;
         }
+        // Match the original CV -> expert -> M256 intersection order. One CV
+        // may contain several experts, and a source may begin mid-M-group.
+        uint32_t take = end - row;
+        const uint32_t expertRemaining = routes->incoming[chunk.peer][expert + 1U] - row;
+        if (take > expertRemaining) take = expertRemaining;
+        const uint32_t groupRemaining = 256U - expertRow % 256U;
+        if (take > groupRemaining) take = groupRemaining;
+        row += take;
     }
     return true;
 }
@@ -207,9 +196,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
     constexpr uint32_t kSubmittedOffset = 32U;
     static_assert(kSubmittedOffset + kMaxPeerChunks * sizeof(uint32_t) <= kRequiredUbBytes);
     LocalTensor<uint32_t> submitted(TPosition::VECCALC, kSubmittedOffset, kMaxPeerChunks);
-    const uint32_t begin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer);
-    const uint32_t end = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer + 1U);
-    const uint32_t total = end - begin;
+    const uint32_t total = RuntimeReceiveCvCount(args, peer);
     for (uint32_t i = 0; i < total; ++i) submitted.SetValue(i, 0U);
     uint32_t remaining = total;
     uint64_t combineBytes = 0U, waitStart = 0U;
@@ -220,7 +207,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         const uint64_t scanStart = timer.TraceBegin();
         for (uint32_t i = 0; i < total;) {
             if (submitted.GetValue(i)) { ++i; continue; }
-            const Chunk first = LoadChunk(args.recvChunks, begin + i);
+            const Chunk first = RuntimeReceiveChunk(args, peer, i);
             if (!IsChunkComputed(args, first)) { ++i; continue; }
             uint32_t count = 1U;
             uint64_t rows = first.rows;
@@ -228,7 +215,7 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
             const uint32_t limit = remaining > 1U ? remaining - 1U : 1U;
             while (count < limit && i + count < total && CombineRangeFitsWord(first.cv, count + 1U)) {
                 if (submitted.GetValue(i + count)) break;
-                const Chunk next = LoadChunk(args.recvChunks, begin + i + count);
+                const Chunk next = RuntimeReceiveChunk(args, peer, i + count);
                 if (!AdjacentChunks(first, rows, count, next) ||
                     (rows + next.rows) * rowBytes > kMaxPutBytes || !IsChunkComputed(args, next)) break;
                 rows += next.rows;
@@ -397,9 +384,7 @@ __aicore__ inline void CommunicatePeerShared(const Arguments& args, uint32_t own
     constexpr uint32_t kSubmittedOffset = ActivationUbContract::inputEnd; // survives shared activation UB use
     static_assert(kSubmittedOffset + kMaxPeerChunks * sizeof(uint32_t) <= kRequiredUbBytes);
     LocalTensor<uint32_t> submitted(TPosition::VECCALC, kSubmittedOffset, kMaxPeerChunks);
-    const uint32_t begin = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer);
-    const uint32_t end = ChunkPeerLowerBound(args.recvChunks, args.config.recvChunkCount, peer + 1U);
-    const uint32_t total = end - begin;
+    const uint32_t total = RuntimeReceiveCvCount(args, peer);
     for (uint32_t i = 0; i < total; ++i) submitted.SetValue(i, 0U);
     uint32_t remaining = total;
     uint64_t combineBytes = 0U, waitStart = 0U;
@@ -409,7 +394,7 @@ __aicore__ inline void CommunicatePeerShared(const Arguments& args, uint32_t own
         const uint64_t scanStart = timer.TraceBegin();
         for (uint32_t i = 0; i < total;) {
             if (submitted.GetValue(i)) { ++i; continue; }
-            const Chunk first = LoadChunk(args.recvChunks, begin + i);
+            const Chunk first = RuntimeReceiveChunk(args, peer, i);
             if (!IsChunkComputed(args, first)) { ++i; continue; }
             uint32_t count = 1U;
             uint64_t rows = first.rows;
@@ -417,7 +402,7 @@ __aicore__ inline void CommunicatePeerShared(const Arguments& args, uint32_t own
             const uint32_t limit = remaining > 1U ? remaining - 1U : 1U;
             while (count < limit && i + count < total && CombineRangeFitsWord(first.cv, count + 1U)) {
                 if (submitted.GetValue(i + count)) break;
-                const Chunk next = LoadChunk(args.recvChunks, begin + i + count);
+                const Chunk next = RuntimeReceiveChunk(args, peer, i + count);
                 if (!AdjacentChunks(first, rows, count, next) ||
                     (rows + next.rows) * rowBytes > kMaxPutBytes || !IsChunkComputed(args, next)) break;
                 rows += next.rows;

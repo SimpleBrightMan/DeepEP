@@ -1,5 +1,9 @@
 # MegaMoE 内核内 Device 路由
 
+> 当前 commfirst 分支已升级为实验性的 protocol4：见
+> [专家唯一 owner 与按需描述符](URMA_EXPERT_OWNER_ROUTING.md)。
+> 下文保留 protocol3 的设计和已执行验证记录；这些编译/EP8结果不适用于 protocol4。
+
 本修改适用于 `megamoe-commfirst-shared` 和 `megamoe-unitflag-shared`。
 生产接口只有 Device 路由，不提供 Host 后端或自动回退。
 
