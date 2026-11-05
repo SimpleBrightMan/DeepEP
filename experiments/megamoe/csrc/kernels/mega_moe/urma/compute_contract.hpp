@@ -181,7 +181,7 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ComputeTileCount(uint32_t rows, u
 MEGAMOE_URMA_COMPUTE_INLINE constexpr bool UseFusedGateUp(const Config& config)
 {
     return static_cast<uint64_t>(config.bs) * config.world * config.topk <
-           static_cast<uint64_t>(kExperts) * kFusedGateUpExpectedRows;
+           static_cast<uint64_t>(config.world) * config.localExperts * kFusedGateUpExpectedRows;
 }
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t Gmm1LogicalTileN(const Config& config)

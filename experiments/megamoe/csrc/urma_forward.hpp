@@ -16,7 +16,7 @@ class UrmaPlan {
 public:
     UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, int64_t topk, int64_t cv_rows,
              int64_t max_recv_rows, int64_t max_tokens, int64_t rank, uint64_t ffts, uint64_t symmetric_address,
-             int64_t symmetric_bytes, int64_t gmm1_ahead_mgroups, int64_t shared_experts=0, int64_t shared_intermediate=0);
+             int64_t symmetric_bytes, int64_t gmm1_ahead_mgroups, int64_t shared_experts=0, int64_t shared_intermediate=0, int64_t num_experts=384);
     std::vector<torch::Tensor> routing_tensors(int64_t bs) const;
     std::vector<int64_t> route_stats() const; // explicit post-forward diagnostic D2H only
     torch::Tensor forward(torch::Tensor x, torch::Tensor x_scales, torch::Tensor topk_idx,

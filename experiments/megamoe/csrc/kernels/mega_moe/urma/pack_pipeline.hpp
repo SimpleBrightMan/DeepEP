@@ -87,7 +87,7 @@ public:
             nextSlot_ = 0U;
         }
         const uint64_t retireAfter = count < kPackPipelineSlots - 1U ? count : kPackPipelineSlots - 1U;
-        uint32_t low = 0U, high = kExperts;
+        uint32_t low = 0U, high = args.config.world * args.config.localExperts;
         while (low < high) {
             const uint32_t mid = (low + high) / 2U;
             if (info->outgoing[mid + 1U] <= begin) low = mid + 1U;

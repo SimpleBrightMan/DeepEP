@@ -8,7 +8,7 @@ namespace MegaMoeUrma {
 // Fixed descriptor/cache capacity. The active communicator is Config::world.
 constexpr uint32_t kWorld = 16;
 constexpr uint32_t kMinWorld = 4;
-constexpr uint32_t kExperts = 384;
+constexpr uint32_t kExperts = 384; // capacity only; active E = world * localExperts
 constexpr uint32_t kMaxLocalExperts = kExperts / kMinWorld;
 constexpr uint32_t kAic = 28;
 constexpr uint32_t kLocalWorkers = 2U * kAic;
@@ -31,7 +31,7 @@ constexpr uint32_t kLocalFlagRouteSummaryDone = 5U; // local immutable receive s
 // local GMM2 group that writes its self return rows directly.
 constexpr uint64_t kReduceSelfDependency = uint64_t{1} << 63U;
 constexpr uint32_t kProtocol = 1;
-constexpr uint32_t kDeviceRoutingProtocol = 6;
+constexpr uint32_t kDeviceRoutingProtocol = 7;
 #define MEGAMOE_URMA_ROUTE_REORDER 0
 constexpr uint32_t kTimerCores = kAic * 3U;
 constexpr uint32_t kTimerPhases = 8U;

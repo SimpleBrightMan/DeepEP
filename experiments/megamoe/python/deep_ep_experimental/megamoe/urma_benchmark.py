@@ -25,6 +25,7 @@ def parse_args(argv=None):
     parser.add_argument("--shared-intermediate", type=int)
     parser.add_argument("--topk", type=int, choices=range(1,9), help="URMA routed experts per token (1..8)")
     parser.add_argument("--hidden", type=int)
+    parser.add_argument("--experts", type=int, help="Total routed experts: EP<=E<=384, divisible by EP")
     parser.add_argument("--intermediate", type=int)
     parser.add_argument("--cv-rows", type=int, default=256)
     parser.add_argument(
@@ -142,6 +143,7 @@ def format_profile_summary(reports, world):
 def main():
     args = parse_args()
     config = load_config(args.config, args.bs_values)
+    if args.experts is not None: config["model"]["num_experts"] = args.experts
     if args.topk is not None: config["model"]["num_topk"] = args.topk
     if args.hidden is not None: config["model"]["hidden"] = args.hidden
     if args.intermediate is not None: config["model"]["intermediate_hidden"] = args.intermediate
