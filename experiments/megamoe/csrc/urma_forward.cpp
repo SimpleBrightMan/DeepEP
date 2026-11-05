@@ -48,6 +48,8 @@ Config Layout(int64_t world, int64_t max_tokens, int64_t topk, int64_t hidden, i
     config.barrierOffset = Align(config.combineReadyOffset +
                                  static_cast<uint64_t>(world) * config.maxPeerChunks * MegaMoeUrma::kFlagBytes);
     config.routeInboxOffset = Align(config.barrierOffset + 4ULL * world * MegaMoeUrma::kFlagBytes);
+    // Keep the single-slot layout. The former entry flag range is reserved;
+    // tail finished observations now certify remote route-mailbox consumption.
     config.routeEntryOffset = Align(config.routeInboxOffset + world * MegaMoeUrma::kRouteMailboxBytes);
     config.routeReadyOffset = config.routeEntryOffset + world * MegaMoeUrma::kFlagBytes;
     config.symmetricBytes = Align(config.routeReadyOffset + world * MegaMoeUrma::kFlagBytes, 2ULL << 20);
@@ -314,6 +316,10 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     CheckTensor(output, 2, "out", device);
     TORCH_CHECK(output.scalar_type() == torch::kBFloat16 && output.sizes() == x.sizes(), "out must be BF16 [BS,H]");
     auto stream = c10_npu::getCurrentNPUStream();
+    // Route inbox/ready are initialized once by Session's workspace zeroing.
+    // Never clear them here: a peer may already have published this
+    // epoch before the receiver enqueues its own invocation. Ready is an MTE
+    // epoch overwrite, unlike the per-call additive SO masks reset below.
     // Dispatch now publishes epoch via SO atomic-add, not MTE overwrite.
     // Reset the receiver-owned CV slots before this invocation's PublishStart.
     // Peers observe that start before submitting; final quiet prevents late

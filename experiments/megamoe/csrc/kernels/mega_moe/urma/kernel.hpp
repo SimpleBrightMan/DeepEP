@@ -251,6 +251,8 @@ __aicore__ inline void CommunicatePeer(const Arguments& args, uint32_t owner, Ti
         }
     }
     // SO finished follows all ready masks on QP0, including an empty stream.
+    // It also certifies that this rank already copied the peer's route inbox;
+    // do not skip empty markers now that the entry rank barrier is removed.
     PublishOrdered(symmetric, PeerPhaseSlot(args, 1U, args.config.rank), peer, args.config.epoch);
     start = timer.TraceBegin();
     Quiet(peer); // Retire BOTH Dispatch and Combine payloads/flags before reuse, in every mode.
@@ -447,6 +449,7 @@ __aicore__ inline void CommunicatePeerShared(const Arguments& args, uint32_t own
             while (GetSystemCycle() - backoff < 200U) {}
         }
     }
+    // Empty streams must still acknowledge route-inbox consumption to peer.
     if(!posted)PublishOrdered(symmetric,PeerPhaseSlot(args,1U,args.config.rank),peer,args.config.epoch);
 }
 

@@ -28,6 +28,11 @@ __aicore__ inline void MarkCubeComplete(const Arguments& args)
 // Each peer has exactly one local observer. Once counted, it never reads that
 // flag again in this invocation. Outbound completion alone is NOT incoming
 // completion: inspect the peer-owned slot in this rank's symmetric window.
+// Protocol5 also uses this observation to recycle SINGLE-SLOT route inboxes:
+// peer.finished(n) is issued only after peer copied all route inboxes for n
+// into its private RouteInfo. Before leaving the kernel every peer owner must
+// observe completion (even for zero CVs), then participate in the local tail
+// join. Outbound Quiet alone or Reduce finishing alone cannot replace this.
 __aicore__ inline bool ObserveIncomingCompletion(const Arguments& args, uint32_t owner, bool& peerCounted,
                                                  bool& selfCounted)
 {

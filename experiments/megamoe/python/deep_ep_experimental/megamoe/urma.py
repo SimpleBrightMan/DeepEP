@@ -50,7 +50,7 @@ def _extension():
         raise RuntimeError("Rebuild the generalized-dimension MegaMoE extension")
     if getattr(extension,"urma_shared_contract",None)!="shared1-unitflag-fp32-sum-v2":
         raise RuntimeError("Rebuild the shared-expert MegaMoE extension")
-    if getattr(extension,"urma_routing_protocol",None)!=4:
+    if getattr(extension,"urma_routing_protocol",None)!=5:
         raise RuntimeError("Device routing requires matching Python/native wheel; rebuild and reinstall")
     return extension
 
@@ -258,6 +258,9 @@ class UrmaBuffer:
 
         The host RLock alone cannot serialize work on different NPU streams.
         These two event edges also order metadata/input writes and output reads.
+        The previous kernel's tail observes every peer's finished notification,
+        which certifies route-inbox consumption before the next launch reuses it.
+        No external benchmark all-reduce is required for this lifetime guarantee.
         """
         runtime = self._runtime
         npu = npu_api()

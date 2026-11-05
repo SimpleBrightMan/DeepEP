@@ -1,4 +1,4 @@
-# 专家唯一 owner 与按需路由（protocol4）
+# 专家唯一 owner 与按需路由（protocol5）
 
 仅 `megamoe-commfirst-shared` 的实验。未编译、未运行 CPU/NPU 测试，按用户要求交由用户执行。
 `megamoe-unitflag-shared` 未修改。此前 protocol3 的测试结果不能作为本次变更的验证。
@@ -13,12 +13,40 @@
 - leader只做384项计数前缀；不再合并56×384直方图。
 - 跨rank仍MTE写计数前缀、返回起点和epoch；不传全部索引、不引入GET。
 - 收到摘要后生成来源前缀、专家M256边界、peer CV前缀和原有小计算任务顺序表。
-- 本卡同步由9次变为6次；原跨rank入口和元数据到达检查保留。
+- 本卡同步从protocol4的6次降到3次；取消入口跨rank屏障，保留本轮元数据到达检查。
   摘要缓存每次调用在写入前失效，发布后只读；没有Host路由或调用前D2H。
 
 固定专家槽的代价是额外预留 `384 * maxBS * TopK * 4` 字节。
 maxBS8192/K8为96MiB，maxBS16384/K8为192MiB；实际只写真实命中的索引。
 分桶UB最高176KiB；后续摘要使用96KiB区域前，分桶VF/MTE均已结束。
+
+## 单槽邮箱复用与同步
+
+邮箱和routeReady均保留单槽，不新增双缓冲。安全性来自算子内部已有的尾部协议：
+
+1. B必须先把第n轮全部来源的路由邮箱复制到自己的RouteInfo，之后才能进入Pack/计算/Combine。
+2. B给A发布第n轮finished，包括B→A没有任何Combine CV的情况。
+3. A的peer通信核必须观察到B的finished；A退出前的本卡join等待全部peer通信核。
+4. A下一轮由同一owner stream串行执行，因此在覆盖B的邮箱前，已经确认B不再读旧邮箱。
+
+finished可以在对端自身Reduce完成前发布：这里需要确认的是路由邮箱已经消费，
+而不是对端整个算子已经退出。后续计算只读私有RouteInfo，不再读取接收邮箱。
+本卡出站quiet、入站finished观察、尾部join和内部stream串行都保留；安全性不依赖
+benchmark的all-reduce。不能只凭本卡quiet或本卡Reduce完成就省略入站finished观察，
+也不能省略空peer的finished。routeReady用MTE覆盖发布epoch，等待精确本轮值，
+只在Session创建时清零，避免清掉提前到达的本轮摘要。
+
+RoutePrepare保留的三处SyncAll：
+
+- 专家计数DMA完成＋所有消费者已失效旧摘要缓存 → leader读取计数、写前缀。
+- 前缀发布完成 → 各摘要发送核读取前缀。
+- 接收摘要/小任务表发布完成＋本卡发送核完成 → 各消费者读取Config并进入后续阶段。
+
+去掉原入口join、摘要发送后的额外join、Config reload后的join。
+摘要发送改读独立且只读的routeOffsets，避免leader重写RouteInfo时与慢发送核读同一区域。
+每核Config reload后保留本核PIPE_ALL；Dispatch/Combine循环不新增屏障。
+无共享路径整个kernel现在是5次本卡全核join（路由3＋首批Pack1＋尾部1）、
+0次显式RankBarrier；元数据/peer-start/完成flag的必要等待仍在。
 
 ## 执行期间
 
@@ -39,7 +67,7 @@ Pack逆映射增加每行一条8B DMA。对齐q记录使用双metadata缓冲，�
 
 ## 接口和诊断
 
-必须完整重编安装wheel，Python/native routing protocol同时为4，测试参数不变。
+必须完整重编安装wheel，Python/native routing protocol同时为5，测试参数不变。
 `prepare_routes()`仍只绑定输入及容量，返回的`DeviceRoutes.order`现在为None；
 `reduce_index`只在执行完成后有效。显式`debug_snapshot()`在执行后从inverse重建CPU
 compact order供旧诊断消费，不参与生产调用或计时；不再导出未物化的大描述符表。

@@ -194,17 +194,23 @@ __aicore__ inline void RouteExpertPrefix(const Arguments& a) {
 
 __aicore__ inline void RouteExchange(const Arguments& a,uint32_t worker) {
     if(worker>=a.config.world)return;
-    RouteLoad(a.routeInfo,kRouteInfoUb,(kExperts+1U)*4U);
-    const auto* r=reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
-    const uint32_t le=a.config.localExperts,base=r->outgoing[worker*le];
+    const uint32_t le=a.config.localExperts;
+    // The leader may build RouteInfo while a slower local sender is still
+    // publishing. Read the immutable, separately stored outgoing prefix here;
+    // no sender races a DMA overwrite of the shared RouteInfo snapshot.
+    RouteLoad(a.routeOffsets+uint64_t(worker)*le*8U,2048U,(le+1U)*8U);
+    LocalTensor<uint64_t> prefix(TPosition::VECCALC,2048U,le+1U);
+    const uint32_t base=static_cast<uint32_t>(prefix.GetValue(0U));
     LocalTensor<uint64_t> ret(TPosition::VECCALC,0U,4U);ret.SetValue(0,base);
     LocalTensor<uint32_t> counts(TPosition::VECCALC,8U,le+1U);
-    for(uint32_t e=0;e<=le;++e)counts.SetValue(e,r->outgoing[worker*le+e]-base);
+    for(uint32_t e=0;e<=le;++e)counts.SetValue(e,static_cast<uint32_t>(prefix.GetValue(e))-base);
     auto* sym=reinterpret_cast<__gm__ uint8_t*>(a.symmetric);
     const uint64_t target=reinterpret_cast<uint64_t>(aclshmem_ptr(
         sym+a.config.routeInboxOffset+uint64_t(a.config.rank)*kRouteMailboxBytes,worker));
     RouteSave(target,0U,8U+(le+1U)*4U);
     LocalTensor<uint64_t> flag(TPosition::VECCALC,1024U,4U);
+    // RouteSave has completed the payload MTE before publishing its exact
+    // epoch into the single ready slot. Do not use an additive SO flag.
     PublishDone(sym,a.config.routeReadyOffset+uint64_t(a.config.rank)*kFlagBytes,worker,a.config.epoch,flag,EVENT_ID0);
 }
 
@@ -250,29 +256,34 @@ __aicore__ inline void PrepareDeviceRoutes(Arguments& a,Timer& timer) {
     const uint64_t start=timer.TraceBegin();
     const uint32_t block=GetBlockIdx()/GetTaskRation();
     InvalidateRouteSummary(a);
-    if constexpr(g_coreType==AIV) {
-        if(LocalWorkerIndex(block,GetSubBlockIdx())==0U) {
-            LocalTensor<uint64_t> flag(TPosition::VECCALC,0U,4U);
-            RankBarrier(reinterpret_cast<__gm__ uint8_t*>(a.symmetric),a.config.routeEntryOffset,
-                a.config.rank,a.config.epoch,flag,EVENT_ID0,a.config.world);
-        }
-    }
-    SyncAll<false>();
+    // No entry rank barrier: before this owner's previous invocation returned,
+    // every peer owner observed that peer's finished epoch, including empty
+    // edges. A peer publishes finished only AFTER RouteSummary copied all
+    // inboxes to its private RouteInfo. The next serialized invocation can
+    // therefore reuse even a single remote mailbox; no benchmark collective
+    // or double buffer is part of this argument. Keep the tail observers/join.
     if constexpr(g_coreType==AIV)RouteOwnedExperts(a,LocalWorkerIndex(block,GetSubBlockIdx()));
+    // #1: all count DMA stores AND all consumers' cache invalidations precede
+    // the leader's first RouteInfo/Config update.
     SyncAll<false>();
     if constexpr(g_coreType==AIV)if(block==0U&&GetSubBlockIdx()==0U)RouteExpertPrefix(a);
+    // #2: count prefixes are immutable and ready for the exchange senders.
     SyncAll<false>();
     if constexpr(g_coreType==AIV)RouteExchange(a,LocalWorkerIndex(block,GetSubBlockIdx()));
-    SyncAll<false>();
     if constexpr(g_coreType==AIV)if(block==0U&&GetSubBlockIdx()==0U) {
+        // Wait for this exact epoch's metadata, including zero-count peers.
+        // A future epoch cannot overwrite this inbox before our own finished
+        // publication, which occurs only after this snapshot has been copied.
         for(uint32_t s=0;s<a.config.world;++s)
-            WaitStartAtLeast(reinterpret_cast<__gm__ uint8_t*>(a.symmetric+a.config.routeReadyOffset+s*kFlagBytes),a.config.epoch);
+            WaitLocalDone(reinterpret_cast<__gm__ uint8_t*>(a.symmetric+a.config.routeReadyOffset+s*kFlagBytes),a.config.epoch);
         RouteSummary(a);
     }
+    // #3: leader publication and all local exchange DMA lifetimes are joined.
     SyncAll<false>();
     RouteReloadConfig(a);
     PipeBarrier<PIPE_ALL>();
-    SyncAll<false>();
+    // Each core consumes its own Config copy; there is no new inter-core
+    // producer to join after the reload. Preserve the local pipeline fence.
     timer.TraceEnd(TraceEvent::RoutePrepare,start);
     timer.CoarseEnd(CoarsePhase::Route);
 }
