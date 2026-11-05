@@ -45,7 +45,7 @@ def _extension():
         raise RuntimeError("Rebuild the generalized-dimension MegaMoE extension")
     if getattr(extension,"urma_shared_contract",None)!="unitflag-shared-peer-reorder-v1":
         raise RuntimeError("Rebuild the shared-expert MegaMoE extension")
-    if getattr(extension,"urma_routing_protocol",None)!=6:
+    if getattr(extension,"urma_routing_protocol",None)!=7:
         raise RuntimeError("Device routing requires matching Python/native wheel; rebuild and reinstall")
     return extension
 
@@ -130,12 +130,15 @@ class UrmaBuffer:
                 raise TypeError("allow_multi_host must be bool")
             integer("hidden", hidden, 256, 8192)
             integer("intermediate_hidden", intermediate_hidden, 256, 16384)
-            integer("num_topk", num_topk, 1, 8)
+            integer("num_experts", num_experts, group.size(), 384)
+            if num_experts % group.size():
+                raise ValueError("num_experts must be divisible by EP")
+            integer("num_topk", num_topk, 1, min(8, num_experts))
             integer("num_shared_experts", num_shared_experts, 0, 1)
             if shared_intermediate_hidden is None: shared_intermediate_hidden=intermediate_hidden
             integer("shared_intermediate_hidden", shared_intermediate_hidden, 256, 16384)
-            if hidden % 256 or intermediate_hidden % 256 or shared_intermediate_hidden % 256 or num_experts != 384:
-                raise ValueError("URMA requires H/I aligned256, E384/topk1..8/S0 or S1")
+            if hidden % 256 or intermediate_hidden % 256 or shared_intermediate_hidden % 256:
+                raise ValueError("URMA requires H/I aligned256, topk1..8/S0 or S1")
             integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 16384)
             integer("cv_rows", cv_rows, 128, 4096)
             integer("gmm1_ahead_mgroups", gmm1_ahead_mgroups, 0, 65536)
@@ -287,7 +290,7 @@ class UrmaBuffer:
                     self._example, self.group.size(), self.intermediate_hidden, self.num_topk,
                     self.cv_rows, self.max_recv_rows, self.num_max_tokens_per_rank, self.group.rank(),
                     _extension().ffts_config(), address, self._runtime.native.capacity,
-                    self.gmm1_ahead_mgroups, self.num_shared_experts, self.shared_intermediate_hidden,
+                    self.gmm1_ahead_mgroups, self.num_shared_experts, self.shared_intermediate_hidden, self.num_experts,
                 )
             routing = DeviceRoutes(*self._plan.routing_tensors(bs))
             return PreparedUrmaRoutes(self, self._plan, routing, bs, topk_idx)

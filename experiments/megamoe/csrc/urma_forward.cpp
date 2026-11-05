@@ -75,7 +75,7 @@ int64_t urma_buffer_size(int64_t world, int64_t max_tokens, int64_t topk, int64_
 
 UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, int64_t topk, int64_t cv_rows,
                    int64_t max_recv_rows, int64_t max_tokens, int64_t rank, uint64_t ffts, uint64_t symmetric_address,
-                   int64_t symmetric_bytes, int64_t gmm1_ahead_mgroups, int64_t shared_experts, int64_t shared_intermediate)
+                   int64_t symmetric_bytes, int64_t gmm1_ahead_mgroups, int64_t shared_experts, int64_t shared_intermediate, int64_t num_experts)
 {
     TORCH_CHECK(example.device().type() == c10::DeviceType::PrivateUse1 && example.dim() == 2 &&
                     example.is_contiguous() && example.size(0) > 0 && example.size(0) <= max_tokens,
@@ -92,7 +92,9 @@ UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, i
     args_.sharedExperts=shared_experts;args_.sharedIntermediate=shared_experts?shared_intermediate:0;
     config.bs = example.size(0);
     config.intermediate = intermediate;
-    config.localExperts = 384U / config.world;
+    TORCH_CHECK(num_experts >= world && num_experts <= MegaMoeUrma::kExperts && num_experts % world == 0 && topk <= num_experts,
+                "URMA experts must divide EP, with EP<=E<=384 and TopK<=E");
+    config.localExperts = num_experts / config.world;
     config.rank = rank;
     config.gmm1AheadMGroups = static_cast<uint32_t>(gmm1_ahead_mgroups);
     TORCH_CHECK(symmetric_address != 0 && symmetric_bytes >= static_cast<int64_t>(config.symmetricBytes),
@@ -169,10 +171,10 @@ UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, i
     order_ = allocate(0); // compact order exists only in explicit post-run diagnostics
     inverse_ = torch::empty({int64_t(expanded_rows)}, example.options().dtype(torch::kInt64));
     reduce_dependencies_ = allocate(0); // Reduce constructs its own UB dependency cache
-    expert_routes_ = torch::empty({384,int64_t(expanded_rows)},example.options().dtype(torch::kInt32));
-    route_counts_ = torch::empty({384}, example.options().dtype(torch::kInt64));
-    route_offsets_ = torch::empty({385}, example.options().dtype(torch::kInt64));
-    route_histogram_ = allocate(384U * sizeof(uint32_t));
+    expert_routes_ = torch::empty({num_experts,int64_t(expanded_rows)},example.options().dtype(torch::kInt32));
+    route_counts_ = torch::empty({num_experts}, example.options().dtype(torch::kInt64));
+    route_offsets_ = torch::empty({num_experts+1}, example.options().dtype(torch::kInt64));
+    route_histogram_ = allocate(num_experts * sizeof(uint32_t));
     route_info_ = allocate(Align(sizeof(MegaMoeUrma::DeviceRouteInfo)));
     route_config_ = allocate(Align(sizeof(Config)));
     args_.order=Address(order_); args_.reduceIndex=Address(inverse_);

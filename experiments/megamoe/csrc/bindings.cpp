@@ -35,6 +35,8 @@ PYBIND11_MODULE(_C, module)
                       uint64_t, int64_t, int64_t>())
         .def(py::init<torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, uint64_t,
                       uint64_t, int64_t, int64_t, int64_t, int64_t>())
+        .def(py::init<torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, uint64_t,
+                      uint64_t, int64_t, int64_t, int64_t, int64_t, int64_t>())
         .def("routing_tensors", &deepep::megamoe::UrmaPlan::routing_tensors)
         .def("route_stats", &deepep::megamoe::UrmaPlan::route_stats)
         .def("forward", &deepep::megamoe::UrmaPlan::forward, py::arg("x"), py::arg("x_scales"), py::arg("topk_idx"), py::arg("topk_weights"), py::arg("weight1"), py::arg("weight2"),

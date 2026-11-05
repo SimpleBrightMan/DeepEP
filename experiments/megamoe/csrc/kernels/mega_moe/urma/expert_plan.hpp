@@ -57,7 +57,7 @@ inline std::vector<ComputeBatchTask> BuildComputeTasks(const std::vector<Compute
 inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, uint64_t maxReceiveRows)
 {
     if (counts == nullptr || (input.world != 4U && input.world != 8U && input.world != 16U) ||
-        input.rank >= input.world || input.localExperts != 384U / input.world || input.bs == 0 || input.bs > kMaxTokensPerRank ||
+        input.rank >= input.world || (input.localExperts == 0U || input.localExperts > kExperts / input.world) || input.bs == 0 || input.bs > kMaxTokensPerRank ||
         (input.topk < 1 || input.topk > 8) || (input.hidden < 256 || input.hidden > 8192 || input.hidden % 256) || (input.intermediate < 256 || input.intermediate > 16384 || input.intermediate % 256) || input.cvRows < 128 ||
         input.cvRows > 4096 || input.cvRows % 128 != 0 || input.maxPeerChunks == 0 ||
         input.maxPeerChunks > kMaxPeerChunks || input.gmm1AheadMGroups > 65536U || maxReceiveRows == 0) {
@@ -78,7 +78,7 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
         for (uint32_t destination = 0; destination < config.world; ++destination) {
             sendBase[source][destination] = row;
             for (uint32_t expert = 0; expert < config.localExperts; ++expert) {
-                const int64_t count = counts[source * kExperts + destination * config.localExperts + expert];
+                const int64_t count = counts[source * (config.world * config.localExperts) + destination * config.localExperts + expert];
                 if (count < 0 || static_cast<uint64_t>(count) > expandedRows) {
                     throw std::invalid_argument("Invalid URMA per-source expert count");
                 }
@@ -143,7 +143,7 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
         std::array<uint64_t, kWorld + 1U> sourceBegin{};
         for (uint32_t source = 0; source < config.world; ++source) {
             sourceBegin[source + 1U] =
-                sourceBegin[source] + counts[source * kExperts + config.rank * config.localExperts + expert];
+                sourceBegin[source] + counts[source * (config.world * config.localExperts) + config.rank * config.localExperts + expert];
         }
         const uint64_t expertRows = sourceBegin[config.world];
         const auto firstGroup = static_cast<uint32_t>(plan.fragments.size());

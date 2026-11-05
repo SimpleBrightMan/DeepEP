@@ -52,7 +52,7 @@ __aicore__ inline void RunSharedGmm(const Arguments& a,uint32_t core,T& timer) {
         }
         gmm.UpdateProblem(config,addr);gmm.Begin();active=true;
         for(uint32_t tile=first;tile<count;tile+=kAic) {
-            TraceMeta meta=FragmentTraceMeta(f,group);meta.expert=kExperts;
+            TraceMeta meta=FragmentTraceMeta(f,group);meta.expert=a.config.world*a.config.localExperts;
             meta.tileN=tile*256;meta.columns=256;
             const auto start=timer.TraceBegin();
             if constexpr(g_coreType==AIC)gmm.Compute(0,tile*256,f.rows,256);
@@ -106,7 +106,7 @@ public:
             op.UpdateNextProblem({config.m,config.outputN,config.k,0});config.tileM=128;
             const uint32_t m=slice*128,rows=f.rows-m<128?f.rows-m:128;
             const MegaMoeImpl::GmmKernel::BlockScheduler::BlockShape shape{rows,256,config.k};
-            auto meta=ComputeTileTraceMeta(FragmentTraceMeta(f,group),m,tile*256,rows,256);meta.expert=kExperts;
+            auto meta=ComputeTileTraceMeta(FragmentTraceMeta(f,group),m,tile*256,rows,256);meta.expert=a.config.world*a.config.localExperts;
             const auto start=timer_.TraceBegin();
             MegaMoeImpl::GmmKernel::Gmm1Aiv1EpilogueTileA8W4<bfloat16_t,UrmaGmmConfig::MakeLayoutC,true>(
                 op,gmC,addr,config,shape,m,tile*256);

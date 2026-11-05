@@ -131,9 +131,11 @@ __aicore__ inline void InvalidateRouteSummary(const Arguments& a) {
 }
 
 __aicore__ inline void RouteOwnedExperts(const Arguments& a,uint32_t worker) {
-    const uint32_t each=kExperts/kLocalWorkers,extra=kExperts%kLocalWorkers;
+    const uint32_t experts=a.config.world*a.config.localExperts;
+    const uint32_t each=experts/kLocalWorkers,extra=experts%kLocalWorkers;
     const uint32_t first=worker*each+(worker<extra?worker:extra);
     const uint32_t owned=each+(worker<extra?1U:0U);
+    if(owned==0U)return; // empty owners still participate in the enclosing joins
     const uint32_t total=a.config.bs*a.config.topk;
     LocalTensor<int32_t> ids(TPosition::VECCALC,ExpertRouteUb::ids,kExpertRouteBatch);
     LocalTensor<int32_t> routes(TPosition::VECCALC,ExpertRouteUb::routes,kExpertRoutesPerWorker*kExpertRouteBatch);
@@ -174,22 +176,23 @@ __aicore__ inline void RouteOwnedExperts(const Arguments& a,uint32_t worker) {
 }
 
 __aicore__ inline void RouteExpertPrefix(const Arguments& a) {
-    RouteLoad(a.routeHistogram,0U,kExperts*4U);
-    LocalTensor<uint32_t> counts(TPosition::VECCALC,0U,kExperts);
-    LocalTensor<uint64_t> exportCounts(TPosition::VECCALC,4096U,kExperts);
-    LocalTensor<uint64_t> exportOffsets(TPosition::VECCALC,8192U,kExperts+1U);
+    const uint32_t experts=a.config.world*a.config.localExperts;
+    RouteLoad(a.routeHistogram,0U,experts*4U);
+    LocalTensor<uint32_t> counts(TPosition::VECCALC,0U,experts);
+    LocalTensor<uint64_t> exportCounts(TPosition::VECCALC,4096U,experts);
+    LocalTensor<uint64_t> exportOffsets(TPosition::VECCALC,8192U,experts+1U);
     auto* r=reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
     uint32_t total=0U;
-    for(uint32_t e=0;e<kExperts;++e) {
+    for(uint32_t e=0;e<experts;++e) {
         const uint32_t n=counts.GetValue(e);
         r->outgoing[e]=total;
         exportOffsets.SetValue(e,uint64_t(total));exportCounts.SetValue(e,uint64_t(n));
         total+=n;
     }
-    r->outgoing[kExperts]=total;exportOffsets.SetValue(kExperts,uint64_t(total));
-    RouteSave(a.routeCounts,4096U,kExperts*8U);
-    RouteSave(a.routeOffsets,8192U,(kExperts+1U)*8U);
-    RouteSave(a.routeInfo,kRouteInfoUb,(kExperts+1U)*4U);
+    r->outgoing[experts]=total;exportOffsets.SetValue(experts,uint64_t(total));
+    RouteSave(a.routeCounts,4096U,experts*8U);
+    RouteSave(a.routeOffsets,8192U,(experts+1U)*8U);
+    RouteSave(a.routeInfo,kRouteInfoUb,(experts+1U)*4U);
 }
 
 __aicore__ inline void RouteExchange(const Arguments& a,uint32_t worker) {
@@ -226,7 +229,7 @@ struct RouteScheduleOutput {
 };
 
 __aicore__ inline void RouteSummary(Arguments& a) {
-    RouteLoad(a.routeInfo,kRouteInfoUb,(kExperts+1U)*4U);
+    RouteLoad(a.routeInfo,kRouteInfoUb,(a.config.world*a.config.localExperts+1U)*4U);
     RouteLoad(a.symmetric+a.config.routeInboxOffset,0U,a.config.world*kRouteMailboxBytes);
     auto* r=reinterpret_cast<__ubuf__ DeviceRouteInfo*>(static_cast<uint64_t>(kRouteInfoUb));
     LocalTensor<uint32_t> inbox(TPosition::VECCALC,0U,a.config.world*kRouteMailboxBytes/4U);

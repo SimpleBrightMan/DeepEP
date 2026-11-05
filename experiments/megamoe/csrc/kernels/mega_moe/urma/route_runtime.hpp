@@ -12,7 +12,7 @@ __aicore__ inline const volatile __gm__ DeviceRouteInfo* RouteInfo(const Argumen
 }
 __aicore__ inline uint32_t RuntimeExpertForExpandedRow(const Arguments& a,uint64_t row) {
     const auto* r=RouteInfo(a);
-    uint32_t lo=0U,hi=kExperts;
+    uint32_t lo=0U,hi=a.config.world*a.config.localExperts;
     while(lo<hi) {
         const uint32_t mid=(lo+hi)/2U;
         if(r->outgoing[mid+1U]<=row)lo=mid+1U;else hi=mid;
