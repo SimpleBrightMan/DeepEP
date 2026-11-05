@@ -2,7 +2,7 @@
 // Modified by SimpleBright_Man 2026
 #include "urma_forward.hpp"
 #include "kernels/mega_moe/urma/compute_contract.hpp"
-#include "kernels/mega_moe/urma/expert_plan.hpp"
+#include "kernels/mega_moe/urma/device_route_plan.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -30,14 +30,15 @@ Config Layout(int64_t world, int64_t max_tokens, int64_t topk, int64_t hidden, i
                 "MegaMoE URMA v1 requires EP4/EP8/EP16, H256..8192 aligned256, K in [1,8] and max_tokens in [1,16384]");
     TORCH_CHECK(cv_rows >= 128 && cv_rows <= 4096 && cv_rows % 128 == 0,
                 "URMA CV rows must be a multiple of 128 in [128,4096]");
-    TORCH_CHECK(max_recv_rows > 0 && max_recv_rows <= world * max_tokens * topk,
-                "max_recv_rows must be positive and no larger than global expanded rows");
+    TORCH_CHECK(max_recv_rows == world * max_tokens * topk,
+                "Device routing requires worst-case receive capacity world*max_tokens*topk");
     Config config{};
     config.world = static_cast<uint32_t>(world);
     config.hidden = hidden;
     config.topk = topk;
     config.cvRows = cv_rows;
     config.maxPeerChunks = (max_tokens * topk + cv_rows - 1) / cv_rows;
+    config.sourceRowCapacity = static_cast<uint64_t>(max_tokens) * topk;
     config.receiveXOffset = 0;
     config.receiveScaleOffset = Align(static_cast<uint64_t>(max_recv_rows) * hidden);
     config.returnYOffset = Align(config.receiveScaleOffset + static_cast<uint64_t>(max_recv_rows) * (hidden / 32));
@@ -46,7 +47,10 @@ Config Layout(int64_t world, int64_t max_tokens, int64_t topk, int64_t hidden, i
                                       static_cast<uint64_t>(world) * config.maxPeerChunks * MegaMoeUrma::kFlagBytes);
     config.barrierOffset = Align(config.combineReadyOffset +
                                  static_cast<uint64_t>(world) * config.maxPeerChunks * MegaMoeUrma::kFlagBytes);
-    config.symmetricBytes = Align(config.barrierOffset + 4ULL * world * MegaMoeUrma::kFlagBytes, 2ULL << 20);
+    config.routeInboxOffset = Align(config.barrierOffset + 4ULL * world * MegaMoeUrma::kFlagBytes);
+    config.routeEntryOffset = Align(config.routeInboxOffset + world * MegaMoeUrma::kRouteMailboxBytes);
+    config.routeReadyOffset = config.routeEntryOffset + world * MegaMoeUrma::kFlagBytes;
+    config.symmetricBytes = Align(config.routeReadyOffset + world * MegaMoeUrma::kFlagBytes, 2ULL << 20);
     return config;
 }
 
@@ -61,14 +65,6 @@ uint64_t Address(const torch::Tensor& tensor)
     return reinterpret_cast<uint64_t>(tensor.data_ptr());
 }
 
-template <class T>
-torch::Tensor Upload(const std::vector<T>& records, const torch::TensorOptions& options)
-{
-    auto cpu = torch::zeros({static_cast<int64_t>(std::max<size_t>(1, records.size()) * sizeof(T))},
-                            torch::TensorOptions().device(torch::kCPU).dtype(torch::kUInt8));
-    if (!records.empty()) std::memcpy(cpu.data_ptr(), records.data(), records.size() * sizeof(T));
-    return cpu.to(options.device());
-}
 }  // namespace
 
 int64_t urma_buffer_size(int64_t world, int64_t max_tokens, int64_t topk, int64_t hidden, int64_t max_recv_rows,
@@ -77,7 +73,7 @@ int64_t urma_buffer_size(int64_t world, int64_t max_tokens, int64_t topk, int64_
     return static_cast<int64_t>(Layout(world, max_tokens, topk, hidden, max_recv_rows, cv_rows).symmetricBytes);
 }
 
-UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t intermediate, int64_t topk, int64_t cv_rows,
+UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, int64_t topk, int64_t cv_rows,
                    int64_t max_recv_rows, int64_t max_tokens, int64_t rank, uint64_t ffts, uint64_t symmetric_address,
                    int64_t symmetric_bytes, int64_t gmm1_ahead_mgroups, int64_t shared_experts, int64_t shared_intermediate)
 {
@@ -86,10 +82,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
                 "URMA example must be contiguous NPU [BS,H], with 0<BS<=max_tokens");
     TORCH_CHECK(gmm1_ahead_mgroups >= 0 && gmm1_ahead_mgroups <= 65536,
                 "gmm1_ahead_mgroups must be in [0,65536]; 0 retains the original expert schedule");
-    TORCH_CHECK(counts_cpu.device().is_cpu() && counts_cpu.scalar_type() == torch::kInt64 &&
-                    counts_cpu.is_contiguous() && counts_cpu.dim() == 2 && counts_cpu.size(1) == 384,
-                "URMA counts must be contiguous CPU int64 [EP,384]");
-    const int64_t world = counts_cpu.size(0);
+    max_tokens_ = max_tokens;
     TORCH_CHECK(intermediate >= 256 && intermediate <= 16384 && intermediate % 256 == 0 && rank >= 0 && rank < world, "URMA requires I256..16384 aligned256 and rank in [0,EP)");
     args_.config = Layout(world, max_tokens, topk, example.size(1), max_recv_rows, cv_rows);
     auto& config = args_.config;
@@ -134,19 +127,19 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
                     ". Multi-host testing requires one mutually accessible UB memory domain.");
     }
 
-    const auto plan =
-        MegaMoeUrma::BuildExpertPlan(counts_cpu.data_ptr<int64_t>(), config, static_cast<uint64_t>(max_recv_rows));
-    config = plan.config;
     const auto options = example.options().dtype(torch::kUInt8);
-    const uint64_t expanded_rows = static_cast<uint64_t>(config.bs) * topk;
+    const uint64_t expanded_rows = static_cast<uint64_t>(max_tokens) * topk;
+    const uint64_t groups = MegaMoeUrma::RouteGroupCapacity(max_recv_rows, config.localExperts);
+    const uint64_t segments = MegaMoeUrma::RouteSegmentCapacity(max_recv_rows, world, cv_rows);
+    const uint64_t chunks = uint64_t(world) * config.maxPeerChunks;
     auto allocate = [&](uint64_t bytes) {
         return torch::empty({static_cast<int64_t>(std::max<uint64_t>(bytes, 512))}, options);
     };
     if(args_.sharedExperts) {
-        const uint64_t si=args_.sharedIntermediate,groups=(config.bs+255U)/256U;
-        shared_gmm1_=allocate(config.bs*si*4);shared_activation_=allocate(config.bs*si);
-        shared_scale_=allocate(config.bs*(si/32));shared_output_=allocate(uint64_t(config.bs)*config.hidden*2);
-        shared_routed_output_=allocate(uint64_t(config.bs)*config.hidden*4);
+        const uint64_t si=args_.sharedIntermediate,groups=(max_tokens+255U)/256U;
+        shared_gmm1_=allocate(max_tokens*si*4);shared_activation_=allocate(max_tokens*si);
+        shared_scale_=allocate(max_tokens*(si/32));shared_output_=allocate(uint64_t(max_tokens)*config.hidden*2);
+        shared_routed_output_=allocate(uint64_t(max_tokens)*config.hidden*4);
         args_.sharedRoutedOutput=Address(shared_routed_output_);
         shared_done1_=allocate(groups*(si/256)*MegaMoeUrma::kFlagBytes);
         shared_done_act_=allocate(groups*MegaMoeUrma::kFlagBytes);
@@ -156,32 +149,37 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     }
     expanded_x_ = allocate(expanded_rows * config.hidden);
     expanded_scale_ = allocate(expanded_rows * (config.hidden / 32));
-    gathered_input_scale_ = allocate(config.receiveRows * (config.hidden / 32));
-    gmm1_ = allocate(config.receiveRows * intermediate * 4);
-    activation_ = allocate(config.receiveRows * intermediate);
-    activation_scale_ = allocate(config.receiveRows * (intermediate / 32));
-    gmm2_ = allocate(config.receiveRows * config.hidden * 2);
-    fragments_ = Upload(plan.fragments, options);
-    segments_ = Upload(plan.segments, options);
-    compute_batches_ = Upload(plan.computeBatches, options);
-    compute_tasks_ = Upload(plan.computeTasks, options);
-    for (const auto& task : plan.computeTasks) {
-        if (task.stage == MegaMoeUrma::ComputeBatchStage::Gmm2) break;
-        gmm1_startup_mgroups_ += plan.computeBatches[task.batchIndex].fragmentCount;
-    }
-    chunk_group_indices_ = Upload(plan.chunkGroupIndices, options);
-    auto dependency_cpu = torch::empty({static_cast<int64_t>(expanded_rows)},
-                                       torch::TensorOptions().device(torch::kCPU).dtype(torch::kInt64));
-    std::memcpy(dependency_cpu.data_ptr(), plan.reduceDependencies.data(), expanded_rows * sizeof(uint64_t));
-    expanded_reduce_dependencies_ = dependency_cpu.to(options.device());
-    send_chunks_ = Upload(plan.sendChunks, options);
-    recv_chunks_ = Upload(plan.recvChunks, options);
-    pack_rounds_ = Upload(plan.packRounds, options);
-    pack_ready_ = allocate(static_cast<uint64_t>(config.world) * config.maxPeerChunks * MegaMoeUrma::kFlagBytes);
-    gmm1_done_ = allocate(config.gmm1Tiles * MegaMoeUrma::kFlagBytes);
-    input_scale_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
-    activation_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
-    gmm2_done_ = allocate(config.fragmentCount * MegaMoeUrma::kFlagBytes);
+    gathered_input_scale_ = allocate(max_recv_rows * (config.hidden / 32));
+    gmm1_ = allocate(max_recv_rows * intermediate * 4);
+    activation_ = allocate(max_recv_rows * intermediate);
+    activation_scale_ = allocate(max_recv_rows * (intermediate / 32));
+    gmm2_ = allocate(max_recv_rows * config.hidden * 2);
+    fragments_ = allocate(groups * sizeof(MegaMoeUrma::Fragment));
+    segments_ = allocate(segments * sizeof(MegaMoeUrma::RowSegment));
+    compute_batches_ = allocate(groups * sizeof(MegaMoeUrma::ComputeBatch));
+    compute_tasks_ = allocate(2 * groups * sizeof(MegaMoeUrma::ComputeBatchTask));
+    chunk_group_indices_ = allocate(segments * sizeof(uint32_t));
+    send_chunks_ = allocate(chunks * sizeof(MegaMoeUrma::Chunk));
+    recv_chunks_ = allocate(chunks * sizeof(MegaMoeUrma::Chunk));
+    pack_rounds_ = allocate(config.maxPeerChunks * sizeof(MegaMoeUrma::PackRound));
+    pack_ready_ = allocate(chunks * MegaMoeUrma::kFlagBytes);
+    gmm1_done_ = allocate(groups * (intermediate / 128U) * MegaMoeUrma::kFlagBytes);
+    input_scale_done_ = allocate(groups * MegaMoeUrma::kFlagBytes);
+    activation_done_ = allocate(groups * MegaMoeUrma::kFlagBytes);
+    gmm2_done_ = allocate(groups * MegaMoeUrma::kFlagBytes);
+    order_ = torch::empty({int64_t(expanded_rows)}, example.options().dtype(torch::kInt64));
+    inverse_ = torch::empty_like(order_);
+    reduce_dependencies_ = torch::empty_like(order_);
+    route_counts_ = torch::empty({384}, example.options().dtype(torch::kInt64));
+    route_offsets_ = torch::empty({385}, example.options().dtype(torch::kInt64));
+    route_histogram_ = allocate(MegaMoeUrma::kRouteHistogramBytes);
+    route_info_ = allocate(Align(sizeof(MegaMoeUrma::DeviceRouteInfo)));
+    route_config_ = allocate(Align(sizeof(Config)));
+    args_.order=Address(order_); args_.reduceIndex=Address(inverse_);
+    args_.reduceDependencies=Address(reduce_dependencies_);
+    args_.routeCounts=Address(route_counts_);args_.routeOffsets=Address(route_offsets_);
+    args_.routeHistogram=Address(route_histogram_);args_.routeInfo=Address(route_info_);
+    args_.routeConfig=Address(route_config_);
     local_flags_ = allocate(16 * MegaMoeUrma::kFlagBytes);
     system_workspace_ = allocate(platform_.system_workspace + (2ULL << 20));
 
@@ -209,30 +207,23 @@ UrmaPlan::UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t inte
     args_.systemWorkspace = Address(system_workspace_);
 }
 
-void UrmaPlan::bind_reduce_dependencies(torch::Tensor reduce_index)
+std::vector<torch::Tensor> UrmaPlan::routing_tensors(int64_t bs) const
 {
-    TORCH_CHECK(!reduce_dependencies_.defined(), "URMA Reduce dependencies have already been bound");
-    CheckTensor(reduce_index, 2, "reduce_index", expanded_x_.device());
-    const auto& config = args_.config;
-    TORCH_CHECK(reduce_index.scalar_type() == torch::kInt64 &&
-                    reduce_index.sizes() == torch::IntArrayRef({config.bs, config.topk}),
-                "reduce_index must be int64 [BS,topk]");
-    // One NPU gather per route preparation avoids a second per-route GM lookup
-    // in the Reduce loop. Values are opaque int64 bit patterns: the high bit
-    // distinguishes direct-self GMM2 completion from remote producer/CV flags.
-    reduce_dependencies_ =
-        expanded_reduce_dependencies_.index_select(0, reduce_index.reshape({-1})).reshape({config.bs, config.topk});
-    bound_reduce_index_ = reduce_index;
-    bound_reduce_index_version_ = reduce_index._version();
-    args_.reduceDependencies = Address(reduce_dependencies_);
-    const auto stream = c10_npu::getCurrentNPUStream();
-    for (const auto* tensor : {&expanded_reduce_dependencies_, &reduce_dependencies_, &bound_reduce_index_}) {
-        c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
-    }
+    TORCH_CHECK(bs > 0 && bs <= max_tokens_, "BS outside allocated capacity");
+    const int64_t n = bs * args_.config.topk;
+    return {order_.narrow(0,0,n), inverse_.narrow(0,0,n).reshape({bs,args_.config.topk}), route_counts_, route_offsets_};
 }
 
-torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::Tensor order,
-                                torch::Tensor reduce_index, torch::Tensor topk_weights, torch::Tensor weight1,
+std::vector<int64_t> UrmaPlan::route_stats() const
+{
+    TORCH_CHECK(last_epoch_ > 0, "Route statistics require a completed forward");
+    ASCEND_DEEPEP_CHECK_ACL(aclrtSynchronizeDevice());
+    Config c{};
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(&c,sizeof(c),route_config_.data_ptr(),sizeof(c),ACL_MEMCPY_DEVICE_TO_HOST));
+    return {int64_t(c.receiveRows),c.fragmentCount,c.routeSegmentCount,c.routeLinkCount};
+}
+
+torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::Tensor topk_idx, torch::Tensor topk_weights, torch::Tensor weight1,
                                 torch::Tensor weight2, torch::Tensor weight_scales1, torch::Tensor weight_scales2,
                                 c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> out, int64_t epoch,
                                 c10::optional<torch::Tensor> trace, bool coarse_trace,
@@ -242,16 +233,11 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     TORCH_CHECK(!coarse_trace || (trace && !timer), "coarse trace requires trace storage and no aggregate timer");
     const auto& c = args_.config;
     const auto device = expanded_x_.device();
-    TORCH_CHECK(reduce_dependencies_.defined() && bound_reduce_index_.defined(),
-                "URMA Reduce dependencies must be bound before forward");
-    TORCH_CHECK(reduce_index.defined() && reduce_index.data_ptr() == bound_reduce_index_.data_ptr() &&
-                    reduce_index._version() == bound_reduce_index_version_ &&
-                    bound_reduce_index_._version() == bound_reduce_index_version_,
-                "URMA reduce_index differs from its bound inverse or was modified; prepare a new route plan");
+    TORCH_CHECK(x.dim()==2 && x.size(0)>0 && x.size(0)<=max_tokens_, "BS outside allocated capacity");
+    args_.config.bs = x.size(0);
     CheckTensor(x, 2, "x", device);
     CheckTensor(x_scales, 3, "x_scales", device);
-    CheckTensor(order, 1, "order", device);
-    CheckTensor(reduce_index, 2, "reduce_index", device);
+    CheckTensor(topk_idx, 2, "topk_idx", device);
     CheckTensor(topk_weights, 2, "topk_weights", device);
     CheckTensor(weight1, 3, "weight1", device);
     CheckTensor(weight2, 3, "weight2", device);
@@ -262,10 +248,8 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     TORCH_CHECK(x_scales.scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
                     x_scales.sizes() == torch::IntArrayRef({c.bs, c.hidden / 64, 2}),
                 "x_scales must be FP8 E8M0 [BS,H/64,2]");
-    TORCH_CHECK(order.scalar_type() == torch::kInt64 && order.numel() == static_cast<int64_t>(c.bs) * c.topk &&
-                    reduce_index.scalar_type() == torch::kInt64 &&
-                    reduce_index.sizes() == torch::IntArrayRef({c.bs, c.topk}),
-                "Invalid route permutation shape/type");
+    TORCH_CHECK((topk_idx.scalar_type()==torch::kInt32 || topk_idx.scalar_type()==torch::kInt64) &&
+                    topk_idx.sizes()==torch::IntArrayRef({c.bs,c.topk}), "topk_idx must be int32/int64 [BS,K]");
     TORCH_CHECK(
         topk_weights.scalar_type() == torch::kFloat32 && topk_weights.sizes() == torch::IntArrayRef({c.bs, c.topk}),
         "weights must be FP32 [BS,K]");
@@ -361,8 +345,8 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     args_.config.epoch = epoch;
     args_.x = Address(x);
     args_.xScale = Address(x_scales);
-    args_.order = Address(order);
-    args_.reduceIndex = Address(reduce_index);
+    args_.topkIds = Address(topk_idx);
+    args_.topkIdBytes = topk_idx.element_size();
     args_.weights = Address(topk_weights);
     args_.weight1 = Address(weight1);
     args_.weight2 = Address(weight2);
@@ -377,8 +361,7 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     last_epoch_ = epoch;
     for (const auto* tensor : {&x,
                                &x_scales,
-                               &order,
-                               &reduce_index,
+                               &topk_idx,
                                &topk_weights,
                                &weight1,
                                &weight2,
@@ -397,9 +380,9 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
                                &compute_batches_,
                                &compute_tasks_,
                                &chunk_group_indices_,
-                               &expanded_reduce_dependencies_,
+                               &order_, &inverse_, &route_counts_, &route_offsets_,
+                               &route_histogram_, &route_info_, &route_config_,
                                &reduce_dependencies_,
-                               &bound_reduce_index_,
                                &send_chunks_,
                                &recv_chunks_,
                                &pack_rounds_,
@@ -440,26 +423,29 @@ std::map<std::string, torch::Tensor> UrmaPlan::debug_snapshot() const
         }
         result.emplace(name, std::move(cpu));
     };
-    const auto& c = args_.config;
+    Config c{};
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(&c,sizeof(c),route_config_.data_ptr(),sizeof(c),ACL_MEMCPY_DEVICE_TO_HOST));
     const uint64_t expanded = static_cast<uint64_t>(c.bs) * c.topk;
     copy("expanded_x", Address(expanded_x_), expanded * c.hidden);
     copy("expanded_scale", Address(expanded_scale_), expanded * (c.hidden / 32));
-    copy("received_x", args_.symmetric + c.receiveXOffset, c.receiveRows * c.hidden);
-    copy("received_scale", args_.symmetric + c.receiveScaleOffset, c.receiveRows * (c.hidden / 32));
+    copy("received_x", args_.symmetric + c.receiveXOffset, c.world * c.sourceRowCapacity * c.hidden);
+    copy("received_scale", args_.symmetric + c.receiveScaleOffset, c.world * c.sourceRowCapacity * (c.hidden / 32));
     copy("gathered_input_scale", Address(gathered_input_scale_), c.receiveRows * (c.hidden / 32));
     copy("gmm1", Address(gmm1_), c.receiveRows * c.intermediate * 4);
     copy("activation", Address(activation_), c.receiveRows * c.intermediate);
     copy("activation_scale", Address(activation_scale_), c.receiveRows * (c.intermediate / 32));
-    copy("gmm2_remote", Address(gmm2_), c.receiveRows * c.hidden * 2);
+    copy("gmm2_remote", Address(gmm2_), c.world * c.sourceRowCapacity * c.hidden * 2);
     copy("returned", args_.symmetric + c.returnYOffset, expanded * c.hidden * 2);
-    for (auto item :
-         {std::make_pair("fragments", &fragments_), std::make_pair("segments", &segments_),
-          std::make_pair("compute_tasks", &compute_tasks_), std::make_pair("send_chunks", &send_chunks_),
-          std::make_pair("recv_chunks", &recv_chunks_), std::make_pair("gmm1_done", &gmm1_done_),
-          std::make_pair("input_scale_done", &input_scale_done_), std::make_pair("activation_done", &activation_done_),
-          std::make_pair("gmm2_done", &gmm2_done_), std::make_pair("local_flags", &local_flags_)}) {
-        copy(item.first, Address(*item.second), item.second->nbytes());
-    }
+    copy("fragments",args_.fragments,c.fragmentCount*sizeof(MegaMoeUrma::Fragment));
+    copy("segments",args_.segments,c.routeSegmentCount*sizeof(MegaMoeUrma::RowSegment));
+    copy("compute_tasks",args_.computeTasks,c.computeTaskCount*sizeof(MegaMoeUrma::ComputeBatchTask));
+    copy("send_chunks",args_.sendChunks,c.sendChunkCount*sizeof(MegaMoeUrma::Chunk));
+    copy("recv_chunks",args_.recvChunks,c.recvChunkCount*sizeof(MegaMoeUrma::Chunk));
+    copy("gmm1_done",args_.gmm1Done,c.gmm1Tiles*MegaMoeUrma::kFlagBytes);
+    copy("gmm2_done",args_.gmm2Done,c.fragmentCount*MegaMoeUrma::kFlagBytes);
+    copy("input_scale_done",args_.inputScaleDone,c.fragmentCount*MegaMoeUrma::kFlagBytes);
+    copy("activation_done",args_.activationDone,c.fragmentCount*MegaMoeUrma::kFlagBytes);
+    copy("local_flags",args_.localFlags,local_flags_.nbytes());
     if(args_.sharedExperts) {
         copy("shared_gmm1",args_.sharedGmm1,shared_gmm1_.nbytes());
         copy("shared_activation",args_.sharedActivation,shared_activation_.nbytes());
@@ -484,7 +470,8 @@ int64_t UrmaPlan::workspace_bytes() const
                                &compute_batches_,
                                &compute_tasks_,
                                &chunk_group_indices_,
-                               &expanded_reduce_dependencies_,
+                               &order_, &inverse_, &route_counts_, &route_offsets_,
+                               &route_histogram_, &route_info_, &route_config_,
                                &reduce_dependencies_,
                                &send_chunks_,
                                &recv_chunks_,

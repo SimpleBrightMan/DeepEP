@@ -30,6 +30,8 @@ constexpr uint32_t kLocalFlagSharedGmm1Done = 4U; // small-BS S1: completed AICs
 // local GMM2 group that writes its self return rows directly.
 constexpr uint64_t kReduceSelfDependency = uint64_t{1} << 63U;
 constexpr uint32_t kProtocol = 1;
+constexpr uint32_t kDeviceRoutingProtocol = 2;
+#define MEGAMOE_URMA_ROUTE_REORDER 0
 constexpr uint32_t kTimerCores = kAic * 3U;
 constexpr uint32_t kTimerPhases = 8U;
 constexpr uint32_t kTimerRecordElements = 16U;
@@ -84,7 +86,7 @@ enum class TraceEvent : uint32_t {
     CoarseDispatch, CoarseCombine, CoarseActivation, CoarseReduce, CoarseLocalSyncEnd,
     CoarseDispatchSubmit, // Submission-only envelope; legacy CoarseDispatch retains its meaning.
     PackRetire, // Pending Pack notification/event release.
-    SharedGmm1Tile, SharedGmm1Drain, SharedActivation, SharedGmm2Tile, SharedGmm2Drain, SharedAdd, CoarseSharedCombineSubmit
+    SharedGmm1Tile, SharedGmm1Drain, SharedActivation, SharedGmm2Tile, SharedGmm2Drain, SharedAdd, CoarseSharedCombineSubmit, RoutePrepare
 };
 
 struct TraceMeta {
@@ -195,6 +197,9 @@ struct Config {
     uint64_t selfSendRow;
     uint64_t selfRecvRow;
     uint64_t selfRows;
+    uint64_t sourceRowCapacity; // fixed pitch; no receiver offset reply
+    uint64_t routeInboxOffset, routeEntryOffset, routeReadyOffset;
+    uint32_t routeSegmentCount, routeLinkCount;
 };
 
 // This POD is copied as kernel launch arguments; every address is device GM.
@@ -244,6 +249,8 @@ struct Arguments {
     uint64_t sharedWeight1, sharedWeight2, sharedScale1, sharedScale2;
     uint64_t sharedGmm1, sharedActivation, sharedActivationScale, sharedOutput;
     uint64_t sharedGmm1Done, sharedActivationDone;
+    uint64_t topkIds, routeHistogram, routeInfo, routeConfig, routeCounts, routeOffsets;
+    uint32_t topkIdBytes;
     uint64_t sharedRoutedOutput; // S1 FP32 routed sum; round only after adding shared result.
 };
 static_assert(sizeof(Fragment) == 40);

@@ -14,11 +14,12 @@ int64_t urma_buffer_size(int64_t world, int64_t max_tokens, int64_t topk, int64_
 
 class UrmaPlan {
 public:
-    UrmaPlan(torch::Tensor example, torch::Tensor counts_cpu, int64_t intermediate, int64_t topk, int64_t cv_rows,
+    UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, int64_t topk, int64_t cv_rows,
              int64_t max_recv_rows, int64_t max_tokens, int64_t rank, uint64_t ffts, uint64_t symmetric_address,
              int64_t symmetric_bytes, int64_t gmm1_ahead_mgroups, int64_t shared_experts=0, int64_t shared_intermediate=0);
-    void bind_reduce_dependencies(torch::Tensor reduce_index);
-    torch::Tensor forward(torch::Tensor x, torch::Tensor x_scales, torch::Tensor order, torch::Tensor reduce_index,
+    std::vector<torch::Tensor> routing_tensors(int64_t bs) const;
+    std::vector<int64_t> route_stats() const; // explicit post-forward diagnostic D2H only
+    torch::Tensor forward(torch::Tensor x, torch::Tensor x_scales, torch::Tensor topk_idx,
                           torch::Tensor topk_weights, torch::Tensor weight1, torch::Tensor weight2,
                           torch::Tensor weight_scales1, torch::Tensor weight_scales2,
                           c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> out, int64_t epoch,
@@ -28,10 +29,6 @@ public:
     int64_t workspace_bytes() const;
     // Explicit diagnostic only: synchronize before copying owned intermediates.
     std::map<std::string, torch::Tensor> debug_snapshot() const;
-    int64_t gmm1_startup_mgroups() const
-    {
-        return gmm1_startup_mgroups_;
-    }
 
 private:
     PlatformInfo platform_{};
@@ -41,11 +38,11 @@ private:
     torch::Tensor fragments_, send_chunks_, recv_chunks_, gmm1_done_, activation_done_, gmm2_done_, local_flags_;
     torch::Tensor segments_, compute_batches_, compute_tasks_, chunk_group_indices_;
     torch::Tensor pack_rounds_, pack_ready_;
-    torch::Tensor expanded_reduce_dependencies_, reduce_dependencies_, bound_reduce_index_;
+    torch::Tensor reduce_dependencies_, order_, inverse_, route_counts_, route_offsets_;
+    torch::Tensor route_histogram_, route_info_, route_config_;
     torch::Tensor system_workspace_;
     torch::Tensor shared_gmm1_,shared_activation_,shared_scale_,shared_output_,shared_routed_output_,shared_done1_,shared_done_act_;
-    int64_t bound_reduce_index_version_ = -1;
     int64_t last_epoch_ = 0;
-    int64_t gmm1_startup_mgroups_ = 0;
+    int64_t max_tokens_ = 0;
 };
 }  // namespace deepep::megamoe

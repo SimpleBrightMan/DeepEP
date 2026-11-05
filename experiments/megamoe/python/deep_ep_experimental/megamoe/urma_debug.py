@@ -217,7 +217,7 @@ def _check_activation(arrays, *, fused_gate_up=False):
     )
 
 
-def save_snapshot(raw, directory, *, bs, hidden, intermediate, topk, received_rows, rank, fused_gate_up=False):
+def save_snapshot(raw, directory, *, bs, hidden, intermediate, topk, received_rows, rank, fused_gate_up=False, receive_capacity_rows=None):
     """Save JSON statistics and small numeric samples; return the JSON report.
 
     Reduce is reconstructed in blocks of at most 64 tokens, one TopK term at
@@ -260,16 +260,17 @@ def save_snapshot(raw, directory, *, bs, hidden, intermediate, topk, received_ro
             byte_arrays[key] = _bytes(value)
         except (TypeError, ValueError, RuntimeError) as error:
             report["errors"].append(f"{key}: {error}")
+    receive_capacity_rows = received_rows if receive_capacity_rows is None else receive_capacity_rows
     shapes = {
         "x": ("fp8_e4m3", (bs, hidden)),
         "x_scale": ("e8m0", (bs, hidden // 32)),
-        "received_x": ("fp8_e4m3", (received_rows, hidden)),
-        "received_scale": ("e8m0", (received_rows, hidden // 32)),
+        "received_x": ("fp8_e4m3", (receive_capacity_rows, hidden)),
+        "received_scale": ("e8m0", (receive_capacity_rows, hidden // 32)),
         "gathered_input_scale": ("e8m0", (received_rows, hidden // 32)),
         "gmm1": ("bf16", (received_rows, intermediate * 2)),
         "activation": ("fp8_e4m3", (received_rows, intermediate)),
         "activation_scale": ("e8m0", (received_rows, intermediate // 32)),
-        "gmm2_remote": ("bf16", (received_rows, hidden)),
+        "gmm2_remote": ("bf16", (receive_capacity_rows, hidden)),
         "returned": ("bf16", (bs * topk, hidden)),
         "output": ("bf16", (bs, hidden)),
         "weights": ("fp32", (bs, topk)),
@@ -403,7 +404,8 @@ def save_snapshot(raw, directory, *, bs, hidden, intermediate, topk, received_ro
 
 def _check_segments(report, samples, arrays, fragments, segments, bs, topk, received_rows, rank):
     expert_coverage = np.zeros(received_rows, dtype=np.uint16)
-    receive_coverage = np.zeros(received_rows, dtype=np.uint16)
+    receive_capacity = arrays["received_x"].shape[0] if "received_x" in arrays else max((int(s["receive_row"])+int(s["rows"]) for s in segments),default=0)
+    receive_coverage = np.zeros(receive_capacity, dtype=np.uint16)
     self_rows = scale_mismatch = self_x_mismatch = self_scale_mismatch = 0
     remote_parts, gathered_x_parts = [], []
     for fragment in fragments:
@@ -422,7 +424,7 @@ def _check_segments(report, samples, arrays, fragments, segments, bs, topk, rece
                     segment["rows"],
                 ),
             )
-            if tile + rows > group_rows or receive + rows > received_rows or returned + rows > bs * topk:
+            if tile + rows > group_rows or receive + rows > receive_capacity or returned + rows > bs * topk:
                 raise ValueError("segment exceeds compute/receive/return row allocation")
             target = row_begin + tile
             expert_coverage[target : target + rows] += 1
@@ -458,7 +460,7 @@ def _check_segments(report, samples, arrays, fragments, segments, bs, topk, rece
         fragment_count=len(fragments),
         segment_count=len(segments),
         expert_rows_covered_once=bool(np.all(expert_coverage == 1)),
-        receive_rows_covered_once=bool(np.all(receive_coverage == 1)),
+        receive_rows_covered_once=bool(np.count_nonzero(receive_coverage) == received_rows and np.all(receive_coverage <= 1)),
         self_rows=self_rows,
         self_pack_x_mismatched_bytes=self_x_mismatch
         if all(k in arrays for k in ("order", "x", "received_x"))

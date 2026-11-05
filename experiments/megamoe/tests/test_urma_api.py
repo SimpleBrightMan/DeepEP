@@ -136,39 +136,20 @@ def test_native_failure_restores_caller_and_poison_prevents_retry_or_teardown(mo
     owner._runtime.closed = True  # Model launcher process termination, not a collective cleanup.
 
 
-def test_dependency_gather_stays_ordered_when_forward_switches_caller_stream(monkeypatch):
+def test_route_binding_never_reads_tensor_values_or_exchanges_counts(monkeypatch):
     events = []
-    caller_a, caller_b, execution = (Stream(name, events) for name in ("a", "b", "owner"))
-    npu = Npu(caller_a, events)
-    monkeypatch.setattr(urma, "npu_api", lambda: npu)
-    owner, _ = owner_for(execution)
-    inverse = object()
-
-    def bind(value):
-        assert value is inverse and npu.current is execution
-        events.append(("gather", npu.current.name))
-
-    def forward(*_):
-        assert npu.current is execution
-        events.append(("forward", npu.current.name))
-        return SimpleNamespace(record_stream=lambda stream: events.append(("record", stream.name)))
-
-    plan = SimpleNamespace(bind_reduce_dependencies=bind, forward=forward)
-    owner._bind_reduce_dependencies(plan, inverse)
-    npu.current = caller_b
-    owner._enqueue_forward(SimpleNamespace(native=plan), ())
-    assert events == [
-        ("wait", "owner", "a"),
-        ("enter", "owner"),
-        ("gather", "owner"),
-        ("restore", "a"),
-        ("wait", "owner", "b"),
-        ("enter", "owner"),
-        ("forward", "owner"),
-        ("restore", "b"),
-        ("wait", "b", "owner"),
-        ("record", "b"),
-    ]
+    owner, aborts = owner_for(Stream("owner", events))
+    owner._device = "npu:0"
+    owner.num_topk, owner.num_max_tokens_per_rank = 6, 16384
+    routes = DeviceRoutes(*(object() for _ in range(4)))
+    owner._plan = SimpleNamespace(routing_tensors=lambda bs: tuple(vars(routes).values()))
+    monkeypatch.setitem(sys.modules,"torch",SimpleNamespace(int32="i32",int64="i64"))
+    # Deliberately has no min/max/cpu/item/tolist or torch arithmetic methods.
+    ids = Tensor((8192,6),"i64")
+    prepared = owner.prepare_routes(ids)
+    assert prepared.topk_idx is ids and prepared.bs == 8192
+    assert prepared.native is owner._plan
+    assert not events and not aborts
     owner.destroy()
 
 
@@ -231,14 +212,14 @@ def prepared_call_setup(monkeypatch):
     epochs = []
 
     def forward(*operands):
-        assert len(operands) == 12  # The existing untraced native signature stays compatible.
+        assert len(operands) == 11  # Raw topk input replaces two precomputed route tensors.
         assert operands[1].shape == (2048, 56, 2)
         epochs.append(operands[-1])
         return Tensor((2048, 3584), "bf16")
 
     def plan():
         routes = DeviceRoutes(*(Tensor((), "int64") for _ in range(4)))
-        return urma.PreparedUrmaRoutes(owner, SimpleNamespace(forward=forward), routes, 2048, 16384, (0, 0, 0, 0))
+        return urma.PreparedUrmaRoutes(owner, SimpleNamespace(forward=forward), routes, 2048, Tensor((2048,8),"int64"))
 
     return owner, aborts, x, topk_weights, w1, w2, epochs, plan
 
@@ -270,7 +251,7 @@ def test_gate_up_layout_uses_actual_expected_expert_rows(monkeypatch, world, bs,
     selected = []
 
     def forward(*operands):
-        selected.append((operands[5], operands[7]))
+        selected.append((operands[4], operands[6]))
         return Tensor((bs, 3584), "bf16")
 
     prepared.native.forward = forward
@@ -282,14 +263,13 @@ def test_gate_up_layout_uses_actual_expected_expert_rows(monkeypatch, world, bs,
     owner.destroy()
 
 
-def test_modified_prepared_routes_abort_before_epoch_or_native_submission(monkeypatch):
+def test_changed_topk_input_is_passed_to_every_kernel_without_host_inspection(monkeypatch):
     owner, aborts, x, probs, w1, w2, epochs, make_plan = prepared_call_setup(monkeypatch)
     prepared = make_plan()
-    prepared.routing.reduce_index._version += 1
-    with pytest.raises(ValueError, match="modified in-place"):
-        owner.forward_prepared(x, probs, w1, w2, prepared)
-    assert epochs == [] and owner._epoch == 0 and len(aborts) == 1
-    owner._runtime.closed = True
+    prepared.topk_idx._version += 1
+    owner.forward_prepared(x, probs, w1, w2, prepared)
+    assert epochs == [1] and not aborts
+    owner.destroy()
 
 
 @pytest.mark.parametrize("topk", [1, 6, 8])
@@ -336,7 +316,7 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
 def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, tail):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object(), megamoe_urma_communication_protocol=urma.COMMUNICATION_PROTOCOL))
     extension = SimpleNamespace(
-        urma_api_protocol=1, urma_tail_schedule=tail, urma_compute_schedule="wave12-ep4-all-bs-samestage-deferred-v6",
+        urma_api_protocol=1, urma_routing_protocol=2, urma_tail_schedule=tail, urma_compute_schedule="wave12-ep4-all-bs-samestage-deferred-v6",
         urma_shared_contract="shared1-unitflag-fp32-sum-v2", urma_dimension_contract="h8192-i16384-aligned256-k1to8-v2-bs16384", urma_communication_protocol=urma.COMMUNICATION_PROTOCOL
     )
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
@@ -355,7 +335,7 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
 def test_native_mgroup_schedule_must_match_before_runtime_creation(monkeypatch, schedule):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object(), megamoe_urma_communication_protocol=urma.COMMUNICATION_PROTOCOL))
     extension = SimpleNamespace(
-        urma_api_protocol=1, urma_tail_schedule="combine-ready-scan-reduce-world-v1", urma_compute_schedule=schedule
+        urma_api_protocol=1, urma_routing_protocol=2, urma_tail_schedule="combine-ready-scan-reduce-world-v1", urma_compute_schedule=schedule
     )
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
     urma._extension.cache_clear()
@@ -378,7 +358,7 @@ def test_commfirst_protocol_rejects_old_native_modules(monkeypatch, old_module):
     protocol = urma.COMMUNICATION_PROTOCOL
     core = SimpleNamespace(create_megamoe_urma_runtime=object(), megamoe_urma_communication_protocol=protocol)
     extension = SimpleNamespace(
-        urma_api_protocol=1,
+        urma_api_protocol=1, urma_routing_protocol=2,
         urma_tail_schedule="combine-ready-scan-reduce-world-v1",
         urma_compute_schedule="wave12-ep4-all-bs-samestage-deferred-v6",
         urma_shared_contract="shared1-unitflag-fp32-sum-v2", urma_dimension_contract="h8192-i16384-aligned256-k1to8-v2-bs16384", urma_communication_protocol=protocol,
@@ -478,8 +458,8 @@ def test_trace_forward_appends_optional_argument_without_moving_timer_out_or_epo
         result = owner.forward(x, object(), probs, w1, w2, timer=timer, out=output, trace=trace)
     else:
         result = owner.forward_prepared(x, probs, w1, w2, prepared, timer=timer, out=output, trace=trace)
-    assert result is output and len(calls) == 1 and len(calls[0]) == 13
-    assert calls[0][9:] == (timer, output, 1, trace)
+    assert result is output and len(calls) == 1 and len(calls[0]) == 12
+    assert calls[0][8:] == (timer, output, 1, trace)
     assert owner._epoch == 1 and not aborts
     owner.destroy()
 

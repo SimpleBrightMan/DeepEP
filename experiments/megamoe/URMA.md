@@ -1,5 +1,7 @@
 # MegaMoE URMA 固定 CV 实验
 
+当前 shared 分支使用[内核内 Device 路由](URMA_DEVICE_ROUTING.md)：首波 Pack 前构建路由，Host 不读取 topk 值、不计算通信表。下文旧实验记录保留其历史语境。
+
 ## 2026-10-23 上游与 SHMEM 同步
 
 `megamoe-urma-combineAdvance-v2` 已合入 `lueelu/DeepEP` 的 main `35fa7d91b321340c153b098bf166202645976a75`：更新独立 `ep_gmm_fused` 的 staging/缓冲深度/self-copy 调度，增加 EP4 配置与测试，并整理文档。此同步没有引入 `megamoe-urma-gmm2-m128n512` 的 tile 实验；advance2 的 MegaMoE 计算和提前 Combine 调度保持原设置。
