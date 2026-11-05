@@ -223,6 +223,12 @@ std::vector<int64_t> UrmaPlan::route_stats() const
     return {int64_t(c.receiveRows),c.fragmentCount,c.routeSegmentCount,c.routeLinkCount};
 }
 
+torch::Tensor UrmaPlan::route_dependency_tensor(int64_t bs) const
+{
+    TORCH_CHECK(bs > 0 && bs <= max_tokens_, "BS outside allocated capacity");
+    return reduce_dependencies_.narrow(0, 0, bs * args_.config.topk).reshape({bs, args_.config.topk});
+}
+
 torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::Tensor topk_idx, torch::Tensor topk_weights, torch::Tensor weight1,
                                 torch::Tensor weight2, torch::Tensor weight_scales1, torch::Tensor weight_scales2,
                                 c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> out, int64_t epoch,

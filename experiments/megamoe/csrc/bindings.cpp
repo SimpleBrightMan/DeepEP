@@ -16,6 +16,7 @@ PYBIND11_MODULE(_C, module)
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.def("buffer_size", &deepep::megamoe::buffer_size);
     module.attr("urma_routing_protocol") = MegaMoeUrma::kDeviceRoutingProtocol;
+    module.attr("urma_route_only") = true;
     module.attr("urma_shared_contract") = "shared1-unitflag-fp32-sum-v2";
     module.attr("urma_api_protocol") = MegaMoeUrma::kProtocol;
     module.attr("urma_dimension_contract") = "h8192-i16384-aligned256-k1to8-v2-bs16384";
@@ -37,6 +38,7 @@ PYBIND11_MODULE(_C, module)
         .def(py::init<torch::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, uint64_t,
                       uint64_t, int64_t, int64_t, int64_t, int64_t>())
         .def("routing_tensors", &deepep::megamoe::UrmaPlan::routing_tensors)
+        .def("route_dependency_tensor", &deepep::megamoe::UrmaPlan::route_dependency_tensor)
         .def("route_stats", &deepep::megamoe::UrmaPlan::route_stats)
         .def("forward", &deepep::megamoe::UrmaPlan::forward, py::arg("x"), py::arg("x_scales"), py::arg("topk_idx"), py::arg("topk_weights"), py::arg("weight1"), py::arg("weight2"),
              py::arg("weight_scales1"), py::arg("weight_scales2"), py::arg("timer"), py::arg("out"), py::arg("epoch"),
