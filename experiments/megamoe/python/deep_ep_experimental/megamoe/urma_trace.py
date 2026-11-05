@@ -69,7 +69,7 @@ class TraceOverflowError(ValueError):
 
 def event_style(event):
     if event == "RouteSummary":
-        return event,"routing.device","rail_animation","Activation helper0 builds incoming route summary while Pack/Dispatch progress"
+        return event,"routing.device","rail_animation","AIV0 source/expert phases and leader prefix; includes phase waits while AIV1 Pack/Dispatch progress"
     if event == "WaitRouteSummary":
         return event,"wait.sync","thread_state_iowait","Wait/acquire published incoming route summary"
     if event == "RoutePrepare":

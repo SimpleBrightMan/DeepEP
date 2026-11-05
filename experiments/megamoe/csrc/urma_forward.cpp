@@ -93,7 +93,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, i
     config.bs = example.size(0);
     config.intermediate = intermediate;
     TORCH_CHECK(num_experts >= world && num_experts <= MegaMoeUrma::kExperts && num_experts % world == 0 && topk <= num_experts,
-                "URMA experts must divide EP, with EP<=E<=384 and TopK<=E");
+                "URMA experts must divide EP, with EP<=E<=512 and TopK<=E");
     config.localExperts = num_experts / config.world;
     config.rank = rank;
     config.gmm1AheadMGroups = static_cast<uint32_t>(gmm1_ahead_mgroups);

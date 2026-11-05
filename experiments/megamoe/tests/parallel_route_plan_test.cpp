@@ -33,29 +33,29 @@ struct Output {
     void ReorderSpan(uint32_t i,uint64_t src,uint64_t dst,uint32_t g,uint32_t rows){set(spans,i,std::make_tuple(src,dst,g,rows));}
     void ReorderRange(uint32_t i,uint32_t begin,uint32_t count){set(ranges,i,std::make_pair(begin,count));}
 };
-static void check(uint32_t ep,uint32_t bs,uint32_t k,uint32_t cv,uint32_t distribution, bool shared) {
+static void check(uint32_t ep,uint32_t experts,uint32_t bs,uint32_t k,uint32_t cv,uint32_t distribution, bool shared) {
     std::mt19937 rng(91+distribution+bs);
-    std::vector<int64_t> counts(ep*kExperts,0);
+    std::vector<int64_t> counts(ep*experts,0);
     for(uint32_t s=0;s<ep;++s)for(uint32_t i=0;i<bs*k;++i) {
-        const uint32_t expert=distribution==0?(i+s*19)%384:distribution==1?rng()%384:
-            distribution==2?0:distribution==3?(s%2?383:1):rng()%7;
-        ++counts[s*kExperts+expert];
+        const uint32_t expert=distribution==0?(i+s*19)%experts:distribution==1?rng()%experts:
+            distribution==2?0:distribution==3?(s%2?experts-1U:1U):rng()%7;
+        ++counts[s*experts+expert];
     }
     for(uint32_t rank=0;rank<ep;++rank) {
         Config c{};c.bs=bs;c.world=ep;c.rank=rank;c.topk=k;c.hidden=5120;c.intermediate=2304;
-        c.localExperts=384/ep;c.cvRows=cv;
+        c.localExperts=experts/ep;c.cvRows=cv;
         // Deliberately allocate beyond this invocation's BS; sparse layout must
         // use capacity, never actual counts. Include changed-BS reuse semantics.
         c.sourceRowCapacity=uint64_t(RouteMin(bs+17,kMaxTokensPerRank))*k;c.maxPeerChunks=(c.sourceRowCapacity+cv-1)/cv;
         c.gmm1AheadMGroups=12;
         auto expected=BuildExpertPlan(counts.data(),c,uint64_t(ep)*c.sourceRowCapacity);
         DeviceRouteInfo info{};
-        for(uint32_t e=0;e<384;++e)info.outgoing[e+1]=info.outgoing[e]+counts[rank*384+e];
+        for(uint32_t e=0;e<experts;++e)info.outgoing[e+1]=info.outgoing[e]+counts[rank*experts+e];
         uint64_t compactPeer[kWorld+1]{};
         for(uint32_t s=0;s<ep;++s) {
-            for(uint32_t e=0;e<rank*c.localExperts;++e)info.returnBase[s]+=counts[s*384+e];
+            for(uint32_t e=0;e<rank*c.localExperts;++e)info.returnBase[s]+=counts[s*experts+e];
             for(uint32_t e=0;e<c.localExperts;++e)
-                info.incoming[s][e+1]=info.incoming[s][e]+counts[s*384+rank*c.localExperts+e];
+                info.incoming[s][e+1]=info.incoming[s][e]+counts[s*experts+rank*c.localExperts+e];
             compactPeer[s+1]=compactPeer[s]+info.incoming[s][c.localExperts];
         }
         const bool wave=ep==4&&(!MEGAMOE_URMA_ROUTE_REORDER||shared);
@@ -190,10 +190,10 @@ static void check(uint32_t ep,uint32_t bs,uint32_t k,uint32_t cv,uint32_t distri
 }
 int main() {
     unsigned cases=0;
-    for(auto ep:{4U,8U,16U})for(auto bs:{1U,1024U,1536U,8192U,16384U})
+    for(auto ep:{4U,8U,16U})for(auto experts:{64U,128U,384U,512U})for(auto bs:{1U,1024U,1536U,8192U,16384U})
       for(auto k:{1U,6U,8U})for(auto cv:{128U,256U,384U,1024U})for(uint32_t distribution=0;distribution<5;++distribution)for(bool shared:{false,true}) {
         // The old oracle bounds capacities to the native absolute max.
-        check(ep,bs,k,cv,distribution,shared);++cases;
+        check(ep,experts,bs,k,cv,distribution,shared);++cases;
       }
     std::cout<<"parallel route S0/S1 descriptor/oracle cases passed="<<cases<<"\n";
 }

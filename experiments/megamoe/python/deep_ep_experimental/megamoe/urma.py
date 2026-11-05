@@ -45,7 +45,7 @@ def _extension():
         raise RuntimeError("Rebuild the generalized-dimension MegaMoE extension")
     if getattr(extension,"urma_shared_contract",None)!="unitflag-shared-peer-reorder-v1":
         raise RuntimeError("Rebuild the shared-expert MegaMoE extension")
-    if getattr(extension,"urma_routing_protocol",None)!=7:
+    if getattr(extension,"urma_routing_protocol",None)!=8:
         raise RuntimeError("Device routing requires matching Python/native wheel; rebuild and reinstall")
     return extension
 
@@ -130,7 +130,7 @@ class UrmaBuffer:
                 raise TypeError("allow_multi_host must be bool")
             integer("hidden", hidden, 256, 8192)
             integer("intermediate_hidden", intermediate_hidden, 256, 16384)
-            integer("num_experts", num_experts, group.size(), 384)
+            integer("num_experts", num_experts, group.size(), 512)
             if num_experts % group.size():
                 raise ValueError("num_experts must be divisible by EP")
             integer("num_topk", num_topk, 1, min(8, num_experts))

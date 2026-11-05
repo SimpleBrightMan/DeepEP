@@ -25,7 +25,7 @@ def parse_args(argv=None):
     parser.add_argument("--shared-intermediate", type=int)
     parser.add_argument("--topk", type=int, choices=range(1,9), help="URMA routed experts per token (1..8)")
     parser.add_argument("--hidden", type=int)
-    parser.add_argument("--experts", type=int, help="Total routed experts: EP<=E<=384, divisible by EP")
+    parser.add_argument("--experts", type=int, help="Total routed experts: EP<=E<=512, divisible by EP")
     parser.add_argument("--intermediate", type=int)
     parser.add_argument("--cv-rows", type=int, default=256)
     parser.add_argument(

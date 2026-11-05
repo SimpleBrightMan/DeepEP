@@ -1,4 +1,16 @@
-# Unitflag shared：专家分工路由与异步摘要（protocol6）
+# 512专家与AIV0并行RouteSummary（protocol8）
+
+当前支持EP<=E<=512、E整除EP、TopK<=min(8,E)。默认仍384。
+RouteSummary由AIV0执行三个阶段：来源rank各自读取、28核分专家汇总、block0小前缀收尾。
+来源与专家阶段分别用本卡计数槽7/8汇合，不新增SyncAll或全卡屏障。
+S0在首两轮Pack join后开始；S1在反量化前开始。AIV1继续原静态Pack并轮询本卡ready。
+RouteSummary(63)现在包含各AIV0本身的阶段工作和阶段内等待，不能视为纯单核构建时间；
+最终摘要ready获取仍在WaitRouteSummary(64)。旧版本说明保留在下方用于了解历史。
+编译/精度状态见本轮验证报告。
+
+---
+
+# Unitflag shared：专家分工路由与异步摘要（protocol8）
 
 把 `megamoe-commfirst-shared@3a7ab63` 的头部方案移入本分支。
 仅做源码移植和静态审阅，按用户要求未编译、未运行CPU/NPU测试；
@@ -51,6 +63,6 @@ destination = self ? returnBase[peer] + peer_row : peer * sourcePitch + peer_row
 
 RoutePrepare/RouteSummary/WaitRouteSummary的事件编号为62/63/64。
 前者现在仅表示本地准备与路由下发，接收摘要构建/等待另列；不能仅凭前者缩短认定整核收益。
-必须重编完整wheel（routing protocol6）；原benchmark命令不变。
+必须重编完整wheel（routing protocol8）；原benchmark命令不变。
 显式执行后debug_snapshot从inverse重建compact order用于诊断，生产调用无Host路由或D2H。
 route_stats的segment/link项返回-1表示未物化；DeviceRoutes.order为None。

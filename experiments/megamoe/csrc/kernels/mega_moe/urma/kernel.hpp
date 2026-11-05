@@ -615,6 +615,7 @@ __aicore__ inline void ProcessRouted(Arguments& args)
         RunProfiledCompute(args, block, timer);
         MarkCubeComplete(args);
     } else if (GetSubBlockIdx() == 0U) {
+        RunAiv0RouteSummary(args,block,timer);
         WaitRouteSummary(args,timer);
         RunProfiledCompute(args, block, timer);
     } else if (block < communicationWorkers) {
@@ -672,6 +673,7 @@ __aicore__ inline void ProcessShared(Arguments& a) {
         else RunSharedComputeSequence(a,block,timer);
         timer.CoarseEnd(CoarsePhase::Gmm);
     } else if(GetSubBlockIdx()==0) {
+        RunAiv0RouteSummary(a,block,timer);
         WaitRouteSummary(a,timer);
         timer.CoarseBegin(CoarsePhase::Dequant);
         if(a.coarseTrace || (!a.trace&&!a.timer)){NoopTimer t;RunSharedComputeSequence(a,block,t);}

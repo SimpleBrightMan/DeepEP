@@ -14,7 +14,7 @@ constexpr uint32_t kRouteInfoUb=96U*1024U;
 struct ExpertRouteUb {
     static constexpr uint32_t ids=0U,raw=16U*1024U,counts=48U*1024U;
     static constexpr uint32_t mask=50U*1024U,totals=52U*1024U,routes=64U*1024U;
-    static constexpr uint32_t end=routes+kExpertRoutesPerWorker*kExpertRouteBatch*4U;
+    static constexpr uint32_t end=routes+kExpertRouteStorageItems*4U;
 };
 static_assert(ExpertRouteUb::end<=kRequiredUbBytes);
 static_assert(kRouteInfoUb+sizeof(DeviceRouteInfo)<=kRequiredUbBytes);
@@ -137,13 +137,14 @@ __aicore__ inline void RouteOwnedExperts(const Arguments& a,uint32_t worker) {
     const uint32_t owned=each+(worker<extra?1U:0U);
     if(owned==0U)return; // empty owners still participate in the enclosing joins
     const uint32_t total=a.config.bs*a.config.topk;
+    const uint32_t batchItems=owned<=7U?kExpertRouteBatch:kExpertWideBatch;
     LocalTensor<int32_t> ids(TPosition::VECCALC,ExpertRouteUb::ids,kExpertRouteBatch);
-    LocalTensor<int32_t> routes(TPosition::VECCALC,ExpertRouteUb::routes,kExpertRoutesPerWorker*kExpertRouteBatch);
+    LocalTensor<int32_t> routes(TPosition::VECCALC,ExpertRouteUb::routes,kExpertRouteStorageItems);
     LocalTensor<uint32_t> counts(TPosition::VECCALC,ExpertRouteUb::counts,64U);
     LocalTensor<uint32_t> totals(TPosition::VECCALC,ExpertRouteUb::totals,kExpertRoutesPerWorker);
     for(uint32_t e=0;e<owned;++e)totals.SetValue(e,0U);
-    for(uint32_t start=0;start<total;start+=kExpertRouteBatch) {
-        const uint32_t valid=RouteMin(kExpertRouteBatch,total-start);
+    for(uint32_t start=0;start<total;start+=batchItems) {
+        const uint32_t valid=RouteMin(batchItems,total-start);
         if(a.topkIdBytes==4U)RouteLoad(a.topkIds+uint64_t(start)*4U,ExpertRouteUb::ids,valid*4U);
         else {
             RouteLoad(a.topkIds+uint64_t(start)*8U,ExpertRouteUb::raw,valid*8U);
@@ -158,13 +159,13 @@ __aicore__ inline void RouteOwnedExperts(const Arguments& a,uint32_t worker) {
         RouteFence<HardEvent::S_V>();
         asc_vf_call<CompactOwnedExpertsVF>(reinterpret_cast<__ubuf__ int32_t*>(ids.GetPhyAddr()),
             reinterpret_cast<__ubuf__ int32_t*>(routes.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ int32_t*>(counts.GetPhyAddr()),valid,start,first,owned);
+            reinterpret_cast<__ubuf__ int32_t*>(counts.GetPhyAddr()),valid,start,first,owned,batchItems);
         RouteFence<HardEvent::V_S>();
         RouteFence<HardEvent::S_MTE3>();
         for(uint32_t e=0;e<owned;++e) {
             const uint32_t n=counts.GetValue(e),written=totals.GetValue(e);
             RouteEnqueueSave(a.expertRoutes+(uint64_t(first+e)*a.config.sourceRowCapacity+written)*4U,
-                ExpertRouteUb::routes+e*kExpertRouteBatch*4U,n*4U);
+                ExpertRouteUb::routes+e*batchItems*4U,n*4U);
             totals.SetValue(e,written+n);
         }
         // All bucket sources stay untouched until this one batch completion.

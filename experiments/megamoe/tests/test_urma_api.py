@@ -287,7 +287,7 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
 def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, tail):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
     extension = SimpleNamespace(
-        urma_api_protocol=1, urma_routing_protocol=7, urma_tail_schedule=tail,
+        urma_api_protocol=1, urma_routing_protocol=8, urma_tail_schedule=tail,
         urma_compute_schedule="unitflag-shared-wave12-ep4-v1",
         urma_dimension_contract="unitflag-h8192-i16384-k1to8-v1-bs16384",
         urma_shared_contract="unitflag-shared-peer-reorder-v1",
@@ -308,7 +308,7 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
 def test_native_mgroup_schedule_must_match_before_runtime_creation(monkeypatch, schedule):
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
     extension = SimpleNamespace(
-        urma_api_protocol=1, urma_routing_protocol=7, urma_tail_schedule="combine-ready-scan-reduce-world-v1", urma_compute_schedule=schedule
+        urma_api_protocol=1, urma_routing_protocol=8, urma_tail_schedule="combine-ready-scan-reduce-world-v1", urma_compute_schedule=schedule
     )
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
     urma._extension.cache_clear()
