@@ -3,7 +3,7 @@
 import math
 import statistics
 
-from .urma_routing import remote_peer_for_worker
+from ._urma_route_reference import remote_peer_for_worker
 
 PHASES = ("Pack", "Dispatch", "Gmm1", "Activation", "Gmm2", "Combine", "Barrier", "Reduce")
 TIMER_NUMEL = 28 * 3 * 8 * 16

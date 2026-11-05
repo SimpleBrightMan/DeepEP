@@ -1,8 +1,8 @@
 """Experimental fixed-CV, PUT-only URMA MegaMoE API.
 
-Route construction is deliberately visible: ``forward`` prepares routes on
-every call. ``forward_prepared`` is a separate, explicitly cached-route path.
-Neither path uses a balanced-route template.
+Routes are rebuilt inside every MegaMoE kernel, before Pack. ``prepare_routes``
+binds the Device input and reuses capacity-sized storage; it does not compute
+or copy routing values. Both public forward paths use Device routing only.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import threading
 from deep_ep._native import npu_api, require_native
 from deep_ep._runtime import Runtime, integer, warn_unclosed
 from deep_ep._store import StoreGroup
-from .urma_routing import DeviceRoutes, prepare_routes
+from .urma_routing import DeviceRoutes
 from .validation import collective_check
 
 COMMUNICATION_PROTOCOL = "unitflag-peer-cv-epoch-so-v1"
@@ -45,6 +45,8 @@ def _extension():
         raise RuntimeError("Rebuild the generalized-dimension MegaMoE extension")
     if getattr(extension,"urma_shared_contract",None)!="unitflag-shared-peer-reorder-v1":
         raise RuntimeError("Rebuild the shared-expert MegaMoE extension")
+    if getattr(extension,"urma_routing_protocol",None)!=2:
+        raise RuntimeError("Device routing requires matching Python/native wheel; rebuild and reinstall")
     return extension
 
 
@@ -81,14 +83,17 @@ class _UrmaRuntime(Runtime):
 
 @dataclass(frozen=True)
 class PreparedUrmaRoutes:
-    """One immutable route plan; the tensor contents must also remain unchanged."""
+    """Bound Device input plus reusable storage; routes are rebuilt on every launch."""
 
     owner: object
     native: object
     routing: DeviceRoutes
     bs: int
-    received_rows: int
-    versions: tuple
+    topk_idx: object
+
+    @property
+    def received_rows(self):
+        raise RuntimeError("received_rows is Device-generated; use native.route_stats() after forward for diagnostics")
 
 
 class UrmaBuffer:
@@ -117,7 +122,7 @@ class UrmaBuffer:
             raise TypeError("URMA experimental API currently requires an explicit StoreGroup")
         error = None
         if max_recv_rows is None:
-            max_recv_rows = 2 * num_max_tokens_per_rank * num_topk
+            max_recv_rows = group.size() * num_max_tokens_per_rank * num_topk
         try:
             if group.size() not in (4, 8, 16):
                 raise ValueError("URMA MegaMoE requires EP4/EP8/EP16")
@@ -136,7 +141,8 @@ class UrmaBuffer:
             integer("gmm1_ahead_mgroups", gmm1_ahead_mgroups, 0, 65536)
             if cv_rows % 128:
                 raise ValueError("cv_rows must be a multiple of 128")
-            integer("max_recv_rows", max_recv_rows, 1, group.size() * num_max_tokens_per_rank * num_topk)
+            if max_recv_rows != group.size() * num_max_tokens_per_rank * num_topk:
+                raise ValueError("Device routing requires max_recv_rows=EP*max_tokens*topk (worst-case capacity)")
         except (TypeError, ValueError) as failure:
             error = str(failure)
         collective_check(
@@ -175,6 +181,7 @@ class UrmaBuffer:
         self._epoch = 0
         self._failure = None
         self._last_prepared = None
+        self._plan = None
         capacity, error = None, None
         try:
             extension = _extension()
@@ -257,96 +264,33 @@ class UrmaBuffer:
         result.record_stream(caller)
         return result
 
-    def _bind_reduce_dependencies(self, plan, reduce_index):
-        """Keep the asynchronous route gather ordered before every forward.
-
-        A prepared plan may be used from a different caller stream. Its hidden
-        dependency table must therefore be produced on the owner stream too.
-        """
-        runtime = self._runtime
-        npu = npu_api()
-        runtime.stream.wait_stream(npu.current_stream(runtime.device))
-        with npu.stream(runtime.stream):
-            plan.bind_reduce_dependencies(reduce_index)
-
     def prepare_routes(self, topk_idx):
-        """NPU sort/count/inverse, CPU count exchange, and native descriptor build.
+        """Bind a contiguous Device top-k tensor; never inspect its values.
 
-        This is a collective, synchronizing preparation step. FULL_E2E includes
-        it; CACHED_FORWARD intentionally does not. Counts are the only routing
-        data exchanged through the host Store.
+        The caller guarantees legal expert IDs. The kernel performs fresh
+        histogram/prefix/exchange/plan construction on every invocation.
+        Multiple bindings reuse this owner's stream-serialized workspace.
         """
         import torch
 
-        with self._operation("route preparation"):
-            error = None
-            try:
-                if topk_idx.device != self._device or topk_idx.dtype not in (torch.int32, torch.int64):
-                    raise ValueError("topk_idx must be int32/int64 on the buffer's NPU")
-                if topk_idx.ndim != 2 or topk_idx.shape[1] != self.num_topk:
-                    raise ValueError("topk_idx must have shape [BS, topk]")
-                bs = topk_idx.shape[0]
-                if not 0 < bs <= self.num_max_tokens_per_rank:
-                    raise ValueError(
-                        f"BS={bs} must be in [1,{self.num_max_tokens_per_rank}]; "
-                        "create UrmaBuffer with num_max_tokens_per_rank >= BS"
-                    )
-                low, high = torch.stack((topk_idx.min(), topk_idx.max())).cpu().tolist()
-                if low < 0 or high >= self.num_experts:
-                    raise ValueError("expert ids must be in [0, num_experts)")
-            except Exception as failure:
-                error = str(failure)
-            collective_check(
-                self.group, "URMA route input", error, tuple(topk_idx.shape) if hasattr(topk_idx, "shape") else None
-            )
-            routing = None
-            try:
-                # Keep version counters even when the application invokes the
-                # inference-only API inside torch.inference_mode().
-                with torch.inference_mode(False), torch.no_grad():
-                    routing = prepare_routes(topk_idx, self.num_experts)
-                local_counts = routing.expert_counts.cpu().tolist()
-            except Exception as failure:
-                error = str(failure)
-            collective_check(self.group, "URMA device routing", error)
-            counts = self.group.all_gather(local_counts, "URMA expert counts")
-            local_experts = self.num_experts // self.group.size()
-            received_by_rank = [
-                sum(sum(source[rank * local_experts : (rank + 1) * local_experts]) for source in counts)
-                for rank in range(self.group.size())
-            ]
-            if any(rows > self.max_recv_rows for rows in received_by_rank):
-                raise ValueError(
-                    f"URMA receive capacity {self.max_recv_rows} exceeded: {received_by_rank}; "
-                    "increase max_recv_rows collectively before creating the buffer"
-                )
-            plan, error = None, None
-            try:
-                counts_cpu = torch.tensor(counts, dtype=torch.int64, device="cpu")
+        with self._operation("route binding"):
+            if topk_idx.device != self._device or topk_idx.dtype not in (torch.int32, torch.int64):
+                raise ValueError("topk_idx must be int32/int64 on the buffer's NPU")
+            if topk_idx.ndim != 2 or topk_idx.shape[1] != self.num_topk or not topk_idx.is_contiguous():
+                raise ValueError("topk_idx must be contiguous [BS, topk]")
+            bs = topk_idx.shape[0]
+            if not 0 < bs <= self.num_max_tokens_per_rank:
+                raise ValueError(f"BS={bs} exceeds allocated capacity {self.num_max_tokens_per_rank}")
+            if self._plan is None:
                 address = require_native("URMA MegaMoE").megamoe_workspace_address(self._runtime.native)
-                plan = _extension().UrmaPlan(
-                    self._example[:bs],
-                    counts_cpu,
-                    self.intermediate_hidden,
-                    self.num_topk,
-                    self.cv_rows,
-                    self.max_recv_rows,
-                    self.num_max_tokens_per_rank,
-                    self.group.rank(),
-                    _extension().ffts_config(),
-                    address,
-                    self._runtime.native.capacity,
-                    self.gmm1_ahead_mgroups,
-                    *((self.num_shared_experts,self.shared_intermediate_hidden) if self.num_shared_experts else ()),
+                self._plan = _extension().UrmaPlan(
+                    self._example, self.group.size(), self.intermediate_hidden, self.num_topk,
+                    self.cv_rows, self.max_recv_rows, self.num_max_tokens_per_rank, self.group.rank(),
+                    _extension().ffts_config(), address, self._runtime.native.capacity,
+                    self.gmm1_ahead_mgroups, self.num_shared_experts, self.shared_intermediate_hidden,
                 )
-                self._bind_reduce_dependencies(plan, routing.reduce_index)
-            except Exception as failure:
-                error = str(failure)
-            collective_check(self.group, "URMA descriptor preparation", error)
-            tensors = (routing.order, routing.reduce_index, routing.expert_counts, routing.expert_offsets)
-            return PreparedUrmaRoutes(
-                self, plan, routing, bs, received_by_rank[self.group.rank()], tuple(value._version for value in tensors)
-            )
+            routing = DeviceRoutes(*self._plan.routing_tensors(bs))
+            return PreparedUrmaRoutes(self, self._plan, routing, bs, topk_idx)
 
     def forward_prepared(self, x, topk_weights, l1_weights, l2_weights, prepared, *, timer=None, out=None, trace=None, coarse_trace=False, shared_l1_weights=None, shared_l2_weights=None):
         """Expand/Dispatch/GMM1/SwiGLU/GMM2/return PUT and flag-gated weighted reduction."""
@@ -356,10 +300,6 @@ class UrmaBuffer:
         with self._operation("forward"):
             if not isinstance(prepared, PreparedUrmaRoutes) or prepared.owner is not self:
                 raise ValueError("prepared routes belong to a different buffer")
-            routing = prepared.routing
-            tensors = (routing.order, routing.reduce_index, routing.expert_counts, routing.expert_offsets)
-            if tuple(value._version for value in tensors) != prepared.versions:
-                raise ValueError("prepared routing tensors were modified in-place")
             if not isinstance(x, tuple) or len(x) != 2:
                 raise TypeError("x must be (FP8 E4M3 data, E8M0 scales)")
             data, scales = x
@@ -422,8 +362,7 @@ class UrmaBuffer:
             native_operands = (
                 data,
                 scales,
-                routing.order,
-                routing.reduce_index,
+                prepared.topk_idx,
                 topk_weights,
                 weight1,
                 weight2,
@@ -433,8 +372,7 @@ class UrmaBuffer:
                 out,
                 self._epoch,
             )
-            # Preserve the original positional signature for untraced calls,
-            # including older test doubles and wheels used without this feature.
+            # Optional instrumentation remains a per-invocation argument.
             if coarse_trace and (trace is None or timer is not None):
                 raise ValueError("coarse_trace requires trace storage and no aggregate timer")
             if self.num_shared_experts:
@@ -474,6 +412,7 @@ class UrmaBuffer:
                 self.group.abort(self._failure)
                 raise
             self._last_prepared = None
+            self._plan = None
             self._example = None
 
     def __del__(self):

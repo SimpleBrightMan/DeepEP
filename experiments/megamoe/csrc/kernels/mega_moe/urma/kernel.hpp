@@ -12,6 +12,7 @@
 #include "peer_reorder_progress.hpp"
 #include "tail_completion.hpp"
 #include "timer.hpp"
+#include "device_routes.hpp"
 #include "transport.hpp"
 
 namespace MegaMoeUrma {
@@ -619,10 +620,11 @@ __aicore__ inline void RunProfiledCompute(const Arguments& args, uint32_t block,
     }
 }
 
-__aicore__ inline void ProcessRouted(const Arguments& args)
+__aicore__ inline void ProcessRouted(Arguments& args)
 {
     Timer timer;
     timer.Init(args.timer, args.trace, args.traceCapacity, args.coarseTrace != 0U);
+    PrepareDeviceRoutes(args,timer);
     const uint32_t block = GetBlockIdx() / GetTaskRation();
     const uint32_t communicationWorkers = CommunicationWorkers(args.config.world);
     const int64_t originalOverflow = GetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL, MegaMoeImpl::OVERFLOW_MODE_CTRL>();
@@ -690,8 +692,9 @@ template<class T> __aicore__ inline void RunSharedComputeSequence(const Argument
     if constexpr(g_coreType==AIC)MarkCubeComplete(a); // routed self-return is ready before Shared GMM2
     RunSharedGmm<false>(a,block,timer);
 }
-__aicore__ inline void ProcessShared(const Arguments& a) {
+__aicore__ inline void ProcessShared(Arguments& a) {
     Timer timer;timer.Init(a.timer,a.trace,a.traceCapacity,a.coarseTrace!=0);timer.SharedMode();
+    PrepareDeviceRoutes(a,timer);
     const uint32_t block=GetBlockIdx()/GetTaskRation(),comm=CommunicationWorkers(a.config.world);
     const int64_t overflow=GetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL,MegaMoeImpl::OVERFLOW_MODE_CTRL>();
     SetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL,MegaMoeImpl::OVERFLOW_MODE_CTRL>(0);

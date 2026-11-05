@@ -13,7 +13,7 @@ import subprocess
 import numpy as np
 import pytest
 
-from deep_ep_experimental.megamoe.urma_routing import plan_routes
+from deep_ep_experimental.megamoe._urma_route_reference import plan_routes
 
 
 @pytest.fixture(scope="module")

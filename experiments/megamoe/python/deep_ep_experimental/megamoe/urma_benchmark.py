@@ -430,7 +430,7 @@ def run(args, config, group):
             error = f"{type(failure).__name__}: {failure}"
         collective_check(group, f"URMA diagnostic allocation BS={bs}", error)
         torch.npu.synchronize()
-        startup_mgroups = int(prepared.native.gmm1_startup_mgroups)
+        startup_mgroups = None  # actual task sequence is generated inside Device
         forward = partial(owner.forward_prepared, x, topk_weights, *weights, prepared, out=output, **shared_options)
         coarse_forward = partial(forward, trace=coarse_trace, coarse_trace=True) if args.timer else None
         fine_forward = partial(forward, timer=timer, trace=trace) if args.fine else None
@@ -477,7 +477,7 @@ def run(args, config, group):
                               f"rank-min={report['rank_min_mean_us']:.3f}us (one diagnostic; excluded from formal mean)", flush=True)
             profile_report = mode_reports["none"]
         reports = dict(
-            bs=bs, received_rows_local=prepared.received_rows,
+            bs=bs, received_rows_local=None,
             gmm1_ahead_mgroups=args.gmm1_ahead_mgroups, gmm1_startup_mgroups_local=startup_mgroups,
             compute_wave_mgroups=wave_mgroups, gmm1_ahead_mgroups_applied=not bool(wave_mgroups),
             profile=profile_report, profiles=mode_reports, profile_directory=capture["profile_dir"],
@@ -523,7 +523,8 @@ def run(args, config, group):
                     hidden=model["hidden"],
                     intermediate=model["intermediate_hidden"],
                     topk=model["num_topk"],
-                    received_rows=prepared.received_rows,
+                    received_rows=int(prepared.native.route_stats()[0]),
+                    receive_capacity_rows=owner.max_recv_rows,
                     rank=rank,
                     fused_gate_up=fused_gate_up,
                 )
@@ -548,7 +549,7 @@ def run(args, config, group):
                 expected_counts,
                 selected,
             )
-            local_validation["received_rows_equal"] = int(actual_counts.sum()) == prepared.received_rows
+            local_validation["received_rows_equal"] = int(actual_counts.sum()) == int(prepared.native.route_stats()[0])
             local_validation["passed"] &= local_validation["received_rows_equal"]
             if not local_validation["received_rows_equal"]:
                 local_validation["reason"] += "; URMA descriptor received_rows disagrees with route counts"

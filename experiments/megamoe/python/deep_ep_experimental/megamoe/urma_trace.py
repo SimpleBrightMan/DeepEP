@@ -57,7 +57,7 @@ EVENTS = (
     "CoarseDispatch", "CoarseCombine", "CoarseActivation", "CoarseReduce", "CoarseLocalSyncEnd",
     "CoarseDispatchSubmit",
     "PackRetire",
-    "SharedGmm1Tile", "SharedGmm1Drain", "SharedActivation", "SharedGmm2Tile", "SharedGmm2Drain", "SharedAdd", "CoarseSharedCombineSubmit",
+    "SharedGmm1Tile", "SharedGmm1Drain", "SharedActivation", "SharedGmm2Tile", "SharedGmm2Drain", "SharedAdd", "CoarseSharedCombineSubmit", "RoutePrepare",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
 SYNC_STAGES = {4: "shared addition complete", 0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
@@ -68,6 +68,8 @@ class TraceOverflowError(ValueError):
 
 
 def event_style(event):
+    if event == "RoutePrepare":
+        return event, "routing.device", "rail_animation", "Device histogram, count exchange, descriptor generation and inverse permutation before Pack"
     if event == "Pack":
         return event, "compute.copy", "rail_animation", "Pack submission; includes retirement of previous segment, current ready may be deferred"
     if event == "PackRetire":

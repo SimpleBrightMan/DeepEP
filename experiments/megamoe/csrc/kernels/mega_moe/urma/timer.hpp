@@ -18,7 +18,7 @@ struct NoopTimer {
     __aicore__ inline void End(Phase, uint64_t = 0U) {}
 };
 
-enum class CoarsePhase : uint32_t { Pack, SyncStart, Gmm, Dequant, Dispatch, Combine, Activation, Reduce, SyncEnd, SharedSum, Count };
+enum class CoarsePhase : uint32_t { Pack, SyncStart, Gmm, Dequant, Dispatch, Combine, Activation, Reduce, SyncEnd, SharedSum, Route, Count };
 
 class Timer {
 public:
@@ -113,7 +113,7 @@ public:
                     if (coarseStart_[p] && (selected == count || coarseStart_[p] < coarseStart_[selected])) selected = p;
                 if (selected == count) break;
                 TraceMeta meta;
-                const auto event = selected == static_cast<uint32_t>(CoarsePhase::SharedSum) ? TraceEvent::SharedAdd :
+                const auto event = selected == static_cast<uint32_t>(CoarsePhase::Route) ? TraceEvent::RoutePrepare : selected == static_cast<uint32_t>(CoarsePhase::SharedSum) ? TraceEvent::SharedAdd :
                     shared_ && selected == static_cast<uint32_t>(CoarsePhase::Combine) ? TraceEvent::CoarseSharedCombineSubmit :
                     shared_ && selected == static_cast<uint32_t>(CoarsePhase::Dispatch) ? TraceEvent::CoarseDispatchSubmit :
                     static_cast<TraceEvent>(static_cast<uint32_t>(TraceEvent::CoarsePack) + selected);

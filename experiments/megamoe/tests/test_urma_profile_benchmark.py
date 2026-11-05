@@ -222,7 +222,7 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
     monkeypatch.setattr(urma_timer, "communication_bandwidth", bandwidth)
     monkeypatch.setattr(urma_timer, "summarize_bandwidth", lambda records: [])
 
-    def export_trace(group, raw, case, *, bs, clock_mhz, include_waits=False):
+    def export_trace(group, raw, case, *, bs, clock_mhz, include_waits=False, model=None):
         calls.append(("trace-export", bs, int(raw[0])))
         assert int(raw[0]) == (6 if case.name == "coarse" else 7)
         return [{"rank": rank, "chrome_path": str(case / f"rank{rank}.json")} for rank in range(16)]

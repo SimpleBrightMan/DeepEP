@@ -3,12 +3,11 @@
 import numpy as np
 import pytest
 
-from deep_ep_experimental.megamoe.urma_routing import (
+from deep_ep_experimental.megamoe._urma_route_reference import (
     CompletionLedger,
     cv_fragments,
     expert_m_groups,
     plan_routes,
-    prepare_routes,
     remote_peer_for_worker,
     simulate_roundtrip,
 )
@@ -160,15 +159,6 @@ def test_deferred_quiet_and_final_barrier_are_required_before_reduction():
     assert ledger.can_reduce()
     with pytest.raises(RuntimeError, match="barrier"):
         ledger.submit_return(0, 1, 2)
-
-
-def test_device_route_algorithm_matches_independent_numpy_sort():
-    torch = pytest.importorskip("torch")
-    ids = np.random.default_rng(19).integers(0, 24, size=(17, 4), dtype=np.int32)
-    expected = plan_routes(ids, 24, 4)
-    actual = prepare_routes(torch.from_numpy(ids), 24)
-    for field in ("order", "reduce_index", "expert_counts", "expert_offsets"):
-        np.testing.assert_array_equal(getattr(actual, field).numpy(), getattr(expected, field))
 
 
 @pytest.mark.parametrize("ids", [np.array([[4]]), np.array([[-1]]), np.array([[1.5]]), np.array([], dtype=np.int32)])
