@@ -25,6 +25,8 @@ struct DeviceRouteInfo {
     uint32_t groupBase[kMaxLocalExperts + 1U];
     uint32_t compactBase[kMaxLocalExperts + 1U];
     uint64_t returnBase[kWorld];
+    uint64_t gmm1Base[kMaxLocalExperts + 1U];
+    uint32_t sendCvBase[kWorld + 1U], recvCvBase[kWorld + 1U];
 };
 static_assert(sizeof(DeviceRouteInfo) < 24U * 1024U);
 
@@ -36,6 +38,16 @@ URMA_ROUTE_INLINE uint64_t RouteGroupCapacity(uint64_t rows, uint32_t experts) {
 URMA_ROUTE_INLINE uint64_t RouteSegmentCapacity(uint64_t rows, uint32_t world, uint32_t cv) {
     // Overlay boundaries of expert M256 groups and each source/expert/CV.
     return RouteGroupCapacity(rows, kExperts / world) + kExperts + (rows + cv - 1U) / cv + world;
+}
+
+URMA_ROUTE_INLINE uint64_t RouteGroupPrefixOffset() {
+    return (sizeof(DeviceRouteInfo)+511U)/512U*512U;
+}
+URMA_ROUTE_INLINE uint64_t RouteLinkPrefixOffset(uint64_t groups) {
+    return (RouteGroupPrefixOffset()+(groups+1U)*sizeof(uint32_t)+511U)/512U*512U;
+}
+URMA_ROUTE_INLINE uint64_t RouteInfoAllocationBytes(uint64_t groups,uint64_t chunks) {
+    return (RouteLinkPrefixOffset(groups)+(chunks+1U)*sizeof(uint32_t)+511U)/512U*512U;
 }
 
 template<class Output>

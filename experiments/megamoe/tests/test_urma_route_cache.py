@@ -14,7 +14,11 @@ def test_route_flush_covers_every_dirty_cache_line(tmp_path):
     root = Path(__file__).resolve().parents[1]
     text = (root / "csrc/kernels/mega_moe/urma/device_routes.hpp").read_text(encoding="utf-8")
     begin = text.index("__aicore__ inline void RouteFlush(")
-    end = text.index("\nstruct DeviceRouteOutput", begin)
+    end = text.index("{", begin) + 1
+    depth = 1
+    while depth:
+        depth += (text[end] == "{") - (text[end] == "}")
+        end += 1
     function = text[begin:end]
     source = tmp_path / "route_cache.cpp"
     source.write_text(r'''

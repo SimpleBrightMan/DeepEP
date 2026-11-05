@@ -30,7 +30,7 @@ constexpr uint32_t kLocalFlagSharedGmm1Done = 4U; // small-BS S1: completed AICs
 // local GMM2 group that writes its self return rows directly.
 constexpr uint64_t kReduceSelfDependency = uint64_t{1} << 63U;
 constexpr uint32_t kProtocol = 1;
-constexpr uint32_t kDeviceRoutingProtocol = 2;
+constexpr uint32_t kDeviceRoutingProtocol = 3;
 #define MEGAMOE_URMA_ROUTE_REORDER 0
 constexpr uint32_t kTimerCores = kAic * 3U;
 constexpr uint32_t kTimerPhases = 8U;
