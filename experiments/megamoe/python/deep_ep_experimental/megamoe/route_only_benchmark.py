@@ -24,6 +24,7 @@ def parse_args(argv=None):
     p.add_argument("--cv-rows", type=int, default=256)
     p.add_argument("--gmm1-ahead-mgroups", type=int, default=12)
     p.add_argument("--routing", choices=("random-balanced", "random", "balanced", "hot", "duplicates"), default="random-balanced")
+    p.add_argument("--check-plan", action="store_true", help="After profiling, compare every active route descriptor field with an independent CPU oracle")
     p.add_argument("--check-patterns", default="", help="Extra untimed routing-only checks, e.g. random,hot,duplicates")
     p.add_argument("--ids-dtype", choices=("int32", "int64"), default="int64")
     p.add_argument("--seed", type=int, default=20261105)
@@ -195,6 +196,12 @@ def run(args, group):
         local_counts = np.bincount(host_ids.reshape(-1), minlength=384).tolist()
         source_counts = group.all_gather(local_counts, f"route-only reference counts BS={bs}")
         result = validate_routes(prepared, host_ids, source_counts, rank, world, max_bs, args.cv_rows)
+        if args.check_plan:
+            from ._route_plan_validation import validate_plan
+            result["plan"] = validate_plan(prepared.native, source_counts, bs=bs, topk=args.topk,
+                world=world, rank=rank, max_bs=max_bs, hidden=args.hidden, intermediate=args.intermediate,
+                cv_rows=args.cv_rows, gmm1_ahead_mgroups=args.gmm1_ahead_mgroups)
+            result["passed"] = result["passed"] and result["plan"]["passed"]
         validation = group.all_gather(result, f"route-only validation BS={bs}")
         report["route_validation"] = dict(passed=all(row["passed"] for row in validation), per_rank=validation)
         if args.timer:
@@ -217,6 +224,11 @@ def run(args, group):
             counts = group.all_gather(np.bincount(alternate.reshape(-1), minlength=384).tolist(),
                                       f"route-only extra counts {bs}/{pattern}")
             check = validate_routes(alternate_prepared, alternate, counts, rank, world, max_bs, args.cv_rows)
+            if args.check_plan:
+                check["plan"] = validate_plan(alternate_prepared.native, counts, bs=bs, topk=args.topk,
+                    world=world, rank=rank, max_bs=max_bs, hidden=args.hidden, intermediate=args.intermediate,
+                    cv_rows=args.cv_rows, gmm1_ahead_mgroups=args.gmm1_ahead_mgroups)
+                check["passed"] = check["passed"] and check["plan"]["passed"]
             checks = group.all_gather(check, f"route-only extra check {bs}/{pattern}")
             report["extra_validation"].append(dict(pattern=pattern, passed=all(v["passed"] for v in checks), per_rank=checks))
         report["passed"] = report["route_validation"]["passed"] and all(v["passed"] for v in report["extra_validation"])

@@ -39,6 +39,7 @@ PYBIND11_MODULE(_C, module)
                       uint64_t, int64_t, int64_t, int64_t, int64_t>())
         .def("routing_tensors", &deepep::megamoe::UrmaPlan::routing_tensors)
         .def("route_dependency_tensor", &deepep::megamoe::UrmaPlan::route_dependency_tensor)
+        .def("route_plan_tensors", &deepep::megamoe::UrmaPlan::route_plan_tensors)
         .def("route_stats", &deepep::megamoe::UrmaPlan::route_stats)
         .def("forward", &deepep::megamoe::UrmaPlan::forward, py::arg("x"), py::arg("x_scales"), py::arg("topk_idx"), py::arg("topk_weights"), py::arg("weight1"), py::arg("weight2"),
              py::arg("weight_scales1"), py::arg("weight_scales2"), py::arg("timer"), py::arg("out"), py::arg("epoch"),

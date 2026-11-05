@@ -19,6 +19,7 @@ public:
              int64_t symmetric_bytes, int64_t gmm1_ahead_mgroups, int64_t shared_experts=0, int64_t shared_intermediate=0);
     std::vector<torch::Tensor> routing_tensors(int64_t bs) const;
     torch::Tensor route_dependency_tensor(int64_t bs) const;
+    std::map<std::string, torch::Tensor> route_plan_tensors() const;
     std::vector<int64_t> route_stats() const; // explicit post-forward diagnostic D2H only
     torch::Tensor forward(torch::Tensor x, torch::Tensor x_scales, torch::Tensor topk_idx,
                           torch::Tensor topk_weights, torch::Tensor weight1, torch::Tensor weight2,

@@ -221,6 +221,11 @@ def run(args, config, group):
     from .urma_timing import UrmaLaunchGuard, measure_profiled_forward, summarize_profile_rounds
     from .validation import collective_check
 
+    if getattr(_extension(), "urma_route_only", False):
+        raise RuntimeError(
+            "This laboratory kernel stops after RoutePrepare; use "
+            "deep_ep_experimental.megamoe.route_only_benchmark instead of the full-FFN runner"
+        )
     rank, world = group.rank(), group.size()
     ranks_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", str(world)))
     collective_check(

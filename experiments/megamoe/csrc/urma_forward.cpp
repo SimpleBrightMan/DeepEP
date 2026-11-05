@@ -173,7 +173,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, i
     route_counts_ = torch::empty({384}, example.options().dtype(torch::kInt64));
     route_offsets_ = torch::empty({385}, example.options().dtype(torch::kInt64));
     route_histogram_ = allocate(MegaMoeUrma::kRouteHistogramBytes);
-    route_info_ = allocate(Align(sizeof(MegaMoeUrma::DeviceRouteInfo)));
+    route_info_ = allocate(MegaMoeUrma::RouteInfoAllocationBytes(groups, chunks));
     route_config_ = allocate(Align(sizeof(Config)));
     args_.order=Address(order_); args_.reduceIndex=Address(inverse_);
     args_.reduceDependencies=Address(reduce_dependencies_);
@@ -495,3 +495,13 @@ int64_t UrmaPlan::workspace_bytes() const
     return bytes;
 }
 }  // namespace deepep::megamoe
+
+// Route-only laboratory validation: views only, no allocation or Host planning.
+std::map<std::string, torch::Tensor> deepep::megamoe::UrmaPlan::route_plan_tensors() const
+{
+    TORCH_CHECK(last_epoch_ > 0, "Route descriptors require a completed forward");
+    return {{"fragments",fragments_},{"segments",segments_},{"send_chunks",send_chunks_},
+            {"recv_chunks",recv_chunks_},{"compute_batches",compute_batches_},
+            {"compute_tasks",compute_tasks_},{"chunk_group_indices",chunk_group_indices_},
+            {"pack_rounds",pack_rounds_},{"config",route_config_}};
+}
