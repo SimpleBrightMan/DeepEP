@@ -5,6 +5,7 @@
 #include "peer_reorder_progress.hpp"
 #include "consumer_completion.hpp"
 #include "completion_batch.hpp"
+#include "activation_ub.hpp"
 #include "reorder.hpp"
 #include "communication_schedule.hpp"
 
@@ -32,9 +33,9 @@ struct DirectReorderWork {
     const Arguments& a;
     PackBatch& pack;
     uint32_t core;
-    UrmaActivation& activation;
+    UbRoutedActivation& activation;
     template<class TimerT> __aicore__ inline void Activate(const RoutedCompletionItem& item,TimerT& timer) {
-        RunReadyActivationTile(a,core,item.fragment,item.group,item.tile,activation,timer,kAic);
+        activation.Run(a,item.fragment,item.group,item.tile,timer);
     }
     __aicore__ inline void Before(){pack.Close();}
     template<class TimerT> __aicore__ inline void Reorder(const RoutedCompletionItem& item,TimerT& timer) {
@@ -199,33 +200,38 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& time
     RoutedCompletionConsumer completion(a,core);completion.Init(); // even zero-task AICs need the single credit
     PackBatch pack(a,timer);CooperativePeer peer(a,core,timer);SharedActivationState shared(a,core,timer);
     if(!peer.Active())timer.CoarseBegin(CoarsePhase::Activation);
-    UrmaActivation activation;
-    activation.Init({.yGmAddr=reinterpret_cast<GM_ADDR>(a.activation),.yScaleGmAddr=reinterpret_cast<GM_ADDR>(a.activationScale),.clampLimit=FLT_MAX});
-    uint32_t nextPack=kPackStartupRounds,nextGather=core;
+    UbRoutedActivation activation;activation.Init(a);
+    const uint32_t comm=CommunicationWorkers(a.config.world),helpers=kAic-comm;
+    uint32_t nextPack=kPackStartupRounds;
+    uint32_t nextGather=peer.Active()?UINT32_MAX:core-comm;
     bool ready=false,packDone=false;
     DirectReorderWork directReorder{a,pack,core,activation};
     while(true) {
-        bool progress=peer.TryDispatch(pack,packDone);
+        bool progress=false;
+        // A bounded Pack quantum each turn, never a Pack-until-empty loop.
+        if(!packDone&&nextPack<a.config.packRoundCount) {
+            PackOneRound(a,nextPack++,core,kAic,pack);progress=true;
+        }
+        if(!packDone&&nextPack>=a.config.packRoundCount) {
+            pack.Close();MarkPackWorkerComplete(a);packDone=true;progress=true;
+        }
         if(!ready&&RouteSummaryReady(a)){AcquireRouteSummary(a);ready=true;progress=true;}
-        if(ready&&packDone)progress=peer.TryCombine(true)||progress;
-        // One bounded communication turn always yields to completion. Otherwise
-        // the UB mailbox would stay full and hold the AIC behind an endless PUT loop.
-        if(ready)progress=(ConsumeIssuedReorders(completion,directReorder,timer)!=0U)||progress;
-        bool localWork=false;
-        if(ready&&nextGather<a.config.fragmentCount) {
+        if(peer.Active())progress=peer.TryDispatch(pack,packDone)||progress;
+        else if(ready&&nextGather<a.config.fragmentCount) {
             const auto f=LoadFragment(a,nextGather);
             if(AreGroupInputsReady(a,f)) {
-                pack.Close();GatherInputScale(a,f,nextGather,timer);nextGather+=kAic;localWork=true;
+                pack.Close();GatherInputScale(a,f,nextGather,timer);
+                nextGather+=helpers;progress=true;
             }
         }
-        if(!localWork&&!packDone&&nextPack<a.config.packRoundCount) {
-            PackOneRound(a,nextPack++,core,kAic,pack);localWork=true;
+        // The single RX mailbox must be consumed in exact producer order.
+        // Never wait for a later GMM1 while an earlier GMM2 owns the mailbox.
+        if(ready)progress=(ConsumeIssuedReorders(completion,directReorder,timer)!=0U)||progress;
+        if(ready&&packDone)progress=peer.TryCombine(true)||progress;
+        incoming.Poll();
+        if(ready&&!progress&&!shared.Done()) {
+            pack.Close();CooperativeNoWait before;progress=shared.TryOne(before);
         }
-        if(!packDone&&nextPack>=a.config.packRoundCount) {pack.Close();MarkPackWorkerComplete(a);packDone=true;localWork=true;}
-        if(ready&&!localWork&&!shared.Done()) {
-            pack.Close();CooperativeNoWait before;localWork=shared.TryOne(before);
-        }
-        progress=localWork||progress;incoming.Poll();
         if(ready&&packDone&&peer.Done()&&completion.Done()&&nextGather>=a.config.fragmentCount&&shared.Done())break;
         if(!progress){const uint64_t tick=GetSystemCycle();while(GetSystemCycle()-tick<64U){}}
     }

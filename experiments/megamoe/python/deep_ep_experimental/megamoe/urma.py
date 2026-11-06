@@ -23,8 +23,8 @@ COMMUNICATION_PROTOCOL = "unitflag-peer-cv-epoch-so-v1"
 
 
 def use_fused_gate_up(bs, world, topk=8, num_experts=384):
-    """Match native UseFusedGateUp: expected expert rows strictly below 128."""
-    return False  # Preserve unitflag planar gate/up for every shape.
+    """All routed GMM1 tasks use gate128/up128; shared=True weights stay planar."""
+    return True
 
 
 @lru_cache(maxsize=1)
@@ -37,7 +37,7 @@ def _extension():
         raise RuntimeError("URMA Python/native versions differ; rebuild and reinstall the complete wheel")
     if getattr(extension, "urma_tail_schedule", None) != "combine-ready-scan-reduce-world-v1":
         raise RuntimeError("URMA tailCover needs its matching native wheel; rebuild and reinstall the complete wheel")
-    if getattr(extension, "urma_compute_schedule", None) != "unitflag-shared-fixub-gmm2-v4":
+    if getattr(extension, "urma_compute_schedule", None) != "unitflag-shared-fixub-both-v5":
         raise RuntimeError(
             "URMA M-group lookahead needs its matching native wheel; rebuild and reinstall the complete wheel"
         )
@@ -45,6 +45,8 @@ def _extension():
         raise RuntimeError("Rebuild the generalized-dimension MegaMoE extension")
     if getattr(extension,"urma_shared_contract",None)!="unitflag-shared-peer-reorder-v1":
         raise RuntimeError("Rebuild the shared-expert MegaMoE extension")
+    if getattr(extension, "urma_routed_weight_layout", None) != "gate128-up128-v1":
+        raise RuntimeError("Rebuild the fused gate128/up128 routed GMM1 extension")
     if getattr(extension,"urma_routing_protocol",None)!=8:
         raise RuntimeError("Device routing requires matching Python/native wheel; rebuild and reinstall")
     return extension
@@ -166,7 +168,7 @@ class UrmaBuffer:
                 timeout,
                 allow_multi_host,
                 "combine-ready-scan-reduce-world-v1",
-                "unitflag-shared-fixub-gmm2-v4",
+                "unitflag-shared-fixub-both-v5",
                 COMMUNICATION_PROTOCOL,
             ),
         )

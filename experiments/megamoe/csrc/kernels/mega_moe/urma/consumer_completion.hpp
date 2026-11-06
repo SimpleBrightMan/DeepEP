@@ -20,7 +20,7 @@ struct DeviceRoutePlanView {
         const auto* p=reinterpret_cast<const __gm__ ComputeBatch*>(a.computeBatches)+i;
         return {p->fragmentBegin,p->fragmentCount};
     }
-    __aicore__ inline uint32_t Tiles(bool g1)const{return ComputeTileCount(kComputeTileM,g1?a.config.intermediate:a.config.hidden);}
+    __aicore__ inline uint32_t Tiles(bool g1)const{return g1 ? Gmm1ComputeTileCount(kComputeTileM,a.config) : ComputeTileCount(kComputeTileM,a.config.hidden);}
     __aicore__ inline Fragment Group(uint32_t group)const{return RuntimeFragment(a,group);}
 };
 class OwnedRouteTileCursor {
@@ -71,18 +71,12 @@ public:
         Prepare();
         const auto start=timer.TraceBegin();RoutedFixChannel::Wait(consumed_);
         item=next_;
-        if(item.gmm1) {
-            auto* done=reinterpret_cast<__gm__ int32_t*>(a_.gmm1Done+item.logicalTile*kFlagBytes);
-            AscendC::WriteGmByPassDCache(done,1);
-        }
-        // GMM2 goes straight to same-core Reorder using item.fragment/tile.
-        // No gmm2MatmulDone publication or Scalar ready re-read is needed.
-        // gmm2Done counts final-layout N tiles, incremented only by ReorderGmm2Tile.
-        // The shared UB stays owned until the same-core activation/Reorder
-        // callback completes its final reads and calls ReleaseCompleted.
+        // Both stages go directly to same-core UB consumers. There is no
+        // intermediate per-tile GM-ready write. Activation/Reorder publish
+        // their downstream group-ready counts after final MTE3 completion.
         ++consumed_;prepared_=false;
         TraceMeta m;m.fragment=item.group;m.expert=item.fragment.expert;
-        m.row=item.fragment.rowBegin;m.rows=item.fragment.rows;m.tileN=uint64_t(item.tile)*256U;m.columns=256U;
+        m.row=item.fragment.rowBegin;m.rows=item.fragment.rows;m.tileN=uint64_t(item.tile)*(item.gmm1?kGmm1LogicalTileN:kComputeTileN);m.columns=item.gmm1?kGmm1LogicalTileN:kComputeTileN;
         timer.TraceEnd(item.gmm1?TraceEvent::Gmm1TileDrain:TraceEvent::Gmm2Drain,start,m);
     }
     __aicore__ inline void ReleaseCompleted(){RoutedFixChannel::Release(consumed_-1U);}

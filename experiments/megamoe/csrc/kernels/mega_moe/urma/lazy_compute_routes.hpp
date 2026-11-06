@@ -88,7 +88,7 @@ __aicore__ inline Fragment RuntimeFragment(const Arguments& args, uint32_t group
     // Cursor自行判断结束，segmentCount=0表示未物化；避免每次轮询重扫全部来源。
     return {expert, group, uint64_t(info->compactBase[expert]) + first, rows, 0U,
             info->gmm1Base[expert] + uint64_t(group - info->groupBase[expert]) *
-                                       (args.config.intermediate / kComputeTileN),
+                                       Gmm1ComputeTileCount(kComputeTileM, args.config),
             uint64_t(group) * (args.config.hidden / kComputeTileN)};
 }
 

@@ -114,6 +114,16 @@ def test_contiguous_reorder_diagnostics_are_optional_and_separate(tmp_path):
     assert report["flags"]["local_named"]["reorder_done"] == 13
 
 
+def test_ub_only_gmm1_does_not_invent_shadow_or_accuracy(tmp_path):
+    raw = fixture_snapshot()
+    del raw["gmm1"]
+    report = save(raw, tmp_path)
+    assert not report["errors"]
+    assert report["unavailable_stages"] == ["gmm1"]
+    assert "gmm1" not in report["stages"]
+    assert "cpu_activation_from_gmm1" not in report["checks"]
+
+
 def test_nonzero_return_zero_output_points_to_reduce(tmp_path):
     raw = fixture_snapshot()
     raw["output"][:] = 0
@@ -391,3 +401,19 @@ def test_conditional_activation_uses_bounded_32_row_blocks(tmp_path, monkeypatch
     report = save(raw, tmp_path, received_rows=70)
     assert sizes == [32, 32, 6]
     assert report["checks"]["cpu_activation_from_gmm1"]["exact_byte_match"]
+
+
+def test_fused_gate_up_snapshot_uses_matching_logical_columns():
+    from deep_ep_experimental.megamoe.urma_debug import _check_activation
+    rows, intermediate = 3, 256
+    gate = np.broadcast_to(np.arange(intermediate, dtype=np.float32)[None, :] / 128, (rows, intermediate))
+    up = np.broadcast_to(1 + np.arange(intermediate, dtype=np.float32)[None, ::-1] / 64, (rows, intermediate))
+    gate, up = reference.bf16(gate), reference.bf16(up)
+    activated = reference.bf16(gate / (1 + np.exp(np.clip(-gate, -80, 80))) * up)
+    codes, scales = reference.quantize_input(activated)
+    planar = np.concatenate([gate, up], axis=-1)
+    fused = np.stack([gate.reshape(rows, 2, 128), up.reshape(rows, 2, 128)], axis=2).reshape(rows, 512)
+    arrays = dict(gmm1=bf16(planar), activation=codes, activation_scale=scales)
+    expected = _check_activation(arrays)
+    arrays["gmm1"] = bf16(fused)
+    assert _check_activation(arrays, fused_gate_up=True) == expected

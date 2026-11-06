@@ -244,6 +244,31 @@ def test_changed_topk_input_is_passed_to_every_kernel_without_host_inspection(mo
     owner.destroy()
 
 
+def test_urma_uses_prepared_fused_pair_without_hot_path_conversion(monkeypatch):
+    owner, aborts, x, probs, w1, w2, epochs, make_plan = prepared_call_setup(monkeypatch)
+    prepared = make_plan()
+    original = prepared.native.forward
+    selected = []
+
+    def forward(*operands):
+        selected.append((operands[4], operands[6]))
+        return original(*operands)
+
+    prepared.native.forward = forward
+    for _ in range(3):
+        owner.forward_prepared(x, probs, w1, w2, prepared)
+    assert all(pair[0] is w1[0] and pair[1] is w1[1] for pair in selected)
+    assert w1[0] is not w1._planar[0]
+    assert not aborts
+    owner.destroy()
+
+
+@pytest.mark.parametrize("bs", [1, 1024, 8192, 16384])
+@pytest.mark.parametrize("ep", [4, 8, 16])
+def test_urma_routed_gate_up_is_fused_for_all_supported_sizes(bs, ep):
+    assert urma.use_fused_gate_up(bs, ep, 6, 512)
+
+
 @pytest.mark.parametrize("capacity", [1, 1024, 2048, 8192, 16384])
 @pytest.mark.parametrize("allow", [False, True])
 @pytest.mark.parametrize("world", [4, 8, 16])
@@ -276,7 +301,7 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
     assert created == [allow]
     assert checks[0][1][-4] is allow
     assert checks[0][1][-3] == "combine-ready-scan-reduce-world-v1"
-    assert checks[0][1][-2] == "unitflag-shared-fixub-gmm2-v4"
+    assert checks[0][1][-2] == "unitflag-shared-fixub-both-v5"
     assert checks[0][1][-1] == urma.COMMUNICATION_PROTOCOL
     assert buffer.gmm1_ahead_mgroups == 12
 
@@ -288,9 +313,10 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
     extension = SimpleNamespace(
         urma_api_protocol=1, urma_routing_protocol=8, urma_tail_schedule=tail,
-        urma_compute_schedule="unitflag-shared-fixub-gmm2-v4",
+        urma_compute_schedule="unitflag-shared-fixub-both-v5",
         urma_dimension_contract="unitflag-h8192-i16384-k1to8-v1-bs16384",
         urma_shared_contract="unitflag-shared-peer-reorder-v1",
+        urma_routed_weight_layout="gate128-up128-v1",
     )
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)
     urma._extension.cache_clear()

@@ -264,7 +264,7 @@ def decode_trace(raw, *, rank, clock_mhz):
         name, category, color, meaning = event_style(event)
         if engine % 3 == 2 and event in ("Gmm1TileDrain", "Gmm2Drain"):
             name = event + " [paired FIX completion]"
-            meaning = "paired AIV1 waits for actual FIX full before publishing GMM1 ready or directly reordering GMM2; not AIC execution time"
+            meaning = "paired AIV1 waits for actual FIX full before consuming the UB mailbox with GMM1 activation or GMM2 reorder; not AIC execution time"
         args = {field: None if value == UNKNOWN else value for field, value in zip(METADATA_FIELDS, row[3:12])}
         if event == "LocalSync":
             stage = args.pop("cv")

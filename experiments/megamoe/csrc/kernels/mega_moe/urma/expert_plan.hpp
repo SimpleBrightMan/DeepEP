@@ -182,7 +182,7 @@ inline ExpertPlan BuildExpertPlan(const int64_t* counts, const Config& input, ui
             }
             group.segmentCount = static_cast<uint32_t>(plan.segments.size()) - group.segmentBegin;
             plan.fragments.push_back(group);
-            config.gmm1Tiles += (config.intermediate + 255U) / 256U;
+            config.gmm1Tiles += (config.intermediate + 127U) / 128U;
             config.gmm2Tiles += (config.hidden + 255U) / 256U;
         }
         plan.computeBatches.push_back({firstGroup, static_cast<uint32_t>(plan.fragments.size()) - firstGroup});

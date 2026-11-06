@@ -237,7 +237,8 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
     benchmark.run(args, config, group)
 
     manifest = json.loads((tmp_path / "rank_0" / "manifest.json").read_text())
-    assert manifest["swiglu_workers"] == manifest["scale_gather_workers"] == manifest["gmm_completion_workers"] == 28
+    assert manifest["swiglu_workers"] == manifest["gmm_completion_workers"] == 28
+    assert manifest["scale_gather_workers"] == 29 - manifest["world"]
     assert "neither uses per-CV Dispatch quiet" in manifest["communication_completion"]
     assert "Device route preparation" in manifest["performance_scope"]
 
@@ -284,6 +285,7 @@ def test_cooperative_manifest_describes_shared_and_routed_only_workers(world, sh
     metadata = benchmark.cooperative_schedule_metadata(world, shared)
     assert metadata["remote_workers"] == world - 1
     assert metadata["swiglu_workers"] == metadata["gmm_completion_workers"] == 28
+    assert metadata["scale_gather_workers"] == 29-world
     assert metadata["startup_pack_workers"] == (28 if shared else 56)
     assert metadata["reduce_workers"] == (56 if shared else 57 - world)
     assert metadata["steady_pack_workers"] == 28

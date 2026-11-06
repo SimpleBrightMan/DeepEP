@@ -138,7 +138,7 @@ def _bf16_round(value):
     return ((bits + 0x7FFF + ((bits >> 16) & 1)) & np.uint32(0xFFFF0000)).view(np.float32)
 
 
-def _check_activation(arrays):
+def _check_activation(arrays, *, fused_gate_up=False):
     """Condition the Golden activation on real GMM1; not hardware emulation."""
     from .reference import bf16, dequantize_input, quantize_input
 
@@ -156,7 +156,14 @@ def _check_activation(arrays):
             raise ValueError(f"non-finite GMM1 in rows {begin}:{end}; conditional activation comparison skipped")
         if np.any((actual_codes & 127) == 127) or np.any(actual_scales == 255):
             raise ValueError(f"non-finite activation code/scale in rows {begin}:{end}; comparison skipped")
-        gate, up = np.split(gmm1, 2, axis=-1)
+        if fused_gate_up:
+            if intermediate % 128:
+                raise ValueError("fused GMM1 snapshot requires I divisible by128")
+            pairs = gmm1.reshape(end - begin, intermediate // 128, 2, 128)
+            gate = pairs[:, :, 0, :].reshape(end - begin, intermediate)
+            up = pairs[:, :, 1, :].reshape(end - begin, intermediate)
+        else:
+            gate, up = np.split(gmm1, 2, axis=-1)
         with np.errstate(over="raise", invalid="raise", divide="raise"):
             # Keep this expression and the BF16/MX conversion identical to
             # reference.expert_forward; no independent rounding policy here.
@@ -262,7 +269,6 @@ def save_snapshot(raw, directory, *, bs, hidden, intermediate, topk, received_ro
         "received_x": ("fp8_e4m3", (receive_capacity_rows, hidden)),
         "received_scale": ("e8m0", (receive_capacity_rows, hidden // 32)),
         "gathered_input_scale": ("e8m0", (received_rows, hidden // 32)),
-        "gmm1": ("bf16", (received_rows, intermediate * 2)),
         "activation": ("fp8_e4m3", (received_rows, intermediate)),
         "activation_scale": ("e8m0", (received_rows, intermediate // 32)),
         "gmm2_remote": ("bf16", (receive_capacity_rows, hidden)),
@@ -272,6 +278,11 @@ def save_snapshot(raw, directory, *, bs, hidden, intermediate, topk, received_ro
         "reduce_index": ("int64", (bs, topk)),
         "order": ("int64", (bs * topk,)),
     }
+    if "gmm1" in byte_arrays:
+        shapes["gmm1"] = ("bf16", (received_rows, intermediate * 2))
+    else:
+        report["unavailable_stages"] = ["gmm1"]
+        report["notes"].append("Routed GMM1 snapshot is unavailable (FIX-to-UB has no GM shadow); conditioned activation comparison is skipped, not passed.")
     if "gmm2_contiguous" in byte_arrays:
         shapes["gmm2_contiguous"] = ("bf16", (received_rows, hidden))
     for name in (
@@ -305,7 +316,8 @@ def save_snapshot(raw, directory, *, bs, hidden, intermediate, topk, received_ro
 
     if all(name in arrays for name in ("gmm1", "activation", "activation_scale")):
         try:
-            report["checks"]["cpu_activation_from_gmm1"] = _check_activation(arrays)
+            report["stages"]["gmm1"]["layout"] = "gate128_up128" if fused_gate_up else "planar"
+            report["checks"]["cpu_activation_from_gmm1"] = _check_activation(arrays, fused_gate_up=fused_gate_up)
         except (ValueError, FloatingPointError) as error:
             report["errors"].append(f"cpu_activation_from_gmm1: {error}")
 

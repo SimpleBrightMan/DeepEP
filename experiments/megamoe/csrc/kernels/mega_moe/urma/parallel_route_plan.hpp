@@ -9,11 +9,7 @@ URMA_ROUTE_INLINE RouteWorkRange RouteWork(uint32_t count,uint32_t worker,uint32
     return {uint32_t(uint64_t(count)*worker/workers),uint32_t(uint64_t(count)*(worker+1U)/workers)};
 }
 URMA_ROUTE_INLINE uint32_t PlanGmm1Tiles(uint32_t rows,const Config& c) {
-#if MEGAMOE_URMA_ROUTE_REORDER
-    return c.intermediate/256U;
-#else
     return Gmm1ComputeTileCount(rows,c);
-#endif
 }
 URMA_ROUTE_INLINE uint32_t PlanExpertForGroup(uint32_t group,const Config& c,URMA_ROUTE_UB DeviceRouteInfo& r) {
     uint32_t lo=0U,hi=c.localExperts;

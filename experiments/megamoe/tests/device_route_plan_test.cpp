@@ -13,7 +13,7 @@ struct Output {
     template<class T>static void set(std::vector<T>& v,uint32_t i,T x){if(v.size()<=i)v.resize(i+1);v[i]=x;}
     uint32_t Gmm1Tiles(uint32_t rows,const Config& c){
 #if MEGAMOE_URMA_ROUTE_REORDER
-        return c.intermediate/256;
+        return (c.intermediate+127U)/128U;
 #else
         return Gmm1ComputeTileCount(rows,c);
 #endif

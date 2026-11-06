@@ -151,7 +151,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, i
     expanded_x_ = allocate(expanded_rows * config.hidden);
     expanded_scale_ = allocate(expanded_rows * (config.hidden / 32));
     gathered_input_scale_ = allocate(max_recv_rows * (config.hidden / 32));
-    gmm1_ = allocate(max_recv_rows * intermediate * 4);
+    gmm1_ = allocate(0); // routed fused GMM1 writes to paired UB
     activation_ = allocate(max_recv_rows * intermediate);
     activation_scale_ = allocate(max_recv_rows * (intermediate / 32));
     gmm2_ = allocate(max_recv_rows * config.hidden * 2);
@@ -164,7 +164,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, i
     recv_chunks_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
     pack_rounds_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
     pack_ready_ = allocate(chunks * MegaMoeUrma::kFlagBytes);
-    gmm1_done_ = allocate(groups * (intermediate / 128U) * MegaMoeUrma::kFlagBytes);
+    gmm1_done_ = allocate(0); // FIFO hardware completion replaces per-tile GM flags
     input_scale_done_ = allocate(groups * MegaMoeUrma::kFlagBytes);
     activation_done_ = allocate(groups * MegaMoeUrma::kFlagBytes);
     gmm2_done_ = allocate(groups * MegaMoeUrma::kFlagBytes);
@@ -337,7 +337,7 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     ASCEND_DEEPEP_CHECK_ACL(
         aclrtMemsetAsync(reinterpret_cast<void*>(args_.symmetric + c.barrierOffset + finished_bytes), finished_bytes, 0,
                          finished_bytes, stream.stream()));
-    for (auto* tensor : {&gmm1_done_, &input_scale_done_, &activation_done_, &gmm2_done_, &gmm_issued_,
+    for (auto* tensor : {&input_scale_done_, &activation_done_, &gmm2_done_, &gmm_issued_,
                          &local_flags_, &pack_ready_}) {
         ASCEND_DEEPEP_CHECK_ACL(
             aclrtMemsetAsync(tensor->data_ptr(), tensor->numel(), 0, tensor->numel(), stream.stream()));
@@ -443,7 +443,7 @@ std::map<std::string, torch::Tensor> UrmaPlan::debug_snapshot() const
     copy("received_x", args_.symmetric + c.receiveXOffset, c.world * c.sourceRowCapacity * c.hidden);
     copy("received_scale", args_.symmetric + c.receiveScaleOffset, c.world * c.sourceRowCapacity * (c.hidden / 32));
     copy("gathered_input_scale", Address(gathered_input_scale_), c.receiveRows * (c.hidden / 32));
-    copy("gmm1", Address(gmm1_), c.receiveRows * c.intermediate * 4);
+    // Routed GMM1 is UB-only; no uninitialized GM shadow is exported.
     copy("activation", Address(activation_), c.receiveRows * c.intermediate);
     copy("activation_scale", Address(activation_scale_), c.receiveRows * (c.intermediate / 32));
     // No routed GMM2 scratch: output is consumed in paired AIV1 UB.
@@ -460,7 +460,7 @@ std::map<std::string, torch::Tensor> UrmaPlan::debug_snapshot() const
         order[inverse[flat]]=static_cast<int64_t>(flat);
     }
     result.emplace("order",compact_order);
-    copy("gmm1_done",args_.gmm1Done,c.gmm1Tiles*MegaMoeUrma::kFlagBytes);
+    // GMM1 tile readiness is now the paired hardware FULL event.
     copy("gmm2_done",args_.gmm2Done,c.fragmentCount*MegaMoeUrma::kFlagBytes);
     copy("input_scale_done",args_.inputScaleDone,c.fragmentCount*MegaMoeUrma::kFlagBytes);
     copy("activation_done",args_.activationDone,c.fragmentCount*MegaMoeUrma::kFlagBytes);

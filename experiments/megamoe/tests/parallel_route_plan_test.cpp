@@ -16,7 +16,7 @@ struct Output {
     template<class T>static void set(std::vector<T>& v,uint32_t i,T x){if(v.size()<=i)v.resize(i+1);v[i]=x;}
     uint32_t Gmm1Tiles(uint32_t rows,const Config& c){
 #if MEGAMOE_URMA_ROUTE_REORDER
-        return c.intermediate/256;
+        return (c.intermediate+127U)/128U;
 #else
         return Gmm1ComputeTileCount(rows,c);
 #endif
@@ -110,7 +110,12 @@ static void check(uint32_t ep,uint32_t experts,uint32_t bs,uint32_t k,uint32_t c
             assert(out.p.packRounds[i].rows==expected.packRounds[i].rows);
             for(uint32_t peer=0;peer<kWorld;++peer) {
                 const auto& a=out.p.packRounds[i].chunks[peer];const auto& b=expected.packRounds[i].chunks[peer];
-                assert(a.peer==b.peer&&a.cv==b.cv&&a.localRow==b.localRow&&a.rows==b.rows);
+                assert(a.rows==b.rows);
+                // Empty virtual CVs carry no payload. The legacy host oracle
+                // retains peer/cv labels; Device emission intentionally zeros
+                // the whole unused slot, as RuntimeSendChunk does.
+                if(a.rows)assert(a.peer==b.peer&&a.cv==b.cv&&a.localRow==b.localRow);
+                else assert(a.peer==0U&&a.cv==0U&&a.localRow==0U);
                 if(a.rows)assert(a.remoteRow==c.rank*c.sourceRowCapacity+i*c.cvRows);
                 else assert(a.remoteRow==0);
                 assert(a.fragmentBegin==b.fragmentBegin&&a.fragmentCount==b.fragmentCount&&a.reserved==b.reserved);
