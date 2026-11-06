@@ -30,6 +30,7 @@ constexpr uint32_t kPackMetadataEventBase = 6U;
 constexpr uint32_t kPackUbBase = ActivationUbContract::inputEnd;
 static_assert(kPackSlotBytes % 32U == 0U && kPackOrderOffset % 32U == 0U);
 static_assert(kPackUbBase + kPackUbBytes <= kRequiredUbBytes, "Pack and activation must fit the minimum UB");
+static_assert(kPackUbBase + kPackUbBytes <= kAiv1PersistentUbBase, "Pack must not overlap peer counters");
 static_assert(kPackInverseOffset % 32U == 0U && kPackInverseBankBytes % 32U == 0U);
 static_assert(kPackInverseOffset + kPackMetadataBanks * kPackInverseBankBytes <= kPackUbBytes);
 

@@ -100,7 +100,8 @@ int main() {
     CheckUniformWindow(0, 12, 24);
     assert(BuildComputeTasks({}, 12).empty());
     static_assert(kComputeTileM == 256 && kActivationTileM == 128);
-    static_assert(kRequiredUbBytes == 196608);
+    static_assert(kRequiredUbBytes == 253952);
+    static_assert(kAiv1PersistentUbBase == 245760);
     static_assert(ActivationUbContract::inputEnd == 131072);
     static_assert(ActivationUbContract::scratchEnd == 103424);
     static_assert(ActivationUbContract::upOffset == 65536);

@@ -138,7 +138,7 @@ def cooperative_schedule_metadata(world, shared_experts):
         gmm2_reorder_assignment="same block as owning AIC: global GMM2 tile modulo 28; MTE3 drain before group ready count",
         gmm2_reorder_workers=28,
         routed_compute_output="FIX to paired AIV1 UB0,128KiB,shared GMMs remain GM-backed",
-        aiv1_ub_bytes=262144,
+        aiv1_ub_bytes=253952,
         gmm2_reorder_batch_max=1,
         gmm2_reorder_handoff="single UB mailbox: captured issued budget -> hardware wait -> direct UB Reorder -> return credit; no intermediate GM tile-ready flag; stop before next GMM1",
         scale_gather_assignment="M-group modulo (29-EP), noncommunication AIV1 only",

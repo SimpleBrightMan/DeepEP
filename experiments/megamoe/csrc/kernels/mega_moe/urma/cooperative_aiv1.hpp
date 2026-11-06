@@ -13,7 +13,7 @@ namespace MegaMoeUrma {
 // Persistent per-peer send/self-ready counters use high UB only after this
 // owner's Pack is finished. Paired tile Reorder uses low 128KiB temporarily.
 struct CooperativeUb {
-    static constexpr uint32_t submitted=248U*1024U;
+    static constexpr uint32_t submitted=kAiv1PersistentUbBase;
     static constexpr uint32_t selfCounts=submitted+kMaxPeerChunks*4U;
 };
 static_assert(CooperativeUb::selfCounts+kMaxPeerChunks*4U<=kRequiredUbBytes);

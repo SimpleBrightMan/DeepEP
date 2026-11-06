@@ -24,7 +24,11 @@ constexpr uint32_t kActivationTileM = 128U;
 constexpr uint32_t kInputScaleBytes = 3584U / 32U;
 constexpr uint32_t kInputScaleUbStride = ((kInputScaleBytes + 31U) / 32U) * 32U;
 constexpr uint32_t kInputScaleUbBytes = kComputeTileM * kInputScaleUbStride;
-constexpr uint32_t kRequiredUbBytes = 256U * 1024U;
+// The platform exposes 248KiB of usable UB on a nominal 256KiB device.
+// Reserve the highest usable 8KiB for persistent peer counters, not scratch.
+constexpr uint32_t kRequiredUbBytes = 248U * 1024U;
+constexpr uint32_t kAiv1PersistentUbBase = 240U * 1024U;
+static_assert(kAiv1PersistentUbBase + 2U * kMaxPeerChunks * sizeof(uint32_t) == kRequiredUbBytes);
 struct ActivationUbContract {
     static constexpr uint32_t elements = kActivationTileM * kComputeTileN;
     static constexpr uint32_t gateOffset = 0U;

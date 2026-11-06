@@ -98,7 +98,7 @@ public:
             using HighUbActivation = MegaMoeImpl::BlockEpilogueActivationMxQuant<
                 fp8_e4m3fn_t,bfloat16_t,64U,256U,false,false,true>;
             constexpr uint32_t highUb=128U*1024U,planeBytes=64U*256U*2U;
-            static_assert(highUb+2U*planeBytes<=248U*1024U);
+            static_assert(highUb+2U*planeBytes<=kAiv1PersistentUbBase);
             HighUbActivation op;
             op.Init({.yGmAddr=reinterpret_cast<GM_ADDR>(a_.sharedActivation),
                      .yScaleGmAddr=reinterpret_cast<GM_ADDR>(a_.sharedActivationScale),

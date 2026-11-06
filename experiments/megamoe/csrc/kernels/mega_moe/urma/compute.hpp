@@ -322,6 +322,9 @@ __aicore__ inline void GatherInputScaleImpl(const Arguments& args, const Fragmen
     source.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
     destination.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.gatheredInputScale));
     LocalTensor<uint8_t> scratch(TPosition::VECCALC, 128U*1024U, kComputeTileM * scaleStride);
+    // H<=8192 is the public dimension contract; the largest gathered plane
+    // ends at192KiB, below the persistent counters at240KiB.
+    static_assert(128U*1024U+kComputeTileM*(8192U/32U)<=kAiv1PersistentUbBase);
     const uint64_t start = timer.TraceBegin();
     auto cursor=RuntimeSegments(args,fragment).MakeCursor();
     RowSegment segment{};
