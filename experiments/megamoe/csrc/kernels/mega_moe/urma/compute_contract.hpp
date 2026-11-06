@@ -185,6 +185,12 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t FirstOwnedComputeTile(uint64_t ti
     return worker >= startOwner ? worker - startOwner : worker + workerCount - startOwner;
 }
 
+// Physical core -> forward tile-owner residue. GMM1 balances the opposite
+// end of the core array; GMM2 retains its ascending owner assignment.
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t RoutedOwnerResidue(bool gmm1, uint32_t core) {
+    return gmm1 ? kAic - 1U - core : core;
+}
+
 struct OwnedComputeGroup {
     uint32_t group;
     uint32_t firstTile;

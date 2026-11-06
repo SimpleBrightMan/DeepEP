@@ -1,69 +1,14 @@
-# Routed GMM completion on paired AIV1
+# Paired consumer experiment v2
 
-Branch: `megamoe-unitflag-exp-consumer`.
+This branch combines the A/B supply experiments with paired AIV1 completion and tile Reorder. See GMM_SUPPLY_EXPERIMENT.md for the complete current policy.
 
-This is an independent experiment based on the unitflag shared implementation.
-It does not include the A-window prefetch or deeper B-buffer experiments. The
-normal benchmark command selects it automatically; no extra runtime switch is
-required. The native/Python schedule marker is
-`unitflag-shared-consumer-fix-v1` so an older wheel is rejected.
+- GMM1 owner = 27 - (global logical tile % 28), including shared GMM1. GMM2 owner = global tile % 28. Paired AIV0 follows the exact AIC sequence; routed activation follows the reversed GMM1 owner.
+- AIC queues real FIX completion (full12/13, empty14/15); issued means submission only. The paired AIV1 consumes hardware completion before publishing gmm1Done/gmm2MatmulDone.
+- gmm2Done now means all stores of a reordered N tile reached the final layout. Only ReorderGmm2Tile increments it, after MTE3 drain. AIC completion or scratch readiness cannot authorize Combine.
+- Every AIV1 performs its paired AIC GMM2 N256 tile scatter. Self results go directly to returnY; remote results go to source-major output. Communication owners only check complete prefixes, PUT data, and publish CV/self/finished flags.
+- The two M128 reorder slots occupy low128KiB and drain before another task reuses UB/events. Communication send/self counters occupy high UB after its Pack completes. The final quiet, incoming completion observation, and invocation-local joins remain.
+- Added A-window prefetch and L1 B4 with independent AIV0 UB input4/output3. Cross-core context-end is flag2, separate from B4..11 and paired completion12..15.
 
-## Completion protocol
+Native schedule marker: unitflag-shared-consumer-abc-v2. Rebuild the wheel; older kernels are rejected by the Python guard. No DCache-bypass experiment is included.
 
-Routed GMM1 and GMM2 retain their immutable, continuous GM output layouts. AIC
-does not perform a Scalar `FIX_S` wait after each routed tile. Instead it enqueues
-these operations in its FIX pipe:
-
-```text
-wait empty[sequence % 2]
-tile's actual FIX writes
-arrive full[sequence % 2]
-```
-
-Scalar then advances an `issued` counter in a per-core 128-byte GM slot. That
-counter indicates submission only, never data readiness. Paired AIV1 reconstructs
-the same tile order from the immutable device-generated compute plan. It waits
-for the matching hardware `full` event, waits for its MTE2-to-Scalar completion,
-and only then publishes the original `gmm1Done` or `gmm2MatmulDone`/`gmm2Done`.
-This prevents a GM descriptor-ring overwrite: waiting in the FIX pipe does not
-stop Scalar from overwriting a mutable descriptor, so no such ring is used.
-
-Channels 12/13 are full, 14/15 are empty, targeting the paired AIV1. The existing
-AIV0 B-supply channels 6..9 and context-retirement channel 10 remain separate.
-Every AIV1 initializes two credits, including zero-task cores; every AIC consumes
-the final two credits at kernel completion. UnitFlag and the existing L0/L1
-resource lifetimes are unchanged. Shared GMM completion remains independent.
-
-## Cooperative AIV1 work
-
-All 28 AIV1 workers consume completion and activate the GMM1 tiles owned by their
-paired AIC (`global tile % 28`). Input scale gather is spread over the same 28
-workers. Peer communication ownership stays one core per peer. Each bounded
-communication turn yields to completion, then scale gather, routed activation,
-and static Pack; shared activation remains the last-priority one-tile task.
-
-Pack retains its outgoing-row static partition. Incoming local AIC tiles and
-outgoing local Pack rows are different route domains and cannot share tile IDs.
-Pack is closed before another DMA stage takes its events. Reorder's persistent
-high-UB bitmaps become live only after this worker finishes all Pack quotas.
-
-Dispatch uses RO payload PUTs followed by the existing same-QP SO publication,
-without a quiet per CV. Combine retains 128-row payload PUTs and one SO flag per
-original CV. The required final quiet and incoming completion observation remain.
-
-## Validation and interpretation
-
-- `owned_compute_cursor_test.cpp` exercises the actual production cursor against
-  an independent full enumeration: 14,000 core configurations, including 310
-  empty-core cases.
-- `routed_fix_channel_test.cpp` uses the actual channel methods with ordered pipe
-  queues to check two-slot reuse and final credit retirement for zero, odd, and
-  long task sequences. This model does not validate device memory ordering.
-- Native CANN compilation and NPU accuracy remain separate checks. Do not infer
-  a speedup from CPU checks or compilation.
-
-Fine mode records tile submission on AIC and real output-completion waits on
-AIV1. The AIC final drain remains included in its GMM envelope. Compare formal
-profile and coarse GMM spans; summing AIC tile bars alone is no longer a complete
-compute-duration measurement. AIV1's completion work can interrupt Pack, so this
-experiment must also be assessed for communication and activation tail changes.
+CPU validation:125 checks passed, including14,000 owned-cursor configurations and delayed DMA Reorder tests. CANN build is in progress at submission; no NPU precision or performance result is claimed for v2. Prior v1 results do not validate this combined version.

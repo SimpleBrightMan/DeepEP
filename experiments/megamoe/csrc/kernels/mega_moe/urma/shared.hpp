@@ -35,7 +35,7 @@ __aicore__ inline void RunSharedGmm(const Arguments& a,uint32_t core,T& timer) {
     for(uint32_t group=0;group<(a.config.bs+255)/256;++group) {
         const auto f=SharedFragment(a,group);
         const uint32_t count=First?a.sharedIntermediate/256:a.config.hidden/256;
-        const uint32_t first=FirstOwnedComputeTile(uint64_t(group)*count,core,kAic);
+        const uint32_t first=FirstOwnedComputeTile(uint64_t(group)*count,RoutedOwnerResidue(First,core),kAic);
         if(first>=count)continue;
         const MegaMoeImpl::BlockJobContext job{core,kAic};
         auto config=UrmaGmmConfig::BuildGmm1ProblemConfig(FragmentShape(v,f),job,kComputeTileM);

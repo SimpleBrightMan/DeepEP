@@ -120,30 +120,28 @@ int main(int argc, char** argv) {
     constexpr uint32_t h = 3584U, ntiles = 14U, prefix = 7U, fragmentIndex = 3U;
     const uint16_t sentinel = 0x7fc1;
     std::vector<bfloat16_t> input((prefix + rows + 9U) * h);
-    std::vector<bfloat16_t> remote((rows + 300U) * h), self((rows + 500U) * h);
+    std::vector<bfloat16_t> remote((world * 512U + rows + 300U) * h), self((rows + 500U) * h);
     for (auto& item : remote) item.bits = sentinel;
     for (auto& item : self) item.bits = sentinel;
     for (uint32_t row = 0; row < input.size() / h; ++row)
         for (uint32_t col = 0; col < h; ++col)
             input[row * h + col].bits = uint16_t(1U + (row * 7919U + col * 997U) % 30000U);
     const uint32_t rank = world - 1U;
-    std::vector<RowSegment> segments(2); // Test nonzero segmentBegin too.
+    DeviceRouteInfo info{};
+    info.groupBase[5]=fragmentIndex;
     std::vector<uint32_t> sourceRow(rows), destinationRow(rows);
     std::vector<bool> local(rows);
-    uint32_t segmentId = 0;
-    for (uint32_t row = 0; row < rows;) {
-        const uint32_t width = std::min(rows - row, segmentId % 3U == 0U ? 43U : 17U);
-        const uint32_t peer = segmentId % 3U == 0U ? rank : segmentId % (world - 1U);
-        segments.push_back({peer, segmentId, 19U + row, 201U + row, row, width, segmentId, 0U});
-        for (uint32_t r = row; r < row + width; ++r) {
-            sourceRow[r] = prefix + r;
-            destinationRow[r] = (peer == rank ? 201U : 19U) + r;
-            local[r] = peer == rank;
+    for (uint32_t peer=0;peer<world;++peer) {
+        uint32_t begin=rows*peer/world,end=rows*(peer+1U)/world;
+        info.sources[5][peer]=begin;info.sources[5][peer+1U]=end;
+        info.incoming[peer][5]=19;info.incoming[peer][6]=19+end-begin;
+        info.returnBase[peer]=182;
+        for(uint32_t r=begin;r<end;++r) {
+            sourceRow[r]=prefix+r;local[r]=peer==rank;
+            destinationRow[r]=(peer==rank?201U:peer*512U+19U)+r-begin;
         }
-        row += width;
-        ++segmentId;
     }
-    Fragment fragment{5U, 2U, prefix, rows, segmentId, 0U, 0U};
+    Fragment fragment{5U, fragmentIndex, prefix, rows, 0U, 0U, 0U};
     std::array<int32_t, 6U * 32U> done{};
     Arguments args{};
     args.config.rank = rank; args.config.world = world; args.config.hidden = h;
@@ -152,7 +150,8 @@ int main(int argc, char** argv) {
     args.gmm2Contiguous = reinterpret_cast<uint64_t>(input.data());
     args.gmm2Output = reinterpret_cast<uint64_t>(remote.data());
     args.gmm2Done = reinterpret_cast<uint64_t>(done.data());
-    args.segments = reinterpret_cast<uint64_t>(segments.data());
+    args.routeInfo = reinterpret_cast<uint64_t>(&info);
+    args.config.cvRows=128;args.config.sourceRowCapacity=512;args.config.maxPeerChunks=1024;
     std::unordered_map<uintptr_t, uint16_t> expected;
     std::unordered_map<uintptr_t, uint32_t> seen;
     for (uint32_t row = 0; row < rows; ++row)

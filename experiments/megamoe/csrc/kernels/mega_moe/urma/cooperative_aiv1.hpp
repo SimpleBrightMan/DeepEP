@@ -4,19 +4,29 @@
 #include "shared.hpp"
 #include "peer_reorder_progress.hpp"
 #include "consumer_completion.hpp"
+#include "reorder.hpp"
 #include "communication_schedule.hpp"
 
 namespace MegaMoeUrma {
-// Persistent Reorder state aliases Pack's high UB, so it becomes live only
-// after this owner has finished every outgoing Pack quota. Activation and
-// completion use low UB and close their DMA lifetimes before each handoff.
+// Persistent per-peer send/self-ready counters use high UB only after this
+// owner's Pack is finished. Paired tile Reorder uses low 128KiB temporarily.
 struct CooperativeUb {
-    static constexpr uint32_t remoteBits=kPackUbBase;
-    static constexpr uint32_t selfBits=remoteBits+kPeerReorderBitmapBytes;
-    static constexpr uint32_t submitted=selfBits+kPeerReorderBitmapBytes;
+    static constexpr uint32_t submitted=kPackUbBase;
     static constexpr uint32_t selfCounts=submitted+kMaxPeerChunks*4U;
 };
 static_assert(CooperativeUb::selfCounts+kMaxPeerChunks*4U<=kPackUbBase+kPackUbBytes);
+
+// A contiguous row prefix is safe only after every N tile of each intersecting
+// M-group has reached its final layout. Counters are published after MTE3 drain.
+__aicore__ inline uint32_t PairedReorderedPrefix(const Arguments& a,const Chunk& c) {
+    RuntimePeerSpans cursor(a,c);PeerReorderSpan span{};uint32_t bit,rows=0U;
+    const auto required=static_cast<int32_t>(a.config.hidden/kComputeTileN);
+    while(cursor.Next(span,bit)) {
+        if(ReadGmByPassDCache(ComputeFlag(a.gmm2Done,span.fragmentIndex))<required)break;
+        rows+=span.rows;
+    }
+    return rows;
+}
 struct CooperativeNoWait { __aicore__ inline void Before(){} };
 
 __aicore__ inline TraceMeta CooperativeChunkMeta(const Chunk& c,uint32_t offset,uint32_t rows) {
@@ -31,9 +41,7 @@ public:
         :a_(a),core_(core),timer_(timer),active_(core<CommunicationWorkers(a.config.world)),
          peer_(active_?PeerForOwner(a.config.rank,core):0U),
          submitted_(TPosition::VECCALC,CooperativeUb::submitted,kMaxPeerChunks),
-         selfCounts_(TPosition::VECCALC,CooperativeUb::selfCounts,kMaxPeerChunks),
-         remoteBits_(TPosition::VECCALC,CooperativeUb::remoteBits,kPeerReorderBitmapWords),
-         selfBits_(TPosition::VECCALC,CooperativeUb::selfBits,kPeerReorderBitmapWords) {
+         selfCounts_(TPosition::VECCALC,CooperativeUb::selfCounts,kMaxPeerChunks) {
         dispatchCount_=active_?RuntimeSendCvCount(a,peer_):0U;
     }
     __aicore__ inline bool Active()const{return active_;}
@@ -121,9 +129,6 @@ private:
         for(uint32_t i=0;i<receives_;++i)submitted_.SetValue(i,0U);
         for(uint32_t i=0;i<selfCount_;++i)selfCounts_.SetValue(i,0U);
         for(uint32_t i=core_;i<selfCount_;i+=CommunicationWorkers(a_.config.world))++selfRemaining_;
-        remoteRange_=PeerReorderSpanRange(a_,begin_,begin_+receives_);
-        selfRange_=PeerReorderSpanRange(a_,selfBegin_,selfBegin_+selfCount_);
-        ClearReorderBitmap(remoteBits_,remoteRange_.spanCount);ClearReorderBitmap(selfBits_,selfRange_.spanCount);
         initialized_=true;
     }
     __aicore__ inline bool TryRemote() {
@@ -132,12 +137,9 @@ private:
             const uint32_t j=nextRemote_;nextRemote_=(nextRemote_+1U)%receives_;
             uint32_t sent=submitted_.GetValue(j);if(sent==kReorderCvSubmitted)continue;
             const Chunk c=RuntimeReceiveChunkByIndex(a_,begin_+j);
-            const auto range=LoadPeerReorderRange(a_,begin_+j);
-            bool waiting=false;TraceMeta waitMeta;waitMeta.peer=peer_;
-            const uint32_t copied=ReorderReadyPeerSpans(a_,range,c,remoteRange_.spanBegin,remoteBits_,timer_,waiting,0U,waitMeta);
-            const uint32_t ready=ReorderedPeerPrefixRows(a_,range,remoteRange_.spanBegin,remoteBits_);
+            const uint32_t ready=PairedReorderedPrefix(a_,c);
             const uint32_t n=RouteMin(kCombinePutRows,c.rows-sent);
-            if(sent+n>ready)return copied!=0U;
+            if(sent+n>ready)return false;
             timer_.CoarseBegin(CoarsePhase::Combine);timer_.Begin(Phase::Combine);
             auto m=CooperativeChunkMeta(c,sent,n);m.bytes=uint64_t(n)*a_.config.hidden*2U;
             auto start=timer_.TraceBegin();
@@ -164,16 +166,10 @@ private:
             const uint32_t j=nextSelf_;nextSelf_+=workers;if(nextSelf_>=selfCount_)nextSelf_=core_;
             const uint32_t before=selfCounts_.GetValue(j);if(before==kReorderCvSubmitted)continue;
             const Chunk c=RuntimeReceiveChunkByIndex(a_,selfBegin_+j);
-            const auto range=LoadPeerReorderRange(a_,selfBegin_+j);
-            bool waiting=false;TraceMeta waitMeta;waitMeta.peer=a_.config.rank;
-            const uint32_t copied=ReorderReadyPeerSpans(a_,range,c,selfRange_.spanBegin,selfBits_,timer_,waiting,0U,waitMeta);
-            if(!copied)return false;
-            selfCounts_.SetValue(j,before+copied);
-            if(before+copied==range.spanCount) {
-                WriteGmByPassDCache(reinterpret_cast<__gm__ uint64_t*>(a_.symmetric+a_.config.combineReadyOffset+
-                    (uint64_t(a_.config.rank)*a_.config.maxPeerChunks+c.cv)*kFlagBytes),a_.config.epoch);
-                selfCounts_.SetValue(j,kReorderCvSubmitted);--selfRemaining_;
-            }
+            if(PairedReorderedPrefix(a_,c)!=c.rows)return false;
+            WriteGmByPassDCache(reinterpret_cast<__gm__ uint64_t*>(a_.symmetric+a_.config.combineReadyOffset+
+                (uint64_t(a_.config.rank)*a_.config.maxPeerChunks+c.cv)*kFlagBytes),a_.config.epoch);
+            selfCounts_.SetValue(j,kReorderCvSubmitted);--selfRemaining_;
             return true;
         }
         return false;
@@ -182,8 +178,7 @@ private:
     bool started_=false,initialized_=false,finished_=false,selfFinished_=false,sharedHeadReady_=false;
     uint32_t dispatchCount_=0U,nextDispatch_=0U,dispatchSteps_=0U,begin_=0U,receives_=0U,selfBegin_=0U,selfCount_=0U;
     uint32_t remaining_=0U,selfRemaining_=0U,nextRemote_=0U,nextSelf_=0U;
-    PeerReorderRange remoteRange_{},selfRange_{};
-    LocalTensor<uint32_t> submitted_,selfCounts_,remoteBits_,selfBits_;
+    LocalTensor<uint32_t> submitted_,selfCounts_;
 };
 
 __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& timer,SharedIncoming& incoming) {
@@ -192,8 +187,8 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& time
     if(!peer.Active())timer.CoarseBegin(CoarsePhase::Activation);
     UrmaActivation activation;
     activation.Init({.yGmAddr=reinterpret_cast<GM_ADDR>(a.activation),.yScaleGmAddr=reinterpret_cast<GM_ADDR>(a.activationScale),.clampLimit=FLT_MAX});
-    uint32_t nextPack=kPackStartupRounds,nextGather=core,nextActivation=0U,activationTile=0U;
-    bool ready=false,packDone=false,activationPrepared=false;
+    uint32_t nextPack=kPackStartupRounds,nextGather=core,nextActivation=0U,activationTile=0U,nextReorder=0U,reorderTile=0U;
+    bool ready=false,packDone=false,activationPrepared=false,reorderPrepared=false;
     while(true) {
         bool progress=peer.TryDispatch(pack,packDone);
         if(!ready&&RouteSummaryReady(a)){AcquireRouteSummary(a);ready=true;progress=true;}
@@ -213,11 +208,23 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& time
         }
         if(ready&&!localWork)while(nextActivation<a.config.fragmentCount) {
             const auto f=LoadFragment(a,nextActivation);
-            if(!activationPrepared){activationTile=FirstOwnedComputeTile(f.gmm1TileBegin,core,kAic);activationPrepared=true;}
+            if(!activationPrepared){activationTile=FirstOwnedComputeTile(f.gmm1TileBegin,RoutedOwnerResidue(true,core),kAic);activationPrepared=true;}
             if(activationTile>=FragmentGmm1Tiles(a,f)){++nextActivation;activationPrepared=false;continue;}
             if(ReadGmByPassDCache(ComputeFlag(a.gmm1Done,f.gmm1TileBegin+activationTile))!=0) {
                 pack.Close();RunReadyActivationTile(a,core,f,nextActivation,activationTile,activation,timer,kAic);
                 activationTile+=kAic;localWork=true;
+            }
+            break;
+        }
+        // Same physical owner as the GMM2 AIC; consume only true FIX-ready
+        // tiles and publish final-layout completion after scatter stores drain.
+        if(ready&&!localWork)while(nextReorder<a.config.fragmentCount) {
+            const auto f=LoadFragment(a,nextReorder);
+            if(!reorderPrepared){reorderTile=FirstOwnedComputeTile(f.gmm2TileBegin,core,kAic);reorderPrepared=true;}
+            if(reorderTile>=FragmentGmm2Tiles(a,f)){++nextReorder;reorderPrepared=false;continue;}
+            if(ReadGmByPassDCache(ComputeFlag(a.gmm2MatmulDone,f.gmm2TileBegin+reorderTile))!=0) {
+                pack.Close();ReorderGmm2Tile(a,f,nextReorder,reorderTile,timer);
+                reorderTile+=kAic;localWork=true;
             }
             break;
         }
@@ -230,7 +237,7 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& time
         }
         progress=localWork||progress;incoming.Poll();
         if(ready&&packDone&&peer.Done()&&completion.Done()&&nextGather>=a.config.fragmentCount&&
-           nextActivation>=a.config.fragmentCount&&shared.Done())break;
+           nextActivation>=a.config.fragmentCount&&nextReorder>=a.config.fragmentCount&&shared.Done())break;
         if(!progress){const uint64_t tick=GetSystemCycle();while(GetSystemCycle()-tick<64U){}}
     }
     pack.Close();

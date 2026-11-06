@@ -31,7 +31,7 @@ public:
                 if(limit_==0U){++step_;continue;}
                 const auto first=plan_.Group(begin_);
                 const uint64_t base=gmm1_?first.gmm1TileBegin:first.gmm2TileBegin;
-                next_=FirstOwnedComputeTile(base,core_,kAic);active_=true;
+                next_=FirstOwnedComputeTile(base,RoutedOwnerResidue(gmm1_,core_),kAic);active_=true;
             }
             if(next_<limit_) {
                 item.gmm1=gmm1_;item.group=begin_+static_cast<uint32_t>(next_/tiles_);

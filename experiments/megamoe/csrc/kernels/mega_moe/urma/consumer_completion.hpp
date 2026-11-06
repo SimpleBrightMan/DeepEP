@@ -71,7 +71,7 @@ public:
         item=next_;
         auto* done=reinterpret_cast<__gm__ int32_t*>((item.gmm1?a_.gmm1Done:a_.gmm2MatmulDone)+item.logicalTile*kFlagBytes);
         AscendC::WriteGmByPassDCache(done,1);
-        if(!item.gmm1)AscendC::AtomicAdd(reinterpret_cast<__gm__ int32_t*>(a_.gmm2Done+uint64_t(item.group)*kFlagBytes),1);
+        // gmm2Done counts final-layout N tiles, incremented only by ReorderGmm2Tile.
         // Credits protect event reuse, not GM storage: every tile has its own
         // immutable output range, so activation/Reorder may execute later.
         RoutedFixChannel::Release(consumed_++);prepared_=false;

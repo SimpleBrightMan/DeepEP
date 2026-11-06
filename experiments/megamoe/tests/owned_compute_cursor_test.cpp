@@ -1,3 +1,6 @@
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include "owned_compute_cursor.hpp"
 #include <cassert>
 #include <iostream>
@@ -26,7 +29,7 @@ int main(){
         for(uint32_t core=0;core<kAic;++core){
             std::vector<Key> expected,actual;
             for(auto task:p.tasks){auto b=p.batches[task.batchIndex];bool g1=task.stage==ComputeBatchStage::Gmm1;uint32_t nt=p.Tiles(g1);
-                for(uint32_t g=b.fragmentBegin;g<b.fragmentBegin+b.fragmentCount;++g)for(uint32_t t=0;t<nt;++t){uint64_t logical=uint64_t(g)*nt+t;if(logical%kAic==core)expected.emplace_back(g1,g,t,logical);}}
+                for(uint32_t g=b.fragmentBegin;g<b.fragmentBegin+b.fragmentCount;++g)for(uint32_t t=0;t<nt;++t){uint64_t logical=uint64_t(g)*nt+t;if((g1?kAic-1U-logical%kAic:logical%kAic)==core)expected.emplace_back(g1,g,t,logical);}}
             OwnedTileSequence<Plan> cursor(p,core);RoutedCompletionItem item;
             while(cursor.Next(item))actual.emplace_back(item.gmm1,item.group,item.tile,item.logicalTile);
             assert(actual==expected);assert(!cursor.Next(item));if(actual.empty())++empty;++cases;

@@ -52,10 +52,10 @@ class A8W4MatmulPipeline {
                                                      Catlass::Gemm::Tile::ScaleGranularity::PER_TENSOR>;
     // A multi-store result needs ordinary NZ L0C and explicit FIX ownership.
     // Keep the existing transformed/unit-flag path for contiguous outputs.
-    using Policy = Catlass::Gemm::MmadA8W4Mx<Arch, !RowIO::kScatterOutput, false, 16, 1, 2, 2, 2, 2>;
+    using Policy = Catlass::Gemm::MmadA8W4Mx<Arch, !RowIO::kScatterOutput, false, 16, 1, 2, 4, 2, 2>;
     using Mmad = Catlass::Gemm::Block::MegaMoeBlockMmadA8W4<Policy, L1, L0, A, A, Out, void, TileCopy>;
     using Prologue =
-        Catlass::Gemm::Block::MegaMoeBlockPrologueA8W4<Arch, 2, Catlass::Gemm::GemmType<W, LayoutB>,
+        Catlass::Gemm::Block::MegaMoeBlockPrologueA8W4<Arch, 4, Catlass::Gemm::GemmType<W, LayoutB>,
                                                        Catlass::Gemm::GemmType<A, LayoutDequantizedB>, L1, TileCopy>;
     using Resource = Catlass::Gemm::Block::MegaMoeResource;
 
@@ -64,8 +64,8 @@ class A8W4MatmulPipeline {
         __aicore__ inline void Begin()
         {
             this->Activate();
-            for (uint16_t i = 0; i < 2; ++i) {
-                AscendC::CrossCoreSetFlag<4, PIPE_MTE1>(8 + i);
+            for (uint16_t i = 0; i < A8W4BDeepResources::BStages; ++i) {
+                AscendC::CrossCoreSetFlag<4, PIPE_MTE1>(A8W4BDeepResources::BEmpty + i);
             }
         }
         __aicore__ inline void End(bool outputDrained)
@@ -92,8 +92,8 @@ class A8W4MatmulPipeline {
         __aicore__ inline void End(bool /*outputDrained*/)
         {
             // Consume the final free-buffer tokens before another slice reuses the flags/L1.
-            for (uint16_t i = 0; i < 2; ++i) {
-                AscendC::CrossCoreWaitFlag<4, PIPE_MTE3>(8 + i);
+            for (uint16_t i = 0; i < A8W4BDeepResources::BStages; ++i) {
+                AscendC::CrossCoreWaitFlag<4, PIPE_MTE3>(A8W4BDeepResources::BEmpty + i);
             }
             op.Deactivate();
         }
