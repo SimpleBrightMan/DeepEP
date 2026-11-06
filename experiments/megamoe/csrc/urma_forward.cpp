@@ -184,7 +184,6 @@ UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, i
     args_.routeHistogram=Address(route_histogram_);args_.routeInfo=Address(route_info_);
     args_.routeConfig=Address(route_config_);
     gmm2_contiguous_ = allocate(max_recv_rows * config.hidden * 2);
-    gmm2_matmul_done_ = allocate(groups * (config.hidden / 256U) * MegaMoeUrma::kFlagBytes);
     peer_reorder_ranges_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
     peer_reorder_spans_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
     local_flags_ = allocate(16 * MegaMoeUrma::kFlagBytes);
@@ -215,7 +214,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, i
     args_.inputScaleDone = Address(input_scale_done_);
     args_.activationDone = Address(activation_done_);
     args_.gmm2Done = Address(gmm2_done_);
-    args_.gmm2MatmulDone = Address(gmm2_matmul_done_);
+    args_.gmm2MatmulDone = 0; // reserved ABI slot; direct same-core completion -> Reorder
     args_.localFlags = Address(local_flags_);
     args_.systemWorkspace = Address(system_workspace_);
 }
@@ -338,7 +337,7 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
     ASCEND_DEEPEP_CHECK_ACL(
         aclrtMemsetAsync(reinterpret_cast<void*>(args_.symmetric + c.barrierOffset + finished_bytes), finished_bytes, 0,
                          finished_bytes, stream.stream()));
-    for (auto* tensor : {&gmm1_done_, &input_scale_done_, &activation_done_, &gmm2_done_, &gmm2_matmul_done_, &gmm_issued_,
+    for (auto* tensor : {&gmm1_done_, &input_scale_done_, &activation_done_, &gmm2_done_, &gmm_issued_,
                          &local_flags_, &pack_ready_}) {
         ASCEND_DEEPEP_CHECK_ACL(
             aclrtMemsetAsync(tensor->data_ptr(), tensor->numel(), 0, tensor->numel(), stream.stream()));
@@ -385,7 +384,7 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
                                &activation_scale_,
                                &gmm2_,
                                &gmm2_contiguous_,
-                               &gmm2_matmul_done_, &gmm_issued_,
+                               &gmm_issued_,
                                &fragments_,
                                &segments_,
                                &compute_batches_,
@@ -466,7 +465,6 @@ std::map<std::string, torch::Tensor> UrmaPlan::debug_snapshot() const
     copy("input_scale_done",args_.inputScaleDone,c.fragmentCount*MegaMoeUrma::kFlagBytes);
     copy("activation_done",args_.activationDone,c.fragmentCount*MegaMoeUrma::kFlagBytes);
     copy("local_flags",args_.localFlags,local_flags_.nbytes());
-    copy("gmm2_matmul_done",args_.gmm2MatmulDone,c.gmm2Tiles*MegaMoeUrma::kFlagBytes);
     if(args_.sharedExperts) {
         copy("shared_gmm1",args_.sharedGmm1,shared_gmm1_.nbytes());
         copy("shared_activation",args_.sharedActivation,shared_activation_.nbytes());
@@ -487,7 +485,7 @@ int64_t UrmaPlan::workspace_bytes() const
                                &activation_scale_,
                                &gmm2_,
                                &gmm2_contiguous_,
-                               &gmm2_matmul_done_, &gmm_issued_,
+                               &gmm_issued_,
                                &fragments_,
                                &segments_,
                                &compute_batches_,

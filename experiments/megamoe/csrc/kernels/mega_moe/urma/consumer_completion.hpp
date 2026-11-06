@@ -58,19 +58,25 @@ public:
     __aicore__ RoutedCompletionConsumer(const Arguments& a,uint32_t core):a_(a),core_(core),cursor_(a,core){}
     __aicore__ inline void Init(){RoutedFixChannel::InitConsumer();}
     // Caller closes Pack/scale/Reorder DMA lifetimes before invoking this.
-    // Route summary must be acquired before using cursor/Done/TryCompleteOne.
+    // Route summary must be acquired before using cursor/Done/IssuedCount.
     __aicore__ inline bool Done(){Prepare();return exhausted_;}
-    __aicore__ inline bool HasIssued(){
-        Prepare();if(exhausted_)return false;
+    __aicore__ inline uint32_t IssuedCount(){
+        Prepare();if(exhausted_)return 0U;
         if(consumed_>=issued_)issued_=static_cast<uint32_t>(AscendC::ReadGmByPassDCache(RoutedIssued(a_,core_)));
-        return consumed_<issued_;
+        return consumed_<issued_ ? issued_-consumed_ : 0U;
     }
-    template<class TimerT> __aicore__ inline bool TryCompleteOne(RoutedCompletionItem& item,TimerT& timer) {
-        if(!HasIssued())return false;
+    __aicore__ inline bool NextIsGmm1(){Prepare();return !exhausted_ && next_.gmm1;}
+    // IssuedCount captured the budget; this method does not poll GM again.
+    template<class TimerT> __aicore__ inline void CompleteIssuedOne(RoutedCompletionItem& item,TimerT& timer) {
+        Prepare();
         const auto start=timer.TraceBegin();RoutedFixChannel::Wait(consumed_);
         item=next_;
-        auto* done=reinterpret_cast<__gm__ int32_t*>((item.gmm1?a_.gmm1Done:a_.gmm2MatmulDone)+item.logicalTile*kFlagBytes);
-        AscendC::WriteGmByPassDCache(done,1);
+        if(item.gmm1) {
+            auto* done=reinterpret_cast<__gm__ int32_t*>(a_.gmm1Done+item.logicalTile*kFlagBytes);
+            AscendC::WriteGmByPassDCache(done,1);
+        }
+        // GMM2 goes straight to same-core Reorder using item.fragment/tile.
+        // No gmm2MatmulDone publication or Scalar ready re-read is needed.
         // gmm2Done counts final-layout N tiles, incremented only by ReorderGmm2Tile.
         // Credits protect event reuse, not GM storage: every tile has its own
         // immutable output range, so activation/Reorder may execute later.
@@ -78,7 +84,6 @@ public:
         TraceMeta m;m.fragment=item.group;m.expert=item.fragment.expert;
         m.row=item.fragment.rowBegin;m.rows=item.fragment.rows;m.tileN=uint64_t(item.tile)*256U;m.columns=256U;
         timer.TraceEnd(item.gmm1?TraceEvent::Gmm1TileDrain:TraceEvent::Gmm2Drain,start,m);
-        return true;
     }
 private:
     __aicore__ inline void Prepare(){if(!prepared_&&!exhausted_){exhausted_=!cursor_.Next(next_);prepared_=!exhausted_;}}

@@ -37,7 +37,7 @@ def _extension():
         raise RuntimeError("URMA Python/native versions differ; rebuild and reinstall the complete wheel")
     if getattr(extension, "urma_tail_schedule", None) != "combine-ready-scan-reduce-world-v1":
         raise RuntimeError("URMA tailCover needs its matching native wheel; rebuild and reinstall the complete wheel")
-    if getattr(extension, "urma_compute_schedule", None) != "unitflag-shared-consumer-abc-v2":
+    if getattr(extension, "urma_compute_schedule", None) != "unitflag-shared-consumer-direct-v3":
         raise RuntimeError(
             "URMA M-group lookahead needs its matching native wheel; rebuild and reinstall the complete wheel"
         )
@@ -166,7 +166,7 @@ class UrmaBuffer:
                 timeout,
                 allow_multi_host,
                 "combine-ready-scan-reduce-world-v1",
-                "unitflag-shared-consumer-abc-v2",
+                "unitflag-shared-consumer-direct-v3",
                 COMMUNICATION_PROTOCOL,
             ),
         )

@@ -260,7 +260,7 @@ struct Arguments {
     uint64_t inputScaleDone;
     uint64_t activationDone;
     uint64_t gmm2Done;        // Completed N tiles per M-group, BEFORE peer row reorder.
-    uint64_t gmm2MatmulDone;  // Per logical GMM2 tile, retained for diagnostics.
+    uint64_t gmm2MatmulDone;  // Reserved, zero: paired direct Reorder needs no intermediate GM flag.
     uint64_t localFlags;
     uint64_t timer;
     uint64_t trace;

@@ -4,6 +4,7 @@
 #include "shared.hpp"
 #include "peer_reorder_progress.hpp"
 #include "consumer_completion.hpp"
+#include "completion_batch.hpp"
 #include "reorder.hpp"
 #include "communication_schedule.hpp"
 
@@ -27,6 +28,14 @@ __aicore__ inline uint32_t PairedReorderedPrefix(const Arguments& a,const Chunk&
     }
     return rows;
 }
+struct DirectReorderWork {
+    const Arguments& a;
+    PackBatch& pack;
+    __aicore__ inline void Before(){pack.Close();}
+    template<class TimerT> __aicore__ inline void Reorder(const RoutedCompletionItem& item,TimerT& timer) {
+        ReorderGmm2Tile(a,item.fragment,item.group,item.tile,timer);
+    }
+};
 struct CooperativeNoWait { __aicore__ inline void Before(){} };
 
 __aicore__ inline TraceMeta CooperativeChunkMeta(const Chunk& c,uint32_t offset,uint32_t rows) {
@@ -187,18 +196,16 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& time
     if(!peer.Active())timer.CoarseBegin(CoarsePhase::Activation);
     UrmaActivation activation;
     activation.Init({.yGmAddr=reinterpret_cast<GM_ADDR>(a.activation),.yScaleGmAddr=reinterpret_cast<GM_ADDR>(a.activationScale),.clampLimit=FLT_MAX});
-    uint32_t nextPack=kPackStartupRounds,nextGather=core,nextActivation=0U,activationTile=0U,nextReorder=0U,reorderTile=0U;
-    bool ready=false,packDone=false,activationPrepared=false,reorderPrepared=false;
+    uint32_t nextPack=kPackStartupRounds,nextGather=core,nextActivation=0U,activationTile=0U;
+    bool ready=false,packDone=false,activationPrepared=false;
+    DirectReorderWork directReorder{a,pack};
     while(true) {
         bool progress=peer.TryDispatch(pack,packDone);
         if(!ready&&RouteSummaryReady(a)){AcquireRouteSummary(a);ready=true;progress=true;}
         if(ready&&packDone)progress=peer.TryCombine(true)||progress;
         // One bounded communication turn always yields to completion. Otherwise
         // the two FIX slots would fill and hold the AIC behind an endless PUT loop.
-        if(ready&&completion.HasIssued()) {
-            pack.Close();RoutedCompletionItem item;
-            progress=completion.TryCompleteOne(item,timer)||progress;
-        }
+        if(ready)progress=(ConsumeIssuedReorders(completion,directReorder,timer)!=0U)||progress;
         bool localWork=false;
         if(ready&&nextGather<a.config.fragmentCount) {
             const auto f=LoadFragment(a,nextGather);
@@ -216,18 +223,6 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& time
             }
             break;
         }
-        // Same physical owner as the GMM2 AIC; consume only true FIX-ready
-        // tiles and publish final-layout completion after scatter stores drain.
-        if(ready&&!localWork)while(nextReorder<a.config.fragmentCount) {
-            const auto f=LoadFragment(a,nextReorder);
-            if(!reorderPrepared){reorderTile=FirstOwnedComputeTile(f.gmm2TileBegin,core,kAic);reorderPrepared=true;}
-            if(reorderTile>=FragmentGmm2Tiles(a,f)){++nextReorder;reorderPrepared=false;continue;}
-            if(ReadGmByPassDCache(ComputeFlag(a.gmm2MatmulDone,f.gmm2TileBegin+reorderTile))!=0) {
-                pack.Close();ReorderGmm2Tile(a,f,nextReorder,reorderTile,timer);
-                reorderTile+=kAic;localWork=true;
-            }
-            break;
-        }
         if(!localWork&&!packDone&&nextPack<a.config.packRoundCount) {
             PackOneRound(a,nextPack++,core,kAic,pack);localWork=true;
         }
@@ -237,7 +232,7 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& time
         }
         progress=localWork||progress;incoming.Poll();
         if(ready&&packDone&&peer.Done()&&completion.Done()&&nextGather>=a.config.fragmentCount&&
-           nextActivation>=a.config.fragmentCount&&nextReorder>=a.config.fragmentCount&&shared.Done())break;
+           nextActivation>=a.config.fragmentCount&&shared.Done())break;
         if(!progress){const uint64_t tick=GetSystemCycle();while(GetSystemCycle()-tick<64U){}}
     }
     pack.Close();
