@@ -1,7 +1,7 @@
 # 实验③：AIV1合作调度与FIX完成消费
 
 仅实验分支 `megamoe-unitflag-exp-consumer`。必须基于本次生产头部更新（AIV0并行RouteSummary）；
-不把实验实现回写到两个shared生产分支。当前仅源码审查/CPU协议检查，不代表NPU精度或性能通过。
+不把实验实现回写到两个shared生产分支。编译与NPU双标杆状态以总实验报告为准；CPU协议检查本身不代表NPU精度或性能通过。
 
 ## 分工
 
@@ -36,7 +36,9 @@
 
 Dispatch coarse条改为submission-only（ID53），不再把没有quiet的下发结束误称为完成。
 通信core的coarse Dispatch/Combine包络可能包含期间的本地工作；其激活/完成细分请看fine。
-非通信core可用CoarseActivation观察合作阶段包络。AIC矩阵tile/drain仍用于统一GMM包络。
+非通信core可用CoarseActivation观察合作阶段包络。AIC矩阵tile与最终drain用于统一GMM包络。
+AIV1上的Gmm1TileDrain/Gmm2Drain明确标成paired FIX completion，不与AIC tile跨泳道合并，也不计作AIC计算时间。
+benchmark manifest记录28个completion/scale/路由激活worker，保留真实S0/S1通信批次与收尾区别。
 
 频繁关闭Pack以让completion/激活复用MTE事件，会带来真实成本；额外Scalar调度、
 Reorder和通信任务也可能让AIV1成为瓶颈。因此本方案是待测实验，不能提前声称AIC一直满载。

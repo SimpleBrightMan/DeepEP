@@ -79,9 +79,9 @@ def event_style(event):
     if event == "PackRetire":
         return event, "compute.drain", "thread_state_iowait", "wait captured Pack fence and publish pending ready; Close also releases six DMA credits"
     if event == "CoarseSharedCombineSubmit":
-        return event, "coarse.envelope", "thread_state_runnable", "Combine submission envelope; final quiet is deferred until after routed Reduce"
+        return event, "coarse.envelope", "thread_state_runnable", "Combine submission envelope including cooperative local work; final quiet is deferred until after routed Reduce"
     if event == "CoarseDispatchSubmit":
-        return event, "coarse.envelope", "thread_state_runnable", "Dispatch submission envelope, not remote completion; final Combine quiet retires both phases"
+        return event, "coarse.envelope", "thread_state_runnable", "Dispatch submission envelope, not remote completion; includes cooperative local work between submissions; final Combine quiet retires both phases"
     if event.startswith("Coarse"):
         return event, "coarse.envelope", "good", "stage envelope including internal gaps; timestamps buffered until final local join"
     if event == "Reduce":
@@ -262,6 +262,9 @@ def decode_trace(raw, *, rank, clock_mhz):
     for start, end, engine, ordinal, row in sorted(records, key=lambda value: (value[0], value[2], value[3])):
         event = EVENTS[row[2]]
         name, category, color, meaning = event_style(event)
+        if engine % 3 == 2 and event in ("Gmm1TileDrain", "Gmm2Drain"):
+            name = event + " [paired FIX completion]"
+            meaning = "paired AIV1 waits for actual FIX full before publishing compute-ready; not AIC execution time"
         args = {field: None if value == UNKNOWN else value for field, value in zip(METADATA_FIELDS, row[3:12])}
         if event == "LocalSync":
             stage = args.pop("cv")

@@ -120,6 +120,33 @@ def parse_args(argv=None):
     return args
 
 
+def cooperative_schedule_metadata(world, shared_experts):
+    """Describe this branch's cooperative schedule without changing measurements."""
+    return dict(
+        dispatch_combine_transition="own Dispatch submitted + own Pack complete -> ready Combine scan; no per-CV Dispatch quiet or local join",
+        dispatch_batch_cvs="S1: 1,1,2,4,8 ramp, at most 8 CVs per cooperative turn; S0: one CV per turn",
+        dispatch_pack_cvs="startup2; steady static outgoing Pack round only after scale gather and routed activation yield; not coupled to merged PUT count",
+        dispatch_publication="one same-QP SO epoch per covered original CV; no per-batch quiet",
+        combine_publication="128-row payload PUT; one SO epoch after each original CV; self CV ready after actual Reorder stores",
+        communication_completion="S1: final quiet after routed Reduce; S0: final quiet after cooperative work; neither uses per-CV Dispatch quiet",
+        remote_workers=world - 1,
+        swiglu_workers=28,
+        scale_gather_workers=28,
+        gmm_completion_workers=28,
+        gmm_completion="paired AIV1 consumes actual FIX full then publishes ready; monotonic issued is submission only; two hardware credits per AIC",
+        routed_activation_assignment="same block as owning AIC: global GMM1 tile modulo 28",
+        scale_gather_assignment="M-group modulo 28",
+        cooperative_aiv1_priority="bounded ready communication -> completion progress -> scale gather -> routed activation -> static Pack -> shared activation",
+        reduce_workers=56 if shared_experts else 56 - (world - 1),
+        reduce_assignment="static contiguous token ranges across AIV0+AIV1; worker=2*block+subblock; AIV0 joins after its own dequant contexts; incoming counters remain AIV1-owned" if shared_experts else "original routed schedule",
+        startup_pack_workers=28 if shared_experts else 56,
+        steady_pack_workers=28,
+        shared_activation_workers=28 if shared_experts else 0,
+        shared_dispatch_startup_limit="BS<4096: per-peer max(1,floor(BS/1024)) merged batches before all local shared GMM1 AICs finish; normal ramp only while gated; no limit for BS>=4096/S0",
+        shared_schedule="shared GMM1 -> routed -> shared GMM2; one lowest-priority shared activation slice per turn; local join + add" if shared_experts else "disabled",
+    )
+
+
 def format_profile_summary(reports, world):
     """Display the already aggregated formal profiler results; no new measurements."""
     headers = ("BS/rank", "EP", "Rounds", "round-max-mean(us)", "round-min-mean(us)")
@@ -329,20 +356,7 @@ def run(args, config, group):
         communication_qps_per_peer=1,
         dispatch_combine_overlap="in-flight Dispatch and Combine on each peer QP",
         same_peer_dispatch_combine_overlap=True,
-        dispatch_combine_transition="own Dispatch submission -> remaining own Pack quota -> ready Combine scan; no Dispatch quiet or local join",
-        dispatch_batch_cvs="1,1,2,4,8,8,...; ready remainder after Pack completes",
-        dispatch_pack_cvs="startup2; after PUT+SO: max(send-count+1, next-batch prefix deficit); full ramp 2,2,3,7,9,...; capped by remaining quota",
-        dispatch_publication="one SO epoch per covered original CV; no per-batch quiet",
-        combine_publication="unitflag: 128-row data PUT; one SO epoch after every complete original CV; self CV ready after Reorder",
-        communication_completion="S1: final quiet after Reduce; S0: per-CV Dispatch quiet and original final Combine quiet",
-        remote_workers=world - 1,
-        swiglu_workers=28 - (world - 1),
-        reduce_workers=56 if model["num_shared_experts"] else 56 - (world - 1),
-        reduce_assignment="static contiguous token ranges across AIV0+AIV1; worker=2*block+subblock; AIV0 joins after its own dequant contexts; incoming counters remain AIV1-owned" if model["num_shared_experts"] else "original routed schedule",
-        startup_pack_workers=28 if model["num_shared_experts"] else 56,
-        shared_activation_workers=28 if model["num_shared_experts"] else 0,
-        shared_dispatch_startup_limit="BS<4096: per-peer max(1,floor(BS/1024)) merged batches before all local shared GMM1 AICs finish; normal ramp only while gated; no limit for BS>=4096/S0",
-        shared_schedule="shared GMM1 -> routed -> shared GMM2; one lowest-priority shared activation slice per turn; local join + add" if model["num_shared_experts"] else "disabled",
+        **cooperative_schedule_metadata(world, model["num_shared_experts"]),
         routing=args.routing,
         cv_rows=args.cv_rows,
         gmm1_ahead_mgroups=args.gmm1_ahead_mgroups,
@@ -352,7 +366,7 @@ def run(args, config, group):
             if args.accuracy_only
             else "torch_npu profiler device kernel duration; no Event or host-wall timing"
         ),
-        performance_scope="mega_moe_urma_kernel only; routes prepared once before profiling",
+        performance_scope="mega_moe_urma(_shared)_kernel including Device route preparation; input/weight generation outside timing",
         performance_rounds="formal iterations only; optional one-shot diagnostics excluded",
         profile_modes=["none"] + (["coarse"] if args.timer else []) + (["fine"] if args.fine else []),
         profile_config="Level0/AiCoreNone/Text; shapes/memory/stack/FLOPs/modules disabled",

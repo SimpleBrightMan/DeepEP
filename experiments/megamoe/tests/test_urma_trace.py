@@ -64,6 +64,41 @@ def test_export_fields_thread_mapping_and_submission_semantics():
     assert result["metadata"]["record_count"] == 3
 
 
+def test_cooperative_fix_completion_stays_on_aiv1_and_keeps_final_aic_drain():
+    from deep_ep_experimental.megamoe.urma_trace import coalesce_gmm_tiles, filter_trace_waits
+
+    raw = trace_buffer()
+    add_record(raw, engine=0, event="Gmm1Tile", start=1000, end=1020, fragment=0, expert=0)
+    add_record(raw, engine=2, event="Gmm1TileDrain", start=1030, end=1060, fragment=0, expert=0)
+    add_record(raw, engine=0, event="Gmm2Tile", start=1070, end=1080, fragment=0, expert=0)
+    add_record(raw, engine=2, event="Gmm2Drain", start=1090, end=1110, fragment=0, expert=0)
+    add_record(raw, engine=0, event="Gmm2Drain", start=1111, end=1200)
+    result = filter_trace_waits(coalesce_gmm_tiles(decode_trace(raw, rank=0, clock_mhz=1000)))
+    rows = events(result)
+    assert len(rows) == 5  # Never merge completion from a different hardware lane.
+    consumers = [row for row in rows if row["tid"] == 2]
+    assert all("paired FIX completion" in row["name"] for row in consumers)
+    assert all("not AIC execution time" in row["args"]["meaning"] for row in consumers)
+    final = next(row for row in rows if row["tid"] == 0 and row["args"]["event_id"] == 21)
+    assert final["args"]["end_tick"] == "1200"
+    assert result["metadata"]["envelope_us"] == pytest.approx(0.2)
+
+
+def test_cooperative_coarse_dispatch_is_submission_and_gmm_envelope_keeps_gaps():
+    raw = trace_buffer()
+    add_record(raw, engine=0, event="CoarseGMM", start=1000, end=10000)
+    add_record(raw, engine=2, event="CoarseDispatchSubmit", start=2000, end=4000)
+    add_record(raw, engine=2, event="CoarseSharedCombineSubmit", start=5000, end=12000)
+    result = decode_trace(raw, rank=0, clock_mhz=1000)
+    dispatch = next(row for row in events(result) if row["args"]["event_id"] == 53)
+    assert "not remote completion" in dispatch["args"]["meaning"]
+    assert "cooperative local work" in dispatch["args"]["meaning"]
+    spans = result["metadata"]["coarse_stage_envelopes_us"]
+    assert spans["CoarseGMM"] == 9.0
+    assert spans["CoarseDispatchSubmit"] == 2.0
+    assert spans["CoarseSharedCombineSubmit"] == 7.0
+
+
 def test_every_event_id_has_a_name_and_no_fabricated_async_events():
     raw = trace_buffer(1)
     for event_id, name in enumerate(EVENTS):

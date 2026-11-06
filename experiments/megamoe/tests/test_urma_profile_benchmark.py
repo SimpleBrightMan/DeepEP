@@ -236,6 +236,11 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
 
     benchmark.run(args, config, group)
 
+    manifest = json.loads((tmp_path / "rank_0" / "manifest.json").read_text())
+    assert manifest["swiglu_workers"] == manifest["scale_gather_workers"] == manifest["gmm_completion_workers"] == 28
+    assert "neither uses per-CV Dispatch quiet" in manifest["communication_completion"]
+    assert "Device route preparation" in manifest["performance_scope"]
+
     for bs in config["bs_values"]:
         assert calls.count(("prepare", bs)) == 1
         assert calls.count(("profile-begin", bs)) == 1
@@ -271,3 +276,15 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
         assert obsolete_label not in output
     summaries = json.loads((tmp_path / "summary.json").read_text())
     assert [row["bs"] for row in summaries] == config["bs_values"]
+
+
+@pytest.mark.parametrize("world", [4, 8, 16])
+@pytest.mark.parametrize("shared", [0, 1])
+def test_cooperative_manifest_describes_shared_and_routed_only_workers(world, shared):
+    metadata = benchmark.cooperative_schedule_metadata(world, shared)
+    assert metadata["remote_workers"] == world - 1
+    assert metadata["swiglu_workers"] == metadata["gmm_completion_workers"] == 28
+    assert metadata["startup_pack_workers"] == (28 if shared else 56)
+    assert metadata["reduce_workers"] == (56 if shared else 57 - world)
+    assert metadata["steady_pack_workers"] == 28
+    assert "submission only" in metadata["gmm_completion"]
