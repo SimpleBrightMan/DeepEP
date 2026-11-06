@@ -1,3 +1,5 @@
+> Current GMM2 placement is documented in [AIV0_GMM2_REORDER.md](AIV0_GMM2_REORDER.md). The two-step history below describes the earlier AIV1 Reorder version.
+
 # FIX-to-UB staged experiment
 
 Step1: routed GMM2 writes BF16 directly from L0C to paired AIV1 UB0, row stride256, single destination subBlock1. Preserves W4 x64 restore and UnitFlag. Reorder reads this UB directly and scatters to final remote/self layout; no intermediate GMM2 GM buffer/read. Routed GMM1 remains planar GM output.

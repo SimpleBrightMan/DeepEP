@@ -17,7 +17,7 @@ struct ContinuousComputeRows : MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment
     bool storeToUb = false;
     template<class TensorL0C>
     __aicore__ inline void StoreUb(const TensorL0C& source,uint32_t rows,uint32_t columns)const {
-        MegaMoeImpl::GmmKernel::StoreUb(source,rows,columns,0b11);
+        MegaMoeImpl::GmmKernel::StoreUb(source,rows,columns,0b11,gather?0U:120U*1024U,gather?1U:0U);
     }
 
     template <class TensorL1>
@@ -59,6 +59,7 @@ public:
     template <class Problem>
     __aicore__ inline void UpdateProblem(const Problem& config, const MegaMoeImpl::GMMAddrInfo& addr, bool gmm1)
     {
+        Pipeline::SetCompactPrologueUb(!gmm1);
         fused_ = gmm1 && Problem::FUSED_GATE_UP;
         Pipeline::UpdateProblem(config, addr, gmm1 ? addr.gmm1OutGlobal : addr.gmm2OutGlobal);
         gateUp_ = gmm1;

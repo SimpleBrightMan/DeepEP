@@ -32,7 +32,7 @@ def parse_args(argv=None):
         "--gmm1-ahead-mgroups",
         type=int,
         default=12,
-        help="GMM1 M-group lookahead for EP8/EP16; ignored on EP4, which always uses wave12",
+        help="GMM1 M-group lookahead; ignored for EP4 with shared experts, which uses wave12",
     )
     parser.add_argument(
         "--exp-shape",
@@ -133,16 +133,20 @@ def cooperative_schedule_metadata(world, shared_experts):
         swiglu_workers=28,
         scale_gather_workers=29-world,
         gmm_completion_workers=28,
-        gmm_completion="paired AIV1 consumes actual FIX full then activates/reorders the single UB mailbox; no intermediate GM ready flag; monotonic issued is submission only; one UB ownership credit per AIC",
+        gmm2_completion_workers=28,
+        gmm2_completion_subblock=0,
+        aiv0_dequant_ub_bytes=dict(gmm1=163840,gmm2=114688),
+        aiv0_gmm2_receive_ub=dict(begin=122880,bytes=131072),
+        gmm_completion="paired AIV1 consumes GMM1 only; monotonic issued is submission only; AIV0 supplies GMM2 then consumes its separate FIX mailbox",
         routed_activation_assignment="same block as owning AIC: 27 - (global fused N128 GMM1 tile modulo 28)",
-        gmm2_reorder_assignment="same block as owning AIC: global GMM2 tile modulo 28; MTE3 drain before group ready count",
+        gmm2_reorder_assignment="paired AIV0: global GMM2 tile modulo 28; MTE3 scatter drain before group ready count",
         gmm2_reorder_workers=28,
-        routed_compute_output="FIX to paired AIV1 UB0,128KiB,shared GMMs remain GM-backed",
+        routed_compute_output="GMM1 FIX->AIV1 UB0, GMM2 FIX->AIV0 UB120KiB; each128KiB; shared GMMs remain GM-backed",
         aiv1_ub_bytes=253952,
         gmm2_reorder_batch_max=1,
-        gmm2_reorder_handoff="single UB mailbox: captured issued budget -> hardware wait -> direct UB Reorder -> return credit; no intermediate GM tile-ready flag; stop before next GMM1",
+        gmm2_reorder_handoff="AIV0 supplies up to one next GMM2 tile before waiting/reordering previous; no intermediate GM tile-ready flag; last stage credit withheld before restoring GMM1 UB",
         scale_gather_assignment="M-group modulo (29-EP), noncommunication AIV1 only",
-        cooperative_aiv1_priority="one static Pack quantum -> dispatch (comm) or ready scale gather (helper) -> FIFO UB activation/reorder -> combine (comm) -> idle soft shared activation",
+        cooperative_aiv1_priority="one static Pack quantum -> dispatch (comm) or ready scale gather (helper) -> GMM1 FIFO UB activation -> combine (comm) -> idle soft shared activation",
         reduce_workers=56 if shared_experts else 56 - (world - 1),
         reduce_assignment="static contiguous token ranges across AIV0+AIV1; worker=2*block+subblock; AIV0 joins after its own dequant contexts; incoming counters remain AIV1-owned" if shared_experts else "original routed schedule",
         startup_pack_workers=28 if shared_experts else 56,
@@ -416,7 +420,7 @@ def run(args, config, group):
     for bs in config["bs_values"]:
         case = rank_dir / f"bs_{bs}"
         case.mkdir()
-        wave_mgroups = 12 if world == 4 else 0
+        wave_mgroups = 12 if world == 4 and model["num_shared_experts"] else 0
         fused_gate_up = use_fused_gate_up(bs, world, model["num_topk"], model["num_experts"])
         if rank == 0:
             expected_rows = bs * world * model["num_topk"] / model["num_experts"]

@@ -29,7 +29,7 @@ __aicore__ inline uint32_t PairedReorderedPrefix(const Arguments& a,const Chunk&
     }
     return rows;
 }
-struct DirectReorderWork {
+struct PairedActivationWork {
     const Arguments& a;
     PackBatch& pack;
     uint32_t core;
@@ -38,9 +38,6 @@ struct DirectReorderWork {
         activation.Run(a,item.fragment,item.group,item.tile,timer);
     }
     __aicore__ inline void Before(){pack.Close();}
-    template<class TimerT> __aicore__ inline void Reorder(const RoutedCompletionItem& item,TimerT& timer) {
-        ReorderGmm2Tile(a,item.fragment,item.group,item.tile,timer);
-    }
 };
 struct CooperativeNoWait { __aicore__ inline void Before(){} };
 
@@ -205,7 +202,7 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& time
     uint32_t nextPack=kPackStartupRounds;
     uint32_t nextGather=peer.Active()?UINT32_MAX:core-comm;
     bool ready=false,packDone=false;
-    DirectReorderWork directReorder{a,pack,core,activation};
+    PairedActivationWork activationWork{a,pack,core,activation};
     while(true) {
         bool progress=false;
         // A bounded Pack quantum each turn, never a Pack-until-empty loop.
@@ -226,7 +223,7 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& time
         }
         // The single RX mailbox must be consumed in exact producer order.
         // Never wait for a later GMM1 while an earlier GMM2 owns the mailbox.
-        if(ready)progress=(ConsumeIssuedReorders(completion,directReorder,timer)!=0U)||progress;
+        if(ready)progress=ConsumeIssuedActivation(completion,activationWork,timer)||progress;
         if(ready&&packDone)progress=peer.TryCombine(true)||progress;
         incoming.Poll();
         if(ready&&!progress&&!shared.Done()) {

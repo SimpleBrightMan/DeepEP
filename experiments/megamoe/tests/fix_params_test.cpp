@@ -15,14 +15,15 @@ struct L0C {
 int main() {
     uint32_t cases=0;
     for(uint32_t m:{1U,17U,128U,256U})for(uint32_t n:{16U,128U,256U})
-    for(uint32_t flag:{0U,2U,3U})for(uint32_t origin:{0U,64U}) {
+    for(uint32_t flag:{0U,2U,3U})for(uint32_t origin:{0U,64U})for(uint8_t sub:{0U,1U}) {
+        const uint32_t base=sub?0U:120U*1024U;
         const uint32_t stride=(m+15U)/16U*16U;
-        MegaMoeImpl::GmmKernel::StoreUb(L0C{stride,origin},m,n,flag);
+        MegaMoeImpl::GmmKernel::StoreUb(L0C{stride,origin},m,n,flag,base,sub);
         const auto& p=AscendC::observed;
         assert(p.mSize==m && p.nSize==n && p.srcStride==stride && p.dstStride==256);
         assert(p.quantPre==::QuantMode_t::QF322BF16_PRE && p.deqScalar==0x42800000ULL);
-        assert(!p.reluEn && p.unitFlag==flag && !p.dualDstCtl && p.subBlockId==1);
-        assert(AscendC::dstAddress==0 && AscendC::srcAddress==4096U+origin*4U);
+        assert(!p.reluEn && p.unitFlag==flag && !p.dualDstCtl && p.subBlockId==sub);
+        assert(AscendC::dstAddress==base && AscendC::srcAddress==4096U+origin*4U);
         ++cases;
     }
     std::cout<<"paired UB fix parameters cases="<<cases<<" passed\n";

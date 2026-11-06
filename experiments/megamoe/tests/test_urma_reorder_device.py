@@ -113,10 +113,11 @@ DRIVER = r"""
 using namespace AscendC;
 using namespace MegaMoeUrma;
 int main(int argc, char** argv) {
-    assert(argc == 4);
+    assert(argc == 5);
+    const uint32_t base=std::stoul(argv[4])?120U*1024U:0U;
     const uint32_t rows = std::stoul(argv[1]);
     const uint32_t world = std::stoul(argv[2]);
-    priority = std::stoul(argv[3]);
+    priority = std::stoul(argv[3]);rxBase=base;
     constexpr uint32_t h = 3584U, ntiles = 14U, prefix = 7U, fragmentIndex = 3U;
     const uint16_t sentinel = 0x7fc1;
     std::vector<bfloat16_t> input((prefix + rows + 9U) * h);
@@ -181,11 +182,12 @@ int main(int argc, char** argv) {
         // Model a fully completed FIX write into the owned mailbox. Refill
         // only after the preceding call drained MTE3 and returned ownership.
         for(const auto& q:queues)assert(q.empty());
-        LocalTensor<bfloat16_t> rx(TPosition::VECCALC,0U,256U*256U);
+        LocalTensor<bfloat16_t> rx(TPosition::VECCALC,base,256U*256U);
         for(uint32_t r=0;r<rows;++r)for(uint32_t n=0;n<256U;++n)
             rx.Data()[r*256U+n]=input[(prefix+r)*h+currentTile*256U+n];
         initialized.fill(true);
-        ReorderGmm2Tile(args, fragment, fragmentIndex, currentTile, timer);
+        if(base)ReorderGmm2Tile<120U*1024U>(args, fragment, fragmentIndex, currentTile, timer);
+        else ReorderGmm2Tile(args, fragment, fragmentIndex, currentTile, timer);
         assert(done[fragmentIndex * 32U] == int32_t(currentTile + 1U));
         // Intentionally do not drain before the next call: production may
         // schedule consecutive reorder tiles with no activation in between.
@@ -212,7 +214,9 @@ def reorder_device_binary(tmp_path_factory):
     if not command or not shutil.which(command[0]):
         pytest.skip("A host C++ compiler is required for production reorder checks")
     temporary = tmp_path_factory.mktemp("urma_reorder_device")
-    fake=fake_ascend().replace("<= (slot + 1U) * 65536U", "<= 128U * 1024U")
+    fake=fake_ascend().replace("<= (slot + 1U) * 65536U", "<= rxBase + 128U * 1024U")
+    fake=fake.replace("192 * 1024", "248 * 1024").replace("inline uint32_t submittedStores", "inline uint32_t rxBase=0;\ninline uint32_t submittedStores")
+    fake=fake.replace("source.address / 65536U", "(source.address-rxBase) / 65536U")
     fake=fake.replace("++tileReads;", 'assert(false && "FIX-UB Reorder must not read GM"); ++tileReads;')
     (temporary / "kernel_operator.h").write_text(fake, encoding="utf-8")
     source = temporary / "reorder.cpp"
@@ -239,14 +243,15 @@ def reorder_device_binary(tmp_path_factory):
     return binary
 
 
+@pytest.mark.parametrize("aiv0", [0, 1])
 @pytest.mark.parametrize("rows", [1, 43, 128, 170, 256])
 @pytest.mark.parametrize("world", [4, 8, 16])
 @pytest.mark.parametrize("engine_priority", [0, 1, 2])
 def test_production_reorder_copies_all_columns_and_publishes_after_stores(
-    reorder_device_binary, rows, world, engine_priority
+    reorder_device_binary, rows, world, engine_priority, aiv0
 ):
     result = subprocess.run(
-        [str(reorder_device_binary), str(rows), str(world), str(engine_priority)],
+        [str(reorder_device_binary), str(rows), str(world), str(engine_priority), str(aiv0)],
         capture_output=True,
         text=True,
         timeout=30,

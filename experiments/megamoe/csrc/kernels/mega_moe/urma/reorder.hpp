@@ -12,8 +12,9 @@ static_assert(kReorderUbBytes == ActivationUbContract::inputEnd);
 
 // The paired AIC already filled low128KiB via FIX. Consume it in place and
 // drain MTE3 before the caller releases the single RX ownership credit.
+template<uint32_t UbOffset=0U,class TimerT>
 __aicore__ inline void ReorderGmm2Tile(const Arguments& args, const Fragment& fragment, uint32_t fragmentIndex,
-                                       uint32_t tile, Timer& timer)
+                                       uint32_t tile, TimerT& timer)
 {
     using namespace AscendC;
     const uint32_t h = args.config.hidden;
@@ -22,7 +23,7 @@ __aicore__ inline void ReorderGmm2Tile(const Arguments& args, const Fragment& fr
     GlobalTensor<bfloat16_t> remote,self;
     remote.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(args.gmm2Output));
     self.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(args.symmetric+args.config.returnYOffset));
-    LocalTensor<bfloat16_t> source(TPosition::VECCALC,0U,kComputeTileM*kReorderColumns);
+    LocalTensor<bfloat16_t> source(TPosition::VECCALC,UbOffset,kComputeTileM*kReorderColumns);
     const uint64_t start=timer.TraceBegin();
     auto cursor=RuntimeSegments(args,fragment).MakeCursor();RowSegment segment{};
     while(cursor.Next(segment)) {

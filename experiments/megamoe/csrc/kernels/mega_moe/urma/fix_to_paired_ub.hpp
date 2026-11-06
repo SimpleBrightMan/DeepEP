@@ -11,10 +11,11 @@ namespace MegaMoeImpl::GmmKernel {
 // W4 GM-output PER_TENSOR *64 restoration before the BF16 cast.
 constexpr AscendC::FixpipeConfig kPairedUbFixConfig{AscendC::CO2Layout::ROW_MAJOR, true};
 template<class TensorL0C>
-__aicore__ inline void StoreUb(const TensorL0C& src, uint32_t rows, uint32_t columns, uint8_t unitFlag) {
+__aicore__ inline void StoreUb(const TensorL0C& src, uint32_t rows, uint32_t columns, uint8_t unitFlag,
+                                   uint32_t ubOffsetBytes=0U,uint8_t subBlockId=1U) {
     using Accumulator = typename TensorL0C::Element;
     static_assert(std::is_same_v<Accumulator, float>);
-    AscendC::LocalTensor<bfloat16_t> dst(AscendC::TPosition::VECCALC, 0U, 256U * 256U);
+    AscendC::LocalTensor<bfloat16_t> dst(AscendC::TPosition::VECCALC, ubOffsetBytes, 256U * 256U);
     AscendC::FixpipeParamsC310<AscendC::CO2Layout::ROW_MAJOR> p{};
     p.mSize = rows;
     p.nSize = columns;
@@ -27,7 +28,7 @@ __aicore__ inline void StoreUb(const TensorL0C& src, uint32_t rows, uint32_t col
     p.reluEn = false;
     p.unitFlag = unitFlag;
     p.dualDstCtl = 0U;
-    p.subBlockId = 1U;
+    p.subBlockId = subBlockId;
     const auto offset = src.layout()(src.coord());
     AscendC::Fixpipe<bfloat16_t, Accumulator, kPairedUbFixConfig>(dst, src.data()[offset], p);
 }

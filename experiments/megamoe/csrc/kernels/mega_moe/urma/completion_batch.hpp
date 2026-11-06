@@ -10,6 +10,19 @@
 #endif
 
 namespace MegaMoeUrma {
+// Only GMM1 is routed to AIV1 now. The consumer cursor skips GMM2 stages;
+// AIV0 consumes those from its own static supply sequence and hardware channel.
+template<class Consumer, class Work, class TimerT>
+URMA_COMPLETION_INLINE bool ConsumeIssuedActivation(Consumer& completion, Work& work, TimerT& timer) {
+    if (!completion.IssuedCount()) return false;
+    work.Before();
+    RoutedCompletionItem item;
+    completion.CompleteIssuedOne(item,timer);
+    work.Activate(item,timer);
+    completion.ReleaseCompleted();
+    return true;
+}
+
 // Bound one cooperative turn to the single hardware UB ownership credit. An issued
 // tile can still be waiting on hardware: never grow this batch while waiting,
 // and never cross into GMM1 when a Reorder batch is already in progress.

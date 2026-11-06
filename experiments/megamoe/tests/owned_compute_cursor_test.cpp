@@ -33,6 +33,11 @@ int main(){
             OwnedTileSequence<Plan> cursor(p,core);RoutedCompletionItem item;
             while(cursor.Next(item))actual.emplace_back(item.gmm1,item.group,item.tile,item.logicalTile);
             assert(actual==expected);assert(!cursor.Next(item));if(actual.empty())++empty;++cases;
+            std::vector<Key> onlyG1;
+            OwnedTileSequence<Plan,true> activationCursor(p,core);
+            while(activationCursor.Next(item)){assert(item.gmm1);onlyG1.emplace_back(item.gmm1,item.group,item.tile,item.logicalTile);}
+            std::vector<Key> expectedG1;for(const auto& key:expected)if(std::get<0>(key))expectedG1.push_back(key);
+            assert(onlyG1==expectedG1);
         }
     }
     assert(empty>0);std::cout<<"owned cursor cases="<<cases<<" empty="<<empty<<" passed\n";

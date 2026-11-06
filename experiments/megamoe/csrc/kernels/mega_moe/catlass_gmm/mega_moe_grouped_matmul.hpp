@@ -179,6 +179,10 @@ public:
         }
     }
 
+    __aicore__ inline void SetCompactPrologueUb(bool compact) {
+        if constexpr(g_coreType==AscendC::AIV)block_.op.SetCompactUb(compact);
+    }
+
     // Preserve the old slice boundary: GMM2/other stages may reuse the same
     // event IDs and L1/L0/UB storage while this C++ object remains alive.
     __aicore__ inline void End(bool outputDrained = false)

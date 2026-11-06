@@ -28,7 +28,7 @@ public:
     __aicore__ OwnedRouteTileCursor(const Arguments& a,uint32_t core):plan_{a},sequence_(plan_,core){}
     __aicore__ inline bool Next(RoutedCompletionItem& item){return sequence_.Next(item);}
 private:
-    DeviceRoutePlanView plan_;OwnedTileSequence<DeviceRoutePlanView> sequence_;
+    DeviceRoutePlanView plan_;OwnedTileSequence<DeviceRoutePlanView,true> sequence_;
 };
 __aicore__ inline __gm__ int32_t* RoutedIssued(const Arguments& a,uint32_t core) {
     return reinterpret_cast<__gm__ int32_t*>(a.gmmIssued+uint64_t(core)*kFlagBytes);

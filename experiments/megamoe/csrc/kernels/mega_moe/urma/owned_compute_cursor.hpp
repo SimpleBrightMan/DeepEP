@@ -18,14 +18,16 @@ struct RoutedCompletionItem {
 
 // Production ownership iterator, independent of storage access. Tests compare
 // this cursor against a naive complete-task enumeration, including idle cores.
-template<class Plan>
+template<class Plan,bool Gmm1Only=false>
 class OwnedTileSequence {
 public:
     URMA_CURSOR_INLINE OwnedTileSequence(const Plan& p,uint32_t core):plan_(p),core_(core){}
     URMA_CURSOR_INLINE bool Next(RoutedCompletionItem& item) {
         while(step_<plan_.TaskCount()) {
             if(!active_) {
-                const auto task=plan_.Task(step_);const auto batch=plan_.Batch(task.batchIndex);
+                const auto task=plan_.Task(step_);
+                if constexpr(Gmm1Only)if(task.stage!=ComputeBatchStage::Gmm1){++step_;continue;}
+                const auto batch=plan_.Batch(task.batchIndex);
                 gmm1_=task.stage==ComputeBatchStage::Gmm1;begin_=batch.fragmentBegin;
                 tiles_=plan_.Tiles(gmm1_);limit_=uint64_t(batch.fragmentCount)*tiles_;
                 if(limit_==0U){++step_;continue;}

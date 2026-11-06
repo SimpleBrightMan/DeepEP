@@ -65,5 +65,8 @@ int main() {
     assert(ConsumeIssuedReorders(c,work,timer)==1 && c.consumed==3);
     assert(ConsumeIssuedReorders(c,work,timer)==1 && c.consumed==4);
     assert(ConsumeIssuedReorders(c,work,timer)==0);
+    Consumer aiv1{{true,true,true},3};Work activationWork{aiv1};
+    for(unsigned i=0;i<3;++i){assert(ConsumeIssuedActivation(aiv1,activationWork,timer));assert(aiv1.released.size()==i+1);}
+    assert(!ConsumeIssuedActivation(aiv1,activationWork,timer));assert(aiv1.reordered.empty());
     std::cout<<scenarios+1<<" completion batch cases passed\n";
 }

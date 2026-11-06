@@ -63,7 +63,7 @@ public:
     static_assert(L1B_STAGES == Buffers::BStages, "AIC/AIV0 B stages must match");
 
     CATLASS_DEVICE
-    MegaMoeBlockPrologueA8W4(const Params& params, bool activate = true)
+    MegaMoeBlockPrologueA8W4(const Params& params, bool activate = true) : resource_(params.resource)
     {
         // Persistent GMM1 contexts also exist on AIV1, which owns no prologue resources.
         if (AscendC::GetSubBlockIdx() != 0) {
@@ -73,16 +73,9 @@ public:
             // Assign L1/L0A/L0B space for each stages
             l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(Buffers::BBase + i * Buffers::BBytes);
         }
-        // Four16KiB FP4 inputs and three32KiB FP8 outputs use independent
-        // cursors/credits. The output banks interleave256B vectors, total160KiB.
-        for(uint32_t i=0;i<UB_INPUT_STAGES;++i) {
-            ubCastInTensor[i]=params.resource.ubBuf.template GetBufferByByte<ElementIn>(i*UB_INPUT_BYTES);
-            ubInputEventList[i]=i;
-        }
-        for(uint32_t i=0;i<UB_OUTPUT_STAGES;++i) {
-            ubCastOutTensor[i]=params.resource.ubBuf.template GetBufferByByte<ElementOut>(UB_INPUT_STAGES*UB_INPUT_BYTES+i*256U);
-            ubOutputEventList[i]=i;
-        }
+        for(uint32_t i=0;i<UB_INPUT_STAGES;++i)ubInputEventList[i]=i;
+        for(uint32_t i=0;i<UB_OUTPUT_STAGES;++i)ubOutputEventList[i]=i;
+        ConfigureUbViews();
         if (activate) {
             Activate();
         }
@@ -95,8 +88,7 @@ public:
             return;
         }
         l1BListId = ubInputListId = ubOutputListId = 0;
-        for(uint32_t i=0;i<UB_INPUT_STAGES;++i)AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[i]);
-        for(uint32_t i=0;i<UB_OUTPUT_STAGES;++i)AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubOutputEventList[i]);
+        SeedUbEvents();
         active_ = true;
     }
 
@@ -106,9 +98,29 @@ public:
         if (!active_) {
             return;
         }
-        for(uint32_t i=0;i<UB_INPUT_STAGES;++i)AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[i]);
-        for(uint32_t i=0;i<UB_OUTPUT_STAGES;++i)AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubOutputEventList[i]);
+        for(uint32_t i=0;i<(compact_?3U:4U);++i)AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[i]);
+        for(uint32_t i=0;i<(compact_?2U:3U);++i)AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubOutputEventList[i]);
         active_ = false;
+    }
+
+    __aicore__ inline void SetCompactUb(bool compact) {
+        if(compact_==compact)return;
+        const bool reopen=active_;
+        Deactivate(); // retires V reads and MTE3 writes before rebinding aliases
+        compact_=compact;ConfigureUbViews();
+        ubInputListId=ubOutputListId=0U;
+        if(reopen){SeedUbEvents();active_=true;}
+    }
+    __aicore__ inline void ConfigureUbViews() {
+        const uint32_t inputs=compact_?3U:4U,outputs=compact_?2U:3U;
+        for(uint32_t i=0;i<inputs;++i)
+            ubCastInTensor[i]=resource_.ubBuf.template GetBufferByByte<ElementIn>(i*UB_INPUT_BYTES);
+        for(uint32_t i=0;i<outputs;++i)
+            ubCastOutTensor[i]=resource_.ubBuf.template GetBufferByByte<ElementOut>(inputs*UB_INPUT_BYTES+i*256U);
+    }
+    __aicore__ inline void SeedUbEvents() {
+        for(uint32_t i=0;i<(compact_?3U:4U);++i)AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[i]);
+        for(uint32_t i=0;i<(compact_?2U:3U);++i)AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubOutputEventList[i]);
     }
 
     CATLASS_DEVICE
@@ -121,6 +133,13 @@ public:
     CATLASS_DEVICE void operator()(const TensorBIn& bGlobal, const ActualBlockShape& actualBlockShape,
                                    const Params& params, bool allowDynamicB = false)
     {
+        if(compact_)Run<3U,2U>(bGlobal,actualBlockShape,params,allowDynamicB);
+        else Run<4U,3U>(bGlobal,actualBlockShape,params,allowDynamicB);
+    }
+
+    template<uint32_t InputStages,uint32_t OutputStages,class TensorBIn,class ActualBlockShape>
+    __aicore__ inline void Run(const TensorBIn& bGlobal,const ActualBlockShape& actualBlockShape,
+                               const Params& params,bool allowDynamicB) {
         uint32_t kSize = tla::get<0>(params.layoutPrologueB.originShape());
         const auto kPlan =
             MegaMoeImpl::GmmKernel::MakeA8W4KPlan(actualBlockShape.m(), actualBlockShape.n(), allowDynamicB);
@@ -142,9 +161,9 @@ public:
                                       tla::MakeShape(count, actualBlockShape.n()));
                 auto l1Tile =
                     GetTile(tensorL1B, tla::MakeCoord(offset, 0), tla::MakeShape(count, actualBlockShape.n()));
-                ProcessL1Nz(l1Tile, gmTile, offset == 0U);
-                ubInputListId=(ubInputListId+1U)%UB_INPUT_STAGES;
-                ubOutputListId=(ubOutputListId+1U)%UB_OUTPUT_STAGES;
+                ProcessL1Nz<OutputStages>(l1Tile, gmTile, offset == 0U);
+                ubInputListId=(ubInputListId+1U)%InputStages;
+                ubOutputListId=(ubOutputListId+1U)%OutputStages;
             }
             // Publish only after both halves are stored in the same L1 B slot.
             AscendC::CrossCoreSetFlag<SYNC_MODE, PIPE_MTE3>(AIV_SYNC_AIC_FLAG + l1BListId);
@@ -152,7 +171,7 @@ public:
         }
     }
 
-    template <class TensorOut, class TensorIn>
+    template <uint32_t OutputStages, class TensorOut, class TensorIn>
     __aicore__ inline void ProcessL1Nz(const TensorOut& tensorOut, const TensorIn& tensorIn, bool firstHalf)
     {
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[ubInputListId]);
@@ -178,14 +197,14 @@ public:
         }
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubOutputEventList[ubOutputListId]);
 
-        AntiQuantComputeNz(tensorCastOut, tensorCastIn);
+        AntiQuantComputeNz<OutputStages>(tensorCastOut, tensorCastIn);
 
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubOutputEventList[ubOutputListId]);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(ubOutputEventList[ubOutputListId]);
 
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[ubInputListId]);
 
-        CopyUb2L1(tensorOut, tensorCastOut);
+        CopyUb2L1<OutputStages>(tensorOut, tensorCastOut);
 
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubOutputEventList[ubOutputListId]);
     }
@@ -208,7 +227,7 @@ public:
         AscendC::DataCopyPad(dstTensor.data()[dstOffset], srcTensor.data()[srcOffset], repeatParams, padParams);
     }
 
-    template <class TensorCastOut, class TensorCastIn>
+    template <uint32_t OutputStages, class TensorCastOut, class TensorCastIn>
     __aicore__ inline void AntiQuantComputeNz(const TensorCastOut& tensorCastOut, const TensorCastIn& tensorCastIn)
     {
         VfParamsNz params;
@@ -217,7 +236,7 @@ public:
 
         params.loopKNum = tla::get<0, 1>(tensorCastIn.shape());
         params.nRealSizeAlign = tla::get<1, 1>(tensorCastIn.shape()) * AscendC::BLOCK_CUBE;
-        params.innerDstStride = AscendC::GetVecLen() * UB_OUTPUT_STAGES;
+        params.innerDstStride = AscendC::GetVecLen() * OutputStages;
         params.innerLoopNum = (params.nRealSizeAlign * tla::get<0, 0>(tensorCastIn.shape())) /
                               static_cast<uint64_t>(AscendC::GetVecLen());
         params.loopKDstStride = params.innerLoopNum * params.innerDstStride;
@@ -270,7 +289,7 @@ public:
         }
     }
 
-    template <class TensorDst, class TensorSrc>
+    template <uint32_t OutputStages, class TensorDst, class TensorSrc>
     __aicore__ inline void CopyUb2L1(TensorDst const& dstTensor, TensorSrc const& srcTensor)
     {
         // Gather this output bank's interleaved256B vectors into contiguous NZ L1.
@@ -279,7 +298,7 @@ public:
         const uint32_t elements = tla::get<0, 1>(srcTensor.shape()) * C0_SIZE_B8 * tla::get<1, 0>(srcTensor.shape()) *
                                   tla::get<1, 1>(srcTensor.shape());
         AscendC::DataCopyParams dataCopyParams(elements / VECTOR_BYTES, VECTOR_BYTES / BLOCK_BYTES,
-                                               (UB_OUTPUT_STAGES - 1U) * VECTOR_BYTES / BLOCK_BYTES, 0);
+                                               (OutputStages - 1U) * VECTOR_BYTES / BLOCK_BYTES, 0);
         auto dstOffset = dstTensor.layout()(dstTensor.coord());
         AscendC::DataCopy(dstTensor.data()[dstOffset], srcTensor.data(), dataCopyParams);
     }
@@ -296,8 +315,12 @@ public:
 
     static constexpr uint32_t UB_INPUT_STAGES=4U,UB_OUTPUT_STAGES=3U;
     static constexpr uint32_t UB_INPUT_BYTES=16U*1024U,UB_OUTPUT_BYTES=32U*1024U;
+    static_assert(3U*UB_INPUT_BYTES+2U*UB_OUTPUT_BYTES==112U*1024U);
+    static_assert(112U*1024U<=120U*1024U); // GMM2 RX starts at120KiB
     static_assert(UB_INPUT_STAGES*UB_INPUT_BYTES+UB_OUTPUT_STAGES*UB_OUTPUT_BYTES<=192U*1024U);
     bool active_=false;
+    MegaMoeResource& resource_;
+    bool compact_=false;
     uint32_t l1BListId{0},ubInputListId{0},ubOutputListId{0};
     int32_t ubInputEventList[UB_INPUT_STAGES],ubOutputEventList[UB_OUTPUT_STAGES];
     AscendC::LocalTensor<ElementIn> ubCastInTensor[UB_INPUT_STAGES];

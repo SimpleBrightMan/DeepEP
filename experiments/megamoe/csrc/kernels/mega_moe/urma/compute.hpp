@@ -11,6 +11,7 @@
 #include "continuous_matmul.hpp"
 #include "deferred_output.hpp"
 #include "consumer_completion.hpp"
+#include "aiv0_reorder.hpp"
 #include "pack_round.hpp"
 #include "tail_completion.hpp"
 #include "transport.hpp"
@@ -175,7 +176,7 @@ using UrmaContinuousGmm = ContinuousMatmul<UrmaProblemConfig>;
 template <class TimerT>
 __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block, uint32_t fragmentIndex,
                                           uint32_t firstTile, bool gmm1, UrmaContinuousGmm& pipeline,
-                                          RoutedCompletionProducer& completion, TimerT& timer)
+                                          RoutedCompletionProducer& completion, Aiv0Reorder<TimerT>& reorder, TimerT& timer)
 {
     const MegaMoeImpl::BlockJobContext job{block, kAic};
     const Fragment fragment = LoadFragment(args, fragmentIndex);
@@ -198,6 +199,7 @@ __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block,
         if (!ready) WaitComputeFlag(flags, fragmentIndex, expected);
         timer.TraceEnd(gmm1 ? TraceEvent::WaitInputScale : TraceEvent::WaitActivation, wait, fragmentMeta);
     }
+    if constexpr(g_coreType==AIV)if(gmm1)reorder.EndStage();
     const Phase phase = gmm1 ? Phase::Gmm1 : Phase::Gmm2;
     timer.Begin(phase);
     const auto addresses = gmm1 ? Gmm1Addresses(args, fragment) : Gmm2Addresses(args, fragment);
@@ -211,7 +213,8 @@ __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block,
         rowIO.inputStride = args.config.intermediate;
     }
     pipeline.SetRowIO(rowIO);
-    pipeline.Begin();  // Idempotent; only the invocation's first owned tile opens events.
+    pipeline.Begin();  // Preserve L1/L0 cursors. UB-only mode switching is in UpdateProblem.
+    if constexpr(g_coreType==AIV)if(!gmm1)reorder.BeginStage();
     const uint32_t count = schedule.GetTileNum();
     for (uint32_t tile = firstTile; tile < count; tile += kAic) {
         const auto coord = schedule.GetBlockCoord(tile);
@@ -223,16 +226,17 @@ __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block,
         const auto tileMeta = ComputeTileTraceMeta(fragmentMeta, m, n, rows, columns);
         if constexpr (g_coreType == AIC) {
             const uint64_t start = timer.TraceBegin();
-            completion.Acquire();
+            if(gmm1)completion.Acquire();else Aiv0Gmm2Channel::Acquire();
             pipeline.Compute(m, n, rows, columns);
             timer.TraceEnd(gmm1 ? TraceEvent::Gmm1Tile : TraceEvent::Gmm2Tile, start, tileMeta);
             // Enqueue actual FIX completion, then announce issue. Scalar does
             // not wait for the output and cannot publish compute-ready here.
-            completion.Commit();
+            if(gmm1)completion.Commit();else Aiv0Gmm2Channel::Publish();
         } else {
             const uint64_t start = timer.TraceBegin();
             pipeline.Dequantize(n, rows, columns);
             timer.TraceEnd(gmm1 ? TraceEvent::Gmm1Dequant : TraceEvent::Gmm2Dequant, start, tileMeta);
+            if(!gmm1)reorder.AfterSupply(fragment,fragmentIndex,tile);
         }
     }
     timer.End(phase);
@@ -259,6 +263,7 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
 {
     UrmaContinuousGmm pipeline;
     RoutedCompletionProducer completion(args,block);
+    Aiv0Reorder<TimerT> reorder(args,timer);
     bool hasWork = false;
     for (uint32_t step = 0U; step < args.config.computeTaskCount; ++step) {
         const auto task = LoadComputeTask(args, step);
@@ -276,11 +281,12 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
             const auto owned = OwnedComputeGroupAt(tile, tilesPerGroup, kAic);
             const uint64_t nextTile = tile + static_cast<uint64_t>(owned.tileCount) * kAic;
             const uint32_t fragmentIndex = range.begin + owned.group;
-            RunComputeFragment(args, block, fragmentIndex, owned.firstTile, isGmm1, pipeline, completion, timer);
+            RunComputeFragment(args, block, fragmentIndex, owned.firstTile, isGmm1, pipeline, completion, reorder, timer);
             hasWork = true;
             tile = nextTile;
         }
     }
+    if constexpr (g_coreType == AIV) reorder.EndStage();
     if constexpr (g_coreType == AIC) completion.Finish(timer);
     if (hasWork) {
         pipeline.End(g_coreType == AIC);
