@@ -183,7 +183,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, i
     args_.routeCounts=Address(route_counts_);args_.routeOffsets=Address(route_offsets_);
     args_.routeHistogram=Address(route_histogram_);args_.routeInfo=Address(route_info_);
     args_.routeConfig=Address(route_config_);
-    gmm2_contiguous_ = allocate(max_recv_rows * config.hidden * 2);
+    gmm2_contiguous_ = allocate(0); // routed GMM2 writes directly to paired UB
     peer_reorder_ranges_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
     peer_reorder_spans_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
     local_flags_ = allocate(16 * MegaMoeUrma::kFlagBytes);
@@ -446,7 +446,7 @@ std::map<std::string, torch::Tensor> UrmaPlan::debug_snapshot() const
     copy("gmm1", Address(gmm1_), c.receiveRows * c.intermediate * 4);
     copy("activation", Address(activation_), c.receiveRows * c.intermediate);
     copy("activation_scale", Address(activation_scale_), c.receiveRows * (c.intermediate / 32));
-    copy("gmm2_contiguous", Address(gmm2_contiguous_), c.receiveRows * c.hidden * 2);
+    // No routed GMM2 scratch: output is consumed in paired AIV1 UB.
     copy("gmm2_remote", Address(gmm2_), c.world * c.sourceRowCapacity * c.hidden * 2);
     copy("returned", args_.symmetric + c.returnYOffset, expanded * c.hidden * 2);
     copy("route_info",args_.routeInfo,sizeof(MegaMoeUrma::DeviceRouteInfo));

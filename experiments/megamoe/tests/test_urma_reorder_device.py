@@ -178,13 +178,20 @@ int main(int argc, char** argv) {
     Timer timer;
     timer.Init(0U);
     for (; currentTile < ntiles; ++currentTile) {
+        // Model a fully completed FIX write into the owned mailbox. Refill
+        // only after the preceding call drained MTE3 and returned ownership.
+        for(const auto& q:queues)assert(q.empty());
+        LocalTensor<bfloat16_t> rx(TPosition::VECCALC,0U,256U*256U);
+        for(uint32_t r=0;r<rows;++r)for(uint32_t n=0;n<256U;++n)
+            rx.Data()[r*256U+n]=input[(prefix+r)*h+currentTile*256U+n];
+        initialized.fill(true);
         ReorderGmm2Tile(args, fragment, fragmentIndex, currentTile, timer);
         assert(done[fragmentIndex * 32U] == int32_t(currentTile + 1U));
         // Intentionally do not drain before the next call: production may
         // schedule consecutive reorder tiles with no activation in between.
     }
     Drain();
-    assert(atomicCalls == ntiles && tileReads == ntiles * ((rows + 127U) / 128U));
+    assert(atomicCalls == ntiles && tileReads == 0U);
     for (const auto& queue : queues) assert(queue.empty());
     for (const auto& kind : events) for (bool flag : kind) assert(!flag);
     assert(seen.size() == uint64_t(rows) * h);
@@ -205,7 +212,9 @@ def reorder_device_binary(tmp_path_factory):
     if not command or not shutil.which(command[0]):
         pytest.skip("A host C++ compiler is required for production reorder checks")
     temporary = tmp_path_factory.mktemp("urma_reorder_device")
-    (temporary / "kernel_operator.h").write_text(fake_ascend(), encoding="utf-8")
+    fake=fake_ascend().replace("<= (slot + 1U) * 65536U", "<= 128U * 1024U")
+    fake=fake.replace("++tileReads;", 'assert(false && "FIX-UB Reorder must not read GM"); ++tileReads;')
+    (temporary / "kernel_operator.h").write_text(fake, encoding="utf-8")
     source = temporary / "reorder.cpp"
     source.write_text(DRIVER, encoding="utf-8")
     binary = temporary / ("reorder.exe" if os.name == "nt" else "reorder")

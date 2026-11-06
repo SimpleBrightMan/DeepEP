@@ -276,7 +276,7 @@ def test_buffer_passes_explicit_multi_host_flag_to_collective_signature_and_runt
     assert created == [allow]
     assert checks[0][1][-4] is allow
     assert checks[0][1][-3] == "combine-ready-scan-reduce-world-v1"
-    assert checks[0][1][-2] == "unitflag-shared-consumer-direct-v3"
+    assert checks[0][1][-2] == "unitflag-shared-fixub-gmm2-v4"
     assert checks[0][1][-1] == urma.COMMUNICATION_PROTOCOL
     assert buffer.gmm1_ahead_mgroups == 12
 
@@ -288,7 +288,7 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
     monkeypatch.setattr(urma, "require_native", lambda *_: SimpleNamespace(create_megamoe_urma_runtime=object()))
     extension = SimpleNamespace(
         urma_api_protocol=1, urma_routing_protocol=8, urma_tail_schedule=tail,
-        urma_compute_schedule="unitflag-shared-consumer-direct-v3",
+        urma_compute_schedule="unitflag-shared-fixub-gmm2-v4",
         urma_dimension_contract="unitflag-h8192-i16384-k1to8-v1-bs16384",
         urma_shared_contract="unitflag-shared-peer-reorder-v1",
     )

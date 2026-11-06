@@ -78,13 +78,14 @@ public:
         // GMM2 goes straight to same-core Reorder using item.fragment/tile.
         // No gmm2MatmulDone publication or Scalar ready re-read is needed.
         // gmm2Done counts final-layout N tiles, incremented only by ReorderGmm2Tile.
-        // Credits protect event reuse, not GM storage: every tile has its own
-        // immutable output range, so activation/Reorder may execute later.
-        RoutedFixChannel::Release(consumed_++);prepared_=false;
+        // The shared UB stays owned until the same-core activation/Reorder
+        // callback completes its final reads and calls ReleaseCompleted.
+        ++consumed_;prepared_=false;
         TraceMeta m;m.fragment=item.group;m.expert=item.fragment.expert;
         m.row=item.fragment.rowBegin;m.rows=item.fragment.rows;m.tileN=uint64_t(item.tile)*256U;m.columns=256U;
         timer.TraceEnd(item.gmm1?TraceEvent::Gmm1TileDrain:TraceEvent::Gmm2Drain,start,m);
     }
+    __aicore__ inline void ReleaseCompleted(){RoutedFixChannel::Release(consumed_-1U);}
 private:
     __aicore__ inline void Prepare(){if(!prepared_&&!exhausted_){exhausted_=!cursor_.Next(next_);prepared_=!exhausted_;}}
     const Arguments& a_;uint32_t core_,consumed_=0U,issued_=0U;

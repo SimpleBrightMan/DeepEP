@@ -10,10 +10,10 @@
 #endif
 
 namespace MegaMoeUrma {
-// Bound one cooperative turn to the two hardware completion credits. An issued
+// Bound one cooperative turn to the single hardware UB ownership credit. An issued
 // tile can still be waiting on hardware: never grow this batch while waiting,
 // and never cross into GMM1 when a Reorder batch is already in progress.
-constexpr uint32_t kDirectReorderBatch = 2U;
+constexpr uint32_t kDirectReorderBatch = 1U;
 template<class Consumer, class Work, class TimerT>
 URMA_COMPLETION_INLINE uint32_t ConsumeIssuedReorders(Consumer& completion, Work& work, TimerT& timer) {
     const uint32_t available = completion.IssuedCount();
@@ -24,10 +24,14 @@ URMA_COMPLETION_INLINE uint32_t ConsumeIssuedReorders(Consumer& completion, Work
     while (count < limit) {
         if (count && completion.NextIsGmm1()) break;
         RoutedCompletionItem item;
-        completion.CompleteIssuedOne(item, timer); // real hardware wait, then return credit
+        completion.CompleteIssuedOne(item, timer); // real hardware wait; retain UB ownership
         ++count;
-        if (item.gmm1) break; // yield to activation/scale supply after one GMM1
-        work.Reorder(item, timer); // no intermediate GM ready flag or second route lookup
+        if (item.gmm1) work.Activate(item,timer);
+        else work.Reorder(item,timer);
+        // Single RX mailbox stays owned through all V/MTE3 reads, including
+        // GM-backed GMM1 activation, which also uses this low-UB workspace.
+        completion.ReleaseCompleted();
+        if (item.gmm1) break;
     }
     return count;
 }

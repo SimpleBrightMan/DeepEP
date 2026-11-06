@@ -1,3 +1,5 @@
+> Current staged FIX-to-UB behavior is documented in [FIX_UB_STEPS.md](FIX_UB_STEPS.md). The text below describes the prior GM-backed experiment.
+
 # AIV1 cooperative schedule — v3
 
 All28 paired AIV1 workers consume their AIC's actual FIX completion. Routed activation ownership is27-(logical GMM1 tile%28); Reorder ownership is logical GMM2 tile%28. Shared activation retains its original low-priority M128 distribution.

@@ -288,5 +288,5 @@ def test_cooperative_manifest_describes_shared_and_routed_only_workers(world, sh
     assert metadata["reduce_workers"] == (56 if shared else 57 - world)
     assert metadata["steady_pack_workers"] == 28
     assert "submission only" in metadata["gmm_completion"]
-    assert metadata["gmm2_reorder_batch_max"] == 2
+    assert metadata["gmm2_reorder_batch_max"] == 1
     assert "no intermediate GM tile-ready flag" in metadata["gmm2_reorder_handoff"]

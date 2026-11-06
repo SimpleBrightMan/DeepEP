@@ -4,6 +4,7 @@
 
 #include "../catlass_gmm/mega_moe_grouped_matmul.hpp"
 #include "lazy_compute_routes.hpp"
+#include "fix_to_paired_ub.hpp"
 
 namespace MegaMoeUrma {
 
@@ -11,7 +12,13 @@ namespace MegaMoeUrma {
 // projections. Updating the expert or stage must never reset those indices.
 // Only GMM1 gathers A; both stages use one continuous Unit Flag output.
 struct ContinuousComputeRows : MegaMoeImpl::GmmKernel::SegmentedRowIO<RowSegment, true, false, RuntimeGroupSegments> {
+    static constexpr bool kMayOutputToUb = true;
     bool gather = true;
+    bool storeToUb = false;
+    template<class TensorL0C>
+    __aicore__ inline void StoreUb(const TensorL0C& source,uint32_t rows,uint32_t columns)const {
+        MegaMoeImpl::GmmKernel::StoreUb(source,rows,columns,0b11);
+    }
 
     template <class TensorL1>
     __aicore__ inline void Gather(TensorL1& dst, uint32_t tileBegin, uint32_t tileRows, uint32_t columnBegin,

@@ -14,6 +14,7 @@ namespace MegaMoeImpl::GmmKernel {
 struct ContiguousRowIO {
     static constexpr bool kGatherInput = false;
     static constexpr bool kScatterOutput = false;
+    static constexpr bool kMayOutputToUb = false;
 };
 
 // Segment is a caller-owned descriptor with sourceRank, receiveRow, returnRow,
@@ -46,6 +47,7 @@ template <class Segment, bool GatherInput, bool ScatterOutput, class SegmentSour
 struct SegmentedRowIO {
     static constexpr bool kGatherInput = GatherInput;
     static constexpr bool kScatterOutput = ScatterOutput;
+    static constexpr bool kMayOutputToUb = false;
 
     const __gm__ Segment* segments = nullptr;
     uint32_t count = 0;

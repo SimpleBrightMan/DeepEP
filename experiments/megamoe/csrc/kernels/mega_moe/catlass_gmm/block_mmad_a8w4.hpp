@@ -552,6 +552,13 @@ public:
         }
         // copy block out
         copyL0CToDst.params.scale = 64;
+        if constexpr (RowIO::kMayOutputToUb) {
+            static_assert(ENABLE_UNIT_FLAG, "Direct UB output uses the unit-flag pipeline");
+            if (rowIO.storeToUb) {
+                rowIO.StoreUb(tensorL0C,mBlockActual,nBlockActual);
+                return;
+            }
+        }
         if constexpr (RowIO::kScatterOutput) {
             static_assert(!ENABLE_UNIT_FLAG, "Segmented output requires ordinary L0C layout and explicit FIX events");
             // A segmented result has several FIX readers of the same L0C

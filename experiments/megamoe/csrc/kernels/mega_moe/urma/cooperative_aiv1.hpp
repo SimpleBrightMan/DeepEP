@@ -12,10 +12,10 @@ namespace MegaMoeUrma {
 // Persistent per-peer send/self-ready counters use high UB only after this
 // owner's Pack is finished. Paired tile Reorder uses low 128KiB temporarily.
 struct CooperativeUb {
-    static constexpr uint32_t submitted=kPackUbBase;
+    static constexpr uint32_t submitted=248U*1024U;
     static constexpr uint32_t selfCounts=submitted+kMaxPeerChunks*4U;
 };
-static_assert(CooperativeUb::selfCounts+kMaxPeerChunks*4U<=kPackUbBase+kPackUbBytes);
+static_assert(CooperativeUb::selfCounts+kMaxPeerChunks*4U<=kRequiredUbBytes);
 
 // A contiguous row prefix is safe only after every N tile of each intersecting
 // M-group has reached its final layout. Counters are published after MTE3 drain.
@@ -31,6 +31,11 @@ __aicore__ inline uint32_t PairedReorderedPrefix(const Arguments& a,const Chunk&
 struct DirectReorderWork {
     const Arguments& a;
     PackBatch& pack;
+    uint32_t core;
+    UrmaActivation& activation;
+    template<class TimerT> __aicore__ inline void Activate(const RoutedCompletionItem& item,TimerT& timer) {
+        RunReadyActivationTile(a,core,item.fragment,item.group,item.tile,activation,timer,kAic);
+    }
     __aicore__ inline void Before(){pack.Close();}
     template<class TimerT> __aicore__ inline void Reorder(const RoutedCompletionItem& item,TimerT& timer) {
         ReorderGmm2Tile(a,item.fragment,item.group,item.tile,timer);
@@ -191,20 +196,20 @@ private:
 };
 
 __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& timer,SharedIncoming& incoming) {
-    RoutedCompletionConsumer completion(a,core);completion.Init(); // even zero-task AICs need both credits
+    RoutedCompletionConsumer completion(a,core);completion.Init(); // even zero-task AICs need the single credit
     PackBatch pack(a,timer);CooperativePeer peer(a,core,timer);SharedActivationState shared(a,core,timer);
     if(!peer.Active())timer.CoarseBegin(CoarsePhase::Activation);
     UrmaActivation activation;
     activation.Init({.yGmAddr=reinterpret_cast<GM_ADDR>(a.activation),.yScaleGmAddr=reinterpret_cast<GM_ADDR>(a.activationScale),.clampLimit=FLT_MAX});
-    uint32_t nextPack=kPackStartupRounds,nextGather=core,nextActivation=0U,activationTile=0U;
-    bool ready=false,packDone=false,activationPrepared=false;
-    DirectReorderWork directReorder{a,pack};
+    uint32_t nextPack=kPackStartupRounds,nextGather=core;
+    bool ready=false,packDone=false;
+    DirectReorderWork directReorder{a,pack,core,activation};
     while(true) {
         bool progress=peer.TryDispatch(pack,packDone);
         if(!ready&&RouteSummaryReady(a)){AcquireRouteSummary(a);ready=true;progress=true;}
         if(ready&&packDone)progress=peer.TryCombine(true)||progress;
         // One bounded communication turn always yields to completion. Otherwise
-        // the two FIX slots would fill and hold the AIC behind an endless PUT loop.
+        // the UB mailbox would stay full and hold the AIC behind an endless PUT loop.
         if(ready)progress=(ConsumeIssuedReorders(completion,directReorder,timer)!=0U)||progress;
         bool localWork=false;
         if(ready&&nextGather<a.config.fragmentCount) {
@@ -212,16 +217,6 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& time
             if(AreGroupInputsReady(a,f)) {
                 pack.Close();GatherInputScale(a,f,nextGather,timer);nextGather+=kAic;localWork=true;
             }
-        }
-        if(ready&&!localWork)while(nextActivation<a.config.fragmentCount) {
-            const auto f=LoadFragment(a,nextActivation);
-            if(!activationPrepared){activationTile=FirstOwnedComputeTile(f.gmm1TileBegin,RoutedOwnerResidue(true,core),kAic);activationPrepared=true;}
-            if(activationTile>=FragmentGmm1Tiles(a,f)){++nextActivation;activationPrepared=false;continue;}
-            if(ReadGmByPassDCache(ComputeFlag(a.gmm1Done,f.gmm1TileBegin+activationTile))!=0) {
-                pack.Close();RunReadyActivationTile(a,core,f,nextActivation,activationTile,activation,timer,kAic);
-                activationTile+=kAic;localWork=true;
-            }
-            break;
         }
         if(!localWork&&!packDone&&nextPack<a.config.packRoundCount) {
             PackOneRound(a,nextPack++,core,kAic,pack);localWork=true;
@@ -231,8 +226,7 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& time
             pack.Close();CooperativeNoWait before;localWork=shared.TryOne(before);
         }
         progress=localWork||progress;incoming.Poll();
-        if(ready&&packDone&&peer.Done()&&completion.Done()&&nextGather>=a.config.fragmentCount&&
-           nextActivation>=a.config.fragmentCount&&shared.Done())break;
+        if(ready&&packDone&&peer.Done()&&completion.Done()&&nextGather>=a.config.fragmentCount&&shared.Done())break;
         if(!progress){const uint64_t tick=GetSystemCycle();while(GetSystemCycle()-tick<64U){}}
     }
     pack.Close();

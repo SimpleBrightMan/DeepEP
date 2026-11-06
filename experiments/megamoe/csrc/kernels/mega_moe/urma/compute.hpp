@@ -80,7 +80,7 @@ __aicore__ inline MegaMoeImpl::GMMAddrInfo Gmm2Addresses(const Arguments& args, 
     addr.bGlobal = reinterpret_cast<GM_ADDR>(args.weight2 + expert * i * h / 2U);
     addr.bScaleGlobal = reinterpret_cast<GM_ADDR>(args.weightScale2 + expert * scaleI * h);
     // The peer's communication AIV1 copies full rows after all group N tiles finish.
-    addr.gmm2OutGlobal = reinterpret_cast<GM_ADDR>(args.gmm2Contiguous + fragment.rowBegin * h * sizeof(bfloat16_t));
+    addr.gmm2OutGlobal = reinterpret_cast<GM_ADDR>(args.gmm2Output + fragment.rowBegin * h * sizeof(bfloat16_t));
     return addr;
 }
 
@@ -203,6 +203,7 @@ __aicore__ inline void RunComputeFragment(const Arguments& args, uint32_t block,
     ContinuousComputeRows rowIO;
     static_cast<UrmaInputRows&>(rowIO) = FragmentRowIO<UrmaInputRows>(args, fragment);
     rowIO.gather = gmm1;
+    rowIO.storeToUb = !gmm1;
     if (!gmm1) {
         rowIO.inputX = addresses.aGlobal;
         rowIO.inputStride = args.config.intermediate;
@@ -318,7 +319,7 @@ __aicore__ inline void GatherInputScaleImpl(const Arguments& args, const Fragmen
     source.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.symmetric + args.config.receiveScaleOffset));
     source.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
     destination.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(args.gatheredInputScale));
-    LocalTensor<uint8_t> scratch(TPosition::VECCALC, 0U, kComputeTileM * scaleStride);
+    LocalTensor<uint8_t> scratch(TPosition::VECCALC, 128U*1024U, kComputeTileM * scaleStride);
     const uint64_t start = timer.TraceBegin();
     auto cursor=RuntimeSegments(args,fragment).MakeCursor();
     RowSegment segment{};

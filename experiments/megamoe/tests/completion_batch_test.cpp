@@ -13,6 +13,8 @@ struct Consumer {
     uint32_t issued=0,consumed=0,polls=0,waits=0;
     std::vector<uint32_t> completed,reordered,released;
     bool grow=false;
+    bool workDone=false;
+    void ReleaseCompleted(){assert(workDone);released.push_back(consumed-1);workDone=false;}
     uint32_t IssuedCount(){++polls;return issued-consumed;}
     bool NextIsGmm1(){return gmm1.at(consumed);}
     void CompleteIssuedOne(RoutedCompletionItem& item,FakeTimer&) {
@@ -21,16 +23,20 @@ struct Consumer {
         item.gmm1=gmm1.at(consumed);item.logicalTile=consumed;
         item.group=consumed/3;item.tile=consumed%3;item.fragment.rowBegin=1000+consumed;
         completed.push_back(consumed);
-        released.push_back(consumed++); // producer credit returned before copying
+        ++consumed; // RX ownership is held until the work finishes
         if(grow)issued=gmm1.size(); // new arrivals cannot grow the captured batch
     }
 };
 struct Work {
     Consumer& c;uint32_t closes=0;
     void Before(){++closes;}
+    void Activate(const RoutedCompletionItem& item,FakeTimer&) {
+        assert(item.gmm1 && c.completed.back()==item.logicalTile);
+        assert(c.released.size()==item.logicalTile);c.workDone=true;
+    }
     void Reorder(const RoutedCompletionItem& item,FakeTimer&) {
         assert(!item.gmm1 && c.completed.back()==item.logicalTile);
-        assert(c.released.back()==item.logicalTile);
+        assert(c.released.size()==item.logicalTile);c.workDone=true;
         assert(item.fragment.rowBegin==1000+item.logicalTile); // descriptor forwarded directly
         c.reordered.push_back(item.logicalTile);
     }
@@ -43,7 +49,7 @@ int main() {
         const uint32_t count=ConsumeIssuedReorders(c,work,timer);
         assert(c.polls==1 && c.waits==count && count<=kDirectReorderBatch);
         assert(work.closes==(initially!=0));
-        const uint32_t expected=!initially?0U:((c.gmm1[0]||initially==1||c.gmm1[1])?1U:2U);
+        const uint32_t expected=initially?1U:0U;
         assert(count==expected);
         // Drain mixed streams across many bounded turns; no missing/duplicate tiles.
         c.issued=8;
@@ -55,7 +61,8 @@ int main() {
     }
     Consumer c{{false,false,false,false},1};c.grow=true;Work work{c};
     assert(ConsumeIssuedReorders(c,work,timer)==1 && c.issued==4 && c.polls==1);
-    assert(ConsumeIssuedReorders(c,work,timer)==2 && c.consumed==3);
+    assert(ConsumeIssuedReorders(c,work,timer)==1 && c.consumed==2);
+    assert(ConsumeIssuedReorders(c,work,timer)==1 && c.consumed==3);
     assert(ConsumeIssuedReorders(c,work,timer)==1 && c.consumed==4);
     assert(ConsumeIssuedReorders(c,work,timer)==0);
     std::cout<<scenarios+1<<" completion batch cases passed\n";

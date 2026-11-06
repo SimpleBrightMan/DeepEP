@@ -1,3 +1,5 @@
+> Current staged FIX-to-UB behavior is documented in [FIX_UB_STEPS.md](FIX_UB_STEPS.md). The text below describes the prior GM-backed experiment.
+
 # Paired consumer experiment v3
 
 This branch combines the A/B supply experiments with paired AIV1 completion and tile Reorder. See GMM_SUPPLY_EXPERIMENT.md for the complete current policy.

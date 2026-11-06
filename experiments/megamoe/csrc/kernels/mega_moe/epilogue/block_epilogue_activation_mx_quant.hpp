@@ -64,6 +64,7 @@ public:
         uint8_t actSubMode{static_cast<uint8_t>(ActSubMode::DEFAULT)};
         float activationAlpha{1.0f};
         float activationBeta{1.0f};
+        uint32_t ubOffsetBytes{0U}; // relocate the whole phase-private workspace
         Arguments() = default;
     };
 
@@ -201,19 +202,24 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
     activationBeta_ = params.activationBeta;
 
     constexpr auto ubOffsets = Detail::BuildActivationMxQuantUbOffsets<DataTypeIn, TileM, TileN, IsInterleaved_>();
-    gluRes_ = LocalTensor<bfloat16_t>(TPosition::VECCALC, ubOffsets.activationOutputOffsetBytes,
+    // Consumers that share UB with a live FIX mailbox can move every local
+    // view together. Default zero preserves all existing epilogue layouts.
+    const uint32_t ubBase = params.ubOffsetBytes;
+    l0cOutUbFirst_ = LocalTensor<DataTypeIn>(TPosition::VECIN, ubBase + kUbFirstOffset, kUbInputElementCapacity);
+    l0cOutUbSecond_ = LocalTensor<DataTypeIn>(TPosition::VECIN, ubBase + kUbSecondOffset, kUbInputElementCapacity);
+    gluRes_ = LocalTensor<bfloat16_t>(TPosition::VECCALC, ubBase + ubOffsets.activationOutputOffsetBytes,
                                       ubOffsets.activationQuantElementCapacity);
-    quantOutput_ = LocalTensor<int8_t>(TPosition::VECOUT, ubOffsets.quantOutputOffsetBytes,
+    quantOutput_ = LocalTensor<int8_t>(TPosition::VECOUT, ubBase + ubOffsets.quantOutputOffsetBytes,
                                        ubOffsets.activationQuantElementCapacity);
     quantScaleOutput_ =
-        LocalTensor<int8_t>(TPosition::VECOUT, ubOffsets.quantScaleOffsetBytes, ubOffsets.scaleElementCapacity);
-    maxExp_ = LocalTensor<uint16_t>(TPosition::VECCALC, ubOffsets.maxExpOffsetBytes, ubOffsets.scaleElementCapacity);
+        LocalTensor<int8_t>(TPosition::VECOUT, ubBase + ubOffsets.quantScaleOffsetBytes, ubOffsets.scaleElementCapacity);
+    maxExp_ = LocalTensor<uint16_t>(TPosition::VECCALC, ubBase + ubOffsets.maxExpOffsetBytes, ubOffsets.scaleElementCapacity);
     halfScale_ =
-        LocalTensor<uint16_t>(TPosition::VECCALC, ubOffsets.reciprocalScaleOffsetBytes, ubOffsets.scaleElementCapacity);
+        LocalTensor<uint16_t>(TPosition::VECCALC, ubBase + ubOffsets.reciprocalScaleOffsetBytes, ubOffsets.scaleElementCapacity);
 
     // weight UB: 放在 VECIN 区之后的安全区域，仅 mode=1 分配
     if constexpr (TopkWeightsPrefetch) {
-        weightUb_ = LocalTensor<float>(TPosition::VECCALC, ubOffsets.topkWeightOffsetBytes,
+        weightUb_ = LocalTensor<float>(TPosition::VECCALC, ubBase + ubOffsets.topkWeightOffsetBytes,
                                        ubOffsets.topkWeightElementCapacity);
     }
 }

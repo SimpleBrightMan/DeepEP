@@ -21,7 +21,7 @@ constexpr uint32_t kActivationTileM = 128U;
 constexpr uint32_t kInputScaleBytes = 3584U / 32U;
 constexpr uint32_t kInputScaleUbStride = ((kInputScaleBytes + 31U) / 32U) * 32U;
 constexpr uint32_t kInputScaleUbBytes = kComputeTileM * kInputScaleUbStride;
-constexpr uint32_t kRequiredUbBytes = 192U * 1024U;
+constexpr uint32_t kRequiredUbBytes = 256U * 1024U;
 struct ActivationUbContract {
     static constexpr uint32_t elements = kActivationTileM * kComputeTileN;
     static constexpr uint32_t gateOffset = 0U;

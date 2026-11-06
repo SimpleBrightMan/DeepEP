@@ -47,7 +47,7 @@ int main() {
         // Scalar can enqueue multiple tiles before the consumer runs. FIX is
         // held by the two credits and must never reuse a full flag early.
         for(unsigned i=0;i<count;++i) { RoutedFixChannel::Acquire(i);RoutedFixChannel::Publish(i); }
-        assert(CreditModel::produced==std::min(count,2U));
+        assert(CreditModel::produced==std::min(count,RoutedFixChannel::Slots));
         for(unsigned i=0;i<count;++i) { RoutedFixChannel::Wait(i);RoutedFixChannel::Release(i); }
         RoutedFixChannel::DrainProducer();
         assert(CreditModel::produced==count&&CreditModel::consumed==count);

@@ -5,10 +5,10 @@
 #include <c_api/asc_simd.h>
 namespace MegaMoeUrma {
 // Hardware channels follow Yancy/DeepEP's AIC->paired-AIV1 completion protocol.
-// B supply uses AIV0 full6/7, empty8/9; these channels use AIV1 full12/13,
-// empty14/15. GM outputs are immutable per logical tile until kernel return.
+// B supply uses AIV0 full4..7, empty8..11; these channels use AIV1 full12,
+// empty14. One low-UB mailbox stays owned until activation/scatter completes.
 struct RoutedFixChannel {
-    static constexpr uint32_t Slots=2U,Full=12U,Empty=14U,Aiv1Target=16U;
+    static constexpr uint32_t Slots=1U,Full=12U,Empty=14U,Aiv1Target=16U;
     __aicore__ static inline void InitConsumer() {
         for(uint32_t i=0;i<Slots;++i)asc_sync_intra_arrive(PIPE_MTE3,Aiv1Target|(Empty+i));
     }

@@ -93,23 +93,42 @@ public:
             if(slice*128>=f.rows){Mark(local);continue;}
             if(!ReadGmByPassDCache(ComputeFlag(a_.sharedGmm1Done,f.gmm1TileBegin+tile)))continue;
             before.Before(); // End a prior idle bar before recording actual shared work.
-            auto v=SharedView(a_);auto addr=Gmm1Addresses(v,f);addr.activationToGmm2Flag=nullptr;
-            UrmaActivation op;
+            // Soft shared activation must never overwrite the low128KiB FIX
+            // mailbox, even while no issue has yet been observed by Scalar.
+            using HighUbActivation = MegaMoeImpl::BlockEpilogueActivationMxQuant<
+                fp8_e4m3fn_t,bfloat16_t,64U,256U,false,false,true>;
+            constexpr uint32_t highUb=128U*1024U,planeBytes=64U*256U*2U;
+            static_assert(highUb+2U*planeBytes<=248U*1024U);
+            HighUbActivation op;
             op.Init({.yGmAddr=reinterpret_cast<GM_ADDR>(a_.sharedActivation),
-                     .yScaleGmAddr=reinterpret_cast<GM_ADDR>(a_.sharedActivationScale),.clampLimit=FLT_MAX});
-            op.UpdateGlobalAddr({static_cast<int64_t>(f.rowBegin*v.config.intermediate),
-                static_cast<int64_t>(f.rowBegin*(v.config.intermediate/32)),0,0,0,0});
-            const MegaMoeImpl::BlockJobContext job{worker_,kAic};
-            auto config=UrmaGmmConfig::BuildGmm1ProblemConfig(FragmentShape(v,f),job,kComputeTileM);
-            const auto layouts=UrmaGmmConfig::BuildLayouts(config);
-            auto gmC=Te::MakeTensor(Te::MakeMemPtr<Te::Location::GM>(reinterpret_cast<__gm__ bfloat16_t*>(addr.gmm1OutGlobal)),layouts.c);
-            op.UpdateNextProblem({config.m,config.outputN,config.k,0});config.tileM=128;
-            const uint32_t m=slice*128,rows=f.rows-m<128?f.rows-m:128;
-            const MegaMoeImpl::GmmKernel::BlockScheduler::BlockShape shape{rows,256,config.k};
-            auto meta=ComputeTileTraceMeta(FragmentTraceMeta(f,group),m,tile*256,rows,256);meta.expert=a_.config.world*a_.config.localExperts;
+                     .yScaleGmAddr=reinterpret_cast<GM_ADDR>(a_.sharedActivationScale),
+                     .clampLimit=FLT_MAX,.ubOffsetBytes=highUb});
+            const uint32_t inter=a_.sharedIntermediate,n=tile*256U;
+            op.UpdateGlobalAddr({static_cast<int64_t>(f.rowBegin*inter),
+                static_cast<int64_t>(f.rowBegin*(inter/32U)),0,0,0,0});
+            op.UpdateNextProblem({f.rows,inter,0,0});
+            GlobalTensor<bfloat16_t> gm;
+            gm.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(a_.sharedGmm1));
+            LocalTensor<bfloat16_t> gate(TPosition::VECIN,highUb,64U*256U);
+            LocalTensor<bfloat16_t> up(TPosition::VECIN,highUb+planeBytes,64U*256U);
+            const uint32_t m=slice*128U,rows=f.rows-m<128U?f.rows-m:128U;
+            auto meta=ComputeTileTraceMeta(FragmentTraceMeta(f,group),m,n,rows,256U);
+            meta.expert=a_.config.world*a_.config.localExperts;
             const auto start=timer_.TraceBegin();
-            MegaMoeImpl::GmmKernel::Gmm1Aiv1EpilogueTileA8W4<bfloat16_t,UrmaGmmConfig::MakeLayoutC,true>(
-                op,gmC,addr,config,shape,m,tile*256);
+            for(uint32_t sub=0;sub<rows;sub+=64U) {
+                const uint32_t actual=rows-sub<64U?rows-sub:64U;
+                const uint64_t input=(f.rowBegin+m+sub)*(2U*inter)+n;
+                const DataCopyExtParams copy{static_cast<uint16_t>(actual),512U,(2U*inter-256U)*2U,0U,0U};
+                SetFlag<HardEvent::S_MTE2>(EVENT_ID0);WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                DataCopyPad(gate,gm[input],copy,{false,0U,0U,0U});
+                DataCopyPad(up,gm[input+inter],copy,{false,0U,0U,0U});
+                SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                SetCtrlSpr<60,60>(0);
+                op({actual,256U,0,0},{int64_t(m+sub)*inter+n,
+                    int64_t(m+sub)*(inter/32U)+n/32U,0,0,0,0});
+            }
+            // The original M128 task/ready-count contract is unchanged: both
+            // sub-slices completed their activation/scale MTE3 stores above.
             AtomicAdd(ComputeFlag(a_.sharedActivationDone,group),1);
             timer_.TraceEnd(TraceEvent::SharedActivation,start,meta);
             Mark(local);cursor_=(local+1)%owned_;return true;

@@ -1,3 +1,5 @@
+> Current staged FIX-to-UB behavior is documented in [FIX_UB_STEPS.md](FIX_UB_STEPS.md). The text below describes the prior GM-backed experiment.
+
 # Combined consumer experiment v2
 
 This branch now combines A-window prefetch, B4 L1 supply, independent AIV0 UB input4/output3, and paired AIV1 FIX completion.
