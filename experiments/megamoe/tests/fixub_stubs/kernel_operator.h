@@ -3,10 +3,10 @@
 #include <cassert>
 #define __aicore__
 struct bfloat16_t { uint16_t bits; };
+enum class QuantMode_t { QF322BF16_PRE };
 namespace AscendC {
 enum class TPosition { CO1, VECCALC };
 enum class CO2Layout { ROW_MAJOR };
-enum class QuantMode_t { QF322BF16_PRE };
 struct FixpipeConfig { CO2Layout format; bool isToUB; };
 template<CO2Layout> struct FixpipeParamsC310 {
     uint32_t mSize{},nSize{},srcStride{},dstStride{};

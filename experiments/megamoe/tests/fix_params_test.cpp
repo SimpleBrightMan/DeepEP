@@ -20,7 +20,7 @@ int main() {
         MegaMoeImpl::GmmKernel::StoreUb(L0C{stride,origin},m,n,flag);
         const auto& p=AscendC::observed;
         assert(p.mSize==m && p.nSize==n && p.srcStride==stride && p.dstStride==256);
-        assert(p.quantPre==AscendC::QuantMode_t::QF322BF16_PRE && p.deqScalar==0x42800000ULL);
+        assert(p.quantPre==::QuantMode_t::QF322BF16_PRE && p.deqScalar==0x42800000ULL);
         assert(!p.reluEn && p.unitFlag==flag && !p.dualDstCtl && p.subBlockId==1);
         assert(AscendC::dstAddress==0 && AscendC::srcAddress==4096U+origin*4U);
         ++cases;

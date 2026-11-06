@@ -20,7 +20,7 @@ __aicore__ inline void StoreUb(const TensorL0C& src, uint32_t rows, uint32_t col
     p.nSize = columns;
     p.srcStride = tla::get<1, 1>(src.stride()) / tla::get<0, 0>(src.stride());
     p.dstStride = 256U;
-    p.quantPre = AscendC::QuantMode_t::QF322BF16_PRE;
+    p.quantPre = ::QuantMode_t::QF322BF16_PRE;
     // Bit representation of float(64), identical to CATLASS PER_TENSOR's
     // static_cast<uint64_t>(*reinterpret_cast<int32_t*>(&params.scale)).
     p.deqScalar = 0x42800000ULL;
