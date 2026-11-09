@@ -368,6 +368,7 @@ def run(args, config, group):
         bandwidth_topology="logical contiguous rank groups of four; multi-host validation is not UBX bandwidth equivalence",
         transport="URMA QP0 RO PUT + per-CV SO Dispatch epochs + SO Combine bitmap publication",
         communication_protocol=COMMUNICATION_PROTOCOL,
+        dispatch_completion_probe=getattr(_extension(), "urma_dispatch_completion_probe", "none"),
         communication_qps_per_peer=1,
         dispatch_combine_overlap="in-flight Dispatch and Combine on each peer QP",
         same_peer_dispatch_combine_overlap=True,
@@ -624,12 +625,17 @@ def run(args, config, group):
             reports["bandwidth"] = summarize_bandwidth(bandwidth_records)
             reports["bandwidth_per_rank"] = bandwidth_records
             reports["bandwidth_scope"] = timer_metadata["scope"]
-            reports["dispatch_bandwidth_unavailable"] = "Dispatch submission end is not completion; no independent completion probe"
+            reports["dispatch_completion_scope"] = "diagnostic-only fixed last-Dispatch SO CQ target; first nonblocking observation, may lag true completion; no per-stage quiet"
+            missing_dispatch = any(row["phase"] == "Dispatch" and row.get("completion_status") == "not_recorded"
+                                   for report in bandwidth_records for row in report["classes"])
+            if missing_dispatch:
+                reports["dispatch_bandwidth_unavailable"] = "some peers have no observed Dispatch completion"
             if model["num_shared_experts"]:
                 reports["combine_bandwidth_unavailable"] = "Shared mode defers final quiet until after routed Reduce; Combine timer is submission-only"
 
             if rank == 0:
-                print("[URMA BW] Dispatch completion bandwidth unavailable: no separate Dispatch quiet", flush=True)
+                print("[URMA BW] Dispatch: " + ("completion missing for some peers" if missing_dispatch else
+                      "first nonblocking CQ completion observation; includes polling delay"), flush=True)
             reports["bandwidth_with_trace"] = args.fine
             if rank == 0:
                 for row in reports["bandwidth"]:

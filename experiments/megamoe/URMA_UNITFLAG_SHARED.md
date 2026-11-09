@@ -1,5 +1,30 @@
 # Unitflag dimensions and shared migration
 
+## Diagnostic-only Dispatch completion observation
+
+With internal timer/coarse/fine enabled, each communication AIV1 captures the
+QP0 CQ target immediately after its last Dispatch SO submission. Each later
+cooperative turn probes that fixed target once; subsequent Combine submissions
+do not move it. The observer reads the last CQE's owner/status or recognizes
+that normal SHMEM polling already retired it. It never consumes CQ entries,
+updates SQ/CQ credits, rings a doorbell, or inserts a quiet/PIPE_ALL. This is
+tied to the direct-QP layout of the pinned SHMEM9479427 SDK.
+
+One successful observation retains a timestamp; subsequent probes do nothing.
+`DispatchSendComplete` (ID43) is exported as a zero-duration observation point
+in both coarse and fine traces. The record and raw timer word7 are written at
+the final trace flush. The point may lie inside a Reduce/quiet scope: only this
+ID43 point is exempt from the decoder's normal nonoverlapping record-order rule.
+The observer remains live in shared-mode Reduce; final quiet provides a fallback
+observation if the main work loop ended before Dispatch was observed complete.
+
+The timestamp is a first software observation, not an exact NIC completion
+timestamp. It can lag completion by work between probes (or a final quiet).
+Dispatch bandwidth therefore includes that observation delay. Negative probes
+add a CQ owner/status load to diagnostic runs; formal timer/trace-off runs do
+not fetch the CQ state or read timestamps for this observer. There is no new
+per-CV flag, remote read, send, QP, or correctness dependency.
+
 ## Current consumer: shared A8W8 (2026-11-09)
 
 `megamoe-unitflag-exp-consumer` uses FP8 E4M3 shared weights with E8M0 MX

@@ -52,8 +52,8 @@ __aicore__ inline TraceMeta CooperativeChunkMeta(const Chunk& c,uint32_t offset,
 // per turn. No blocking PeerStart/PackReady wait and no per-CV quiet.
 class CooperativePeer {
 public:
-    __aicore__ CooperativePeer(Arguments& a,uint32_t core,Timer& timer)
-        :a_(a),core_(core),timer_(timer),active_(core<CommunicationWorkers(a.config.world)),
+    __aicore__ CooperativePeer(Arguments& a,uint32_t core,Timer& timer,DispatchCompletionObserver& observer)
+        :a_(a),core_(core),timer_(timer),dispatchObserver_(observer),active_(core<CommunicationWorkers(a.config.world)),
          peer_(active_?PeerForOwner(a.config.rank,core):0U),
          submitted_(TPosition::VECCALC,CooperativeUb::submitted,kMaxPeerChunks),
          selfCounts_(TPosition::VECCALC,CooperativeUb::selfCounts,kMaxPeerChunks) {
@@ -99,7 +99,11 @@ public:
             PublishOrdered(symmetric,a_.config.dispatchReadyOffset+(uint64_t(a_.config.rank)*a_.config.maxPeerChunks+cv)*kFlagBytes,peer_,a_.config.epoch);
         timer_.TraceEnd(TraceEvent::DispatchPublish,start,m);
         timer_.End(Phase::Dispatch,uint64_t(rows)*(a_.config.hidden+scales),true);
-        nextDispatch_+=count;++dispatchSteps_;if(DispatchDone())timer_.CoarseEnd(CoarsePhase::Dispatch);
+        nextDispatch_+=count;++dispatchSteps_;
+        if(DispatchDone()) {
+            timer_.CoarseEnd(CoarsePhase::Dispatch);
+            dispatchObserver_.Arm(peer_,dispatchCount_-1U);
+        }
         return true;
     }
 
@@ -124,6 +128,7 @@ public:
     __aicore__ inline void FinishRouted(SharedIncoming& incoming) {
         if(!active_)return;
         const uint64_t start=timer_.TraceBegin();Quiet(peer_);
+        incoming.dispatch.Poll(); // fallback if the work loop ended before observation
         TraceMeta m;m.peer=peer_;timer_.TraceEnd(TraceEvent::CombineSendComplete,start,m);
         timer_.CoarseEnd(CoarsePhase::Combine);
         if(receives_)timer_.MarkSendComplete(Phase::Combine);
@@ -189,7 +194,7 @@ private:
         }
         return false;
     }
-    Arguments& a_;uint32_t core_;Timer& timer_;bool active_;uint32_t peer_;
+    Arguments& a_;uint32_t core_;Timer& timer_;DispatchCompletionObserver& dispatchObserver_;bool active_;uint32_t peer_;
     bool started_=false,initialized_=false,finished_=false,selfFinished_=false,sharedHeadReady_=false;
     uint32_t dispatchCount_=0U,nextDispatch_=0U,dispatchSteps_=0U,begin_=0U,receives_=0U,selfBegin_=0U,selfCount_=0U;
     uint32_t remaining_=0U,selfRemaining_=0U,nextRemote_=0U,nextSelf_=0U;
@@ -197,8 +202,9 @@ private:
 };
 
 __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& timer,SharedIncoming& incoming) {
+    incoming.dispatch.Init(timer);
     RoutedCompletionConsumer completion(a,core);completion.Init(); // even zero-task AICs need the single credit
-    PackBatch pack(a,timer);CooperativePeer peer(a,core,timer);SharedActivationState shared(a,core,timer);
+    PackBatch pack(a,timer);CooperativePeer peer(a,core,timer,incoming.dispatch);SharedActivationState shared(a,core,timer);
     if(!peer.Active())timer.CoarseBegin(CoarsePhase::Activation);
     UbRoutedActivation activation;activation.Init(a);
     const uint32_t comm=CommunicationWorkers(a.config.world),helpers=kAic-comm;

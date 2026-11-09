@@ -94,7 +94,7 @@ enum class TraceEvent : uint32_t {
     Gmm2Reorder = 40U,
     WaitGmm2Reorder,
     CombineSendComplete,
-    DispatchSendComplete, // Reserved here, shared coarse event IDs start at 44.
+    DispatchSendComplete, // Diagnostic CQ observation point; coarse IDs start at44.
     CoarsePack, CoarseLocalSyncStart, CoarseGMM, CoarseDequant,
     CoarseDispatch, CoarseCombine, CoarseActivation, CoarseReduce, CoarseLocalSyncEnd,
     CoarseDispatchSubmit, PackRetire, SharedGmm1Tile, SharedGmm1Drain, SharedActivation,

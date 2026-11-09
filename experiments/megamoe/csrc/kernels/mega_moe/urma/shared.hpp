@@ -5,6 +5,7 @@
 #include "tile_completion.hpp"
 #include "shared_add.hpp"
 #include "tail_completion.hpp"
+#include "dispatch_completion.hpp"
 namespace MegaMoeUrma {
 using SharedGmm1 = SharedMxGmm<true>;
 using SharedGmm2 = SharedMxGmm<false>;
@@ -143,7 +144,11 @@ private:
 
 struct SharedIncoming {
     const Arguments& a;uint32_t core;bool peer=false,self=false;
-    __aicore__ inline void Poll(){if(core<CommunicationWorkers(a.config.world))ObserveIncomingCompletion(a,core,peer,self);}
+    DispatchCompletionObserver dispatch;
+    __aicore__ inline void Poll(){
+        dispatch.Poll();
+        if(core<CommunicationWorkers(a.config.world))ObserveIncomingCompletion(a,core,peer,self);
+    }
 };
 
 __aicore__ inline void RunActivationShared(Arguments& args, uint32_t worker, Timer& timer)

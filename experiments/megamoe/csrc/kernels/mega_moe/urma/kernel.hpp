@@ -715,6 +715,7 @@ __aicore__ inline void ProcessShared(Arguments& a) {
         timer.CoarseEnd(CoarsePhase::Reduce);
         if(block<comm) {
             const auto start=timer.TraceBegin();Quiet(PeerForOwner(a.config.rank,block));
+            incoming.dispatch.Poll(); // observer also survives into shared-mode Reduce
             TraceMeta completion;completion.peer=PeerForOwner(a.config.rank,block);
             timer.TraceEnd(TraceEvent::CombineSendComplete,start,completion);
             while(!ObserveIncomingCompletion(a,block,incoming.peer,incoming.self)) {

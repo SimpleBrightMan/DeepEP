@@ -218,7 +218,7 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
         assert world == group.size()
         calls.append(("timer-export", int(raw[0])))
         assert int(raw[0]) == 7
-        return {"rank": rank}
+        return {"rank": rank, "classes": [{"phase": "Dispatch", "completion_status": "not_recorded"}]}
 
     monkeypatch.setattr(urma_timer, "communication_bandwidth", bandwidth)
     monkeypatch.setattr(urma_timer, "summarize_bandwidth", lambda records: [])

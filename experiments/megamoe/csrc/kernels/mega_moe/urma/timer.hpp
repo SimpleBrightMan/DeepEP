@@ -43,6 +43,17 @@ public:
 #endif
     }
 
+    __aicore__ inline bool DiagnosticEnabled() const { return address_!=0U || traceAddress_!=0U; }
+
+    // One successful nonblocking CQ observation, not a quiet/wait interval.
+    // Both modes retain a point in Scalar state until FinishTrace. No trace
+    // GM store or pipeline drain is inserted in the cooperative/reduce loop.
+    __aicore__ inline void RecordDispatchCompletion(uint32_t peer,uint32_t cv) {
+        if(!DiagnosticEnabled())return;
+        const uint64_t tick=AscendC::GetSystemCycle();
+        dispatchTick_=tick;dispatchPeer_=peer;dispatchCv_=cv;
+    }
+
     __aicore__ inline uint64_t TraceBegin() const
     {
         return traceAddress_ == 0U || coarse_ ? 0U : AscendC::GetSystemCycle();
@@ -102,6 +113,11 @@ public:
     // An unfinished kernel leaves a zero header and is rejected by the reader.
     __aicore__ inline void FinishTrace()
     {
+        if(dispatchTick_!=0U && address_!=0U) {
+            auto* record=reinterpret_cast<__gm__ uint64_t*>(address_)+
+                (static_cast<uint64_t>(core_)*kTimerPhases+Phase::Dispatch)*kTimerRecordElements;
+            record[7]=dispatchTick_;FlushTraceLine(record);
+        }
         if (traceAddress_ == 0U) return;
         // All engines have passed the final local join. Emit only now, sorted
         // by start so the ordinary raw trace decoder keeps its ordering checks.
@@ -122,6 +138,13 @@ public:
                 WriteTrace(event, coarseStart_[selected], coarseEnd_[selected], meta);
                 coarseStart_[selected] = 0U;
             }
+        }
+        // Observation may happen inside a Reduce/quiet envelope. Append this
+        // independent point after ordinary scopes, keeping its original tick.
+        // The decoder allows only this zero-duration ID43 point out of order.
+        if(dispatchTick_!=0U) {
+            TraceMeta meta;meta.peer=dispatchPeer_;meta.cv=dispatchCv_;
+            WriteTrace(TraceEvent::DispatchSendComplete,dispatchTick_,dispatchTick_,meta);
         }
         auto* header = TraceHeader();
         header[0] = kTraceSchema;
@@ -171,6 +194,8 @@ public:
     }
 
 private:
+    uint64_t dispatchTick_=0U;
+    uint32_t dispatchPeer_=0U,dispatchCv_=0U;
     bool shared_=false;
     __aicore__ inline __gm__ uint64_t* TraceHeader() const
     {
