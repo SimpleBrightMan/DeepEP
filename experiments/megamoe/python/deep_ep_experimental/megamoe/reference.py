@@ -69,6 +69,20 @@ def unpack_weight(pair):
     return values * np.repeat(scale, 32, axis=-1)
 
 
+def expand_fp4_to_fp8(pair):
+    """Exact offline E2M1 -> E4M3 conversion, preserving MX scale bytes.
+
+    This is used only for benchmark fixture preparation, never in forward.
+    The native shared API accepts arbitrary finite FP8 E4M3 values.
+    """
+    packed, scales = pair
+    packed = np.asarray(packed, dtype=np.uint8)
+    lut = fp8_encode(FP4)
+    codes = np.empty((*packed.shape[:-1], packed.shape[-1] * 2), dtype=np.uint8)
+    codes[..., ::2], codes[..., 1::2] = lut[packed & 15], lut[packed >> 4]
+    return codes, np.asarray(scales, dtype=np.uint8).copy()
+
+
 def make_weights(experts, hidden, intermediate, seed):
     """Generate packed FP4 and non-uniform E8M0 scales; never quantize weights on the hot path."""
     rng = np.random.default_rng(seed)

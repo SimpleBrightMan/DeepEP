@@ -8,13 +8,13 @@
 namespace MegaMoeUrma {
 
 // All 28 steady Pack owners publish this existing counter only after Close().
-// Startup AIV0 work precedes the original local startup join. No producer
+// S1 also counts 28 startup-only AIV0 owners (no startup join). No producer
 // waits for Reduce, so consumers may wait here without delaying a producer.
 __aicore__ inline void WaitPackInverseReady(const Arguments& args)
 {
     using namespace AscendC;
     auto* done = reinterpret_cast<__gm__ int32_t*>(args.localFlags + kLocalFlagPackDone * kFlagBytes);
-    while (ReadGmByPassDCache(done) != static_cast<int32_t>(kAic)) {
+    while (ReadGmByPassDCache(done) != static_cast<int32_t>(args.sharedExperts ? kLocalWorkers : kAic)) {
         const uint64_t start = GetSystemCycle();
         while (GetSystemCycle() - start < 200U) {}
     }

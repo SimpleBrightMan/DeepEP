@@ -1,5 +1,55 @@
 # Unitflag dimensions and shared migration
 
+## Current consumer: shared A8W8 (2026-11-09)
+
+`megamoe-unitflag-exp-consumer` uses FP8 E4M3 shared weights with E8M0 MX
+scales. Routed experts remain FP4; shared experts remain OFF by default.
+The previous implementation is preserved at
+`megamoe-unitflag-exp-consumer-shared-a8w4` (`2b7d894`). The migration notes
+below describe earlier implementations, not this branch's current schedule.
+
+With one shared expert enabled:
+
+- AIC: shared W8 GMM1 -> original routed W4 compute -> shared W8 GMM2.
+  W8 loads both matrices directly into L1; UnitFlag and the same context/slot
+  cursors persist across tiles and M-groups within each shared GMM. Shared
+  gate/up stays planar; routed FIX-to-AIV1 UB and paired consumers are unchanged.
+- AIV0: RouteSummary -> its static half of startup Pack2 -> wait for same-core
+  shared GMM1 L1 release -> routed W4 dequant -> immediate routed Reduce.
+  It no longer dequantizes either shared GMM, and Reduce overlaps shared GMM2.
+- AIV1: the other static half of startup Pack2 -> original cooperative loop
+  (remaining Pack, communication/scale gather, activation/Reorder) -> Reduce.
+  Startup has 56 owners; steady Pack still has 28. Each startup row is assigned
+  exactly once. Inverse-map readers wait for all 56 Pack completion credits.
+- L1 handoff is per core, not an additional full-core/rank barrier. Shared GMM1
+  destroys its AIC context before releasing AIV0. AIV0 drains its routed
+  prologue before releasing shared GMM2. Final local join and FP32 shared-add /
+  BF16 output rounding are unchanged. S0 keeps its existing schedule.
+
+Public shared input pairs (prepare outside forward, no hot-path conversion):
+
+```python
+# All tensors on the same NPU. FP8 weights are contiguous ND, not packed FP4/NZ.
+# sw1: [1, 2 * shared_I, H], sw2: [1, H, shared_I], torch.float8_e4m3fn
+# ss1: [1, 2 * shared_I, H // 64, 2], ss2: [1, H, shared_I // 64, 2]
+# scales use torch.float8_e8m0fnu; shared_I is independent of routed I.
+shared_l1, shared_l2 = transform_weights_for_mega_moe(
+    (sw1, ss1), (sw2, ss2), shared=True)
+# Pass shared_l1_weights=shared_l1, shared_l2_weights=shared_l2 to forward.
+```
+
+The benchmark CLI is unchanged (`--shared-experts 1 --shared-intermediate ...`).
+For comparison against existing CPU Golden and NPU cascade fixtures, it expands
+their FP4 code values exactly into FP8 before timing and keeps the scales.
+This preserves the reference math; the device kernel only receives/loads W8.
+The public interface also accepts FP8 values outside that fixture's FP4 subset.
+The shared contract is `unitflag-shared-a8w8-early-reduce-v1`; rebuild/reinstall
+the complete wheel. The routed compute schedule ID remains v5.
+
+Performance tradeoff: shared weight payload doubles, with additional AIC B-load
+pressure. Freeing AIV0 and starting Reduce earlier do not guarantee lower total
+latency, especially when inbound Combine data is still unavailable.
+
 Base: origin/megamoe-urma-unitflag-so b904c14. Commit one generalizes H (256..8192,
 multiple256), routed I (256..16384, multiple256), and TopK1..8, E384, EP4/8/16.
 CLI: --hidden / --intermediate / --topk. Shared experts remain disabled in this commit.

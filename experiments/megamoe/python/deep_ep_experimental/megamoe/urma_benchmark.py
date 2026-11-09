@@ -144,12 +144,13 @@ def cooperative_schedule_metadata(world, shared_experts):
         scale_gather_assignment="M-group modulo (29-EP), noncommunication AIV1 only",
         cooperative_aiv1_priority="one static Pack quantum -> dispatch (comm) or ready scale gather (helper) -> FIFO UB activation/reorder -> combine (comm) -> idle soft shared activation",
         reduce_workers=56 if shared_experts else 56 - (world - 1),
-        reduce_assignment="static contiguous token ranges across AIV0+AIV1; worker=2*block+subblock; AIV0 joins after its own dequant contexts; incoming counters remain AIV1-owned" if shared_experts else "original routed schedule",
-        startup_pack_workers=28 if shared_experts else 56,
+        reduce_assignment="static contiguous token ranges across AIV0+AIV1; worker=2*block+subblock; AIV0 joins after routed dequant, overlapping shared W8 GMM2; incoming counters remain AIV1-owned" if shared_experts else "original routed schedule",
+        startup_pack_workers=56,
         steady_pack_workers=28,
         shared_activation_workers=28 if shared_experts else 0,
         shared_dispatch_startup_limit="BS<4096: per-peer max(1,floor(BS/1024)) merged batches before all local shared GMM1 AICs finish; normal ramp only while gated; no limit for BS>=4096/S0",
-        shared_schedule="shared GMM1 -> routed -> shared GMM2; one lowest-priority shared activation slice per turn; local join + add" if shared_experts else "disabled",
+        shared_weight_type="FP8 E4M3 + E8M0 (routed FP4)",
+        shared_schedule="AIC: shared W8 GMM1 -> routed W4 -> shared W8 GMM2; AIV0: startup Pack -> routed dequant -> Reduce; one lowest-priority shared activation slice per turn; local join + add" if shared_experts else "disabled",
     )
 
 
@@ -331,7 +332,15 @@ def run(args, config, group):
     shared_raw=None;shared_options={}
     if model["num_shared_experts"]:
         shared_raw=make_weights(1,model["hidden"],model["shared_intermediate_hidden"],config["seed"]+100000)
-        sw1,sw2=transform_weights_for_mega_moe(*map(device_pair,shared_raw),shared=True)
+        # Exact FP4 -> FP8 encoding expansion outside timing. CPU Golden and
+        # NPU cascade use the same real weights, keeping old accuracy baselines
+        # comparable; the fused operator receives genuine W8 tensors.
+        from .reference import expand_fp4_to_fp8
+        def shared_device_pair(pair):
+            data, scale = expand_fp4_to_fp8(pair)
+            return (torch.from_numpy(data).npu().view(torch.float8_e4m3fn),
+                    torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
+        sw1,sw2=transform_weights_for_mega_moe(*map(shared_device_pair,shared_raw),shared=True)
         shared_options=dict(shared_l1_weights=sw1,shared_l2_weights=sw2)
 
     launch_guard = UrmaLaunchGuard(
@@ -385,6 +394,7 @@ def run(args, config, group):
         input="prequantized FP8 E4M3 + E8M0; conversion/input generation outside measurement",
         native_urma_protocol=int(_extension().urma_api_protocol),
         compute_schedule=getattr(_extension(), "urma_compute_schedule", "source-cv"),
+        shared_contract=_extension().urma_shared_contract,
         local_pipeline=getattr(_extension(), "urma_local_pipeline", "single-slot"),
         tail_schedule=_extension().urma_tail_schedule,
         timer_clock_mhz=args.timer_clock_mhz,

@@ -43,7 +43,7 @@ def _extension():
         )
     if getattr(extension, "urma_dimension_contract", None) != "unitflag-h8192-i16384-k1to8-v1-bs16384":
         raise RuntimeError("Rebuild the generalized-dimension MegaMoE extension")
-    if getattr(extension,"urma_shared_contract",None)!="unitflag-shared-peer-reorder-v1":
+    if getattr(extension,"urma_shared_contract",None)!="unitflag-shared-a8w8-early-reduce-v1":
         raise RuntimeError("Rebuild the shared-expert MegaMoE extension")
     if getattr(extension, "urma_routed_weight_layout", None) != "gate128-up128-v1":
         raise RuntimeError("Rebuild the fused gate128/up128 routed GMM1 extension")
@@ -335,7 +335,10 @@ class UrmaBuffer:
                 sw1,ss1=shared_l1_weights;sw2,ss2=shared_l2_weights
                 if isinstance(shared_l1_weights,_RoutedWeightPair):
                     raise ValueError("Shared GMM1 requires planar shared=True prepared weights")
-                _check_fp4_weight_format(sw1,"shared_l1_weights");_check_fp4_weight_format(sw2,"shared_l2_weights")
+                import torch_npu
+                for sw in (sw1,sw2):
+                    if sw.dtype != torch.float8_e4m3fn or not sw.is_contiguous() or torch_npu.get_npu_format(sw) != 2:
+                        raise ValueError("Shared weights require contiguous ND FP8 E4M3 [1,N,K]; routed weights remain FP4")
                 shared=(sw1,sw2,ss1,ss2)
             elif shared_l1_weights is not None or shared_l2_weights is not None:
                 raise ValueError("S0 does not accept shared weights")

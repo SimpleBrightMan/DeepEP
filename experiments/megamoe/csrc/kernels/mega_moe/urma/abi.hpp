@@ -31,6 +31,10 @@ constexpr uint32_t kLocalFlagReorderDone = 4U;
 constexpr uint32_t kLocalFlagSharedGmm1Done = 5U;
 constexpr uint32_t kLocalFlagRouteSummaryDone = 6U;
 constexpr uint32_t kLocalFlagRouteSourcesDone = 7U; // committed AIV0 source snapshots
+// Separate cache lines: per-core L1 ownership handoff shared W8 -> routed W4 -> shared W8.
+constexpr uint32_t kLocalFlagSharedL1Released = 16U;
+constexpr uint32_t kLocalFlagRoutedPrologueReleased = kLocalFlagSharedL1Released + kAic;
+constexpr uint32_t kSharedLocalFlagCount = kLocalFlagRoutedPrologueReleased + kAic;
 constexpr uint32_t kLocalFlagRouteExpertsDone = 8U; // committed AIV0 expert shards
 // Reduce dependency values are uint64 bit patterns stored in an int64 tensor.
 // Low values address a producer/CV completion flag; tagged values address a

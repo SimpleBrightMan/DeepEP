@@ -186,7 +186,7 @@ UrmaPlan::UrmaPlan(torch::Tensor example, int64_t world, int64_t intermediate, i
     gmm2_contiguous_ = allocate(0); // routed GMM2 writes directly to paired UB
     peer_reorder_ranges_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
     peer_reorder_spans_ = allocate(0); // lazy descriptor; placeholder for lifetime bookkeeping
-    local_flags_ = allocate(16 * MegaMoeUrma::kFlagBytes);
+    local_flags_ = allocate((shared_experts ? MegaMoeUrma::kSharedLocalFlagCount : 16U) * MegaMoeUrma::kFlagBytes);
     gmm_issued_=allocate(MegaMoeUrma::kAic*MegaMoeUrma::kFlagBytes);
     args_.gmmIssued=Address(gmm_issued_);
     system_workspace_ = allocate(platform_.system_workspace + (2ULL << 20));
@@ -281,9 +281,9 @@ torch::Tensor UrmaPlan::forward(torch::Tensor x, torch::Tensor x_scales, torch::
         const int64_t si=args_.sharedIntermediate;
         CheckTensor(*shared_w1,3,"shared_w1",device);CheckTensor(*shared_w2,3,"shared_w2",device);
         CheckTensor(*shared_s1,4,"shared_s1",device);CheckTensor(*shared_s2,4,"shared_s2",device);
-        TORCH_CHECK(shared_w1->scalar_type()==torch::kUInt8 && shared_w2->scalar_type()==torch::kUInt8 &&
-                    shared_w1->sizes()==torch::IntArrayRef({1,2*si,c.hidden/2}) &&
-                    shared_w2->sizes()==torch::IntArrayRef({1,c.hidden,si/2}),"Invalid shared FP4 weights");
+        TORCH_CHECK(shared_w1->scalar_type()==c10::ScalarType::Float8_e4m3fn && shared_w2->scalar_type()==c10::ScalarType::Float8_e4m3fn &&
+                    shared_w1->sizes()==torch::IntArrayRef({1,2*si,c.hidden}) &&
+                    shared_w2->sizes()==torch::IntArrayRef({1,c.hidden,si}),"Shared weights must be FP8 E4M3 ND [1,N,K]");
         TORCH_CHECK(shared_s1->scalar_type()==c10::ScalarType::Float8_e8m0fnu && shared_s2->scalar_type()==c10::ScalarType::Float8_e8m0fnu &&
                     shared_s1->sizes()==torch::IntArrayRef({1,2*si,c.hidden/64,2}) &&
                     shared_s2->sizes()==torch::IntArrayRef({1,c.hidden,si/64,2}),"Invalid shared scales");

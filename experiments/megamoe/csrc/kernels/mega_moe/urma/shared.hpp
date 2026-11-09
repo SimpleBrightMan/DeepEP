@@ -1,13 +1,13 @@
 #pragma once
 #include "compute.hpp"
 #include "shared_contract.hpp"
+#include "shared_mx.hpp"
 #include "tile_completion.hpp"
 #include "shared_add.hpp"
 #include "tail_completion.hpp"
 namespace MegaMoeUrma {
-using SharedGmm1 = MegaMoeImpl::GmmKernel::CatlassGmm1<UrmaProblemConfig,false,MegaMoeImpl::GmmKernel::ContiguousRowIO>;
-using SharedGmm2 = MegaMoeImpl::GmmKernel::CatlassGmm2<UrmaProblemConfig,false,MegaMoeImpl::GmmKernel::ContiguousRowIO>;
-// Contiguous output makes both classes select MmadA8W4Mx<..., unitFlag=true>.
+using SharedGmm1 = SharedMxGmm<true>;
+using SharedGmm2 = SharedMxGmm<false>;
 __aicore__ inline Arguments SharedView(const Arguments& a) {
     Arguments v=a;v.config.intermediate=a.sharedIntermediate;
     v.weight1=a.sharedWeight1;v.weight2=a.sharedWeight2;v.weightScale1=a.sharedScale1;v.weightScale2=a.sharedScale2;
@@ -56,7 +56,6 @@ __aicore__ inline void RunSharedGmm(const Arguments& a,uint32_t core,T& timer) {
             meta.tileN=tile*256;meta.columns=256;
             const auto start=timer.TraceBegin();
             if constexpr(g_coreType==AIC)gmm.Compute(0,tile*256,f.rows,256);
-            else gmm.Dequantize(tile*256,f.rows,256);
             timer.TraceEnd(First?TraceEvent::SharedGmm1Tile:TraceEvent::SharedGmm2Tile,start,meta);
             if constexpr(First && g_coreType==AIC)pending.AfterSubmit(true,f.gmm1TileBegin+tile,meta);
         }
@@ -64,7 +63,7 @@ __aicore__ inline void RunSharedGmm(const Arguments& a,uint32_t core,T& timer) {
     if constexpr(First && g_coreType==AIC)pending.Flush();
     if(active) {
         const auto start=timer.TraceBegin();
-        gmm.End(First && g_coreType==AIC);CompleteComputeContext();
+        gmm.End(First && g_coreType==AIC); // W8 has no paired AIV0 context to retire.
         timer.TraceEnd(First?TraceEvent::SharedGmm1Drain:TraceEvent::SharedGmm2Drain,start);
     }
 }

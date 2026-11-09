@@ -155,6 +155,7 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
     extension = SimpleNamespace(
         urma_api_protocol=1,
         urma_compute_schedule="expert-m256-mgroup-lookahead-v1",
+        urma_shared_contract="unitflag-shared-a8w8-early-reduce-v1",
         urma_local_pipeline="multi-slot",
         urma_tail_schedule="combine-ready-scan-reduce-world-v1",
         urma_timer_schema=1,
@@ -286,7 +287,7 @@ def test_cooperative_manifest_describes_shared_and_routed_only_workers(world, sh
     assert metadata["remote_workers"] == world - 1
     assert metadata["swiglu_workers"] == metadata["gmm_completion_workers"] == 28
     assert metadata["scale_gather_workers"] == 29-world
-    assert metadata["startup_pack_workers"] == (28 if shared else 56)
+    assert metadata["startup_pack_workers"] == 56
     assert metadata["reduce_workers"] == (56 if shared else 57 - world)
     assert metadata["steady_pack_workers"] == 28
     assert "submission only" in metadata["gmm_completion"]

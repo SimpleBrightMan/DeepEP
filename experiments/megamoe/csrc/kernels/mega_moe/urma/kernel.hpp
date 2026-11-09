@@ -649,6 +649,8 @@ __aicore__ inline void ProcessRouted(Arguments& args)
 template<class T> __aicore__ inline void RunSharedComputeSequence(const Arguments& a,uint32_t block,T& timer) {
     RunSharedGmm<true>(a,block,timer);
     if constexpr(g_coreType==AIC) {
+        // SharedMxGmm (including its destructor) no longer owns L1/events.
+        WriteGmByPassDCache(LocalCompletionFlag(a,kLocalFlagSharedL1Released+block),1);
         // RunSharedGmm has drained this core's shared GMM1 output and retired
         // its context. Count also cores with zero assigned shared tiles.
         // Do not wait for routed compute/shared GMM2: that would create a cycle
@@ -658,6 +660,9 @@ template<class T> __aicore__ inline void RunSharedComputeSequence(const Argument
     }
     RunCubeAndPrologue(a,block,timer);
     if constexpr(g_coreType==AIC)MarkCubeComplete(a); // routed self-return is ready before Shared GMM2
+    // AIV0 must finish/release routed B slots before the W8 AIC context
+    // initializes those same L1 addresses. AIV0 then proceeds to Reduce.
+    WaitComputeFlag(a.localFlags,kLocalFlagRoutedPrologueReleased+block,1);
     RunSharedGmm<false>(a,block,timer);
 }
 __aicore__ inline void ProcessShared(Arguments& a) {
@@ -675,13 +680,23 @@ __aicore__ inline void ProcessShared(Arguments& a) {
     } else if(GetSubBlockIdx()==0) {
         RunAiv0RouteSummary(a,block,timer);
         WaitRouteSummary(a,timer);
+        timer.CoarseBegin(CoarsePhase::Pack);
+        PackBatch startup(a,timer);
+        for(uint32_t round=0;round<kPackStartupRounds;++round)
+            PackOneRound(a,round,LocalWorkerIndex(block,0U),kLocalWorkers,startup);
+        startup.Close();MarkPackWorkerComplete(a);
+        timer.CoarseEnd(CoarsePhase::Pack);
+        // AIC may still be in shared GMM1 while this AIV0 finishes Pack.
+        // Do not initialize the routed W4 B ring until its L1 owner releases it.
+        WaitComputeFlag(a.localFlags,kLocalFlagSharedL1Released+block,1);
         timer.CoarseBegin(CoarsePhase::Dequant);
-        if(a.coarseTrace || (!a.trace&&!a.timer)){NoopTimer t;RunSharedComputeSequence(a,block,t);}
-        else RunSharedComputeSequence(a,block,timer);
+        if(a.coarseTrace || (!a.trace&&!a.timer)){NoopTimer t;RunCubeAndPrologue(a,block,t);}
+        else RunCubeAndPrologue(a,block,timer);
         timer.CoarseEnd(CoarsePhase::Dequant);
         // This AIV0 has finished its own dequant contexts. Release its local
         // UB/event use before Reduce; do not wait for other AIC/AIV workers.
         PipeBarrier<PIPE_ALL>();
+        WriteGmByPassDCache(LocalCompletionFlag(a,kLocalFlagRoutedPrologueReleased+block),1);
         NoReduceObserver observer; // incoming counters remain AIV1-owned
         timer.CoarseBegin(CoarsePhase::Reduce);
         ReduceGeneric<true>(a,LocalWorkerIndex(block,0U),kLocalWorkers,timer,observer);
@@ -690,7 +705,7 @@ __aicore__ inline void ProcessShared(Arguments& a) {
         if(block<comm)PublishPeerStart(a,block,timer);
         timer.CoarseBegin(CoarsePhase::Pack);
         PackBatch pack(a,timer);
-        for(uint32_t round=0;round<kPackStartupRounds;++round)PackOneRound(a,round,block,kAic,pack);
+        for(uint32_t round=0;round<kPackStartupRounds;++round)PackOneRound(a,round,LocalWorkerIndex(block,1U),kLocalWorkers,pack);
         pack.Close();timer.CoarseEnd(CoarsePhase::Pack);
         SharedIncoming incoming{a,block};
         RunCooperativeAiv1(a,block,timer,incoming);
