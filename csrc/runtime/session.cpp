@@ -140,11 +140,10 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     bool runtime_started = false;
     try {
         if (megamoe_urma) {
-            // Each of the world-1 communication workers owns one remote PE.
-            // RO payload writes and SO completion atomics share QP0. Dispatch
-            // submissions finish before Combine; no second QP is required.
+            // EP4/8 experiment: two independent QPs and two exclusive writers
+            // per remote peer. EP16 retains QP0 and one writer per peer.
             // Disable shared Clos SQs so different peer owners stay isolated.
-            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 1U), "aclshmemx_set_qp_num(MegaMoE URMA)");
+            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, (size==4||size==8)?2U:1U), "aclshmemx_set_qp_num(MegaMoE URMA)");
             attr.runtime_config.udma_shared_jetty = ACLSHMEM_CONFIG_DISABLED;
             if (set_masks) {
                 check(set_masks(nullptr, 0U), "aclshmemx_set_udma_peer_qp_masks(clear, MegaMoE URMA)");

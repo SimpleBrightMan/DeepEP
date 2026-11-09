@@ -228,8 +228,8 @@ private:
     AscendC::LocalTensor<uint32_t> routes_;
 };
 
-template <typename TraceSink>
-__aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink& timer)
+template <typename TraceSink,class Observer>
+__aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink& timer,Observer& observer)
 {
     using namespace AscendC;
     using Ub = ReduceUbContract;
@@ -268,6 +268,7 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
     uint32_t admitted = 0U;
     uint32_t probes = 0U;
     while (admitted != owned) {
+        observer.Poll();
         bool progress = false;
         for (uint32_t token = 0U; token < owned; ++token) {
             if (ReduceBitSet(issued, token)) continue;
@@ -304,6 +305,11 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
     meta.rows = owned;
     meta.bytes = static_cast<uint64_t>(owned) * Ub::bf16RowBytes;
     timer.TraceEnd(TraceEvent::Reduce, reduceStart, meta);
+}
+
+struct LegacyNoReduceObserver {__aicore__ inline void Poll(){}};
+template<class T> __aicore__ inline void Reduce(const Arguments& a,uint32_t worker,T& timer){
+    LegacyNoReduceObserver observer;Reduce(a,worker,timer,observer);
 }
 
 }  // namespace MegaMoeUrma

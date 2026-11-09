@@ -42,7 +42,11 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
     receive_markers = values[..., 5] == DISPATCH_SEND_TO_RECEIVE
     if np.any(receive_markers[:, :, :1]) or np.any(receive_markers[:, :, 2:]):
         raise ValueError("receive timing semantics are valid only for Dispatch")
-    receive_mode = bool(np.any(values[:world-1, 2, 1, 5] == DISPATCH_SEND_TO_RECEIVE))
+    lanes=2 if np.any(values[:,2,:,12]==2) else 1
+    if lanes==2 and world not in (4,8):raise ValueError("dual-QP timer requires EP4/8")
+    owners=(world-1)*lanes
+    def peer_for(owner):return remote_peer_for_worker(rank,owner//lanes,world)
+    receive_mode = bool(np.any(values[:owners, 2, 1, 5] == DISPATCH_SEND_TO_RECEIVE))
     active = (values[..., 4] > 0) | receive_markers
     if np.any(values[..., 6][active] != TIMER_SCHEMA):
         raise ValueError("URMA timer schema is missing or incompatible")
@@ -63,6 +67,7 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
         metric="single_direction_aggregate_effective_payload_gbps",
         denominator="Dispatch kind2: same-rank class max(peer receive observation) - min(outgoing first PUT); other records retain outbound completion spans",
         dispatch_endpoint="peer_to_local_receive" if receive_mode else "outbound_completion",
+        communication_lanes=lanes,
         includes_self_copy_in_intra=False,
         classes=[],
     )
@@ -70,8 +75,8 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
         phase_idx = PHASES.index(phase)
         for kind in ("INTRA", "CROSS"):
             selected = []
-            for owner in range(world):
-                peer = remote_peer_for_worker(rank, owner, world) if owner < world - 1 else rank
+            for owner in range(owners if lanes==2 else world):
+                peer = peer_for(owner) if owner < owners else rank
                 owner_kind = "INTRA" if peer // group_size == rank // group_size else "CROSS"
                 record = values[owner, 2, phase_idx]
                 if owner_kind == kind and record[3] > 0:
@@ -81,8 +86,8 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
             rx_records = []
             use_receive = phase == "Dispatch" and receive_mode
             if use_receive:
-                for owner in range(world - 1):
-                    peer = remote_peer_for_worker(rank, owner, world)
+                for owner in range(0,owners,lanes):
+                    peer = peer_for(owner)
                     owner_kind = "INTRA" if peer // group_size == rank // group_size else "CROSS"
                     if owner_kind == kind:
                         rx_records.append((owner, peer, values[owner, 2, phase_idx]))
@@ -151,7 +156,9 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
                     submission_envelope_ticks=recorded_last - first if submission_only else None,
                     submission_sum_ticks=sum(int(record[2]) for _, _, record in selected) if submission_only else None,
                     workers=[owner for owner, _, _ in selected],
-                    peers=[peer for _, peer, _ in selected],
+                    peers=list(dict.fromkeys(peer for _,peer,_ in selected)) if lanes==2 else [peer for _,peer,_ in selected],
+                    peer_per_worker=[peer for _,peer,_ in selected],
+                    qp_per_worker=[owner%lanes for owner,_,_ in selected],
                     includes_self_copy=includes_self_copy,
                 )
             )

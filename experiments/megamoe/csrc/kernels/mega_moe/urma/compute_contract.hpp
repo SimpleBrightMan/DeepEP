@@ -3,6 +3,7 @@
 #pragma once
 
 #include "abi.hpp"
+#include "peer_lanes.hpp"
 
 namespace MegaMoeUrma {
 
@@ -67,7 +68,7 @@ struct ComputeBatchRange {
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t CommunicationWorkers(uint32_t world)
 {
-    return world - 1U;
+    return CommunicationRoles(world);
 }
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ActivationWorkers(uint32_t world)
@@ -77,7 +78,7 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ActivationWorkers(uint32_t world)
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ReduceWorkers(uint32_t world)
 {
-    return kLocalWorkers - CommunicationWorkers(world);
+    return DualPeerMode(world)?kLocalWorkers:kLocalWorkers - CommunicationWorkers(world);
 }
 
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t LocalWorkerIndex(uint32_t block, uint32_t subblock)
@@ -105,6 +106,7 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t LocalRowBegin(uint64_t rows, uint
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ReduceWorkerIndex(uint32_t block, uint32_t subblock,
                                                                  uint32_t world = kWorld)
 {
+    if(DualPeerMode(world))return LocalWorkerIndex(block,subblock);
     const uint32_t communicationWorkers = CommunicationWorkers(world);
     return subblock == 0U
                ? block

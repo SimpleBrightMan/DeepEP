@@ -8,7 +8,8 @@ import pytest
 
 @pytest.mark.parametrize('enabled',[False,True])
 @pytest.mark.parametrize('coarse',[False,True])
-def test_peer_receive_observer(tmp_path,enabled,coarse):
+@pytest.mark.parametrize('world',[4,8,16])
+def test_peer_receive_observer(tmp_path,enabled,coarse,world):
     cxx=shlex.split(os.environ.get('CXX','c++'))
     if not shutil.which(cxx[0]):pytest.skip('C++ compiler required')
     root=Path(__file__).resolve().parents[3]
@@ -43,7 +44,7 @@ int main(){
     std::vector<uint64_t> trace(kTimerCores*stride,0),aggregate(kTimerElements,0),flags(16*128/8,0);
     Timer timer;timer.Init(reinterpret_cast<uint64_t>(aggregate.data()),reinterpret_cast<uint64_t>(trace.data()),capacity,COARSE);
     timer.Begin(Dispatch);timer.End(Dispatch,1024,true);
-    Arguments a{};a.config.cvRows=256;a.config.maxPeerChunks=4;a.config.hidden=3584;a.config.epoch=7;
+    Arguments a{};a.config.world=WORLD;a.config.cvRows=256;a.config.maxPeerChunks=4;a.config.hidden=3584;a.config.epoch=7;
     a.symmetric=reinterpret_cast<uint64_t>(flags.data());
     DispatchReceiveObserver observer;observer.Init(timer);observer.Arm(a,2,600);
     const auto firstClock=AscendC::cycles;
@@ -55,9 +56,10 @@ int main(){
     assert(AscendC::cycles==firstClock);
     flags[(2*4+2)*16]=7;observer.Poll();
 #ifdef DEEPEP_MEGAMOE_TIMER
-    assert(AscendC::reads==4 && AscendC::cycles==firstClock+1);
+    const uint64_t expectedReads=WORLD==16?4:7;
+    assert(AscendC::reads==expectedReads && AscendC::cycles==firstClock+1);
     for(auto value:trace)assert(value==0); // deferred trace store
-    observer.Poll();assert(AscendC::reads==4);
+    observer.Poll();assert(AscendC::reads==expectedReads);
     timer.WriteTrace(TraceEvent::Reduce,firstClock-1,firstClock+10,TraceMeta{});
     timer.FinishTrace();
     const auto* point=trace.data()+2*stride+kTraceHeaderElements+kTraceRecordElements;
@@ -67,6 +69,14 @@ int main(){
         auto* row=aggregate.data()+(2*kTimerPhases+Dispatch)*kTimerRecordElements;
         assert(row[5]==2 && row[7]==firstClock && row[8]==600*(3584+112) && row[9]==600);
         assert(row[3]==1024); // outgoing numerator preserved
+    }
+    if(WORLD!=16) {
+        Timer later;later.Init(0,reinterpret_cast<uint64_t>(trace.data()),capacity,COARSE);
+        DispatchReceiveObserver pair;pair.Init(later);
+        flags[(2*4+2)*16]=7;flags[(2*4+1)*16]=0;
+        pair.Arm(a,2,600);const auto before=AscendC::cycles;
+        pair.Poll();assert(AscendC::cycles==before); // global last CV is insufficient
+        flags[(2*4+1)*16]=7;pair.Poll();assert(AscendC::cycles==before+1);
     }
     std::vector<uint64_t> emptyAggregate(kTimerElements,0),emptyTrace(kTimerCores*stride,0);
     Timer emptyTimer;emptyTimer.Init(reinterpret_cast<uint64_t>(emptyAggregate.data()),reinterpret_cast<uint64_t>(emptyTrace.data()),capacity,COARSE);
@@ -89,7 +99,7 @@ int main(){
 '''
     src=tmp_path/'test.cpp';src.write_text(cpp,encoding='utf-8')
     exe=tmp_path/('test.exe' if os.name=='nt' else 'test')
-    defines=['-DCOARSE='+str(int(coarse))]+(['-DDEEPEP_MEGAMOE_TIMER'] if enabled else [])
+    defines=['-DCOARSE='+str(int(coarse)),'-DWORLD='+str(world)]+(['-DDEEPEP_MEGAMOE_TIMER'] if enabled else [])
     subprocess.run([*cxx,'-std=c++17','-UNDEBUG',*defines,'-I',str(tmp_path),'-I',str(inc),str(src),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
 

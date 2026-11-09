@@ -284,11 +284,11 @@ def test_run_profiles_three_modes_and_exports_only_last_trace(
 @pytest.mark.parametrize("shared", [0, 1])
 def test_cooperative_manifest_describes_shared_and_routed_only_workers(world, shared):
     metadata = benchmark.cooperative_schedule_metadata(world, shared)
-    assert metadata["remote_workers"] == world - 1
+    assert metadata["remote_workers"] == (world - 1) * (2 if world in (4,8) else 1)
     assert metadata["swiglu_workers"] == metadata["gmm_completion_workers"] == 28
-    assert metadata["scale_gather_workers"] == 29-world
+    assert metadata["scale_gather_workers"] == 28 - (world-1)*(2 if world in (4,8) else 1)
     assert metadata["startup_pack_workers"] == 56
-    assert metadata["reduce_workers"] == (56 if shared else 57 - world)
+    assert metadata["reduce_workers"] == (56 if shared or world in (4,8) else 57 - world)
     assert metadata["steady_pack_workers"] == 28
     assert "submission only" in metadata["gmm_completion"]
     assert metadata["gmm2_reorder_batch_max"] == 1

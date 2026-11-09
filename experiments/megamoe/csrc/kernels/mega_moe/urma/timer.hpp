@@ -43,6 +43,9 @@ public:
 #endif
     }
 
+    __aicore__ inline void ConfigureCommunication(uint32_t peer,uint32_t qp,uint32_t lanes,uint32_t hidden) {
+        commPeer_=peer;commQp_=qp;commLanes_=lanes;commHidden_=hidden;
+    }
     __aicore__ inline bool DiagnosticEnabled() const { return address_!=0U || traceAddress_!=0U; }
 
     // One successful nonblocking peer-receive observation, not a quiet/wait interval.
@@ -119,7 +122,9 @@ public:
             // Timing kind2: outgoing first PUT -> incoming last Dispatch.
             // Empty receive edges have no end tick but remain explicitly known.
             record[5]=2U;record[6]=kProtocol;record[7]=dispatchRows_?dispatchTick_:0U;
-            record[8]=dispatchBytes_;record[9]=dispatchRows_;FlushTraceLine(record);
+            record[8]=dispatchBytes_;record[9]=dispatchRows_;
+            if(commLanes_>1U){record[10]=commPeer_;record[11]=commQp_;record[12]=commLanes_;}
+            FlushTraceLine(record);
             FlushTraceLine(record+8);
         }
         if (traceAddress_ == 0U) return;
@@ -133,6 +138,12 @@ public:
                     if (coarseStart_[p] && (selected == count || coarseStart_[p] < coarseStart_[selected])) selected = p;
                 if (selected == count) break;
                 TraceMeta meta;
+                if(commLanes_>1U && (selected==static_cast<uint32_t>(CoarsePhase::Dispatch)||selected==static_cast<uint32_t>(CoarsePhase::Combine))) {
+                    const bool dispatch=selected==static_cast<uint32_t>(CoarsePhase::Dispatch);
+                    meta.peer=commPeer_;meta.tileM=commQp_;meta.columns=commLanes_;
+                    meta.bytes=dispatch?commDBytes_:commCBytes_;
+                    meta.rows=meta.bytes/(dispatch?commHidden_+commHidden_/32U:commHidden_*2U);
+                }
                 const auto event = selected == static_cast<uint32_t>(CoarsePhase::RouteSummary) ? TraceEvent::RouteSummary :
                     selected == static_cast<uint32_t>(CoarsePhase::RouteWait) ? TraceEvent::WaitRouteSummary :
                     selected == static_cast<uint32_t>(CoarsePhase::Route) ? TraceEvent::RoutePrepare : selected == static_cast<uint32_t>(CoarsePhase::SharedSum) ? TraceEvent::SharedAdd :
@@ -148,7 +159,12 @@ public:
         // The decoder allows only this zero-duration ID65 point out of order.
         if(dispatchTick_!=0U) {
             TraceMeta meta;meta.peer=dispatchPeer_;meta.cv=dispatchCv_;meta.rows=dispatchRows_;meta.bytes=dispatchBytes_;
+            if(commLanes_>1U){meta.tileM=commQp_;meta.columns=commLanes_;}
             WriteTrace(TraceEvent::DispatchReceiveComplete,dispatchTick_,dispatchTick_,meta);
+        }
+        if(combineTick_!=0U) {
+            TraceMeta meta;meta.peer=commPeer_;meta.tileM=commQp_;meta.columns=commLanes_;
+            WriteTrace(TraceEvent::CombineSendComplete,combineTick_,combineTick_,meta);
         }
         auto* header = TraceHeader();
         header[0] = kTraceSchema;
@@ -168,6 +184,10 @@ public:
 
     __aicore__ inline void End(Phase phase, uint64_t bytes = 0U, bool submissionOnly = false)
     {
+        if(coarse_&&traceAddress_!=0U&&commLanes_>1U) {
+            if(phase==Phase::Dispatch)commDBytes_+=bytes;
+            else if(phase==Phase::Combine)commCBytes_+=bytes;
+        }
         if (address_ == 0U) return;
         const uint64_t end = AscendC::GetSystemCycle();
         total_[phase] += end - start_[phase];
@@ -182,6 +202,10 @@ public:
         record[4] = count_[phase];
         record[5] = submissionOnly ? 1U : 0U;
         record[6] = kProtocol;
+        if(commLanes_>1U&&(phase==Phase::Dispatch||phase==Phase::Combine)) {
+            record[10]=commPeer_;record[11]=commQp_;record[12]=commLanes_;
+            FlushTraceLine(record+8);
+        }
         AscendC::GlobalTensor<uint64_t> tensor;
         tensor.SetGlobalBuffer(record);
         AscendC::DataCacheCleanAndInvalid<uint64_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
@@ -190,10 +214,11 @@ public:
 
     __aicore__ inline void MarkSendComplete(Phase phase)
     {
+        if(phase==Phase::Combine&&commLanes_>1U&&DiagnosticEnabled())combineTick_=AscendC::GetSystemCycle();
         if (address_ == 0U) return;
         auto* record = reinterpret_cast<__gm__ uint64_t*>(address_) +
                        (static_cast<uint64_t>(core_) * kTimerPhases + phase) * kTimerRecordElements;
-        record[7] = AscendC::GetSystemCycle();
+        record[7] = combineTick_?combineTick_:AscendC::GetSystemCycle();
         FlushTraceLine(record);
     }
 
@@ -201,6 +226,8 @@ private:
     uint64_t dispatchTick_=0U;
     uint64_t dispatchBytes_=0U;
     uint32_t dispatchPeer_=0U,dispatchCv_=0U,dispatchRows_=0U;
+    uint32_t commPeer_=0U,commQp_=0U,commLanes_=1U,commHidden_=0U;
+    uint64_t commDBytes_=0U,commCBytes_=0U,combineTick_=0U;
     bool shared_=false;
     __aicore__ inline __gm__ uint64_t* TraceHeader() const
     {

@@ -1,5 +1,6 @@
 #pragma once
 #include "timer.hpp"
+#include "peer_lanes.hpp"
 namespace MegaMoeUrma {
 // Diagnostic-only observer of peer -> THIS rank. Every peer submits CVs in
 // order on one QP; its final SO epoch certifies all prior X/scale PUTs to us.
@@ -25,9 +26,14 @@ public:
             timer_->RecordDispatchReceive(peer,0U,0U,0U);
             return;
         }
-        cv_=(rows-1U)/a.config.cvRows;
-        flag_=reinterpret_cast<__gm__ uint64_t*>(a.symmetric+a.config.dispatchReadyOffset+
-            (uint64_t(peer)*a.config.maxPeerChunks+cv_)*kFlagBytes);
+        const uint32_t total=(rows+a.config.cvRows-1U)/a.config.cvRows;
+        cv_=total-1U;lanes_=PeerLanes(a.config.world);mask_=0U;
+        for(uint32_t lane=0;lane<lanes_;++lane) {
+            if(PeerOwnedCvs(total,lane,lanes_)==0U)continue;
+            flag_[lane]=reinterpret_cast<__gm__ uint64_t*>(a.symmetric+a.config.dispatchReadyOffset+
+                (uint64_t(peer)*a.config.maxPeerChunks+PeerLastCv(total,lane,lanes_))*kFlagBytes);
+            mask_|=1U<<lane;
+        }
         pending_=true;
 #else
         (void)a;(void)peer;(void)rows;
@@ -35,7 +41,10 @@ public:
     }
     __aicore__ inline void Poll() {
 #ifdef DEEPEP_MEGAMOE_TIMER
-        if(!pending_ || AscendC::ReadGmByPassDCache(flag_)!=epoch_)return;
+        if(!pending_)return;
+        for(uint32_t lane=0;lane<lanes_;++lane)
+            if((mask_&(1U<<lane))&&AscendC::ReadGmByPassDCache(flag_[lane])==epoch_)mask_&=~(1U<<lane);
+        if(mask_)return;
         timer_->RecordDispatchReceive(peer_,cv_,rows_,bytes_);
         pending_=false;
 #endif
@@ -43,7 +52,8 @@ public:
 private:
 #ifdef DEEPEP_MEGAMOE_TIMER
     Timer* timer_=nullptr;
-    __gm__ uint64_t* flag_=nullptr;
+    __gm__ uint64_t* flag_[2]{};
+    uint32_t lanes_=1U,mask_=0U;
     uint64_t epoch_=0U,bytes_=0U;
     uint32_t peer_=0U,cv_=0U,rows_=0U;
     bool pending_=false;

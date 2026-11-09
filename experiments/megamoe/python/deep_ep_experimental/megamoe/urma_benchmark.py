@@ -129,9 +129,11 @@ def cooperative_schedule_metadata(world, shared_experts):
         dispatch_publication="one same-QP SO epoch per covered original CV; no per-batch quiet",
         combine_publication="128-row payload PUT; one SO epoch after each original CV; self CV ready after actual Reorder stores",
         communication_completion="S1: final quiet after routed Reduce; S0: final quiet after cooperative work; neither uses per-CV Dispatch quiet",
-        remote_workers=world - 1,
+        remote_workers=(world-1)*(2 if world in (4,8) else 1),
+        incoming_completion_observers=world-1,
+        peer_qps=2 if world in (4,8) else 1,
         swiglu_workers=28,
-        scale_gather_workers=29-world,
+        scale_gather_workers=28-(world-1)*(2 if world in (4,8) else 1),
         gmm_completion_workers=28,
         gmm_completion="paired AIV1 consumes actual FIX full then activates/reorders the single UB mailbox; no intermediate GM ready flag; monotonic issued is submission only; one UB ownership credit per AIC",
         routed_activation_assignment="same block as owning AIC: 27 - (global fused N128 GMM1 tile modulo 28)",
@@ -141,14 +143,15 @@ def cooperative_schedule_metadata(world, shared_experts):
         aiv1_ub_bytes=253952,
         gmm2_reorder_batch_max=1,
         gmm2_reorder_handoff="single UB mailbox: captured issued budget -> hardware wait -> direct UB Reorder -> return credit; no intermediate GM tile-ready flag; stop before next GMM1",
-        scale_gather_assignment="M-group modulo (29-EP), noncommunication AIV1 only",
+        scale_gather_assignment="M-group modulo (28-communication_workers), noncommunication AIV1 only",
+        peer_cv_ownership="even/odd CVs on QP0/QP1 for EP4/8; EP16 single owner",
         cooperative_aiv1_priority="one static Pack quantum -> dispatch (comm) or ready scale gather (helper) -> FIFO UB activation/reorder -> combine (comm) -> idle soft shared activation",
-        reduce_workers=56 if shared_experts else 56 - (world - 1),
-        reduce_assignment="static contiguous token ranges across AIV0+AIV1; worker=2*block+subblock; AIV0 joins after routed dequant, overlapping shared W8 GMM2; incoming counters remain AIV1-owned" if shared_experts else "original routed schedule",
+        reduce_workers=56 if shared_experts or world in (4,8) else 56 - (world - 1),
+        reduce_assignment="all56 static token ranges; all AIV1 reduce before per-lane final quiet; lane0 observes both peer finished flags" if world in (4,8) else "original EP16 schedule",
         startup_pack_workers=56,
         steady_pack_workers=28,
         shared_activation_workers=28 if shared_experts else 0,
-        shared_dispatch_startup_limit="BS<4096: per-peer max(1,floor(BS/1024)) merged batches before all local shared GMM1 AICs finish; normal ramp only while gated; no limit for BS>=4096/S0",
+        shared_dispatch_startup_limit="BS<4096: per-lane max(1,floor(BS/1024)) merged batches before all local shared GMM1 AICs finish; normal ramp only while gated; no limit for BS>=4096/S0",
         shared_weight_type="FP8 E4M3 + E8M0 (routed FP4)",
         shared_schedule="AIC: shared W8 GMM1 -> routed W4 -> shared W8 GMM2; AIV0: startup Pack -> routed dequant -> Reduce; one lowest-priority shared activation slice per turn; local join + add" if shared_experts else "disabled",
     )
@@ -366,10 +369,10 @@ def run(args, config, group):
         ranks_per_node=ranks_per_node,
         allow_multi_host=args.allow_multi_host,
         bandwidth_topology="logical contiguous rank groups of four; multi-host validation is not UBX bandwidth equivalence",
-        transport="URMA QP0 RO PUT + per-CV SO Dispatch epochs + SO Combine bitmap publication",
+        transport="EP4/8: two QP owners per peer, parity CVs, RO PUT + same-QP SO; EP16: original QP0",
         communication_protocol=COMMUNICATION_PROTOCOL,
         dispatch_completion_probe=getattr(_extension(), "urma_dispatch_completion_probe", "none"),
-        communication_qps_per_peer=1,
+        communication_qps_per_peer=2 if world in (4,8) else 1,
         dispatch_combine_overlap="in-flight Dispatch and Combine on each peer QP",
         same_peer_dispatch_combine_overlap=True,
         **cooperative_schedule_metadata(world, model["num_shared_experts"]),
@@ -409,6 +412,9 @@ def run(args, config, group):
     )
     (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     if rank == 0:
+        print(f"[URMA PEER LANES] EP={world} remote_AIV1={manifest['remote_workers']} "
+              f"QP/peer={manifest['communication_qps_per_peer']} Reduce={manifest['reduce_workers']} "
+              "CV ownership=even/odd for EP4/8; EP16 original",flush=True)
         print(
             f"[URMA SCHEDULE] compute={manifest['compute_schedule']} communication_cv_rows={args.cv_rows} "
             f"gmm1_ahead_mgroups={args.gmm1_ahead_mgroups} "
@@ -630,7 +636,7 @@ def run(args, config, group):
                                    for report in bandwidth_records for row in report["classes"])
             if missing_dispatch:
                 reports["dispatch_bandwidth_unavailable"] = "some peers have no observed Dispatch completion"
-            if model["num_shared_experts"]:
+            if model["num_shared_experts"] and world==16:
                 reports["combine_bandwidth_unavailable"] = "Shared mode defers final quiet until after routed Reduce; Combine timer is submission-only"
 
             if rank == 0:

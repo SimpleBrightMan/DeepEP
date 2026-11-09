@@ -54,13 +54,16 @@ class CooperativePeer {
 public:
     __aicore__ CooperativePeer(Arguments& a,uint32_t core,Timer& timer,DispatchReceiveObserver& observer)
         :a_(a),core_(core),timer_(timer),dispatchObserver_(observer),active_(core<CommunicationWorkers(a.config.world)),
-         peer_(active_?PeerForOwner(a.config.rank,core):0U),
+         peer_(active_?PeerForOwner(a.config.rank,core,a.config.world):0U),
          submitted_(TPosition::VECCALC,CooperativeUb::submitted,kMaxPeerChunks),
          selfCounts_(TPosition::VECCALC,CooperativeUb::selfCounts,kMaxPeerChunks) {
-        dispatchCount_=active_?RuntimeSendCvCount(a,peer_):0U;
+        lane_=OwnerQp(core,a.config.world);lanes_=PeerLanes(a.config.world);
+        const uint32_t total=active_?RuntimeSendCvCount(a,peer_):0U;
+        nextDispatch_=lane_;dispatchCount_=total;
+        if(active_)timer_.ConfigureCommunication(peer_,lane_,lanes_,a.config.hidden);
     }
     __aicore__ inline bool Active()const{return active_;}
-    __aicore__ inline bool DispatchDone()const{return nextDispatch_==dispatchCount_;}
+    __aicore__ inline bool DispatchDone()const{return nextDispatch_>=dispatchCount_;}
     __aicore__ inline bool Done()const{return !active_||(initialized_&&finished_&&selfFinished_);}
 
     __aicore__ inline bool TryDispatch(PackBatch& pack,bool packDone) {
@@ -77,7 +80,8 @@ public:
         // Retain S1's 1/1/2/4/8 ramp and merged-batch startup limit. Bound a
         // cooperative turn to eight CVs so FIX consumption gets a fair chance.
         const bool unrestricted=packDone&&(sharedHeadReady_||a_.config.bs>=4096U);
-        const uint32_t target=a_.sharedExperts?RouteMin(8U,DispatchBatchLimit(dispatchSteps_,dispatchCount_-nextDispatch_,unrestricted)):1U;
+        const uint32_t target=DualPeerMode(a_.config.world)?1U:
+            a_.sharedExperts?RouteMin(8U,DispatchBatchLimit(dispatchSteps_,dispatchCount_-nextDispatch_,unrestricted)):1U;
         uint32_t count=1U,rows=c.rows;
         while(count<target) {
             const auto next=RuntimeSendChunk(a_,peer_,nextDispatch_+count);
@@ -86,20 +90,20 @@ public:
             rows+=next.rows;++count;
         }
         timer_.CoarseBegin(CoarsePhase::Dispatch);timer_.Begin(Phase::Dispatch);
-        auto m=CooperativeChunkMeta(c,0U,rows);m.bytes=uint64_t(rows)*a_.config.hidden;
+        auto m=CommMeta(c,0U,rows);m.bytes=uint64_t(rows)*a_.config.hidden;
         auto start=timer_.TraceBegin();
         Put(symmetric,a_.config.receiveXOffset+c.remoteRow*a_.config.hidden,
-            reinterpret_cast<__gm__ uint8_t*>(a_.expandedX+c.localRow*a_.config.hidden),static_cast<uint32_t>(m.bytes),peer_);
+            reinterpret_cast<__gm__ uint8_t*>(a_.expandedX+c.localRow*a_.config.hidden),static_cast<uint32_t>(m.bytes),peer_,lane_);
         timer_.TraceEnd(TraceEvent::DispatchPutX,start,m);
         const uint32_t scales=a_.config.hidden/32U;m.bytes=uint64_t(rows)*scales;start=timer_.TraceBegin();
         Put(symmetric,a_.config.receiveScaleOffset+c.remoteRow*scales,
-            reinterpret_cast<__gm__ uint8_t*>(a_.expandedScale+c.localRow*scales),static_cast<uint32_t>(m.bytes),peer_);
+            reinterpret_cast<__gm__ uint8_t*>(a_.expandedScale+c.localRow*scales),static_cast<uint32_t>(m.bytes),peer_,lane_);
         timer_.TraceEnd(TraceEvent::DispatchPutScale,start,m);m.bytes=0;start=timer_.TraceBegin();
         for(uint32_t cv=c.cv;cv<c.cv+count;++cv)
-            PublishOrdered(symmetric,a_.config.dispatchReadyOffset+(uint64_t(a_.config.rank)*a_.config.maxPeerChunks+cv)*kFlagBytes,peer_,a_.config.epoch);
+            PublishOrdered(symmetric,a_.config.dispatchReadyOffset+(uint64_t(a_.config.rank)*a_.config.maxPeerChunks+cv)*kFlagBytes,peer_,a_.config.epoch,lane_);
         timer_.TraceEnd(TraceEvent::DispatchPublish,start,m);
         timer_.End(Phase::Dispatch,uint64_t(rows)*(a_.config.hidden+scales),true);
-        nextDispatch_+=count;++dispatchSteps_;
+        nextDispatch_+=count*lanes_;++dispatchSteps_;
         if(DispatchDone()) {
             timer_.CoarseEnd(CoarsePhase::Dispatch);
         }
@@ -115,10 +119,10 @@ public:
         progress=TrySelf()||progress;
         if(remaining_==0U&&!finished_) {
             const uint64_t start=timer_.TraceBegin();
-            PublishOrdered(reinterpret_cast<__gm__ uint8_t*>(a_.symmetric),PeerPhaseSlot(a_,1U,a_.config.rank),peer_,a_.config.epoch);
+            PublishOrdered(reinterpret_cast<__gm__ uint8_t*>(a_.symmetric),PeerPhaseSlot(a_,1U,a_.config.rank)+lane_*64U,peer_,a_.config.epoch,lane_);
             TraceMeta m;m.peer=peer_;timer_.TraceEnd(TraceEvent::CombinePublish,start,m);
             finished_=true;progress=true;
-            if(a_.sharedExperts)timer_.CoarseEnd(CoarsePhase::Combine);
+            if(a_.sharedExperts||DualPeerMode(a_.config.world))timer_.CoarseEnd(CoarsePhase::Combine);
         }
         if(selfRemaining_==0U&&!selfFinished_) {MarkReorderComplete(a_);selfFinished_=true;progress=true;}
         return progress;
@@ -134,6 +138,10 @@ public:
         FinishCombinePeer(a_,core_,incoming.peer,incoming.self);
     }
 private:
+    __aicore__ inline TraceMeta CommMeta(const Chunk& c,uint32_t offset,uint32_t rows) {
+        auto m=CooperativeChunkMeta(c,offset,rows);
+        if(lanes_>1U){m.tileM=lane_;m.columns=lanes_;}return m;
+    }
     __aicore__ inline bool TryStart() {
         if(started_)return true;
         auto* flag=reinterpret_cast<__gm__ uint64_t*>(a_.symmetric+PeerPhaseSlot(a_,0U,peer_));
@@ -142,8 +150,10 @@ private:
     }
     __aicore__ inline void InitReceive() {
         const auto* r=RouteInfo(a_);
-        begin_=r->recvCvBase[peer_];receives_=r->recvCvBase[peer_+1U]-begin_;
-        dispatchObserver_.Arm(a_,peer_,r->incoming[peer_][a_.config.localExperts]);
+        const uint32_t base=r->recvCvBase[peer_],total=r->recvCvBase[peer_+1U]-base;
+        begin_=base+lane_;receives_=PeerOwnedCvs(total,lane_,lanes_);
+        if(PeerLeader(core_,a_.config.world))
+            dispatchObserver_.Arm(a_,peer_,r->incoming[peer_][a_.config.localExperts]);
         selfBegin_=r->recvCvBase[a_.config.rank];selfCount_=r->recvCvBase[a_.config.rank+1U]-selfBegin_;
         remaining_=receives_;selfRemaining_=0U;nextSelf_=core_;
         for(uint32_t i=0;i<receives_;++i)submitted_.SetValue(i,0U);
@@ -156,21 +166,21 @@ private:
         for(uint32_t skipped=0;skipped<receives_;++skipped) {
             const uint32_t j=nextRemote_;nextRemote_=(nextRemote_+1U)%receives_;
             uint32_t sent=submitted_.GetValue(j);if(sent==kReorderCvSubmitted)continue;
-            const Chunk c=RuntimeReceiveChunkByIndex(a_,begin_+j);
+            const Chunk c=RuntimeReceiveChunkByIndex(a_,begin_+j*lanes_);
             const uint32_t ready=PairedReorderedPrefix(a_,c);
             const uint32_t n=RouteMin(kCombinePutRows,c.rows-sent);
             if(sent+n>ready)return false;
             timer_.CoarseBegin(CoarsePhase::Combine);timer_.Begin(Phase::Combine);
-            auto m=CooperativeChunkMeta(c,sent,n);m.bytes=uint64_t(n)*a_.config.hidden*2U;
+            auto m=CommMeta(c,sent,n);m.bytes=uint64_t(n)*a_.config.hidden*2U;
             auto start=timer_.TraceBegin();
             Put(reinterpret_cast<__gm__ uint8_t*>(a_.symmetric),a_.config.returnYOffset+(c.remoteRow+sent)*a_.config.hidden*2U,
-                reinterpret_cast<__gm__ uint8_t*>(a_.gmm2Output+(c.localRow+sent)*a_.config.hidden*2U),static_cast<uint32_t>(m.bytes),peer_);
+                reinterpret_cast<__gm__ uint8_t*>(a_.gmm2Output+(c.localRow+sent)*a_.config.hidden*2U),static_cast<uint32_t>(m.bytes),peer_,lane_);
             timer_.TraceEnd(TraceEvent::CombinePut,start,m);timer_.End(Phase::Combine,m.bytes,true);
             sent+=n;submitted_.SetValue(j,sent);
             if(sent==c.rows) {
                 start=timer_.TraceBegin();m.bytes=0U;
                 PublishOrdered(reinterpret_cast<__gm__ uint8_t*>(a_.symmetric),
-                    a_.config.combineReadyOffset+(uint64_t(a_.config.rank)*a_.config.maxPeerChunks+c.cv)*kFlagBytes,peer_,a_.config.epoch);
+                    a_.config.combineReadyOffset+(uint64_t(a_.config.rank)*a_.config.maxPeerChunks+c.cv)*kFlagBytes,peer_,a_.config.epoch,lane_);
                 timer_.TraceEnd(TraceEvent::CombinePublish,start,m);
                 submitted_.SetValue(j,kReorderCvSubmitted);--remaining_;
             }
@@ -196,6 +206,7 @@ private:
     }
     Arguments& a_;uint32_t core_;Timer& timer_;DispatchReceiveObserver& dispatchObserver_;bool active_;uint32_t peer_;
     bool started_=false,initialized_=false,finished_=false,selfFinished_=false,sharedHeadReady_=false;
+    uint32_t lane_=0U,lanes_=1U;
     uint32_t dispatchCount_=0U,nextDispatch_=0U,dispatchSteps_=0U,begin_=0U,receives_=0U,selfBegin_=0U,selfCount_=0U;
     uint32_t remaining_=0U,selfRemaining_=0U,nextRemote_=0U,nextSelf_=0U;
     LocalTensor<uint32_t> submitted_,selfCounts_;
@@ -242,7 +253,7 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a,uint32_t core,Timer& time
         if(!progress){const uint64_t tick=GetSystemCycle();while(GetSystemCycle()-tick<64U){}}
     }
     pack.Close();
-    if(!a.sharedExperts)peer.FinishRouted(incoming);
+    if(!a.sharedExperts&&!DualPeerMode(a.config.world))peer.FinishRouted(incoming);
     if(!peer.Active())timer.CoarseEnd(CoarsePhase::Activation);
     // S1 preserves the outer Reduce -> final quiet/finished-observe ordering.
 }

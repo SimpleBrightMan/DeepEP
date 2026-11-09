@@ -19,7 +19,7 @@ from deep_ep._store import StoreGroup
 from .urma_routing import DeviceRoutes
 from .validation import collective_check
 
-COMMUNICATION_PROTOCOL = "unitflag-peer-cv-epoch-so-v1"
+COMMUNICATION_PROTOCOL = "unitflag-dualqp-ep48-v1"
 
 
 def use_fused_gate_up(bs, world, topk=8, num_experts=384):
@@ -30,6 +30,8 @@ def use_fused_gate_up(bs, world, topk=8, num_experts=384):
 @lru_cache(maxsize=1)
 def _extension():
     core = require_native("URMA MegaMoE")
+    if getattr(core,"megamoe_urma_parallel_qps",None)!="two-per-peer-ep48-v1":
+        raise RuntimeError("Rebuild the complete dual-QP core runtime and MegaMoE wheel")
     if not hasattr(core, "create_megamoe_urma_runtime"):
         raise RuntimeError("Install a wheel built with the MegaMoE URMA runtime")
     extension = importlib.import_module(__package__ + "._C")
@@ -47,7 +49,7 @@ def _extension():
         raise RuntimeError("Rebuild the shared-expert MegaMoE extension")
     if getattr(extension, "urma_routed_weight_layout", None) != "gate128-up128-v1":
         raise RuntimeError("Rebuild the fused gate128/up128 routed GMM1 extension")
-    if getattr(extension,"urma_dispatch_completion_probe",None)!="diagnostic-peer-dispatch-receive-v2":
+    if getattr(extension,"urma_dispatch_completion_probe",None)!="diagnostic-peer-dual-dispatch-receive-v3":
         raise RuntimeError("Rebuild the matching Dispatch receive-observation wheel")
     if getattr(extension,"urma_routing_protocol",None)!=8:
         raise RuntimeError("Device routing requires matching Python/native wheel; rebuild and reinstall")

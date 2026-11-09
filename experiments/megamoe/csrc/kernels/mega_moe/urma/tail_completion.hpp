@@ -41,13 +41,21 @@ __aicore__ inline bool ObserveIncomingCompletion(const Arguments& args, uint32_t
                                                  bool& selfCounted)
 {
     using namespace AscendC;
+    // Only lane0 accounts for this source rank. Lane1 still owns self-ready
+    // quotas and its QP quiet, but must not increment rank completion twice.
+    if(!PeerLeader(owner,args.config.world)){peerCounted=true;return true;}
     if (!peerCounted) {
-        const uint32_t peer = PeerForOwner(args.config.rank, owner);
+        const uint32_t peer = PeerForOwner(args.config.rank, owner, args.config.world);
         auto* finished = reinterpret_cast<__gm__ uint64_t*>(args.symmetric + PeerPhaseSlot(args, 1U, peer));
         // Empty peer streams can finish a later invocation before this owner
         // observes the prior one. A later finished epoch also certifies the
         // current return data; per-CV payload flags still require exact epochs.
-        if (ReadGmByPassDCache(finished) >= args.config.epoch) {
+        bool done=ReadGmByPassDCache(finished)>=args.config.epoch;
+        if(done&&DualPeerMode(args.config.world)) {
+            auto* second=reinterpret_cast<__gm__ uint64_t*>(reinterpret_cast<__gm__ uint8_t*>(finished)+64U);
+            done=ReadGmByPassDCache(second)>=args.config.epoch;
+        }
+        if (done) {
             AtomicAdd(LocalCompletionFlag(args, kLocalFlagIncomingDone), 1);
             peerCounted = true;
         }

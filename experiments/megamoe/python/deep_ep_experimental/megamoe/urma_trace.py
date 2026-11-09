@@ -201,7 +201,7 @@ def decode_trace(raw, *, rank, clock_mhz):
                 raise ValueError(f"engine={engine} record={ordinal}: unknown event id={event_id}")
             if end < start or start == UNKNOWN or end == UNKNOWN:
                 raise ValueError(f"engine={engine} record={ordinal}: invalid ticks start={start} end={end}")
-            observation_point = event_id in (43, 65) and start == end
+            observation_point = event_id in (42, 43, 65) and start == end
             if not observation_point:
                 if previous_end is not None and start < previous_end:
                     raise ValueError(f"engine={engine} record={ordinal}: overlapping or out-of-order event ticks")
@@ -276,6 +276,13 @@ def decode_trace(raw, *, rank, clock_mhz):
             name = event + " [paired FIX completion]"
             meaning = "paired AIV1 waits for actual FIX full before consuming the UB mailbox with GMM1 activation or GMM2 reorder; not AIC execution time"
         args = {field: None if value == UNKNOWN else value for field, value in zip(METADATA_FIELDS, row[3:12])}
+        if row[2] in (1,2,3,4,10,11,30,42,43,48,49,53,61,65) and args.get("columns") == 2:
+            args["communication_lanes"]=args.pop("columns")
+            args["qp"]=args.pop("tile_m")
+            if row[2] in (49,61):
+                args["submission_only"]=True
+                name="CoarseCombineSubmit [dual-QP]"
+                meaning="dual-QP Combine submission envelope; each lane's final quiet is a separate completion point"
         if event == "LocalSync":
             stage = args.pop("cv")
             args.update(sync_stage=stage, sync_stage_name=SYNC_STAGES.get(stage, "unknown"))

@@ -1,5 +1,53 @@
 # Unitflag dimensions and shared migration
 
+## EP4/EP8 two-owner, two-QP experiment
+
+Branch: `megamoe-unitflag-exp-dualqp`, based on consumer `10d0dd1`.
+Only EP4/8 use this schedule. EP16 retains one QP/owner per remote peer.
+Each remote peer's sorted owner index p maps to AIV1 blocks 2*p and 2*p+1,
+owning QP0 and QP1 respectively. Self is not a network peer: EP4 uses6 remote
+communication AIV1s and EP8 uses14. ScaleGather has22/14 helper AIV1s respectively.
+All28 AIV1s still retain their same-core activation/Reorder and static Pack jobs.
+
+Dispatch assigns whole CVs statically by parity (0/2/4/... vs1/3/5/...). Ten CVs
+therefore give five to each lane, without making the second owner wait for the
+back half to be packed. Each lane submits one original CV at a time, after its
+complete Pack-ready count; no1/1/2/4 ramp or merged batches in EP4/8. The existing
+small-BS shared-GMM1 startup throttle applies per lane. Combine uses the same CV
+ownership but preserves128-row partial submissions and the existing ready scan.
+Neither stage splits one CV across QPs; its data and final SO use the SAME QP.
+
+The pinned SDK public atomic API hardcodes QP0. QP1 SO uses its identical
+`aclshmemi_udma_post_send` FAA path with qp_idx=1; no third-party source changes.
+The runtime configures two QPs and disables shared jetties. Each queue has one
+exclusive writer and quiet caller. The source's finished slot uses separate
+64B halves for the two lanes. Only lane0 observes both incoming finished epochs
+and contributes one source-rank completion count. Dispatch receive diagnostics
+also use one leader per peer, checking each nonempty lane's last CV separately.
+Self CV-ready work remains statically spread over all communication owners.
+
+EP4/8 route Reduce is statically partitioned across all56 AIVs, with or without
+shared experts. Each worker enters after its own compute/consumer work; no new
+global barrier precedes Reduce. The H3584/K8 whole-row six-slot Reduce pipeline
+is preserved, as is the generic reducer for other shapes. Communication AIV1s
+keep observing incoming completion during Reduce, and quiet their own QP only
+after their Reduce quota. Final local joins still protect reuse of source and
+workspace buffers. AIC scheduling, GMM tiles and Pack row ownership are unchanged.
+
+Each lane's unavoidable final quiet supplies a completion point (no extra CQ
+poller). Trace events carry explicit peer/qp/communication_lanes; coarse records
+carry actual assigned rows/bytes. Raw communication records use words10/11/12
+for peer/qp/lane-count, while only lane0 emits the per-peer receive observation.
+Analysis must combine both lane payloads and use their extrema, not infer one
+peer from one core. Old raw/trace files retain their original mapping.
+
+Rebuild the COMPLETE wheel including core runtime; capability checks require
+`two-per-peer-ep48-v1` and `diagnostic-peer-dual-dispatch-receive-v3`.
+The ordinary benchmark CLI is unchanged; no extra switch is needed for EP4/8.
+More communication workers reduce ScaleGather parallelism (EP8:21->14 helpers),
+and two queues may increase contention. Performance and accuracy need device
+validation; compilation/CPU-model checks are not an NPU pass.
+
 ## Diagnostic Dispatch send-to-receive span
 
 This supersedes the earlier outbound CQ experiment. During Combine, each

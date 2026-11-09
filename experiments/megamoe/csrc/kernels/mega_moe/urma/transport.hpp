@@ -6,6 +6,7 @@
 #include <cstdint>
 #include "kernel_operator.h"
 #include "shmem.h"
+#include "peer_lanes.hpp"
 
 namespace MegaMoeUrma {
 
@@ -16,19 +17,12 @@ constexpr uint32_t kSignalCopyBytes = 32U;
 constexpr uint32_t kMaxPutBytes = 256U * 1024U * 1024U;
 constexpr uint32_t kCommunicationQp = 0U;
 
-// One AIV1 owns QP0 for each remote peer. Dispatch submissions precede Combine.
-// The SO atomic API uses QP0; all payloads must use that same ordered queue.
-__aicore__ inline uint32_t PeerForOwner(uint32_t rank, uint32_t owner)
-{
-    return owner < rank ? owner : owner + 1U;
-}
-
 // dstOffset names a LOCAL symmetric-window address; SHMEM translates it for
 // peer. Do not pass an already translated MTE peer pointer to this function.
 // The caller completes local GM producers before submitting and retains src
 // unchanged until Quiet(peer, qp) returns. This transport deliberately has no GET.
 __aicore__ inline void Put(__gm__ uint8_t* symmetricBase, uint64_t dstOffset, __gm__ uint8_t* src, uint32_t bytes,
-                           uint32_t peer)
+                           uint32_t peer,uint32_t qp=kCommunicationQp)
 {
     if (bytes == 0U) return;
     if (bytes > kMaxPutBytes) {
@@ -36,24 +30,34 @@ __aicore__ inline void Put(__gm__ uint8_t* symmetricBase, uint64_t dstOffset, __
         return;
     }
     aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_S, ACLSHMEMX_UDMA_OP_CONFIG_RO>(symmetricBase + dstOffset, src, nullptr,
-                                                                            bytes, peer, kCommunicationQp, 0U);
+                                                                            bytes, peer, qp, 0U);
 }
 
 // The receiver resets this invocation's slots before publishing its start.
 // SO is ordered after every preceding RO/SO on this PE/QP. Ordinary NO PUTs
 // would not provide this guarantee. This is async and has no per-CV quiet.
 __aicore__ inline void PublishOrdered(__gm__ uint8_t* symmetricBase, uint64_t signalOffset, uint32_t peer,
-                                      uint64_t epoch)
+                                      uint64_t epoch,uint32_t qp=kCommunicationQp)
 {
+    if(qp!=0U) {
+        // The pinned public atomic API hardcodes QP0. Use the identical SDK
+        // FAA post path with an explicit QP, so SO orders THIS lane's RO PUTs.
+        auto* dst=reinterpret_cast<__gm__ uint64_t*>(symmetricBase+signalOffset);
+        auto* remote=aclshmem_ptr(dst,peer);
+        aclshmemi_udma_params_t<uint64_t,aclshmemi_udma_opcode_t::UDMA_OP_WRITE_WITH_REDUCE> params{.value=epoch,.cond=0};
+        aclshmemi_udma_post_send<uint64_t,aclshmemi_udma_opcode_t::UDMA_OPCODE_FAA,ACLSHMEMX_UDMA_OP_CONFIG_SO>(
+            reinterpret_cast<__gm__ uint8_t*>(remote),nullptr,peer,qp,sizeof(uint64_t),params);
+        return;
+    }
     aclshmemx_udma_atomic_add<uint64_t, ACLSHMEMX_UDMA_OP_CONFIG_SO>(
         reinterpret_cast<__gm__ uint64_t*>(symmetricBase + signalOffset), epoch, peer);
 }
 
 // Blocking completion of all local submissions, including the final SO flag.
 // The one-owner rule also applies here: no second worker may poll the same CQ.
-__aicore__ inline void Quiet(uint32_t peer)
+__aicore__ inline void Quiet(uint32_t peer,uint32_t qp=kCommunicationQp)
 {
-    aclshmemx_udma_qp_quiet(peer, kCommunicationQp);
+    aclshmemx_udma_qp_quiet(peer, qp);
 }
 
 // MTE publication is retained only for the invocation start/barrier handshake.

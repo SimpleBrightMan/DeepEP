@@ -82,7 +82,7 @@ __aicore__ inline void TraceLocalSync(Timer& timer, uint32_t stage)
 // PUTs address disjoint source intervals in receive storage.
 __aicore__ inline void PublishPeerStart(const Arguments& args, uint32_t owner, Timer& timer)
 {
-    const uint32_t peer = PeerForOwner(args.config.rank, owner);
+    const uint32_t peer = PeerForOwner(args.config.rank, owner, args.config.world);
     LocalTensor<uint64_t> signal(TPosition::VECCALC, kCommunicationSignalOffset, 4U);
     TraceMeta meta;
     meta.peer = peer;
@@ -101,7 +101,7 @@ __aicore__ inline void PublishPeerStart(const Arguments& args, uint32_t owner, T
 
 __aicore__ inline void CommunicatePeer(Arguments& args, uint32_t owner, Timer& timer)
 {
-    const uint32_t peer = PeerForOwner(args.config.rank, owner);
+    const uint32_t peer = PeerForOwner(args.config.rank, owner, args.config.world);
     const uint32_t workers = CommunicationWorkers(args.config.world);
     auto* symmetric = reinterpret_cast<__gm__ uint8_t*>(args.symmetric);
     TraceMeta peerMeta;
@@ -317,7 +317,7 @@ __aicore__ inline void CommunicatePeer(Arguments& args, uint32_t owner, Timer& t
 
 __aicore__ inline void CommunicatePeerShared(Arguments& args, uint32_t owner, Timer& timer,SharedIncoming& incoming)
 {
-    const uint32_t peer = PeerForOwner(args.config.rank, owner);
+    const uint32_t peer = PeerForOwner(args.config.rank, owner, args.config.world);
     auto* symmetric = reinterpret_cast<__gm__ uint8_t*>(args.symmetric);
     TraceMeta peerMeta; peerMeta.peer = peer;
     timer.Begin(Phase::Barrier);
@@ -588,6 +588,21 @@ __aicore__ inline void RunProfiledCompute(const Arguments& args, uint32_t block,
     }
 }
 
+// All communication cores can Reduce before outbound quiet. Only lane0
+// accounts for incoming peer completion; each lane exclusively drains its QP.
+__aicore__ inline void FinishParallelCommunication(const Arguments& a,uint32_t core,Timer& timer,SharedIncoming& incoming) {
+    const uint32_t peer=PeerForOwner(a.config.rank,core,a.config.world),qp=OwnerQp(core,a.config.world);
+    const auto start=timer.TraceBegin();Quiet(peer,qp);
+    TraceMeta meta;meta.peer=peer;meta.tileM=qp;meta.columns=PeerLanes(a.config.world);
+    timer.TraceEnd(TraceEvent::CombineQuiet,start,meta);
+    timer.MarkSendComplete(Phase::Combine);
+    incoming.Poll();
+    while(!ObserveIncomingCompletion(a,core,incoming.peer,incoming.self)) {
+        incoming.Poll();
+        const auto tick=GetSystemCycle();while(GetSystemCycle()-tick<200U){}
+    }
+}
+
 __aicore__ inline void ProcessRouted(Arguments& args)
 {
     Timer timer;
@@ -595,11 +610,12 @@ __aicore__ inline void ProcessRouted(Arguments& args)
     PrepareDeviceRoutes(args,timer);
     const uint32_t block = GetBlockIdx() / GetTaskRation();
     const uint32_t communicationWorkers = CommunicationWorkers(args.config.world);
+    SharedIncoming incoming{args,block};
     const int64_t originalOverflow = GetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL, MegaMoeImpl::OVERFLOW_MODE_CTRL>();
     SetCtrlSpr<MegaMoeImpl::OVERFLOW_MODE_CTRL, MegaMoeImpl::OVERFLOW_MODE_CTRL>(0);
 
     if constexpr (g_coreType == AIV) {
-        if (GetSubBlockIdx() == 1U && block < communicationWorkers) {
+        if (GetSubBlockIdx() == 1U && block < communicationWorkers && PeerLeader(block,args.config.world)) {
             PublishPeerStart(args, block, timer);
         }
         timer.CoarseBegin(CoarsePhase::Pack);
@@ -620,7 +636,6 @@ __aicore__ inline void ProcessRouted(Arguments& args)
         WaitRouteSummary(args,timer);
         RunProfiledCompute(args, block, timer);
     } else {
-        SharedIncoming incoming{args,block};
         RunCooperativeAiv1(args,block,timer,incoming);
     }
     if constexpr (g_coreType == AIV) {
@@ -631,13 +646,20 @@ __aicore__ inline void ProcessRouted(Arguments& args)
         if (worker < ReduceWorkers(args.config.world)) {
             timer.Begin(Phase::ReducePhase);
             timer.CoarseBegin(CoarsePhase::Reduce);
-            if(UseLegacyReduce(args.config)) Reduce(args, worker, timer);
+            if(DualPeerMode(args.config.world)&&GetSubBlockIdx()==1U) {
+                if(UseLegacyReduce(args.config))Reduce(args,worker,timer,incoming);
+                else ReduceGeneric<false>(args,worker,ReduceWorkers(args.config.world),timer,incoming);
+            } else if(UseLegacyReduce(args.config)) Reduce(args, worker, timer);
             else ReduceGeneric(args, worker, ReduceWorkers(args.config.world), timer);
             timer.CoarseEnd(CoarsePhase::Reduce);
             const uint64_t owned = ReduceOwnedRows(args.config.bs, worker, args.config.world);
             timer.End(Phase::ReducePhase, owned * args.config.hidden * sizeof(bfloat16_t));
             PipeBarrier<PIPE_ALL>();
         }
+    }
+    if constexpr(g_coreType==AIV) {
+        if(DualPeerMode(args.config.world)&&GetSubBlockIdx()==1U&&block<communicationWorkers)
+            FinishParallelCommunication(args,block,timer,incoming);
     }
     // A local MIX join, not a rank barrier: every reducer, peer owner and AIC
     // must finish before returning and reusing this invocation's workspaces.
@@ -702,7 +724,7 @@ __aicore__ inline void ProcessShared(Arguments& a) {
         ReduceGeneric<true>(a,LocalWorkerIndex(block,0U),kLocalWorkers,timer,observer);
         timer.CoarseEnd(CoarsePhase::Reduce);
     } else {
-        if(block<comm)PublishPeerStart(a,block,timer);
+        if(block<comm&&PeerLeader(block,a.config.world))PublishPeerStart(a,block,timer);
         timer.CoarseBegin(CoarsePhase::Pack);
         PackBatch pack(a,timer);
         for(uint32_t round=0;round<kPackStartupRounds;++round)PackOneRound(a,round,LocalWorkerIndex(block,1U),kLocalWorkers,pack);
@@ -713,10 +735,12 @@ __aicore__ inline void ProcessShared(Arguments& a) {
         timer.CoarseBegin(CoarsePhase::Reduce);
         ReduceGeneric<true>(a,LocalWorkerIndex(block,1U),kLocalWorkers,timer,incoming);
         timer.CoarseEnd(CoarsePhase::Reduce);
-        if(block<comm) {
-            const auto start=timer.TraceBegin();Quiet(PeerForOwner(a.config.rank,block));
+        if(block<comm && DualPeerMode(a.config.world)) {
+            FinishParallelCommunication(a,block,timer,incoming);
+        } else if(block<comm) {
+            const auto start=timer.TraceBegin();Quiet(PeerForOwner(a.config.rank,block,a.config.world));
             incoming.dispatch.Poll(); // observer also survives into shared-mode Reduce
-            TraceMeta completion;completion.peer=PeerForOwner(a.config.rank,block);
+            TraceMeta completion;completion.peer=PeerForOwner(a.config.rank,block,a.config.world);
             timer.TraceEnd(TraceEvent::CombineSendComplete,start,completion);
             while(!ObserveIncomingCompletion(a,block,incoming.peer,incoming.self)) {
                 const auto t=GetSystemCycle();while(GetSystemCycle()-t<200U){}
