@@ -52,7 +52,7 @@ __aicore__ inline TraceMeta CooperativeChunkMeta(const Chunk& c,uint32_t offset,
 // per turn. No blocking PeerStart/PackReady wait and no per-CV quiet.
 class CooperativePeer {
 public:
-    __aicore__ CooperativePeer(Arguments& a,uint32_t core,Timer& timer,DispatchCompletionObserver& observer)
+    __aicore__ CooperativePeer(Arguments& a,uint32_t core,Timer& timer,DispatchReceiveObserver& observer)
         :a_(a),core_(core),timer_(timer),dispatchObserver_(observer),active_(core<CommunicationWorkers(a.config.world)),
          peer_(active_?PeerForOwner(a.config.rank,core):0U),
          submitted_(TPosition::VECCALC,CooperativeUb::submitted,kMaxPeerChunks),
@@ -102,7 +102,6 @@ public:
         nextDispatch_+=count;++dispatchSteps_;
         if(DispatchDone()) {
             timer_.CoarseEnd(CoarsePhase::Dispatch);
-            dispatchObserver_.Arm(peer_,dispatchCount_-1U);
         }
         return true;
     }
@@ -128,7 +127,7 @@ public:
     __aicore__ inline void FinishRouted(SharedIncoming& incoming) {
         if(!active_)return;
         const uint64_t start=timer_.TraceBegin();Quiet(peer_);
-        incoming.dispatch.Poll(); // fallback if the work loop ended before observation
+        incoming.dispatch.Poll(); // final observation; local quiet is NOT receive evidence
         TraceMeta m;m.peer=peer_;timer_.TraceEnd(TraceEvent::CombineSendComplete,start,m);
         timer_.CoarseEnd(CoarsePhase::Combine);
         if(receives_)timer_.MarkSendComplete(Phase::Combine);
@@ -144,6 +143,7 @@ private:
     __aicore__ inline void InitReceive() {
         const auto* r=RouteInfo(a_);
         begin_=r->recvCvBase[peer_];receives_=r->recvCvBase[peer_+1U]-begin_;
+        dispatchObserver_.Arm(a_,peer_,r->incoming[peer_][a_.config.localExperts]);
         selfBegin_=r->recvCvBase[a_.config.rank];selfCount_=r->recvCvBase[a_.config.rank+1U]-selfBegin_;
         remaining_=receives_;selfRemaining_=0U;nextSelf_=core_;
         for(uint32_t i=0;i<receives_;++i)submitted_.SetValue(i,0U);
@@ -194,7 +194,7 @@ private:
         }
         return false;
     }
-    Arguments& a_;uint32_t core_;Timer& timer_;DispatchCompletionObserver& dispatchObserver_;bool active_;uint32_t peer_;
+    Arguments& a_;uint32_t core_;Timer& timer_;DispatchReceiveObserver& dispatchObserver_;bool active_;uint32_t peer_;
     bool started_=false,initialized_=false,finished_=false,selfFinished_=false,sharedHeadReady_=false;
     uint32_t dispatchCount_=0U,nextDispatch_=0U,dispatchSteps_=0U,begin_=0U,receives_=0U,selfBegin_=0U,selfCount_=0U;
     uint32_t remaining_=0U,selfRemaining_=0U,nextRemote_=0U,nextSelf_=0U;

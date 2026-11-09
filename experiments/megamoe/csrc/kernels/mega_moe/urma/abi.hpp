@@ -98,7 +98,7 @@ enum class TraceEvent : uint32_t {
     CoarsePack, CoarseLocalSyncStart, CoarseGMM, CoarseDequant,
     CoarseDispatch, CoarseCombine, CoarseActivation, CoarseReduce, CoarseLocalSyncEnd,
     CoarseDispatchSubmit, PackRetire, SharedGmm1Tile, SharedGmm1Drain, SharedActivation,
-    SharedGmm2Tile, SharedGmm2Drain, SharedAdd, CoarseSharedCombineSubmit, RoutePrepare, RouteSummary, WaitRouteSummary
+    SharedGmm2Tile, SharedGmm2Drain, SharedAdd, CoarseSharedCombineSubmit, RoutePrepare, RouteSummary, WaitRouteSummary, DispatchReceiveComplete
 };
 
 struct TraceMeta {

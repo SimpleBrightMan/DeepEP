@@ -8,7 +8,7 @@ import urma_trace_to_text as base
 
 STAGES = {
     "Dsubmit": {1, 2, 4, 48, 53}, "Csubmit": {10, 30, 49, 61},
-    "Dcomplete": {43}, "Ccomplete": {42},
+    "Dcomplete": {43}, "Dreceive": {65}, "Ccomplete": {42},
     "routedGMM": {15, 16, 19, 21, 27, 33, 34, 35, 36},
     "sharedGMM1": {55, 56}, "sharedGMM2": {58, 59},
     "allGMM": {15, 16, 19, 21, 27, 33, 34, 35, 36, 46, 55, 56, 58, 59},
@@ -49,6 +49,7 @@ def render(doc, *, source="trace.json", ranks="slowest", detail=False, cores=Non
     def stage(rows,name):
         out=[e for e in rows if e['id'] in STAGES[name]]
         if name in ('allGMM','routedGMM','sharedGMM1','sharedGMM2'):out=[e for e in out if e['tid']%3==0]
+        if name=='Dreceive':out=[e for e in out if e.get('args',{}).get('rows',0)>0]
         if name=='dequant':out=[e for e in out if e['tid']%3==1]
         return out
     if ranks=="slowest":selected=[max(sorted(data),key=span)]

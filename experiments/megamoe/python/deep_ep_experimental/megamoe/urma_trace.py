@@ -57,7 +57,7 @@ EVENTS = (
     "CoarseDispatch", "CoarseCombine", "CoarseActivation", "CoarseReduce", "CoarseLocalSyncEnd",
     "CoarseDispatchSubmit",
     "PackRetire",
-    "SharedGmm1Tile", "SharedGmm1Drain", "SharedActivation", "SharedGmm2Tile", "SharedGmm2Drain", "SharedAdd", "CoarseSharedCombineSubmit", "RoutePrepare", "RouteSummary", "WaitRouteSummary",
+    "SharedGmm1Tile", "SharedGmm1Drain", "SharedActivation", "SharedGmm2Tile", "SharedGmm2Drain", "SharedAdd", "CoarseSharedCombineSubmit", "RoutePrepare", "RouteSummary", "WaitRouteSummary", "DispatchReceiveComplete",
 )
 METADATA_FIELDS = ("peer", "cv", "fragment", "expert", "row", "rows", "tile_m", "tile_n", "columns")
 SYNC_STAGES = {4: "shared addition complete", 0: "pack", 1: "compute/return", 2: "rank barrier", 3: "local invocation completion"}
@@ -121,6 +121,9 @@ def event_style(event):
             "thread_state_iowait",
             "final outbound-peer quiet; end confirms all prior Dispatch/Combine payload PUTs and SO flags to this peer completed",
         )
+    if event == "DispatchReceiveComplete":
+        return (event + " [peer to local complete]", "transport.receive_observation", "good",
+                "first nonblocking observation of this peer's final Dispatch SO epoch in local memory; includes all preceding X/scale PUTs from peer to this rank; rows=0 marks an empty incoming edge and contributes no receive-end timestamp")
     if event == "DispatchSendComplete":
         return (
             event + " [outbound completion]",
@@ -198,7 +201,7 @@ def decode_trace(raw, *, rank, clock_mhz):
                 raise ValueError(f"engine={engine} record={ordinal}: unknown event id={event_id}")
             if end < start or start == UNKNOWN or end == UNKNOWN:
                 raise ValueError(f"engine={engine} record={ordinal}: invalid ticks start={start} end={end}")
-            observation_point = event_id == 43 and start == end
+            observation_point = event_id in (43, 65) and start == end
             if not observation_point:
                 if previous_end is not None and start < previous_end:
                     raise ValueError(f"engine={engine} record={ordinal}: overlapping or out-of-order event ticks")
@@ -267,6 +270,8 @@ def decode_trace(raw, *, rank, clock_mhz):
         if event == "DispatchSendComplete" and start == end:
             name = event + " [nonblocking observation]"
             category, color = "transport.completion_observation", "good"
+        if event == "DispatchReceiveComplete" and row[8] == 0:
+            name = event + " [empty incoming edge]"
         if engine % 3 == 2 and event in ("Gmm1TileDrain", "Gmm2Drain"):
             name = event + " [paired FIX completion]"
             meaning = "paired AIV1 waits for actual FIX full before consuming the UB mailbox with GMM1 activation or GMM2 reorder; not AIC execution time"

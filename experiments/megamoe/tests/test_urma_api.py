@@ -316,6 +316,7 @@ def test_native_tail_schedule_must_match_before_runtime_creation(monkeypatch, ta
         urma_compute_schedule="unitflag-shared-fixub-both-v5",
         urma_dimension_contract="unitflag-h8192-i16384-k1to8-v1-bs16384",
         urma_shared_contract="unitflag-shared-a8w8-early-reduce-v1",
+        urma_dispatch_completion_probe="diagnostic-peer-dispatch-receive-v2",
         urma_routed_weight_layout="gate128-up128-v1",
     )
     monkeypatch.setattr(urma.importlib, "import_module", lambda *_: extension)

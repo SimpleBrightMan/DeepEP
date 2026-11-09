@@ -4,6 +4,35 @@ import pytest
 from deep_ep_experimental.megamoe.urma_timer import TIMER_NUMEL, communication_bandwidth, summarize_bandwidth
 
 
+def test_dispatch_send_to_receive_scopes_include_receive_only_peers():
+    raw=np.zeros((28,3,8,16),dtype=np.int64)
+    # Rank0 EP8: peers1..3 INTRA,4..7 CROSS. All incoming edges are known.
+    for owner in range(7):raw[owner,2,1,5:7]=[2,1]
+    def edge(peer,first,last,send_bytes,received_at,recv_bytes):
+        row=raw[peer-1,2,1]
+        if send_bytes: row[:7]=[first,last,last-first,send_bytes,1,2,1]
+        row[7:10]=[received_at,recv_bytes,1 if recv_bytes else 0]
+    edge(1,100,1000,100,500,100)  # Rx may precede last outgoing submission.
+    edge(2,120,300,200,900,300)
+    edge(3,130,300,300,0,0)      # no incoming: exclude from receive end
+    edge(4,0,0,0,1200,400)      # incoming-only peer must affect CROSS end
+    edge(5,150,400,100,0,0)
+    edge(6,70,250,200,800,200)
+    report=communication_bandwidth(raw,0,world=8)
+    rows={r['communication_class']:r for r in report['classes'] if r['phase']=='Dispatch'}
+    assert rows['INTRA']['envelope_ticks']==800
+    assert rows['INTRA']['payload_bytes']==600
+    assert rows['INTRA']['received_payload_bytes']==400
+    assert rows['INTRA']['completion_status']=='peer_dispatch_received'
+    assert rows['CROSS']['envelope_ticks']==1130
+    assert rows['CROSS']['payload_bytes']==300
+    assert rows['CROSS']['receive_peers']==[4,6]
+    assert rows['CROSS']['endpoint_semantics']=='outgoing_first_to_incoming_last'
+    raw[3,2,1,7]=0
+    cross=next(r for r in communication_bandwidth(raw,0,world=8)['classes'] if r['phase']=='Dispatch' and r['communication_class']=='CROSS')
+    assert cross['bandwidth_gbps'] is None and cross['missing_completion_peers']==[4]
+
+
 def timer_with_records():
     value = np.zeros((28, 3, 8, 16), dtype=np.int64)
     # rank0 owner0 -> rank1 INTRA; owner3 -> rank4 CROSS; owner15 -> self.

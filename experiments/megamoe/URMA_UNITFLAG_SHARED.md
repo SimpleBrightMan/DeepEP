@@ -1,29 +1,40 @@
 # Unitflag dimensions and shared migration
 
-## Diagnostic-only Dispatch completion observation
+## Diagnostic Dispatch send-to-receive span
 
-With internal timer/coarse/fine enabled, each communication AIV1 captures the
-QP0 CQ target immediately after its last Dispatch SO submission. Each later
-cooperative turn probes that fixed target once; subsequent Combine submissions
-do not move it. The observer reads the last CQE's owner/status or recognizes
-that normal SHMEM polling already retired it. It never consumes CQ entries,
-updates SQ/CQ credits, rings a doorbell, or inserts a quiet/PIPE_ALL. This is
-tied to the direct-QP layout of the pinned SHMEM9479427 SDK.
+This supersedes the earlier outbound CQ experiment. During Combine, each
+communication AIV1 nonblockingly reads its peer's final incoming Dispatch CV SO
+flag in LOCAL memory. Equality with this invocation's epoch certifies all X and
+scale PUTs from that peer to this rank, since that peer submits CVs in QP order.
+No CQ inspection or extra remote operation remains. The observer continues into
+shared-mode Reduce and stops after one positive observation. Empty incoming edges
+are recorded as rows=0 and never contribute a receive-end timestamp.
 
-One successful observation retains a timestamp; subsequent probes do nothing.
-`DispatchSendComplete` (ID43) is exported as a zero-duration observation point
-in both coarse and fine traces. The record and raw timer word7 are written at
-the final trace flush. The point may lie inside a Reduce/quiet scope: only this
-ID43 point is exempt from the decoder's normal nonoverlapping record-order rule.
-The observer remains live in shared-mode Reduce; final quiet provides a fallback
-observation if the main work loop ended before Dispatch was observed complete.
+`DispatchReceiveComplete` is new event65, distinct from old outbound event43.
+Coarse/fine retain the timestamp and emit the point at the final trace flush.
+The decoder allows these completion points to lie inside other scopes without
+weakening normal scope-order checks. Raw timer kind2 uses word7 for receive
+observation (zero for empty inbound), word8 for received bytes, word9 for rows;
+word3 still holds outgoing bytes. Older kind0/1 and ID43 retain their meanings.
 
-The timestamp is a first software observation, not an exact NIC completion
-timestamp. It can lag completion by work between probes (or a final quiet).
-Dispatch bandwidth therefore includes that observation delay. Negative probes
-add a CQ owner/status load to diagnostic runs; formal timer/trace-off runs do
-not fetch the CQ state or read timestamps for this observer. There is no new
-per-CV flag, remote read, send, QP, or correctness dependency.
+For each rank and selected peer set (all remote, INTRA, or CROSS):
+
+    T_dispatch = max(nonempty incoming peer completion observation)
+                 - min(outgoing Dispatch PUT start)
+    bandwidth  = sum(outgoing X + scale bytes) / T_dispatch
+
+Both endpoints are from this rank's clock. A receive-only peer contributes to
+the end even if no data was sent to it. Missing receive markers, absent start/
+end, or nonpositive span make the metric unavailable. Self is excluded.
+This is an exchange-span effective rate, not pure outbound link throughput;
+outgoing and incoming bytes may differ for unbalanced routing. The end includes
+polling delay and may be later than actual arrival. Combine and overall timing
+keep their existing selected completion/proxy conventions.
+
+Only diagnostic runs observe flags. Formal timer/trace-off calls do not perform
+these reads or timestamp operations. No quiet, PIPE_ALL, new flag, QP, or
+correctness dependency is added. Rebuild all ranks' complete Python/native
+wheel for capability `diagnostic-peer-dispatch-receive-v2`.
 
 ## Current consumer: shared A8W8 (2026-11-09)
 

@@ -14,7 +14,7 @@ STAGES=[('GMM',GMM,0),('SharedG1',SHARED1,0),('SharedG2',SHARED2,0),
         ('RouteG1',G1,0),('RouteG2',G2,0),('Dequant',{17,20,37,38,47,55,56,58,59},1),
         ('Pack',{0,44,54},None),('ScaleGather',{28},None),('Activation',{23,50},None),
         ('SharedActivation',{57},None),('Dsubmit',{1,2,4,48,53},None),
-        ('Csubmit',{10,30,49,61},None),('Reorder',{40},None),('Quiet',{3,11,42,43},None),
+        ('Dreceive',{65},None),('Csubmit',{10,30,49,61},None),('Reorder',{40},None),('Quiet',{3,11,42,43},None),
         ('Reduce',{25,32,51},None),('SharedAdd',{60},None),('Sync',{24,26,45,52},None)]
 SOURCE_NAMES={15:'Gmm1Tile',16:'Gmm1TileDrain',27:'Gmm1Drain',19:'Gmm2Tile',21:'Gmm2Drain',
               14:'WaitDispatch',18:'WaitActivation',29:'WaitInputScale',17:'Gmm1Dequant',20:'Gmm2Dequant'}
@@ -88,7 +88,9 @@ def render(document,source='allrank.json',limit=60000):
     for name,ids,engine in STAGES:
         parts=[]
         for rank in selected:
-            es=choose(data[rank],ids,engine);parts.append(f'{window(es)} {f(longest(es)) if es else "-"} {len(es)}')
+            es=choose(data[rank],ids,engine)
+            if name=='Dreceive':es=[e for e in es if e.get('args',{}).get('rows',0)>0]
+            parts.append(f'{window(es)} {f(longest(es)) if es else "-"} {len(es)}')
         add(name+' | '+' | '.join(parts))
     add('[WAITS] stage FAST(longest_core_sum max_record count) SLOW(...); missing=-, not0')
     for label,ids,engine in [('AIC-input',{29},0),('AIC-activation',{18},0),('peer-start',{6},2),('dispatch-ready',{14},2),('combine-ready',{9},2),('activation-helper',{22},2),('reduce-ready',{31},None),('reorder-ready',{41},2)]:

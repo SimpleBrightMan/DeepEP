@@ -45,13 +45,13 @@ public:
 
     __aicore__ inline bool DiagnosticEnabled() const { return address_!=0U || traceAddress_!=0U; }
 
-    // One successful nonblocking CQ observation, not a quiet/wait interval.
+    // One successful nonblocking peer-receive observation, not a quiet/wait interval.
     // Both modes retain a point in Scalar state until FinishTrace. No trace
     // GM store or pipeline drain is inserted in the cooperative/reduce loop.
-    __aicore__ inline void RecordDispatchCompletion(uint32_t peer,uint32_t cv) {
+    __aicore__ inline void RecordDispatchReceive(uint32_t peer,uint32_t cv,uint32_t rows,uint64_t bytes) {
         if(!DiagnosticEnabled())return;
         const uint64_t tick=AscendC::GetSystemCycle();
-        dispatchTick_=tick;dispatchPeer_=peer;dispatchCv_=cv;
+        dispatchTick_=tick;dispatchPeer_=peer;dispatchCv_=cv;dispatchRows_=rows;dispatchBytes_=bytes;
     }
 
     __aicore__ inline uint64_t TraceBegin() const
@@ -116,7 +116,11 @@ public:
         if(dispatchTick_!=0U && address_!=0U) {
             auto* record=reinterpret_cast<__gm__ uint64_t*>(address_)+
                 (static_cast<uint64_t>(core_)*kTimerPhases+Phase::Dispatch)*kTimerRecordElements;
-            record[7]=dispatchTick_;FlushTraceLine(record);
+            // Timing kind2: outgoing first PUT -> incoming last Dispatch.
+            // Empty receive edges have no end tick but remain explicitly known.
+            record[5]=2U;record[6]=kProtocol;record[7]=dispatchRows_?dispatchTick_:0U;
+            record[8]=dispatchBytes_;record[9]=dispatchRows_;FlushTraceLine(record);
+            FlushTraceLine(record+8);
         }
         if (traceAddress_ == 0U) return;
         // All engines have passed the final local join. Emit only now, sorted
@@ -141,10 +145,10 @@ public:
         }
         // Observation may happen inside a Reduce/quiet envelope. Append this
         // independent point after ordinary scopes, keeping its original tick.
-        // The decoder allows only this zero-duration ID43 point out of order.
+        // The decoder allows only this zero-duration ID65 point out of order.
         if(dispatchTick_!=0U) {
-            TraceMeta meta;meta.peer=dispatchPeer_;meta.cv=dispatchCv_;
-            WriteTrace(TraceEvent::DispatchSendComplete,dispatchTick_,dispatchTick_,meta);
+            TraceMeta meta;meta.peer=dispatchPeer_;meta.cv=dispatchCv_;meta.rows=dispatchRows_;meta.bytes=dispatchBytes_;
+            WriteTrace(TraceEvent::DispatchReceiveComplete,dispatchTick_,dispatchTick_,meta);
         }
         auto* header = TraceHeader();
         header[0] = kTraceSchema;
@@ -195,7 +199,8 @@ public:
 
 private:
     uint64_t dispatchTick_=0U;
-    uint32_t dispatchPeer_=0U,dispatchCv_=0U;
+    uint64_t dispatchBytes_=0U;
+    uint32_t dispatchPeer_=0U,dispatchCv_=0U,dispatchRows_=0U;
     bool shared_=false;
     __aicore__ inline __gm__ uint64_t* TraceHeader() const
     {

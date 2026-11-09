@@ -144,7 +144,7 @@ private:
 
 struct SharedIncoming {
     const Arguments& a;uint32_t core;bool peer=false,self=false;
-    DispatchCompletionObserver dispatch;
+    DispatchReceiveObserver dispatch;
     __aicore__ inline void Poll(){
         dispatch.Poll();
         if(core<CommunicationWorkers(a.config.world))ObserveIncomingCompletion(a,core,peer,self);

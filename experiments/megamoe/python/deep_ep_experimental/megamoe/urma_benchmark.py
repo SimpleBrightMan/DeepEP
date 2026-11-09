@@ -625,7 +625,7 @@ def run(args, config, group):
             reports["bandwidth"] = summarize_bandwidth(bandwidth_records)
             reports["bandwidth_per_rank"] = bandwidth_records
             reports["bandwidth_scope"] = timer_metadata["scope"]
-            reports["dispatch_completion_scope"] = "diagnostic-only fixed last-Dispatch SO CQ target; first nonblocking observation, may lag true completion; no per-stage quiet"
+            reports["dispatch_completion_scope"] = "diagnostic-only peer-to-local final Dispatch SO observation; class last receive minus class first outgoing PUT; outgoing bytes numerator; polling delay included"
             missing_dispatch = any(row["phase"] == "Dispatch" and row.get("completion_status") == "not_recorded"
                                    for report in bandwidth_records for row in report["classes"])
             if missing_dispatch:
@@ -635,7 +635,7 @@ def run(args, config, group):
 
             if rank == 0:
                 print("[URMA BW] Dispatch: " + ("completion missing for some peers" if missing_dispatch else
-                      "first nonblocking CQ completion observation; includes polling delay"), flush=True)
+                      "first outgoing PUT to last peer Dispatch received; includes polling delay"), flush=True)
             reports["bandwidth_with_trace"] = args.fine
             if rank == 0:
                 for row in reports["bandwidth"]:
