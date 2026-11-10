@@ -44,8 +44,11 @@ mkdir -p -- "$URMA_HW_OUTPUT"
 export URMA_HW_OUTPUT=$(cd -- "$URMA_HW_OUTPUT" && pwd)
 mkdir -- "$URMA_HW_OUTPUT/runs"
 
+# Skip is counted before kernel-name matching in msopprof 26.2. Keep zero:
+# setup/exp/all-reduce kernels must not consume a guessed warmup skip count.
+# The application invokes MegaMoE exactly once per rank per replay.
 options=(--replay-mode=application --aic-metrics="$metric" --warm-up=0
-    --kernel-name='*mega_moe_urma_kernel*' --launch-count=1 --kill=false
+    --kernel-name='*mega_moe_urma_kernel*' --launch-skip-before-match=0 --launch-count=1 --kill=false
     --mstx=false --output="$URMA_HW_OUTPUT/profile")
 if [[ $metric == InstrTimeline ]]; then
     options+=(--instr-timeline-pipe="${URMA_HW_PIPES:-cube|fixp|mte1|mte2|mte3|vector}")

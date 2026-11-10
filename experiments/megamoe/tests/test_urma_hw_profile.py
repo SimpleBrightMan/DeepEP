@@ -47,6 +47,7 @@ class CaptureTests(unittest.TestCase):
         self.assertNotIn("URMA_HW_WARMUP", script)
         self.assertIn("--warm-up=0", script)
         self.assertIn("--launch-count=1", script)
+        self.assertIn("--launch-skip-before-match=0", script)
         self.assertIn("--kernel-name='*mega_moe_urma_kernel*'", script)
 
 
