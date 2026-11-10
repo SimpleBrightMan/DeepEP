@@ -1,15 +1,12 @@
-"""CPU-only sequencing checks; these do not validate NPU/tool compatibility."""
-
-from contextlib import contextmanager
-import unittest
-from unittest.mock import patch
-
+"""CPU-only sequencing checks; not NPU/tool compatibility validation."""
 import importlib.util
 from pathlib import Path
-from unittest.mock import patch
-spec=importlib.util.spec_from_file_location("urma_hw_profile",Path(__file__).resolve().parents[1]/"scripts/urma_hw_profile.py")
-module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
-capture_forward, MstxRange = module.capture_forward, module.MstxRange
+import unittest
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+spec = importlib.util.spec_from_file_location("urma_hw_profile", SCRIPTS / "urma_hw_profile.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
 
 
 class CaptureTests(unittest.TestCase):
@@ -26,47 +23,31 @@ class CaptureTests(unittest.TestCase):
             def end(self):
                 events.append("guard.end")
 
-        class Marker:
-            @contextmanager
-            def capture(self):
-                events.append("range.begin")
-                try:
-                    yield
-                finally:
-                    events.append("range.end")
+        return events, Guard()
 
-        return events, Guard(), Marker()
+    def test_exactly_one_forward_with_alignment(self):
+        events, guard = self.fixtures()
+        module.capture_forward(lambda: events.append("forward"), guard)
+        self.assertEqual(events, ["guard.begin", "align", "forward", "guard.end"])
 
-    def test_only_last_forward_is_selected(self):
-        events, guard, marker = self.fixtures()
-        capture_forward(lambda: events.append("forward"), guard, marker, 10)
-        self.assertEqual(events, ["guard.begin"] + ["align", "forward"] * 10 + ["align"] +
-                         ["range.begin", "forward", "range.end", "guard.end"])
-
-    def test_zero_warmup_still_captures_one(self):
-        events, guard, marker = self.fixtures()
-        capture_forward(lambda: events.append("forward"), guard, marker, 0)
-        self.assertEqual(events, ["guard.begin", "align", "range.begin", "forward",
-                                  "range.end", "guard.end"])
-
-    def test_failure_closes_range_without_entering_tail_collective(self):
-        events, guard, marker = self.fixtures()
+    def test_failure_does_not_enter_tail_collective(self):
+        events, guard = self.fixtures()
 
         def fail():
             raise RuntimeError("launch failed")
 
         with self.assertRaisesRegex(RuntimeError, "launch failed"):
-            capture_forward(fail, guard, marker, 0)
-        self.assertEqual(events, ["guard.begin", "align", "range.begin", "range.end"])
+            module.capture_forward(fail, guard)
+        self.assertEqual(events, ["guard.begin", "align"])
 
-    def test_mstx_zero_id_is_closed(self):
-        with patch.object(module.ctypes,"CDLL") as load:
-            load.return_value.mstxRangeStartA.return_value = 0
-            marker = MstxRange()
-            with marker.capture():
-                pass
-            load.return_value.mstxRangeStartA.assert_called_once_with(b"urma_capture", None)
-            load.return_value.mstxRangeEnd.assert_called_once_with(0)
+    def test_launcher_uses_kernel_filter_without_mstx_or_warmup(self):
+        script = (SCRIPTS / "run_urma_hw_profile.sh").read_text()
+        self.assertIn("--mstx=false", script)
+        self.assertNotIn("--mstx-include", script)
+        self.assertNotIn("URMA_HW_WARMUP", script)
+        self.assertIn("--warm-up=0", script)
+        self.assertIn("--launch-count=1", script)
+        self.assertIn("--kernel-name='*mega_moe_urma_kernel*'", script)
 
 
 if __name__ == "__main__":

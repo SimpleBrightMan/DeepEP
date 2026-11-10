@@ -20,7 +20,7 @@ if [[ ${1:-} == --launch ]]; then
         --standalone --nnodes=1 --nproc-per-node="$URMA_HW_EP" --max-restarts=0 \
         --log-dir "$run_dir/torchrun" --redirects 3 --tee 3 \
         "$script_dir/urma_hw_profile.py" --output-dir "$run_dir" \
-        --warmup "${URMA_HW_WARMUP:-10}" --exp-repeat "${URMA_HW_EXP_REPEAT:-50}" \
+        --exp-repeat "${URMA_HW_EXP_REPEAT:-50}" \
         --bs "${URMA_HW_BS:-1024}" --cv-rows "${URMA_HW_CV_ROWS:-256}" \
         --routing "${URMA_HW_ROUTING:-random-balanced}" --timeout 600
 fi
@@ -46,7 +46,7 @@ mkdir -- "$URMA_HW_OUTPUT/runs"
 
 options=(--replay-mode=application --aic-metrics="$metric" --warm-up=0
     --kernel-name='*mega_moe_urma_kernel*' --launch-count=1 --kill=false
-    --mstx=true --mstx-include=urma_capture --output="$URMA_HW_OUTPUT/profile")
+    --mstx=false --output="$URMA_HW_OUTPUT/profile")
 if [[ $metric == InstrTimeline ]]; then
     options+=(--instr-timeline-pipe="${URMA_HW_PIPES:-cube|fixp|mte1|mte2|mte3|vector}")
 fi

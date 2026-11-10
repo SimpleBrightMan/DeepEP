@@ -5,8 +5,6 @@ Run through run_urma_hw_profile.sh, not directly.
 """
 
 import argparse
-from contextlib import contextmanager
-import ctypes
 from datetime import datetime, timezone
 from functools import partial
 import json
@@ -15,44 +13,11 @@ from pathlib import Path
 import sys
 
 
-class MstxRange:
-    """Use the official C SDK directly, independent of PyTorch profiler state."""
-
-    def __init__(self):
-        library = os.environ.get("URMA_MSTX_LIBRARY", "libms_tools_ext.so")
-        try:
-            self.lib = ctypes.CDLL(library)
-        except OSError as error:
-            raise RuntimeError(
-                f"Cannot load MSTX SDK {library}; locate libms_tools_ext.so under "
-                "$ASCEND_HOME_PATH and export URMA_MSTX_LIBRARY=/absolute/path/to/it"
-            ) from error
-        self.lib.mstxRangeStartA.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
-        self.lib.mstxRangeStartA.restype = ctypes.c_uint64
-        self.lib.mstxRangeEnd.argtypes = [ctypes.c_uint64]
-        self.lib.mstxRangeEnd.restype = None
-
-    @contextmanager
-    def capture(self):
-        # A host range is sufficient: TASK_QUEUE_ENABLE=0 keeps native launch
-        # on this thread. No extra device mark or stream synchronization.
-        identifier = self.lib.mstxRangeStartA(b"urma_capture", None)
-        # msopprof 922e637's injection implementation can assign range ID 0.
-        try:
-            yield
-        finally:
-            self.lib.mstxRangeEnd(identifier)
-
-
-def capture_forward(forward, guard, marker, warmup):
-    """Exactly one selected forward per application replay, after warmup."""
+def capture_forward(forward, guard):
+    """One MegaMoE call per rank per application replay; no warmup or MSTX."""
     guard.begin()
-    for _ in range(warmup):
-        guard.before_forward()
-        forward()
     guard.before_forward()
-    with marker.capture():
-        forward()
+    forward()
     guard.end()
 
 
@@ -79,9 +44,8 @@ def run(args, group):
     rank = group.rank()
     directory = args.output_dir / f"rank_{rank}"
     directory.mkdir(parents=True, exist_ok=False)
-    marker = MstxRange()
     collective_check(group, "hardware profiling options", None,
-                     (config, args.warmup, args.exp_repeat, args.exp_shape))
+                     (config, args.exp_repeat, args.exp_shape))
     owner = UrmaBuffer(group, **model, num_max_tokens_per_rank=args.bs,
                        cv_rows=args.cv_rows, gmm1_ahead_mgroups=12)
 
@@ -110,9 +74,9 @@ def run(args, group):
         pid=os.getpid(), python=sys.executable, package=str(package.__file__),
         created_utc=datetime.now(timezone.utc).isoformat(), config=config,
         bs=args.bs, ep=world, cv_rows=args.cv_rows, gmm1_ahead_mgroups=12,
-        warmup=args.warmup, selected_forward_calls=1,
+        warmup=0, total_forward_calls=1, selected_forward_calls=1,
         internal_timer=False, internal_trace=False, nested_profiler=False,
-        launch_guard=guard.describe(), mstx_range="urma_capture",
+        launch_guard=guard.describe(), mstx_enabled=False,
         native_schedule=getattr(_extension(), "urma_compute_schedule", None),
         native_tail=getattr(_extension(), "urma_tail_schedule", None),
         shmem_endpoint=os.environ["DEEPEP_SHMEM_ENDPOINT"],
@@ -124,9 +88,9 @@ def run(args, group):
     group.barrier("hardware profile ready")
     if rank == 0:
         print(f"[HW PROFILE] EP{world} BS{args.bs} H3584 I1280 E384 K8; "
-              f"warmup={args.warmup}; selected=1; timer/trace off; "
+              "warmup=0; total=1; selected=1; MSTX off; timer/trace off; "
               "HCCL barrier + exp retained", flush=True)
-    capture_forward(forward, guard, marker, args.warmup)
+    capture_forward(forward, guard)
     group.barrier("hardware profile forward completed")
     # Do not report accuracy or a hardware trace as successful based on execution
     # alone. The external tool owns the capture/export status and output files.
@@ -145,13 +109,12 @@ def main():
     parser.add_argument("--bs", type=int, default=1024)
     parser.add_argument("--cv-rows", type=int, default=256)
     parser.add_argument("--routing", choices=("balanced", "random-balanced"), default="random-balanced")
-    parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--exp-repeat", type=int, default=50)
     parser.add_argument("--exp-shape", nargs=2, type=int, default=[100000, 20000])
     parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args()
-    if args.warmup < 0 or args.exp_repeat < 0 or min(args.exp_shape) < 1 or args.timeout < 1:
-        parser.error("invalid warmup/exp/timeout")
+    if args.exp_repeat < 0 or min(args.exp_shape) < 1 or args.timeout < 1:
+        parser.error("invalid exp/timeout")
     if os.environ.get("TASK_QUEUE_ENABLE") != "0":
         raise RuntimeError("Launch through run_urma_hw_profile.sh (TASK_QUEUE_ENABLE=0 required)")
     if not os.environ.get("MSOPPROF_EXE_PATH"):
