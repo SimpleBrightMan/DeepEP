@@ -31,7 +31,7 @@ void check(int status, const char* operation)
 
 struct SessionPolicy {
     bool megamoe;
-    bool udma;
+    bool dedicated_peer_qp;
     uint64_t maximum_bytes;
     uint64_t required_peer_transports;
 };
@@ -98,7 +98,7 @@ std::unique_ptr<Session> Session::create_megamoe(int rank, int size, uint64_t by
     else
         throw std::invalid_argument("MegaMoE backend must be pod or urma");
     const auto policy = policy_for(profile);
-    return std::make_unique<Session>(rank, size, bytes, endpoint, timeout, policy.udma, profile);
+    return std::make_unique<Session>(rank, size, bytes, endpoint, timeout, policy.dedicated_peer_qp, profile);
 }
 
 Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
@@ -106,7 +106,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
 {
     const auto policy = policy_for(profile);
     const bool megamoe = policy.megamoe;
-    if (policy.udma && (size != 4 && size != 8 && size != 16))
+    if (policy.dedicated_peer_qp && (size != 4 && size != 8 && size != 16))
         throw std::invalid_argument("Selected MegaMoE backend requires EP4/EP8/EP16");
     if (combine_only && (!udma || megamoe)) throw std::invalid_argument("Combine-only requires UDMA");
     if (use_1g_huge_pages && (!udma || megamoe))
@@ -120,7 +120,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     const uint64_t maximum_bytes = policy.maximum_bytes;
     if (size < 2 || size > (megamoe ? 128 : 512) || (!megamoe && (size & (size - 1))) || rank < 0 || rank >= size ||
         bytes < alignment || bytes > maximum_bytes || bytes % alignment != 0 || timeout < 1 || timeout > 3600 ||
-        (megamoe && (mpi || combine_only || use_1g_huge_pages || udma != policy.udma)) ||
+        (megamoe && (mpi || combine_only || use_1g_huge_pages || udma != policy.dedicated_peer_qp)) ||
         (!mpi && (endpoint.empty() || endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN ||
                   endpoint.find('\0') != std::string::npos))) {
         throw std::invalid_argument("Invalid rank, capacity, timeout or bootstrap endpoint");
@@ -162,7 +162,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     using SetPeerQpMasks = int (*)(const uint64_t*, uint32_t);
     auto set_masks =
         udma ? reinterpret_cast<SetPeerQpMasks>(dlsym(RTLD_DEFAULT, "aclshmemx_set_udma_peer_qp_masks")) : nullptr;
-    if (udma && dense != "1" && !set_masks) {
+    if (peer_table_ && dense != "1" && !set_masks) {
         throw std::runtime_error(
             "SHMEM lacks aclshmemx_set_udma_peer_qp_masks; use the SDK pinned in dependencies.lock.json, "
             "or explicitly select dense channels with DEEPEP_SHMEM_DENSE_QPS=1");
@@ -173,12 +173,20 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     bool init_attempted = false;
     bool runtime_started = false;
     try {
-        if (udma) {
-            // Reuse Elastic queue provisioning for all UDMA sessions.
-            // MegaMoE's device code still submits payload and SO flags on QP0.
-            // Elastic Combine owns pairs 0..15; peer-table Dispatch uses pairs 0..7.
+        if (policy.dedicated_peer_qp) {
+            // Each of the world-1 communication workers owns one remote PE.
+            // RO payload writes and SO completion atomics share QP0. Dispatch
+            // submissions finish before Combine; no second QP is required.
+            // Disable shared Clos SQs so different peer owners stay isolated.
+            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, 1U), "aclshmemx_set_qp_num(MegaMoE)");
+            check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, false), "aclshmemx_set_shared_jetty(URMA)");
+            if (set_masks) {
+                check(set_masks(nullptr, 0U), "aclshmemx_set_udma_peer_qp_masks(clear, MegaMoE)");
+            }
+        } else if (udma) {
+            // Combine owns pairs 0..15; peer-table Dispatch uses pairs 0..7.
+            // Serialized operators reuse the bank, not concurrent SQ writers.
             // The pinned SDK shares Clos SQs across peers; MESH routes are separate.
-            // MegaMoE's concurrent peer owners require validation with shared SQs.
             check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, ascend_deepep::udma_layout::kQpCount),
                   "aclshmemx_set_qp_num");
             check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, true), "aclshmemx_set_shared_jetty");
