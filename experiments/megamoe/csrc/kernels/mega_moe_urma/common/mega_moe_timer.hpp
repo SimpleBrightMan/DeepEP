@@ -44,6 +44,7 @@ enum class CoarsePhase : uint32_t {
     Route,
     RouteSummary,
     RouteWait,
+    SharedActivationTail,  // second disjoint AIV0 interval, emitted as the existing activation event
     Count
 };
 
@@ -180,7 +181,8 @@ public:
                 if (selected == count) break;
                 TraceMeta meta;
                 const auto event =
-                    selected == static_cast<uint32_t>(CoarsePhase::RouteSummary) ? TraceEvent::RouteSummary
+                    selected == static_cast<uint32_t>(CoarsePhase::SharedActivationTail) ? TraceEvent::CoarseActivation
+                    : selected == static_cast<uint32_t>(CoarsePhase::RouteSummary) ? TraceEvent::RouteSummary
                     : selected == static_cast<uint32_t>(CoarsePhase::RouteWait)  ? TraceEvent::WaitRouteSummary
                     : selected == static_cast<uint32_t>(CoarsePhase::Route)      ? TraceEvent::RoutePrepare
                     : selected == static_cast<uint32_t>(CoarsePhase::SharedSum)  ? TraceEvent::SharedAdd

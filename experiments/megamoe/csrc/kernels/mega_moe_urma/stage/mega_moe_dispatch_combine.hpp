@@ -299,6 +299,7 @@ private:
     LocalTensor<uint32_t> submitted_, selfCounts_;
 };
 
+template <class SharedWork = SharedActivationState>
 __aicore__ inline void RunCooperativeAiv1(Arguments& a, uint32_t core, Timer& timer, SharedIncoming& incoming)
 {
     incoming.dispatch.Init(timer);
@@ -306,7 +307,7 @@ __aicore__ inline void RunCooperativeAiv1(Arguments& a, uint32_t core, Timer& ti
     completion.Init();  // even zero-task AICs need the single credit
     PackBatch pack(a, timer);
     CooperativePeer peer(a, core, timer, incoming.dispatch);
-    SharedActivationState shared(a, core, timer);
+    SharedWork shared(a, core, timer);
     if (!peer.Active()) timer.CoarseBegin(CoarsePhase::Activation);
     UbRoutedActivation activation;
     activation.Init(a);

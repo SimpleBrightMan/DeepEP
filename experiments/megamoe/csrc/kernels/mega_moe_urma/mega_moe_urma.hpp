@@ -158,6 +158,59 @@ __aicore__ inline void RunSharedComputeSequence(const Arguments& a, uint32_t blo
     WaitComputeFlag(a.localFlags, kLocalFlagRoutedPrologueReleased + block, 1);
     RunSharedGmm<false>(a, block, timer);
 }
+// Large-BS S1 only. Keep all group/tile IDs global across the two GMM1
+// contexts; both their FIX drains and destructors precede L1 ownership transfer.
+template <class T>
+__aicore__ inline void RunSplitSharedComputeSequence(const Arguments& a, uint32_t block, T& timer)
+{
+    const uint32_t split = SharedHeadGroupCount(a.config.bs);
+    RunSharedGmm<true>(a, block, timer, 0U, split);
+    WriteGmByPassDCache(LocalCompletionFlag(a, kLocalFlagSharedL1Released + block), 1);
+    RunCubeAndPrologue(a, block, timer);
+    MarkCubeComplete(a);
+    WaitComputeFlag(a.localFlags, kLocalFlagRoutedPrologueReleased + block, 1);
+    RunSharedGmm<true>(a, block, timer, split, SharedGroupCount(a.config.bs));
+    RunSharedGmm<false>(a, block, timer);
+}
+
+__aicore__ inline void RunSplitSharedAiv0(const Arguments& a, uint32_t block, Timer& timer)
+{
+    SharedActivationState activation(a, block, timer);
+    CooperativeNoWait before;
+    // Pack is already drained. This AIV0 does not own a routed B context yet,
+    // so its phase-private activation scratch/events cannot alias live dequant.
+    timer.CoarseBegin(CoarsePhase::Activation);
+    while (!ReadGmByPassDCache(LocalCompletionFlag(a, kLocalFlagSharedL1Released + block))) {
+        if (!activation.TryOne(before, SharedHeadGroupCount(a.config.bs))) {
+            const auto start = GetSystemCycle();
+            while (GetSystemCycle() - start < 64U) {}
+        }
+    }
+    timer.CoarseEnd(CoarsePhase::Activation);
+    PipeBarrier<PIPE_ALL>();
+    timer.CoarseBegin(CoarsePhase::Dequant);
+    if (a.coarseTrace || (!a.trace && !a.timer)) {
+        NoopTimer t;
+        RunCubeAndPrologue(a, block, t);
+    } else {
+        RunCubeAndPrologue(a, block, timer);
+    }
+    timer.CoarseEnd(CoarsePhase::Dequant);
+    PipeBarrier<PIPE_ALL>();
+    // Release routed L1 BEFORE waiting for shared tail tiles. The paired AIC
+    // needs this handoff to produce those tiles; waiting first would deadlock.
+    WriteGmByPassDCache(LocalCompletionFlag(a, kLocalFlagRoutedPrologueReleased + block), 1);
+    timer.CoarseBegin(CoarsePhase::SharedActivationTail);
+    while (!activation.Done()) {
+        if (!activation.TryOne(before)) {
+            const auto start = GetSystemCycle();
+            while (GetSystemCycle() - start < 64U) {}
+        }
+    }
+    timer.CoarseEnd(CoarsePhase::SharedActivationTail);
+    PipeBarrier<PIPE_ALL>();
+}
+
 __aicore__ inline void ProcessShared(Arguments& a)
 {
     Timer timer;
@@ -173,8 +226,13 @@ __aicore__ inline void ProcessShared(Arguments& a)
         timer.CoarseBegin(CoarsePhase::Gmm);
         if (a.coarseTrace || (!a.trace && !a.timer)) {
             NoopTimer t;
-            RunSharedComputeSequence(a, block, t);
-        } else
+            if (UseSplitSharedGmm(a.config.bs))
+                RunSplitSharedComputeSequence(a, block, t);
+            else
+                RunSharedComputeSequence(a, block, t);
+        } else if (UseSplitSharedGmm(a.config.bs))
+            RunSplitSharedComputeSequence(a, block, timer);
+        else
             RunSharedComputeSequence(a, block, timer);
         timer.CoarseEnd(CoarsePhase::Gmm);
     } else if (GetSubBlockIdx() == 0) {
@@ -187,20 +245,24 @@ __aicore__ inline void ProcessShared(Arguments& a)
         startup.Close();
         MarkPackWorkerComplete(a);
         timer.CoarseEnd(CoarsePhase::Pack);
-        // AIC may still be in shared GMM1 while this AIV0 finishes Pack.
-        // Do not initialize the routed W4 B ring until its L1 owner releases it.
-        WaitComputeFlag(a.localFlags, kLocalFlagSharedL1Released + block, 1);
-        timer.CoarseBegin(CoarsePhase::Dequant);
-        if (a.coarseTrace || (!a.trace && !a.timer)) {
-            NoopTimer t;
-            RunCubeAndPrologue(a, block, t);
-        } else
-            RunCubeAndPrologue(a, block, timer);
-        timer.CoarseEnd(CoarsePhase::Dequant);
-        // This AIV0 has finished its own dequant contexts. Release its local
-        // UB/event use before Reduce; do not wait for other AIC/AIV workers.
-        PipeBarrier<PIPE_ALL>();
-        WriteGmByPassDCache(LocalCompletionFlag(a, kLocalFlagRoutedPrologueReleased + block), 1);
+        if (UseSplitSharedGmm(a.config.bs)) {
+            RunSplitSharedAiv0(a, block, timer);
+        } else {
+            // AIC may still be in shared GMM1 while this AIV0 finishes Pack.
+            // Do not initialize the routed W4 B ring until its L1 owner releases it.
+            WaitComputeFlag(a.localFlags, kLocalFlagSharedL1Released + block, 1);
+            timer.CoarseBegin(CoarsePhase::Dequant);
+            if (a.coarseTrace || (!a.trace && !a.timer)) {
+                NoopTimer t;
+                RunCubeAndPrologue(a, block, t);
+            } else
+                RunCubeAndPrologue(a, block, timer);
+            timer.CoarseEnd(CoarsePhase::Dequant);
+            // This AIV0 has finished its own dequant contexts. Release its local
+            // UB/event use before Reduce; do not wait for other AIC/AIV workers.
+            PipeBarrier<PIPE_ALL>();
+            WriteGmByPassDCache(LocalCompletionFlag(a, kLocalFlagRoutedPrologueReleased + block), 1);
+        }
         NoReduceObserver observer;  // incoming counters remain AIV1-owned
         timer.CoarseBegin(CoarsePhase::Reduce);
         ReduceGeneric<true>(a, LocalWorkerIndex(block, 0U), kLocalWorkers, timer, observer);
@@ -214,7 +276,10 @@ __aicore__ inline void ProcessShared(Arguments& a)
         pack.Close();
         timer.CoarseEnd(CoarsePhase::Pack);
         SharedIncoming incoming{a, block};
-        RunCooperativeAiv1(a, block, timer, incoming);
+        if (UseSplitSharedGmm(a.config.bs))
+            RunCooperativeAiv1<NoSharedActivation>(a, block, timer, incoming);
+        else
+            RunCooperativeAiv1(a, block, timer, incoming);
         PipeBarrier<PIPE_ALL>();
         timer.CoarseBegin(CoarsePhase::Reduce);
         ReduceGeneric<true>(a, LocalWorkerIndex(block, 1U), kLocalWorkers, timer, incoming);

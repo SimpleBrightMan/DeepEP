@@ -7,6 +7,7 @@
 #include "kernels/mega_moe_urma/mega_moe_urma_tiling.hpp"
 #include "kernels/mega_moe_common/catlass_gmm/mega_moe_mx_matmul.hpp"
 #include "kernel_operator.h"
+#include "kernels/mega_moe_urma/common/mega_moe_shared_schedule.hpp"
 #include "kernels/mega_moe_urma/stage/mega_moe_gmm.hpp"
 #include "kernels/mega_moe_urma/common/mega_moe_completion.hpp"
 #include "kernels/mega_moe_urma/common/mega_moe_transport.hpp"
@@ -15,31 +16,9 @@
 // Shared-expert task layout, matmul, activation and final addition.
 
 namespace MegaMoeUrma {
-#if defined(__NPU_DEVICE__)
-#define SHARED_INLINE __aicore__ inline
-#else
-#define SHARED_INLINE inline
-#endif
-SHARED_INLINE constexpr uint32_t SharedTaskCount(uint32_t bs, uint32_t intermediate)
-{
-    return ((bs + 255U) / 256U) * (intermediate / 256U) * 2U;
-}
-SHARED_INLINE constexpr uint32_t SharedOwnedTasks(uint32_t total, uint32_t worker)
-{
-    return worker < total ? (total - 1U - worker) / 28U + 1U : 0U;
-}
-struct SharedTask {
-    uint32_t group, tile, slice;
-};
-SHARED_INLINE constexpr SharedTask SharedTaskAt(uint32_t task, uint32_t intermediate)
-{
-    const uint32_t n = intermediate / 256U;
-    return {task / (n * 2U), (task / 2U) % n, task % 2U};
-}
 constexpr uint32_t kSharedMaxOwnedTasks = SharedOwnedTasks(SharedTaskCount(kMaxTokensPerRank, 16384U), 0U);
 constexpr uint32_t kSharedDoneWords = (kSharedMaxOwnedTasks + 63U) / 64U;
 static_assert(kSharedMaxOwnedTasks == 293U && kSharedDoneWords == 5U);
-#undef SHARED_INLINE
 }  // namespace MegaMoeUrma
 
 namespace MegaMoeUrma {
@@ -230,14 +209,18 @@ struct SharedOutputBackend {
     }
 };
 template <bool First, class T>
-__aicore__ inline void RunSharedGmm(const Arguments& a, uint32_t core, T& timer)
+__aicore__ inline void RunSharedGmm(const Arguments& a, uint32_t core, T& timer,
+                                     uint32_t groupBegin = 0U, uint32_t groupEnd = UINT32_MAX)
 {
+    const uint32_t groups = SharedGroupCount(a.config.bs);
+    if (groupEnd > groups) groupEnd = groups;
+    if (groupBegin >= groupEnd) return;
     auto v = SharedView(a);
     std::conditional_t<First, SharedGmm1, SharedGmm2> gmm;
     SharedOutputBackend<T> backend{a, timer};
     TileCompletion<SharedOutputBackend<T>> pending(backend);
     bool active = false;
-    for (uint32_t group = 0; group < (a.config.bs + 255) / 256; ++group) {
+    for (uint32_t group = groupBegin; group < groupEnd; ++group) {
         const auto f = SharedFragment(a, group);
         const uint32_t count = First ? a.sharedIntermediate / 256 : a.config.hidden / 256;
         const uint32_t first = FirstOwnedComputeTile(uint64_t(group) * count, RoutedOwnerResidue(First, core), kAic);
@@ -304,10 +287,14 @@ public:
         return finished_ == owned_;
     }
     template <class BeforeWork>
-    __aicore__ inline bool TryOne(BeforeWork& before)
+    __aicore__ inline bool TryOne(BeforeWork& before, uint32_t groupLimit = UINT32_MAX)
     {
-        for (uint32_t j = 0; j < owned_; ++j) {
-            const uint32_t local = (cursor_ + j) % owned_;
+        const uint32_t groups = SharedGroupCount(a_.config.bs);
+        const uint32_t limit = groupLimit < groups
+                                   ? SharedOwnedTasks(groupLimit * (a_.sharedIntermediate / 256U) * 2U, worker_)
+                                   : owned_;
+        for (uint32_t j = 0; j < limit; ++j) {
+            const uint32_t local = (cursor_ + j) % limit;
             if (done_[local / 64] & (uint64_t{1} << (local % 64))) continue;
             const uint32_t task = worker_ + local * kAic;
             const auto assignment = SharedTaskAt(task, a_.sharedIntermediate);
@@ -376,8 +363,15 @@ private:
     const Arguments& a_;
     uint32_t worker_;
     Timer& timer_;
-    uint64_t done_[kSharedDoneWords]{};  // BS16384/I16384: at most293 tasks per AIV1
+    uint64_t done_[kSharedDoneWords]{};  // BS16384/I16384: at most293 tasks per activation owner
     uint32_t total_ = 0, owned_ = 0, finished_ = 0, cursor_ = 0;
+};
+
+struct NoSharedActivation {
+    __aicore__ inline NoSharedActivation(const Arguments&, uint32_t, Timer&) {}
+    __aicore__ inline bool Done() const { return true; }
+    template <class BeforeWork>
+    __aicore__ inline bool TryOne(BeforeWork&) { return false; }
 };
 
 struct SharedIncoming {
