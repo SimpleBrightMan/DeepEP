@@ -5,6 +5,7 @@
 #include "kernel_launch.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -47,7 +48,7 @@ uint32_t DispatchCopyBytes(const MegaMoeTilingData& t)
 {
     const uint32_t token = AlignUp(t.h, uint32_t{256});
     const uint32_t scale = AlignUp(CeilDiv(t.h, uint32_t{32}), uint32_t{32});
-    return token + scale;
+    return token + scale + 32U;
 }
 
 MegaMoeDispatchBufferConfig DispatchConfig(const MegaMoeTilingData& t, uint32_t ub)
@@ -134,10 +135,11 @@ void SetSendMaskConfigs(MegaMoeTilingData& t, uint32_t ub)
         CeilDiv(static_cast<uint64_t>(layout.flagResetElementCount), static_cast<uint64_t>(t.blockAivNum)));
     const uint32_t reset_count = std::min(reset_per_core, static_cast<uint32_t>(DISPATCH_RESET_BATCH));
     const uint32_t reset_bytes = AlignUp(reset_count, uint32_t{MegaMoeImpl::INT32_PER_256B}) * 4U;
-    const uint32_t quant_out = AlignUp(t.h, 256U) + AlignUp(CeilDiv(t.h, 32U), 32U);
+    const uint32_t quant_out = DispatchCopyBytes(t);
     const uint32_t quant_in = AlignUp(t.h, 128U) * 2U;
     const auto inputMode = MegaMoeImpl::SelectInputPreparationMode(
-        t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4, t.sharedExpertNum, t.bs);
+        t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4, t.sharedExpertNum, t.bs,
+        t.variableTokenCounts != 0U);
     const uint32_t route_cores =
         inputMode == MegaMoeImpl::InputPreparationMode::Aiv1RouteOverlap ? t.aicNum : t.blockAivNum;
     const uint32_t max_experts = MegaMoeImpl::CalcSendMaskExpertCapacity(&t, route_cores);
@@ -213,11 +215,12 @@ PlatformInfo GetPlatformInfo()
 
 MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t topk, int64_t local_experts,
                              int64_t world, int64_t max_tokens, int64_t max_recv, bool is_a8w4, int64_t shared_experts,
-                             const PlatformInfo& p)
+                             const PlatformInfo& p, bool variable_token_counts)
 {
     MegaMoeTilingData t{};
     t.moeExpertPerRank = static_cast<uint32_t>(local_experts);
     t.bs = static_cast<uint32_t>(bs);
+    t.variableTokenCounts = variable_token_counts ? 1U : 0U;
     t.h = static_cast<uint32_t>(h);
     t.hiddenDim = static_cast<uint32_t>(hidden_dim);
     t.epWorldSize = static_cast<uint32_t>(world);
@@ -260,7 +263,8 @@ void CheckTensor(const torch::Tensor& t, int64_t dims, const char* name)
 
 Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world,
            int64_t max_tokens, bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts,
-           uint64_t symmetric_address, int64_t symmetric_bytes, int64_t local_rank)
+           uint64_t symmetric_address, int64_t symmetric_bytes, int64_t local_rank, bool route_weight_before_quant,
+           bool variable_token_counts, c10::optional<torch::Tensor> workspace_hint)
     : ffts_(ffts)
 {
     CheckTensor(example, 2, "plan input");
@@ -285,14 +289,24 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
                 " bytes, got ", symmetric_bytes);
     platform_ = GetPlatformInfo();
     tiling_ = MakeTiling(example.size(0), example.size(1), intermediate * 2, topk, experts, world, max_tokens, 0,
-                         is_a8w4, shared_experts, platform_);
+                         is_a8w4, shared_experts, platform_, variable_token_counts);
     tiling_.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
+    TORCH_CHECK(!route_weight_before_quant || (is_a8w4 && topk <= MegaMoeImpl::META_INFO_SIZE),
+                "pre-quant routing requires A8W4 and topK<=8");
+    tiling_.topkWeightsPrefetch = route_weight_before_quant ? 1U : 0U;
     static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
     const MegaMoeImpl::WorkspaceInfo info(nullptr, &tiling_);
     const int64_t bytes =
         info.workspaceSize + static_cast<int64_t>(platform_.system_workspace) + kReservedWorkspaceBytes;
     TORCH_CHECK(bytes > info.workspaceSize, "MegaMoE workspace size overflow");
-    workspace_ = torch::empty({bytes}, example.options().dtype(torch::kUInt8));
+    if (workspace_hint.has_value()) {
+        CheckTensor(*workspace_hint, 1, "workspace hint");
+        TORCH_CHECK(workspace_hint->device()==example.device() && workspace_hint->scalar_type()==torch::kUInt8,
+                    "workspace hint must be uint8 on the plan device");
+    }
+    // 同一owner的图在专属流串行运行，可共享scratch；每张图仍保留自己的tiling/context。
+    workspace_ = workspace_hint.has_value() && workspace_hint->numel()>=bytes
+                     ? *workspace_hint : torch::empty({bytes}, example.options().dtype(torch::kUInt8));
     context_ = torch::empty({static_cast<int64_t>(sizeof(Mc2Aclnn::Mc2MoeContext))}, workspace_.options());
 
     // peer 地址和 context 只在准备阶段解析，不在每次 forward 中重新分配、同步拷贝。
@@ -318,8 +332,13 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     torch::Tensor weight1, torch::Tensor weight2, torch::Tensor weight_scales1, torch::Tensor weight_scales2,
     c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> shared_weight1,
     c10::optional<torch::Tensor> shared_weight2, c10::optional<torch::Tensor> shared_weight_scales1,
-    c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<torch::Tensor> out)
+    c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<double> activation_clamp,
+    c10::optional<torch::Tensor> out)
 {
+    TORCH_CHECK(!activation_clamp.has_value() ||
+                    (std::isfinite(*activation_clamp) && *activation_clamp > 0.0 &&
+                     *activation_clamp <= std::numeric_limits<float>::max()),
+                "activation_clamp must be None or finite positive FP32");
     CheckTensor(x, 2, "x");
     TORCH_CHECK(!local_buffer_.defined() || compute_replay_,
                 "Local compute requires prepare_local_compute before forward; communication is forbidden");
@@ -393,7 +412,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                 "all four shared weight and scale tensors must be supplied together");
     int64_t shared_experts = 0;
     if (has_shared) {
-        TORCH_CHECK(is_a8w4, "shared experts currently require A8W4 weights");
+        TORCH_CHECK(is_a8w4, "shared FP8 experts currently require the routed A8W4 kernel");
         CheckTensor(*shared_weight1, 3, "shared_weight1");
         CheckTensor(*shared_weight2, 3, "shared_weight2");
         CheckTensor(*shared_weight_scales1, 4, "shared_weight_scales1");
@@ -405,14 +424,15 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
              {&*shared_weight1, &*shared_weight2, &*shared_weight_scales1, &*shared_weight_scales2}) {
             TORCH_CHECK(tensor->device() == x.device(), "shared tensors must be on the same device as x");
         }
-        TORCH_CHECK(shared_weight1->scalar_type() == torch::kUInt8 && shared_weight2->scalar_type() == torch::kUInt8,
-                    "shared weights must use packed E2M1 uint8 NZ storage");
+        TORCH_CHECK(shared_weight1->scalar_type() == c10::ScalarType::Float8_e4m3fn &&
+                        shared_weight2->scalar_type() == c10::ScalarType::Float8_e4m3fn,
+                    "shared weights must use FP8 E4M3 NZ storage; packed FP4 is no longer accepted");
         TORCH_CHECK(shared_weight_scales1->scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
                         shared_weight_scales2->scalar_type() == c10::ScalarType::Float8_e8m0fnu,
                     "shared weight scales must be FP8 E8M0");
-        TORCH_CHECK(shared_weight1->sizes() == torch::IntArrayRef({shared_experts, hidden, h / 2}) &&
-                        shared_weight2->sizes() == torch::IntArrayRef({shared_experts, h, hidden / 4}),
-                    "shared weights must match routed H and hiddenDim: [S, hiddenDim, H/2], [S, H, hiddenDim/4]");
+        TORCH_CHECK(shared_weight1->sizes() == torch::IntArrayRef({shared_experts, hidden, h}) &&
+                        shared_weight2->sizes() == torch::IntArrayRef({shared_experts, h, hidden / 2}),
+                    "shared FP8 weights must match routed H and hiddenDim: [S, hiddenDim, H], [S, H, hiddenDim/2]");
         TORCH_CHECK(shared_weight_scales1->sizes() ==
                             torch::IntArrayRef({shared_experts, hidden, CeilDiv(h, int64_t{64}), 2}) &&
                         shared_weight_scales2->sizes() ==
@@ -430,11 +450,15 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     const auto stream = c10_npu::getCurrentNPUStream();
     auto ptr = [](const torch::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
     auto opt = [&](const c10::optional<torch::Tensor>& tensor) { return tensor ? ptr(*tensor) : nullptr; };
+    // 每次调用显式传递，不把某次 clamp 留在复用 Plan 中影响后续 None 调用。
+    auto launch_tiling = tiling_;
+    launch_tiling.clampLimit = activation_clamp.has_value()
+                                  ? static_cast<float>(*activation_clamp) : std::numeric_limits<float>::max();
     mega_moe_kernel_do(platform_.block_dim, platform_.ub, stream.stream(), is_a8w4, ptr(context_), ptr(x),
                        opt(x_scales), ptr(topk_ids), ptr(topk_weights), ptr(weight1), ptr(weight2), ptr(weight_scales1),
                        ptr(weight_scales2), opt(shared_weight1), opt(shared_weight2), opt(shared_weight_scales1),
                        opt(shared_weight_scales2), ptr(y), ptr(expert_tokens), ptr(workspace_), opt(timer),
-                       reinterpret_cast<const uint8_t*>(&tiling_), ffts_, compute_replay_);
+                       reinterpret_cast<const uint8_t*>(&launch_tiling), ffts_, compute_replay_);
     // The direct kernel launch bypasses the PyTorch dispatcher; record that
     // every argument remains live until the current NPU stream reaches it.
     for (const auto* tensor : {&x, &topk_ids, &topk_weights, &weight1, &weight2, &weight_scales1, &weight_scales2,

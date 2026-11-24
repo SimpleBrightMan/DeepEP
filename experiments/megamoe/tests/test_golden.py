@@ -55,9 +55,10 @@ def naive(config, world, source, bs, routing, check_tokens):
         result += local_reference(x, ids[selected], weights[selected], *map(unpack_weight, raw), owner * local)
     if model["num_shared_experts"]:
         raw = make_weights(
-            model["num_shared_experts"], model["hidden"], model["intermediate_hidden"], config["seed"] + 100000
+            model["num_shared_experts"], model["hidden"], model["intermediate_hidden"], config["seed"] + 100000,
+            weight_bits=8,
         )
-        for w1, w2 in zip(*map(unpack_weight, raw)):
+        for w1, w2 in zip(*(unpack_weight(p, weight_bits=8) for p in raw)):
             result += expert_forward(x, w1, w2)
     return bf16(result), counts[source * local : (source + 1) * local], selected
 

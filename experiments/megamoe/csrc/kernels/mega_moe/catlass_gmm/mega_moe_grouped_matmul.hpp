@@ -45,13 +45,14 @@ class A8W4MatmulPipeline {
     using C = typename Config::KernelConfig;
     using A = typename C::ElementAType;
     using W = typename C::ElementBType;
+    static constexpr bool PACKED_WEIGHT = std::is_same_v<W, __fp4e2m1x2>;
     using Out = typename C::ElementCType;
     using SA = typename C::ElementMxScaleAType;
     using SB = typename C::ElementMxScaleBType;
     using Arch = Catlass::Arch::Ascend950;
     using Buffers = A8W4BufferPlan;
     using LayoutA = CatlassGroupedMatmulLayouts::LayoutA;
-    using LayoutB = CatlassGroupedMatmulLayouts::LayoutB<true, true>;
+    using LayoutB = CatlassGroupedMatmulLayouts::LayoutB<PACKED_WEIGHT, true>;
     using LayoutC = CatlassGroupedMatmulLayouts::LayoutC;
     using LayoutScaleA = CatlassGroupedMatmulLayouts::LayoutScaleA;
     using LayoutScaleB = CatlassGroupedMatmulLayouts::LayoutScaleB;
@@ -65,7 +66,7 @@ class A8W4MatmulPipeline {
                                                      Catlass::Gemm::Tile::ScaleGranularity::PER_TENSOR>;
     using Policy = Catlass::Gemm::MmadA8W4Mx<Arch, true, false, 8, 1,
                                            Buffers::AStages, Buffers::BStages, 2, 2>;
-    using Mmad = Catlass::Gemm::Block::MegaMoeBlockMmadA8W4<Policy, L1, L0, A, A, Out, void, TileCopy>;
+    using Mmad = Catlass::Gemm::Block::MegaMoeBlockMmadA8W4<Policy, L1, L0, A, A, Out, void, TileCopy, PACKED_WEIGHT>;
     using Prologue =
         Catlass::Gemm::Block::MegaMoeBlockPrologueA8W4<Arch, Buffers::BStages, Catlass::Gemm::GemmType<W, LayoutB>,
                                                        Catlass::Gemm::GemmType<A, LayoutDequantizedB>, L1, TileCopy>;
@@ -217,7 +218,7 @@ public:
         config_.n = config.n;
         config_.k = config.k;
         config_.scaleK = config.scaleK;
-        if constexpr (IsGmm2) blockedWeightScales_ = true;
+        if constexpr (IsGmm2) blockedWeightScales_ = PACKED_WEIGHT;
         else blockedWeightScales_ = ProblemConfig::FUSED_GATE_UP;
         addr_ = {addr.aGlobal, addr.bGlobal, addr.aScaleGlobal, addr.bScaleGlobal};
         output_ = output;

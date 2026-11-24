@@ -159,6 +159,17 @@ __aicore__ inline void StoreDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
     TEventID eventId = static_cast<TEventID>(bufferIdx);
     WaitFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
     LocalTensor<ActivationType> tokenScaleBuffer = GetDispatchCopyBuffer(context, scratch, bufferIdx);
+    if (params.tilingData->topkWeightsPrefetch != 0U) {
+        // payload与权重随同一个MTE2完成；Scalar读UB前需要自己的完成边界。
+        SetFlag<HardEvent::MTE2_S>(eventId);
+        WaitFlag<HardEvent::MTE2_S>(eventId);
+        auto metadata = reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr) +
+                        static_cast<uint64_t>(copyIdx) * META_INFO_SIZE;
+        const int32_t slot = ReadGmByPassDCache(metadata + TOPK_INDEX);
+        auto bits = tokenScaleBuffer[context.quantTokenAlignBytes + context.quantScaleAlignBytes]
+                        .template ReinterpretCast<int32_t>();
+        WriteGmByPassDCache(metadata + WEIGHT_INDEX, bits.GetValue(slot));
+    }
     LocalTensor<QuantScaleType> scaleBuffer =
         tokenScaleBuffer[context.quantTokenAlignBytes].template ReinterpretCast<QuantScaleType>();
 

@@ -9,7 +9,8 @@ namespace MegaMoeImpl {
 struct Aiv1ResidentUbLayout {
     static constexpr uint32_t ActivationRows = 64U;
     static constexpr uint32_t ActivationColumns = 256U;
-    static constexpr uint32_t ActivationBytes = ActivationRows * ActivationColumns * 2U * 2U;
+    static constexpr uint32_t ActivationBytes = ActivationRows * ActivationColumns * 2U * 2U +
+        ActivationRows * 32U + ActivationRows * ActivationColumns / 32U;
     static constexpr uint32_t CombineMetaRows = 384U;
     static constexpr uint32_t MetaWords = 8U;
     uint64_t dispatchBase;

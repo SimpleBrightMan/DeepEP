@@ -44,6 +44,20 @@ def _host_boot_id():
         return ""
 
 
+def _physical_device_id(logical_device, visible_devices):
+    """校验的是物理卡身份；DeepInfer每个进程可只暴露一张不同的卡。"""
+    if not visible_devices:
+        return logical_device
+    try:
+        devices=[int(item.strip()) for item in visible_devices.split(',')]
+    except ValueError:
+        return -1
+    if (not devices or min(devices)<0 or len(set(devices))!=len(devices)
+            or not 0<=logical_device<len(devices)):
+        return -1
+    return devices[logical_device]
+
+
 def rank_and_world(group, rank=None, world_size=None):
     """Resolve an explicit SHMEM identity or an existing framework group."""
     if group is None:
@@ -157,7 +171,7 @@ class Runtime:
                         [
                             digest(host_id) if host_id else 0,
                             digest(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")),
-                            self.device,
+                            _physical_device_id(self.device, os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")),
                         ]
                     )
                 local_values.append(int(udma) + 2 * int(combine_only) + 4 * int(dense_qps))
@@ -183,18 +197,16 @@ class Runtime:
                             f"Cannot read a valid Linux /proc/sys/kernel/random/boot_id on group ranks {invalid_hosts}; "
                             "host identity is required before SHMEM initialization"
                         )
-                    hosts = {value[4] for value in values}
-                    for host in hosts:
-                        local = [value for value in values if value[4] == host]
-                        if len({value[5] for value in local}) != 1:
-                            raise ValueError("Ranks on one host must use a common visible-device mapping")
+                    invalid_devices=[i for i,value in enumerate(values) if value[6]<0]
+                    if invalid_devices:
+                        raise ValueError(f'Invalid visible-device mapping on group ranks {invalid_devices}')
                     devices = {}
                     for peer_rank, value in enumerate(values):
                         key = (value[4], value[6])
                         if key in devices:
                             raise ValueError(
                                 f"Each rank must use a distinct local NPU: group ranks {devices[key]} and "
-                                f"{peer_rank} use local device {value[6]} on the same Linux host"
+                                f"{peer_rank} use physical device {value[6]} on the same Linux host"
                             )
                         devices[key] = peer_rank
             self.rank, self.world_size = rank, size

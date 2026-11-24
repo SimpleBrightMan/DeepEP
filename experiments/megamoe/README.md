@@ -5,8 +5,11 @@ Modified by Joyce_An 2026
 
 # MegaMoE Prefill Beta
 
+本工作树是尚未验收的 [DeepInfer 兼容候选](DEEPINFER_COMPATIBILITY.md)，不是已发布 main。
+支持显式正有限 `activation_clamp` 的参数传递；原生协议 10 必须整体重建。
+
 当前有效入口、支持范围、BS/M作用域与策略表见 [ACTIVE_POLICY.md](ACTIVE_POLICY.md)。
-当前routed A8W4仅支持无共享专家；下方历史共享专家回归不代表当前launcher仍允许该配置。
+本兼容工作树已接入 FP8 共享专家路径；其当前设备验收范围见兼容说明，不能继承原 main 无共享专家的验收结论。
 
 2026-10-27基线：统一Wave＋GM、可读性整理及slice级GMM2完成通知。routed A8W4已通过
 EP8/EP32七个BS及随机/偏斜路由的全量独立Golden，见[验收结果](../../analysis/gm-readable-1026/golden/RESULTS.md)。
@@ -278,11 +281,12 @@ def fp8_fp4_mega_moe(
 | `sym_buffer.topk_idx` | int32 `[B,K]`，全局专家 ID，同 token 不重复且不能为 -1 |
 | `sym_buffer.topk_weights` | FP32 `[B,K]` 路由权重；BF16/FP8 输入均从 buffer 读取路由 |
 | `l1_weights / l2_weights` | 两对 `(weight, scale)`，当前测试使用 FP4 E2M1 权重 + E8M0 scale |
-| `shared_l1_weights / shared_l2_weights` | 共享专家的两对权重，必须同时传入，数量与 buffer 的 S 一致；默认不使用 |
+| `shared_l1_weights / shared_l2_weights` | FP8 E4M3 权重 + E8M0 scale，两对必须同时传入，数量与 buffer 的 S 一致；默认 S=0 |
 | `cumulative_local_expert_recv_stats` | 可选 int32 `[L]`，在原值上累加专家接收 token 数 |
 | `timer` | 可选 `buffer.allocate_timer()`；仅在单独诊断调用中传入 |
 
-`recipe/activation/activation_clamp/fast_math` 当前仅支持签名中的默认值。所有张量在 buffer 所在 NPU 上。
+`recipe/activation/fast_math` 当前仅支持签名中的默认值。`activation_clamp` 可为 None 或正有限 FP32 数值；
+本兼容候选的设备验收状态见上述说明。所有张量在 buffer 所在 NPU 上。
 FP8 输入仍需打包到通信区，因此流水中的 `AIV_QUANT` 此时表示打包，不是重新量化。
 
 权重在测试/推理前转换一次，转换过程不计入性能测量：
@@ -293,7 +297,21 @@ FP8 输入仍需打包到通信区，因此流水中的 `AIV_QUANT` 此时表示
 | GMM2 | `[L,H,I/2]` | `[L,H,I/64,2]` |
 
 调用 `w1, w2 = transform_weights_for_mega_moe(raw_w1, raw_w2)` 得到 Ascend NZ 权重。FP4 routed GMM1 一次准备两套 weight/scale：实际 B≤256 使用 `[gate128, up128]` 融合布局，B>256 使用 `[gate | up]` 配对布局。转换不进入计时区间，但额外保留一份 GMM1 权重和 scale；GMM2 不复制。
-请完整保留返回的 `w1`，不要解包后重组、原地修改或自行搬运其张量；权重更新或设备变化时从原始 ND 重新转换。共享专家将首维 L 换成 S，并传入 `shared=True`，使用 planar 权重布局。
+请完整保留返回的 `w1`，不要解包后重组、原地修改或自行搬运其张量；权重更新或设备变化时从原始 ND 重新转换。
+
+共享专家固定使用 FP8 E4M3，不再接受 packed FP4。原始 ND 输入如下，调用
+`transform_weights_for_mega_moe(shared_w1, shared_w2, shared=True)` 只转换为普通 NZ，
+不重新量化、不交错 gate/up；两层 scale 都保持逐N行布局，不使用路由 GMM2 的 N256 scale 重排。
+
+| 共享专家原始输入 | FP8 E4M3 权重 | E8M0 scale |
+| --- | --- | --- |
+| GMM1 | `[S,2I,H]`，先 gate 后 up | `[S,2I,H/64,2]` |
+| GMM2 | `[S,H,I]` | `[S,H,I/64,2]` |
+
+`mma_type="fp8xfp4"` 仍描述路由专家，不表示共享专家也是FP4。
+共享 FP8 保留原 AIC/AIV0 槽位和完成协议，只跳过 FP4 位解包；FIX 输出为1倍，
+路由 FP4 原有的64倍补偿不变。Python/native 协议升级为9，必须整包重建，不能混用旧 wheel。
+该输入合同的修改不代表新共享路径已完成 NPU Golden 或性能验收。
 不能直接传入已经做过 CUDA 专用重排的权重。
 
 buffer 的构造参数如下，模型参数含义与测试 JSON 相同：
@@ -498,7 +516,7 @@ python experiments/megamoe/scripts/batch_launch.py --hosts-file "$HOSTS_FILE" --
 ```
 
 需要其他数量可复制 JSON、修改 `num_shared_experts` 后使用 `--config /path/to/case.json`。
-脚本自动生成对应共享权重、传给公开接口，CPU Golden 也包含共享专家；
+脚本自动生成 FP8 共享权重（路由仍为FP4）、传给公开接口，CPU Golden 也按 FP8 解码共享专家；
 **没有 `--shared-experts` 开关**。warmup/iters/seed 同样在 JSON 中修改。
 
 ### 测试结果

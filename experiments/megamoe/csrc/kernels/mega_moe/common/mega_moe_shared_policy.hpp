@@ -25,8 +25,10 @@ enum class InputPreparationMode {
 };
 
 MEGAMOE_SHARED_POLICY_INLINE constexpr InputPreparationMode SelectInputPreparationMode(
-    bool isA8W4, uint32_t sharedExperts, uint32_t bs)
+    bool isA8W4, uint32_t sharedExperts, uint32_t bs, bool variableTokenCounts = false)
 {
+    // ragged ranks可能跨越decode阈值，必须选同一跨rank握手；共享GEMM分块仍可各卡独立。
+    if (variableTokenCounts) return InputPreparationMode::AllAivRankBarrier;
     if (UsesCountEpochInputReady(isA8W4, bs)) {
         return InputPreparationMode::CountEpoch;
     }

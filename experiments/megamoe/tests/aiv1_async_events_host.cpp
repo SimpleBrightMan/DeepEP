@@ -84,6 +84,26 @@ int main() {
     assert(sends==0);
     run_until([]{for(auto& q:queue)if(!q.empty())return false; return true;});
     for(auto& domain:flag) for(bool f:domain) assert(!f);
+    // 路由/共享tile交错提交，256行tile分成4个64行块；不得提前覆盖另一个任务的量化输出。
+    Aiv1ActivationUb::Init();
+    unsigned ubOwner=0, lastStored=0, issued=0;
+    for(unsigned tile=0;tile<19;++tile) {
+        const unsigned rows = tile%3==0 ? 1 : tile%3==1 ? 96 : 256;
+        for(unsigned row=0;row<rows;row+=64) {
+            const unsigned version=++issued;
+            Aiv1ActivationUb::Acquire();
+            queue[M2].push_back([&,version]{assert(lastStored==version-1);ubOwner=version;return true;});
+            SetFlag<H::MTE2_V>(0); WaitFlag<H::MTE2_V>(0);
+            queue[V].push_back([&,version]{assert(ubOwner==version);return true;});
+            SetFlag<H::V_MTE3>(0); WaitFlag<H::V_MTE3>(0);
+            queue[M3].push_back([&,version]{assert(ubOwner==version);lastStored=version;return true;});
+            Aiv1ActivationUb::Release();
+        }
+    }
+    Aiv1ActivationUb::Finish();
+    run_until([]{for(auto& q:queue)if(!q.empty())return false;return true;});
+    assert(lastStored==issued);
+    for(auto& domain:flag) for(bool f:domain) assert(!f);
     // Zero-activation invocation also returns its one initial credit.
     Aiv1ActivationUb::Init(); Aiv1ActivationUb::Finish();
     run_until([]{for(auto& q:queue)if(!q.empty())return false; return true;});

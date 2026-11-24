@@ -5,7 +5,8 @@
 ## 支持范围
 
 - 主要入口：Ascend950、MTE/SHMEM、非量化Combine、SwiGLU、FP8激活/FP4权重，推理用途。
-- 当前A8W4 launcher仅允许**无共享专家**；Python参数、共享专家stage与历史测试仍有相关结构，不代表当前入口可发射共享专家。
+- 本兼容工作树在 A8W4 routed 路径接入 FP8 共享专家，并增加显式 clamp 传递。
+  原 main 的已验证范围与本候选的待验收能力必须分开，见 [DeepInfer 兼容状态](DEEPINFER_COMPATIBILITY.md)。
 - A8W8保留自己的原有入口和策略，不随本次A8W4整理改动。
 - BS输入上限65536；每个shape仍须通过GM/SHMEM/UB容量检查，不保证上限用例一定能分配或发射。
 

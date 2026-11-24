@@ -214,6 +214,7 @@ def run(args, config, group):
         measurement="full_moe",
         api="fp8_fp4_mega_moe",
         numerical_contract="ascend_post_gmm2_route_weight_v1",
+        weight_storage=dict(routed="FP4_E2M1", shared="FP8_E4M3"),
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
     )
@@ -226,9 +227,12 @@ def run(args, config, group):
         **model,
     )
 
-    def device_pair(pair):
+    def device_pair(pair, *, fp8=False):
         data, scale = pair
-        return (torch.from_numpy(data).npu(), torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
+        weight = torch.from_numpy(data).npu()
+        if fp8:
+            weight = weight.view(torch.float8_e4m3fn)
+        return (weight, torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
 
     if args.timer and not buffer.timer_enabled:
         raise RuntimeError("Timer requires a W4A8 wheel built with DEEPEP_MEGAMOE_TIMER=ON")
@@ -239,9 +243,10 @@ def run(args, config, group):
     shared_raw, shared_kwargs = None, {}
     if model["num_shared_experts"]:
         shared_raw = make_weights(
-            model["num_shared_experts"], model["hidden"], model["intermediate_hidden"], config["seed"] + 100000
+            model["num_shared_experts"], model["hidden"], model["intermediate_hidden"], config["seed"] + 100000,
+            weight_bits=8,
         )
-        shared = transform_weights_for_mega_moe(*map(device_pair, shared_raw), shared=True)
+        shared = transform_weights_for_mega_moe(*(device_pair(p, fp8=True) for p in shared_raw), shared=True)
         shared_kwargs = dict(shared_l1_weights=shared[0], shared_l2_weights=shared[1])
     for bs in config["bs_values"]:
         case = rank_dir / f"bs_{bs}"

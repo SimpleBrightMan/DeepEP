@@ -43,6 +43,13 @@ __aicore__ inline void LoadTokenUnpermuteWeights(const MoeStageCommonConfig& com
                                                  TokenUnpermuteScratch& scratch, int32_t jobOffset,
                                                  int32_t batchTokenOffset, int32_t batchTokenCount)
 {
+    if (params.tilingData->topkWeightsPrefetch != 0U) {
+        // pre-quant路径已在SwiGLU中应用过，所有Combine实现都必须避免重复加权。
+        Duplicate(scratch.topKWeightsTensor, 1.0F, batchTokenCount * common.topK);
+        SetFlag<HardEvent::V_S>(EVENT_ID0);
+        WaitFlag<HardEvent::V_S>(EVENT_ID0);
+        return;
+    }
     if constexpr (Std::IsSame<TopkWeightsType, float>::value) {
         GlobalTensor<float> topKWeightsGm;
         topKWeightsGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.probsGmAddr));
@@ -87,12 +94,19 @@ __aicore__ inline void LoadMoeExpertInput(const TokenUnpermuteConfig& context, c
 // 累加一个 token 对应的全部 MoE 专家输入。
 template <uint8_t CombineMode, bool TopkWeightsPrefetch>
 __aicore__ inline void AccumulateMoeExpertsForToken(const TokenUnpermuteConfig& context,
-                                                    const MoeStageCommonConfig& common, TokenUnpermuteScratch& scratch,
+                                                    const MoeStageCommonConfig& common, const Params& params,
+                                                    TokenUnpermuteScratch& scratch,
                                                     int32_t tokenIdx, int32_t localIdx,
                                                     const GlobalTensor<bfloat16_t>& expandedX,
                                                     const MegaMoeUnpermuteBufferConfig& bufferConfig)
 {
+    GlobalTensor<int32_t> routeIds;
+    routeIds.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.expertIdxGmAddr));
+    bool hasRoutedValue = false;
     for (int32_t expertIdx = 0; expertIdx < static_cast<int32_t>(common.topK); ++expertIdx) {
+        // -1不产生远端Combine写回，必须跳过；读取未初始化槽再乘零仍可能传播NaN。
+        if (params.tilingData->variableTokenCounts != 0U &&
+            routeIds.GetValue(static_cast<uint64_t>(tokenIdx) * common.topK + expertIdx) < 0) continue;
         int32_t accumulationItemIdx = localIdx * static_cast<int32_t>(common.topK + common.sharedExpertNum) + expertIdx;
         int32_t inputBufferIdx = accumulationItemIdx % bufferConfig.inputBufferCount;
         TEventID event = static_cast<TEventID>(inputBufferIdx);
@@ -106,7 +120,7 @@ __aicore__ inline void AccumulateMoeExpertsForToken(const TokenUnpermuteConfig& 
         SetFlag<HardEvent::S_V>(event);
         WaitFlag<HardEvent::S_V>(event);
         PipeBarrier<PIPE_V>();
-        if (expertIdx == 0) {
+        if (!hasRoutedValue) {
             {
                 float expertScale = scratch.topKWeightsTensor.GetValue(localIdx * common.topK + expertIdx);
                 Muls(scratch.dataResFp32Tensor, dataInFp32, expertScale, common.tokenHiddenDim);
@@ -120,7 +134,12 @@ __aicore__ inline void AccumulateMoeExpertsForToken(const TokenUnpermuteConfig& 
             Add(scratch.dataResFp32Tensor, scratch.dataResFp32Tensor, dataInFp32, common.tokenHiddenDim);
             PipeBarrier<PIPE_V>();
         }
+        hasRoutedValue = true;
         SetFlag<HardEvent::V_MTE2>(event);
+    }
+    if (!hasRoutedValue) {
+        Duplicate(scratch.dataResFp32Tensor, 0.0F, common.tokenHiddenDim);
+        PipeBarrier<PIPE_V>();
     }
 }
 
@@ -184,7 +203,7 @@ __aicore__ inline void ProcessTokenUnpermuteBatch(
     }
     for (int32_t localIdx = 0; localIdx < batchTokenCount; ++localIdx) {
         int32_t tokenIdx = jobOffset + batchTokenOffset + localIdx;
-        AccumulateMoeExpertsForToken<CombineMode, TopkWeightsPrefetch>(context, common, scratch, tokenIdx, localIdx,
+        AccumulateMoeExpertsForToken<CombineMode, TopkWeightsPrefetch>(context, common, params, scratch, tokenIdx, localIdx,
                                                                        expandedX, bufferConfig);
         for (uint32_t sharedExpertIdx = 0; sharedExpertIdx < common.sharedExpertNum; ++sharedExpertIdx) {
             AccumulateSharedExpertForToken<Gmm1TileM>(common, params, scratch, tokenIdx, localIdx, sharedExpertIdx,
@@ -264,7 +283,7 @@ __aicore__ inline bool TryFusedTokenUnpermute(const MoeStageCommonConfig& common
     uint32_t chunk = (capacity / 128U) * 128U;
     chunk = chunk < common.tokenHiddenDim ? chunk : common.tokenHiddenDim;
     // 非整向量尾部保留原实现；不能越界读GM或使用未初始化的BF16 lane。
-    if (common.sharedExpertNum != 0U || common.tokenHiddenDim % 128U != 0U || chunk == 0U ||
+    if (params.tilingData->variableTokenCounts != 0U || common.sharedExpertNum != 0U || common.tokenHiddenDim % 128U != 0U || chunk == 0U ||
         common.topK > 65535U) return false;
     const uint32_t slotElements = common.topK * chunk;
     LocalTensor<bfloat16_t> packed(TPosition::VECCALC, 0U, 2U * slotElements);

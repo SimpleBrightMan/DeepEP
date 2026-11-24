@@ -159,6 +159,7 @@ protected:
     static constexpr bool ENABLE_A8W4 =
         Std::IsSame<Weight1Type, fp4x2_e2m1_t>::value && Std::IsSame<QuantOutType, fp8_e4m3fn_t>::value;
     static_assert(ENABLE_A8W4, "This orchestration base is W4A8 only; A8W8 has its own implementation");
+    using SharedWeightType = __fp8e4m3;  // 共享专家独立使用原生FP8，不继承路由FP4存储类型。
     static constexpr uint32_t GMM1_TILE_M = L1_TILE_M_256;
     // 只缩小激活私有工作区，不改变GMM tile或ready计数粒度。
     static constexpr uint32_t EPILOGUE_TILE_M = Aiv1ResidentUbLayout::ActivationRows;
@@ -178,8 +179,16 @@ protected:
 
     using BlockEpilogue =
         BlockEpilogueActivationMxQuant<ActivationQuantOutType, bfloat16_t, EPILOGUE_TILE_M, L1_TILE_N, false>;
-    using SharedBlockEpilogue =
-        BlockEpilogueActivationMxQuant<ActivationQuantOutType, bfloat16_t, L1_TILE_M_256, L1_TILE_N, false>;
+    // 共享与路由激活串行复用同一64KiB区，不能沿用旧256行共享scratch覆盖常驻通信槽。
+    using SharedBlockEpilogue = BlockEpilogue;
+    static constexpr auto ACTIVATION_UB =
+        Detail::BuildActivationMxQuantUbOffsets<bfloat16_t, EPILOGUE_TILE_M, L1_TILE_N, false>();
+    static_assert(ACTIVATION_UB.secondInputOffsetBytes +
+                      ACTIVATION_UB.firstInputElementCapacity * sizeof(bfloat16_t) <=
+                  Aiv1ResidentUbLayout::ActivationBytes);
+    static_assert(ACTIVATION_UB.reciprocalScaleOffsetBytes +
+                      ACTIVATION_UB.scaleElementCapacity * sizeof(uint16_t) <=
+                  Aiv1ResidentUbLayout::ActivationBytes);
     BlockEpilogue epilogueOp_;
     SharedBlockEpilogue sharedEpilogueOp_;
     TokenDispatchScratch<ActivationType> tokenDispatchScratch_;
@@ -242,7 +251,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Init(
     worldSize_ = tilingData->epWorldSize;
     moeExpertPerRank_ = tilingData->moeExpertPerRank;
     sharedExpertNum_ = tilingData->sharedExpertNum;
-    inputMode_ = SelectInputPreparationMode(ENABLE_A8W4, sharedExpertNum_, tilingData->bs);
+    inputMode_ = SelectInputPreparationMode(ENABLE_A8W4, sharedExpertNum_, tilingData->bs,
+                                           tilingData->variableTokenCounts != 0U);
     mGroupsPerWave_ = tilingData->mGroupsPerWave;
     gmm2PingPongIdx_ = 0;
     mc2Context_ = reinterpret_cast<__gm__ Mc2MoeContext*>(context);
@@ -274,7 +284,9 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Init(
                       .actMode = tilingData->actMode,
                       .actSubMode = tilingData->actSubMode,
                       .activationAlpha = tilingData->activationAlpha,
-                      .activationBeta = tilingData->activationBeta});
+                      .activationBeta = tilingData->activationBeta,
+                      .routeWeightBeforeQuant = tilingData->topkWeightsPrefetch != 0U,
+                      .deepInferQuant = tilingData->topkWeightsPrefetch != 0U});
     commonConfig_ = {.rankId = rankId_,
                      .worldSize = worldSize_,
                      .moeExpertPerRank = moeExpertPerRank_,
@@ -498,7 +510,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm1
     uint16_t pingpongIdx = 0U;
     GmmRuntimeState runtimeState{startBlockIdx, vecSetSyncCom, pingpongIdx};
     for (uint32_t sharedExpertIdx = 0U; sharedExpertIdx < sharedExpertNum_; ++sharedExpertIdx) {
-        UpdateSharedExpertGmm1GlobalBuffer<ActivationType, Weight1Type, ActivationQuantOutType, QuantScaleOutType,
+        UpdateSharedExpertGmm1GlobalBuffer<ActivationType, SharedWeightType, ActivationQuantOutType, QuantScaleOutType,
                                            ENABLE_A8W4>(commonConfig_, gmmExecutionConfig_, params_.workspaceInfo,
                                                         sharedWeightTensorListAddrs_, sharedEpilogueOp_, gmmAddrInfo,
                                                         sharedExpertIdx);
@@ -510,8 +522,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm1
             // Shared activation uses its own completion protocol, never the routed tile sequence.
             gmmAddrInfo.gmmToEpilogueFlag = nullptr;
         }
-        RunGmm1A8W4<QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType, GMM1_TILE_M,
-                    L1_TILE_M_256, true>(sharedEpilogueOp_, params_, problemShape, gmmAddrInfo, startBlockIdx,
+        RunGmm1A8W4<QuantOutType, SharedWeightType, bfloat16_t, QuantScaleOutType, QuantScaleOutType, GMM1_TILE_M,
+                    EPILOGUE_TILE_M, true>(sharedEpilogueOp_, params_, problemShape, gmmAddrInfo, startBlockIdx,
                                          gmm1TileReadySequence, gmmExecutionConfig_.blockJob,
                                          sharedExpertIdx * commonConfig_.tokenNum, sharedExpertIdx);
         if constexpr (ENABLE_A8W4) {
@@ -528,7 +540,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm1
     }
 }
 
-// Dispatch / 路由 SwiGLU / Combine 复用 UB；每次切回共享激活都必须重新绑定 scratch 和输出视图。
+// 共享与路由激活复用低64KiB；通信区不重叠。切回共享时重新绑定独立的GM输出视图。
 template <TemplateMegaMoeTypeClass>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::InitSharedActivation(ProblemShape& shape)
 {
@@ -539,7 +551,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::InitSharedActivation(Pr
         .actMode = params_.tilingData->actMode,
         .actSubMode = params_.tilingData->actSubMode,
         .activationAlpha = params_.tilingData->activationAlpha,
-        .activationBeta = params_.tilingData->activationBeta};
+        .activationBeta = params_.tilingData->activationBeta,
+        .deepInferQuant = params_.tilingData->topkWeightsPrefetch != 0U};
     sharedEpilogueOp_.Init(epilogueParams);
     Get<M_VALUE>(shape) = commonConfig_.tokenNum;
     Get<N_VALUE>(shape) = commonConfig_.gmm1OutputDim;
@@ -571,16 +584,16 @@ __aicore__ inline bool MegaMoe<TemplateMegaMoeTypeFunc>::TryRunSharedExpertActiv
         ProblemShape shape;
         InitSharedActivation(shape);
         GMMAddrInfo addr{};
-        UpdateSharedExpertGmm1GlobalBuffer<ActivationType, Weight1Type, ActivationQuantOutType, QuantScaleOutType,
+        UpdateSharedExpertGmm1GlobalBuffer<ActivationType, SharedWeightType, ActivationQuantOutType, QuantScaleOutType,
                                            ENABLE_A8W4>(commonConfig_, gmmExecutionConfig_, params_.workspaceInfo,
                                                         sharedWeightTensorListAddrs_, sharedEpilogueOp_, addr,
                                                         cursor.expert);
         timer_.SetWave(AscendTimer::NO_WAVE);
         timer_.SetSlice(cursor.expert, 0U, commonConfig_.tokenNum);
         addr.timer = timer_.Enabled() ? &timer_ : nullptr;
-        RunReadyGmm1ActivationTileA8W4<QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
+        RunReadyGmm1ActivationTileA8W4<QuantOutType, SharedWeightType, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
                                        GMM1_TILE_M>(sharedEpilogueOp_, shape, addr, gmmExecutionConfig_.blockJob,
-                                                    cursor.nextTile, 0U, AscendTimer::AIV_SHARED_SWIGLU);
+                                                    cursor.nextTile, 0U, AscendTimer::AIV_SHARED_SWIGLU, true);
         timer_.ClearSlice();
         cursor.nextTile += blockNum_;
         if (cursor.nextTile >= cursor.tileCount) {
@@ -642,7 +655,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm2
     GmmRuntimeState runtimeState{startBlockIdx, vecSetSyncCom, gmm2PingPongIdx_};
     GMMAddrInfo gmmAddrInfo{};
     for (uint32_t sharedExpertIdx = 0U; sharedExpertIdx < sharedExpertNum_; ++sharedExpertIdx) {
-        UpdateSharedExpertGmm2GlobalBuffer<ActivationQuantOutType, Weight1Type, QuantScaleOutType, GMM1_TILE_M>(
+        UpdateSharedExpertGmm2GlobalBuffer<ActivationQuantOutType, SharedWeightType, QuantScaleOutType, GMM1_TILE_M>(
             commonConfig_, gmmExecutionConfig_, params_.workspaceInfo, sharedWeightTensorListAddrs_, gmmAddrInfo,
             sharedExpertIdx);
         if constexpr (ENABLE_A8W4) {
@@ -650,8 +663,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm2
             timer_.SetSlice(sharedExpertIdx, 0U, commonConfig_.tokenNum);
             gmmAddrInfo.timer = timer_.Enabled() ? &timer_ : nullptr;
         }
-        RunGmm2A8W4<ActivationQuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType, GMM1_TILE_M,
-                    false, true>(problemShape, gmmAddrInfo, startBlockIdx, gmmExecutionConfig_.blockJob,
+        RunGmm2A8W4<ActivationQuantOutType, SharedWeightType, bfloat16_t, QuantScaleOutType, QuantScaleOutType, GMM1_TILE_M,
+                    true, true>(problemShape, gmmAddrInfo, startBlockIdx, gmmExecutionConfig_.blockJob,
                                  commonConfig_.tokenNum, 0U);
         if constexpr (ENABLE_A8W4) {
             timer_.ClearSlice();

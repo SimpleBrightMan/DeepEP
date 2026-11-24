@@ -15,6 +15,7 @@
 
 #include "resource.hpp"
 #include "a8w4_k_plan.hpp"
+#include "weight_copy_plan.hpp"
 #include "../common/gmm1_async_completion.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/coord.hpp"
@@ -31,7 +32,7 @@ namespace Catlass::Gemm::Block {
 
 // Based on CATLASS example 74. Only AIV0 produces the complete L1 B tile.
 template <class DispatchPolicy_, class L1TileShape_, class L0TileShape_, class ElementA_, class ElementB_,
-          class ElementC_, class ElementBias_, class TileCopy_,
+          class ElementC_, class ElementBias_, class TileCopy_, bool PackedWeight = true,
           class TileMmad_ =
               Gemm::Tile::TileMmadTla<typename DispatchPolicy_::ArchTag, ElementA_, typename TileCopy_::LayoutTagL1A>>
 struct MegaMoeBlockMmadA8W4 {
@@ -394,12 +395,12 @@ public:
         const uint32_t kb = kPlan.kb;
         const uint32_t kL1Loop = CeilDiv(kBlockActual, kb);
         // 最后K衔接：一个N半块完成累加就发FIX，不等另一半的MMAD提交。
-        // 回调只负责输出；保持scale=64、父L0C stride和每半块的unit flag。
+        // FP4 位展开需补偿64倍；原生 FP8 不经过展开，FIX 必须保持1倍。
         auto emitHalf = [&](const auto& accumulator, uint32_t column, uint32_t columns) __aicore__ {
             auto destination = GetTile(tensorC, tla::MakeCoord(0U, column),
                                        tla::MakeShape(mBlockActual, columns));
             typename TileCopy::template CopyL0CToDst<decltype(destination)> copy;
-            copy.params.scale = 64;
+            copy.params.scale = MegaMoeImpl::GmmKernel::WeightFixScale(PackedWeight);
             copy(destination, accumulator, 0b11);
         };
         for (uint32_t kL1Idx = 0; kL1Idx < kL1Loop; ++kL1Idx) {
@@ -611,7 +612,7 @@ public:
             if (mL1Actual <= 128U) return;  // 两个N半块已在最后K中各提交一次FIX。
         }
         // copy block out
-        copyL0CToDst.params.scale = 64;
+        copyL0CToDst.params.scale = MegaMoeImpl::GmmKernel::WeightFixScale(PackedWeight);
         if constexpr (!ENABLE_UNIT_FLAG) {
             AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);
             AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventList[l0CListId]);

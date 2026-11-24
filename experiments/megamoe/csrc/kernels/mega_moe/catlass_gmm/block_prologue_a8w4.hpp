@@ -15,6 +15,7 @@
 #include "resource.hpp"
 #include "a8w4_k_plan.hpp"
 #include "packed_weight_tiles.hpp"
+#include "weight_copy_plan.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/coord.hpp"
 #include "catlass/numeric_size.hpp"
@@ -35,6 +36,7 @@ public:
     using ElementOut = typename OutType_::Element;
     using LayoutIn = typename InType_::Layout;
     using LayoutOut = typename OutType_::Layout;
+    static constexpr bool PACKED_WEIGHT = std::is_same_v<LayoutIn, layout::Weight4BitnZ>;
     using TileShapeL1 = TileShapeL1_;
     using TileCopy = TileCopy_;
     using LayoutPrologueB = typename TileCopy::LayoutPrologueB;
@@ -58,7 +60,8 @@ public:
         __ubuf__ ElementOut* weightOutUbAddr;
     };
 
-    static_assert(std::is_same_v<LayoutIn, layout::Weight4BitnZ>, "MegaMoE requires packed NZ weights");
+    static_assert(PACKED_WEIGHT || (std::is_same_v<LayoutIn, layout::nZ> && std::is_same_v<ElementIn, __fp8e4m3>),
+                  "MegaMoE weights require packed FP4 NZ or FP8 NZ");
     static_assert(tla::get<1>(TileShapeL1{}) * tla::get<2>(TileShapeL1{}) <= 64 * 1024,
                   "Single-AIV weight output exceeds its UB stage");
     static_assert(L1B_STAGES == Buffers::BStages, "AIC/AIV0 must share the B stage count");
@@ -75,16 +78,24 @@ public:
             l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(
                 Buffers::BBase + i * Buffers::BBytes);
         }
-        // 三个 packed 输入槽 [0,96KiB)，两个 FP8 输出槽 [96,224KiB)。
-        // 输入只等 V 读完，输出只等 MTE3 读完，两套游标/credit 不再绑定。
-        for (uint32_t i = 0; i < UB_INPUT_STAGES; i++) {
-            ubCastInTensor[i] = params.resource.ubBuf.template GetBufferByByte<ElementIn>(i * UB_INPUT_BYTES);
-            ubInputEventList[i] = i;
-        }
-        for (uint32_t i = 0; i < UB_OUTPUT_STAGES; i++) {
-            ubCastOutTensor[i] = params.resource.ubBuf.template GetBufferByByte<ElementOut>(
-                UB_INPUT_STAGES * UB_INPUT_BYTES + i * 256U);
-            ubOutputEventList[i] = i;
+        if constexpr (!PACKED_WEIGHT) {
+            // 共享 FP8 只搬运不解包；两个64KiB槽由 MTE3->MTE2 保护，未占用 AIV1 UB。
+            for (uint32_t i = 0; i < UB_OUTPUT_STAGES; ++i) {
+                ubCastOutTensor[i] = params.resource.ubBuf.template GetBufferByByte<ElementOut>(i * UB_OUTPUT_BYTES);
+                ubOutputEventList[i] = i;
+            }
+        } else {
+            // 三个 packed 输入槽 [0,96KiB)，两个 FP8 输出槽 [96,224KiB)。
+            // 输入只等 V 读完，输出只等 MTE3 读完，两套游标/credit 不再绑定。
+            for (uint32_t i = 0; i < UB_INPUT_STAGES; i++) {
+                ubCastInTensor[i] = params.resource.ubBuf.template GetBufferByByte<ElementIn>(i * UB_INPUT_BYTES);
+                ubInputEventList[i] = i;
+            }
+            for (uint32_t i = 0; i < UB_OUTPUT_STAGES; i++) {
+                ubCastOutTensor[i] = params.resource.ubBuf.template GetBufferByByte<ElementOut>(
+                    UB_INPUT_STAGES * UB_INPUT_BYTES + i * 256U);
+                ubOutputEventList[i] = i;
+            }
         }
         if (activate) {
             Activate();
@@ -98,11 +109,17 @@ public:
             return;
         }
         l1BListId = ubInputListId = ubOutputListId = 0;
-        for (uint32_t i = 0; i < UB_INPUT_STAGES; ++i) {
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[i]);
-        }
-        for (uint32_t i = 0; i < UB_OUTPUT_STAGES; ++i) {
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubOutputEventList[i]);
+        if constexpr (!PACKED_WEIGHT) {
+            for (uint32_t i = 0; i < UB_OUTPUT_STAGES; ++i) {
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(ubOutputEventList[i]);
+            }
+        } else {
+            for (uint32_t i = 0; i < UB_INPUT_STAGES; ++i) {
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[i]);
+            }
+            for (uint32_t i = 0; i < UB_OUTPUT_STAGES; ++i) {
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubOutputEventList[i]);
+            }
         }
         active_ = true;
     }
@@ -124,11 +141,17 @@ public:
         if (!active_) {
             return;
         }
-        for (uint32_t i = 0; i < UB_INPUT_STAGES; i++) {
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[i]);
-        }
-        for (uint32_t i = 0; i < UB_OUTPUT_STAGES; i++) {
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubOutputEventList[i]);
+        if constexpr (!PACKED_WEIGHT) {
+            for (uint32_t i = 0; i < UB_OUTPUT_STAGES; ++i) {
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(ubOutputEventList[i]);
+            }
+        } else {
+            for (uint32_t i = 0; i < UB_INPUT_STAGES; i++) {
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(ubInputEventList[i]);
+            }
+            for (uint32_t i = 0; i < UB_OUTPUT_STAGES; i++) {
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ubOutputEventList[i]);
+            }
         }
         active_ = false;
     }
@@ -163,7 +186,12 @@ public:
                                       tla::MakeShape(actualK, columns));
                 auto l1Tile = GetTile(tensorL1B, tla::MakeCoord(0, 0),
                                       tla::MakeShape(actualK, columns));
-                ProcessL1Nz(l1Tile, gmTile, kSize, kLoopIdx * kL1Size, weightN + n);
+                if constexpr (PACKED_WEIGHT) {
+                    ProcessL1Nz(l1Tile, gmTile, kSize, kLoopIdx * kL1Size, weightN + n);
+                } else {
+                    CopyFp8NzToL1(l1Tile, gmTile, tla::get<1>(params.layoutPrologueB.originShape()),
+                                   weightN + n, kLoopIdx * kL1Size, actualK, columns);
+                }
                 ubInputListId = (ubInputListId + 1U) % UB_INPUT_STAGES;
                 ubOutputListId = (ubOutputListId + 1U) % UB_OUTPUT_STAGES;
                 // 小M每K窗口依次发布N0/N128；每个独立64KiB槽均有自己的full/empty。
@@ -171,6 +199,30 @@ public:
                 l1BListId = (l1BListId + 1) % L1B_STAGES;
             }
         }
+    }
+
+    template <class TensorOut, class TensorIn>
+    __aicore__ inline void CopyFp8NzToL1(const TensorOut& out, const TensorIn& in,
+                                        uint32_t fullN, uint32_t startN, uint32_t startK,
+                                        uint32_t tileK, uint32_t tileN)
+    {
+        const uint16_t event = ubOutputEventList[ubOutputListId];
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event);
+        const auto plan = MegaMoeImpl::GmmKernel::MakeFp8NzCopyPlan(fullN, startN, startK, tileK, tileN);
+        AscendC::DataCopyExtParams copy{};
+        copy.blockCount = plan.blocks;
+        copy.blockLen = plan.blockBytes;
+        copy.srcStride = plan.sourceGapBytes;
+        copy.dstStride = 0;
+        AscendC::DataCopyPadExtParams<ElementOut> padding{};
+        AscendC::DataCopyPad(ubCastOutTensor[ubOutputListId], in.data()[plan.sourceOffset], copy, padding);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(event);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(event);
+        // L1仍由配对AIC的最后一次MTE1读取归还，不能用本核DMA完成替代。
+        AscendC::CrossCoreWaitFlag<SYNC_MODE, PIPE_MTE3>(AIC_SYNC_AIV_FLAG + l1BListId);
+        const auto dstOffset = out.layout()(out.coord());
+        AscendC::DataCopy(out.data()[dstOffset], ubCastOutTensor[ubOutputListId], tileK * tileN);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(event);
     }
 
     template <class TensorOut, class TensorIn>

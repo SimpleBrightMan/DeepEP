@@ -520,7 +520,8 @@ __aicore__ inline void RunGmm2A8W4(const AscendC::Shape<int64_t, int64_t, int64_
     static_assert(!SourceGmm1Fused || (IsWaveFlagGrained && !IsShared),
                   "Fused GMM1 readiness requires routed wave counters");
     static_assert(std::is_same_v<ElementA, __fp8e4m3>, "Activation must be __fp8e4m3");
-    static_assert(std::is_same_v<ElementB, __fp4e2m1x2>, "Weight must be __fp4e2m1x2");
+    static_assert(std::is_same_v<ElementB, __fp4e2m1x2> || std::is_same_v<ElementB, __fp8e4m3>,
+                  "Weight must be packed FP4 or native FP8");
 
     using GmmConfig = GmmKernel::Config<true, ElementA, ElementB, ElementC, ElementMxScaleA, ElementMxScaleB, false,
                                         IsShared, false, IsWaveFlagGrained, SourceGmm1Fused>;

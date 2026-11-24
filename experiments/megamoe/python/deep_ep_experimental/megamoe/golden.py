@@ -46,6 +46,7 @@ def contract(config, world, bs, input_kind, routing, check_tokens):
         routing=routing,
         check_tokens=check_tokens,
         numerical_contract="ascend_post_gmm2_route_weight_v1",
+        weight_storage=dict(routed="FP4_E2M1", shared="FP8_E4M3"),
     )
 
 
@@ -159,13 +160,14 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
                 yield token, weights[token, slot], pair
         shared = model["num_shared_experts"]
         if shared:
-            raw = make_weights(shared, model["hidden"], model["intermediate_hidden"], config["seed"] + 100000)
+            raw = make_weights(shared, model["hidden"], model["intermediate_hidden"], config["seed"] + 100000,
+                               weight_bits=8)
             for expert in range(shared):
                 yield np.arange(len(x)), None, tuple((data[expert], scale[expert]) for data, scale in raw)
 
     def forward(job):
         token, route_weight, pair = job
-        w1, w2 = map(unpack_weight, pair)
+        w1, w2 = (unpack_weight(p, weight_bits=8 if route_weight is None else 4) for p in pair)
         result = np.empty((len(token), model["hidden"]), dtype=np.float32)
         for start in range(0, len(token), chunk_tokens):
             stop = start + chunk_tokens

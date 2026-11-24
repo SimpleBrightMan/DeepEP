@@ -13,7 +13,7 @@ from deep_ep_experimental.megamoe.api import _MegaRuntime
 
 
 @pytest.mark.parametrize("backend", ["store", "gloo"])
-@pytest.mark.parametrize("case", ["same-host", "different-host", "missing-host", "mapping", "device", "engine"])
+@pytest.mark.parametrize("case", ["same-host", "different-host", "missing-host", "mapping", "invalid-mapping", "device", "engine"])
 def test_megamoe_bootstrap(monkeypatch, backend, case):
     monkeypatch.setattr(_runtime, "endpoint", lambda: "tcp://127.0.0.1:19091")
     monkeypatch.setattr(_runtime, "_OWNER", None)
@@ -47,6 +47,8 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
             peer[4] = 0
         elif case == "mapping":
             peer[5] += 1
+        elif case == "invalid-mapping":
+            peer[6] = -1
         elif case == "device":
             peer[6] = 0
         elif case == "engine":
@@ -72,7 +74,7 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
 
     errors = {
         "missing-host": "host identity is required",
-        "mapping": "common visible-device mapping",
+        "invalid-mapping": "Invalid visible-device mapping",
         "device": "distinct local NPU",
         "engine": "runtime engines",
     }
@@ -87,3 +89,9 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
             assert created[0][:3] == (0, 2, 2 << 20)
         finally:
             runtime.close()
+
+
+@pytest.mark.parametrize('logical,visible,expected',[(0,'',0),(0,'7',7),(1,'4,2',2),
+    (0,'0,0',-1),(2,'4,2',-1),(0,'x',-1),(0,'-1',-1)])
+def test_physical_device_mapping(logical,visible,expected):
+    assert _runtime._physical_device_id(logical,visible)==expected

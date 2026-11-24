@@ -321,7 +321,7 @@ grad_x, grad_topk_weights = dispatch_backward(grad_recv_x, grad_recv_weights, ha
 
 MegaMoE 将 token 分发、两次专家矩阵计算、SwiGLU、量化和结果归并融合为一次前向调用。Prefill 与 Decode 共用以下接口。
 
-下面展示 FP8 输入、FP4 权重、每卡 1 个共享专家的集成流程。通过 `torchrun` 启动，所有 rank 设置相同的 `DEEPEP_SHMEM_ENDPOINT=tcp://<主节点IPv4>:<空闲端口>`，端口与 `MASTER_PORT` 分开。
+下面展示 FP8 输入、路由 FP4 / 共享 FP8 权重、每卡 1 个共享专家的集成流程。通过 `torchrun` 启动，所有 rank 设置相同的 `DEEPEP_SHMEM_ENDPOINT=tcp://<主节点IPv4>:<空闲端口>`，端口与 `MASTER_PORT` 分开。
 模型需提供当前 NPU 上的 `x_fp8`、`x_sf`、`topk_idx`、`topk_weights`，以及原始 ND 布局的路由和共享专家 `(weight, scale)` 权重对；形状与类型见 [MegaMoE 输入和权重布局](experiments/megamoe/README.md)。
 
 ```python

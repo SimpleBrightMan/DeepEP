@@ -31,7 +31,7 @@ __aicore__ inline QuantProcessConfig CreateQuantProcessConfig(uint32_t tokenHidd
         Ops::Base::CeilAlign(tokenHiddenDim / AElemsPerByte, static_cast<uint32_t>(ALIGN_256)) * sizeof(ActivationType);
     uint32_t quantScaleAlignBytes = Ops::Base::CeilAlign(
         quantScaleNumAlignPerToken * static_cast<uint32_t>(sizeof(QuantScaleOutType)), static_cast<uint32_t>(ALIGN_32));
-    uint32_t quantTokenScaleAlignBytes = quantTokenAlignBytes + quantScaleAlignBytes;
+    uint32_t quantTokenScaleAlignBytes = quantTokenAlignBytes + quantScaleAlignBytes + ALIGN_32;
 
     return {quantTokenAlignBytes, quantScaleAlignBytes, quantTokenScaleAlignBytes, quantScaleNumAlignPerToken};
 }
@@ -54,7 +54,12 @@ __aicore__ inline void LoadTopkWeightsToUb(const Params& params, const QuantProc
                                            const LocalTensor<ActivationType>& xOutTensor, int32_t tokenIndex,
                                            TEventID event)
 {
-
+    if (params.tilingData->topkWeightsPrefetch == 0U) return;
+    GlobalTensor<float> weights;
+    weights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.probsGmAddr));
+    auto dst = xOutTensor[config.quantTokenAlignBytes + config.quantScaleAlignBytes].template ReinterpretCast<float>();
+    DataCopyPad(dst, weights[static_cast<uint64_t>(tokenIndex) * params.tilingData->topK],
+                {1U, params.tilingData->topK * static_cast<uint32_t>(sizeof(float)), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
 }
 
 // 原型：MegaMoe::QuantProcessInRank。量化一个逻辑 AIV 任务负责的本卡 token。
@@ -95,6 +100,14 @@ __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidde
         DataCopyPad(buffer[config.quantTokenAlignBytes], scales[row * scaleBytes],
                     {static_cast<uint16_t>(count), scaleBytes, 0U, scaleGap, 0U},
                     {false, 0U, 0U, 0U});
+        if (params.tilingData->topkWeightsPrefetch != 0U) {
+            GlobalTensor<uint8_t> weights;
+            weights.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(params.probsGmAddr));
+            DataCopyPad(buffer[config.quantTokenAlignBytes + config.quantScaleAlignBytes],
+                        weights[row * params.tilingData->topK * sizeof(float)],
+                        {static_cast<uint16_t>(count), params.tilingData->topK * static_cast<uint32_t>(sizeof(float)), 0U,
+                         (config.quantTokenScaleAlignBytes - ALIGN_32) / ALIGN_32, 0U}, {false, 0U, 0U, 0U});
+        }
         SetFlag<HardEvent::MTE2_MTE3>(event);
         WaitFlag<HardEvent::MTE2_MTE3>(event);
         DataCopyPad(output[row * config.quantTokenScaleAlignBytes], buffer,

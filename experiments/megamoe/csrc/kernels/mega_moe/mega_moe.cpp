@@ -73,8 +73,8 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
         const auto resident = MegaMoeImpl::MakeAiv1ResidentUbLayout(
             tiling.h, tiling.epWorldSize, tiling.moeExpertPerRank, config.routeItemsPerBatch,
             config.bufferCount, config.copyBufferBytes, slots);
-        // 当前入口不支持共享激活；容量错误在发射NPU前报告。
-        if (tiling.sharedExpertNum != 0U || !resident.valid ||
+        // 共享/路由激活使用同一64KiB credit；通信区容量错误在发射NPU前报告。
+        if (!resident.valid ||
             config.bufferCount > MegaMoeImpl::Aiv1AsyncEvents::DispatchSlots ||
             resident.end > ub_bytes || resident.end > 256U * 1024U) {
             throw std::invalid_argument("AIV1 resident UB unsupported: BS=" + std::to_string(tiling.bs) +

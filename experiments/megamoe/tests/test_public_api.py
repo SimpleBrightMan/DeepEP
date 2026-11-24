@@ -118,13 +118,18 @@ def backend(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "torch.distributed", dist)
 
-    def format_cast(t, acl_format, *, customize_dtype, input_dtype):
+    def format_cast(t, acl_format, *, customize_dtype=None, input_dtype=None):
         # 检查实际传入的协议，不能把所有 format_cast 参数都静默忽略。
-        assert t.dtype == "uint8" and acl_format == 29
-        assert customize_dtype == "float8_e4m3fn" and input_dtype == "float4_e2m1fn_x2"
+        assert acl_format == 29
+        fp8 = t.dtype == "float8_e4m3fn"
+        if fp8:
+            assert customize_dtype is None and input_dtype is None
+        else:
+            assert t.dtype == "uint8"
+            assert customize_dtype == "float8_e4m3fn" and input_dtype == "float4_e2m1fn_x2"
         events.append(("format_cast", t))
         t = Tensor(t.data.copy(), t.dtype, t.device)
-        t.npu_format = 50  # FP4 打包成 uint8 后，输出码与请求的29不同。
+        t.npu_format = 51 if fp8 else 50
         return t
 
     monkeypatch.setitem(
@@ -194,6 +199,73 @@ def weights():
     return tuple(api._TilePackedWeightPair(pair) for pair in prepared)
 
 
+@pytest.mark.parametrize("protocol", [8, 9, 10, 11])
+def test_clamp_signature_rejects_old_native_protocol(monkeypatch, protocol):
+    api._extension.cache_clear()
+    monkeypatch.setattr(api, "require_native", lambda _: SimpleNamespace(create_megamoe_runtime=object()))
+    monkeypatch.setattr(api.importlib, "import_module", lambda _: SimpleNamespace(api_protocol=protocol))
+    with pytest.raises(RuntimeError, match="Python/native versions differ"):
+        api._extension()
+    api._extension.cache_clear()
+
+
+def test_prequant_flag_is_frozen_in_prepared_plan(backend, monkeypatch):
+    original = backend.ext.Plan
+    configs = []
+    def plan(*args):
+        configs.append(args)
+        return original(*args)
+    monkeypatch.setattr(backend.ext, "Plan", plan)
+    b = api.SymmBuffer(backend.buffer.group, 4, 17, 2, 1024, 256, route_weight_before_quant=True)
+    try:
+        b.prepare(17)
+        assert configs[-1][-4:] == (-1, True, False, None)
+        assert b.route_weight_before_quant is True
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize("kwargs", [{"num_topk":9,"mma_type":"fp8xfp4","route_weight_before_quant":True},
+                                    {"num_topk":2,"mma_type":"fp8xfp8","route_weight_before_quant":True},
+                                    {"num_topk":2,"mma_type":"fp8xfp4","route_weight_before_quant":1}])
+def test_prequant_contract_rejected_before_runtime_creation(backend, kwargs):
+    previous=list(backend.events)
+    with pytest.raises(ValueError, match="pre-quant routing|must be bool"):
+        api.SymmBuffer(backend.buffer.group, 32, 17, kwargs['num_topk'], 1024, 256,
+                      **{k:v for k,v in kwargs.items() if k!='num_topk'})
+    assert backend.events == previous
+
+
+def test_ragged_mask_validation_and_plan_contract(backend,monkeypatch):
+    configs=[];original=backend.ext.Plan
+    def plan(*args):
+        configs.append(args);return original(*args)
+    monkeypatch.setattr(backend.ext,'Plan',plan)
+    b=api.SymmBuffer(backend.buffer.group,4,17,2,1024,256,variable_token_counts=True)
+    try:
+        b.topk_idx.data[:]=[-1,-1];b.topk_weights.data[:]=[0,0]
+        b.validate_inputs(1);b.prepare(1)
+        assert configs[-1][-2] is True
+        b.topk_weights.data[0,0]=1
+        with pytest.raises(ValueError,match='invalid routes require zero'):b.validate_inputs(1)
+    finally:b.destroy()
+
+
+def test_retained_graph_plan_survives_shape_switch(backend):
+    b=backend.buffer;b.prepare(17);first=b._plan;b.retain_prepared_plan()
+    b.prepare(1);b.prepare(17)
+    assert b._plan is first
+    assert [e for e in backend.events if isinstance(e,tuple) and e[0]=='prepare']==[('prepare',17),('prepare',1)]
+
+
+def test_compact_preparation_omits_unused_planar_copy(backend):
+    raw=((Tensor(np.zeros((2,512,512)),'uint8'),Tensor(np.full((2,512,16,2),127),'float8_e8m0fnu')),
+         (Tensor(np.zeros((2,1024,128)),'uint8'),Tensor(np.full((2,1024,4,2),127),'float8_e8m0fnu')))
+    l1,l2=api.transform_weights_for_mega_moe(*raw,keep_planar=False)
+    assert isinstance(l1,api._TilePackedWeightPair) and not isinstance(l1,api._RoutedWeightPair)
+    assert len([e for e in backend.events if isinstance(e,tuple) and e[0]=='format_cast'])==2
+
+
 @pytest.mark.parametrize("bf16", [False, True])
 def test_public_workflow_output_stats_timer_and_preparation_reuse(backend, bf16):
     b = backend.buffer
@@ -224,6 +296,25 @@ def test_public_workflow_output_stats_timer_and_preparation_reuse(backend, bf16)
     assert b.workspace_bytes == 4096 and b.symmetric_buffer_bytes == 2 << 20
     b.prepare(1)
     assert b._plan.bs == 1 and b._plan_bs == 1
+
+
+def test_activation_clamp_is_explicit_per_launch(backend):
+    b = backend.buffer
+    y = Tensor(np.zeros((17, 1024)), "bfloat16")
+    for clamp in (None, 10.0, 2, None):
+        api.fp8_fp4_mega_moe(y, *weights(), b, activation_clamp=clamp)
+    calls = [event[1] for event in backend.events if isinstance(event, tuple) and event[0] == "launch"]
+    assert [call[-2] for call in calls] == [None, 10.0, 2.0, None]
+    assert all(call[-1] is y for call in calls)
+    assert sum(event == ("prepare", 17) for event in backend.events) == 1
+
+
+@pytest.mark.parametrize("clamp", [True, 0, -1, float("nan"), float("inf"), 1e40, "10"])
+def test_invalid_activation_clamp_rejected_before_launch(backend, clamp):
+    y = Tensor(np.zeros((17, 1024)), "bfloat16")
+    with pytest.raises(ValueError, match="activation_clamp"):
+        api.fp8_fp4_mega_moe(y, *weights(), backend.buffer, activation_clamp=clamp)
+    assert not any(isinstance(e, tuple) and e[0] == "launch" for e in backend.events)
 
 
 def test_compute_replay_checks_preparation_and_native_support(backend):
@@ -337,14 +428,71 @@ def test_fp4_and_packed_e8m0_are_reinterpreted_without_numeric_cast(backend, dty
     np.testing.assert_array_equal(planar_scale.data, sf.reshape(1, 512, 2, 2))
 
 
-def test_shared_fp4_preparation_retains_planar_gmm1_and_blocks_gmm2_scales(backend):
+def test_shared_fp8_preparation_retains_planar_weights_and_scales(backend):
     raw = np.arange(512 * 64, dtype=np.uint8).reshape(1, 512, 64)
-    sf = np.arange(512 * 4, dtype=np.uint8).reshape(1, 512, 2, 2)
-    pair = Tensor(raw, "uint8"), Tensor(sf, "float8_e8m0fnu")
+    sf = np.arange(512 * 2, dtype=np.uint8).reshape(1, 512, 1, 2)
+    pair = Tensor(raw, "float8_e4m3fn"), Tensor(sf, "float8_e8m0fnu")
     for idx, (weight, scale) in enumerate(api.transform_weights_for_mega_moe(pair, pair, shared=True)):
         np.testing.assert_array_equal(weight.data, raw)
-        expected_sf = sf if idx == 0 else sf.reshape(1,2,256,2,2).transpose(0,1,3,2,4).reshape(sf.shape)
-        np.testing.assert_array_equal(scale.data, expected_sf)
+        np.testing.assert_array_equal(scale.data, sf)
+        assert weight.dtype == "float8_e4m3fn" and weight.npu_format == 51
+    assert pair[0].npu_format == 2  # 准备不修改原始ND张量。
+
+
+def shared_weights():
+    pairs = []
+    for n, k in ((512, 1024), (1024, 256)):
+        weight = Tensor(np.zeros((2, n, k)), "float8_e4m3fn")
+        weight.npu_format = 51
+        pairs.append((weight, Tensor(np.full((2, n, k // 64, 2), 127), "float8_e8m0fnu")))
+    return pairs
+
+
+def test_mixed_routed_fp4_shared_fp8_reaches_native_without_hot_path_conversion(backend):
+    backend.buffer.num_shared_experts = 2
+    sw1, sw2 = shared_weights()
+    api.fp8_fp4_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), *weights(), backend.buffer,
+                        shared_l1_weights=sw1, shared_l2_weights=sw2)
+    launch = next(e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch")
+    assert launch[9] is sw1[0] and launch[10] is sw2[0]
+    assert not any(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events)
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "int8"])
+def test_shared_fp4_rejected_at_preparation_and_forward(backend, dtype):
+    pair = Tensor(np.zeros((2, 512, 512)), dtype), Tensor(np.full((2, 512, 16, 2), 127), "float8_e8m0fnu")
+    with pytest.raises(TypeError, match="shared weights must be FP8 E4M3"):
+        api.transform_weights_for_mega_moe(pair, pair, shared=True)
+    backend.buffer.num_shared_experts = 2
+    with pytest.raises(TypeError, match="shared_l1_weights: shared weights must be FP8 E4M3"):
+        api.fp8_fp4_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), *weights(), backend.buffer,
+                            shared_l1_weights=pair, shared_l2_weights=pair)
+    assert not any(isinstance(e, tuple) and e[0] == "launch" for e in backend.events)
+
+
+@pytest.mark.parametrize("name", ["shared_l1_weights", "shared_l2_weights"])
+def test_shared_fp8_wrong_shape_rejected_before_launch(backend, name):
+    backend.buffer.num_shared_experts = 2
+    pairs = dict(zip(("l1_weights", "l2_weights", "shared_l1_weights", "shared_l2_weights"),
+                     (*weights(), *shared_weights())))
+    weight, scale = pairs[name]
+    wrong = Tensor(np.zeros((*weight.shape[:-1], weight.shape[-1] // 2)), "float8_e4m3fn")
+    wrong.npu_format = 51
+    pairs[name] = (wrong, scale)
+    with pytest.raises(ValueError, match=rf"{name}: expected FP8 shape"):
+        api.fp8_fp4_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), sym_buffer=backend.buffer, **pairs)
+    assert not any(isinstance(e, tuple) and e[0] == "launch" for e in backend.events)
+
+
+def test_shared_fp8_preparation_rejects_old_nz_and_bad_scale(backend):
+    pairs = shared_weights()
+    with pytest.raises(ValueError, match="prepare shared FP8 from raw ND"):
+        api.transform_weights_for_mega_moe(*pairs, shared=True)
+    for weight, _ in pairs:
+        weight.npu_format = 2
+    pairs[0] = pairs[0][0], Tensor(np.ones((2, 512, 1, 2)), "float8_e8m0fnu")
+    with pytest.raises(ValueError, match="expected E8M0 scales"):
+        api.transform_weights_for_mega_moe(*pairs, shared=True)
 
 
 @pytest.mark.parametrize("n,pairs", [(256,48),(512,112),(1024,2)])
@@ -434,16 +582,27 @@ def test_prepared_fp4_nz_variants_reach_launch(backend, weight_format):
     assert any(isinstance(event, tuple) and event[0] == "launch" for event in backend.events)
 
 
-@pytest.mark.parametrize("name", ["l1_weights", "l2_weights", "shared_l1_weights", "shared_l2_weights"])
+@pytest.mark.parametrize("name", ["l1_weights", "l2_weights"])
 @pytest.mark.parametrize("weight_format", [2, 4, 51, 52, 53, 54])
 def test_invalid_fp4_layout_rejected_with_tensor_context_before_launch(backend, name, weight_format):
     b = backend.buffer
     b.num_shared_experts = 2
-    pairs = dict(zip(("l1_weights", "l2_weights", "shared_l1_weights", "shared_l2_weights"), (*weights(), *weights())))
+    pairs = dict(zip(("l1_weights", "l2_weights", "shared_l1_weights", "shared_l2_weights"), (*weights(), *shared_weights())))
     pairs[name][0].npu_format = weight_format
     with pytest.raises(ValueError, match=rf"{name}:.*got format={weight_format}, dtype=uint8, shape="):
         api.fp8_fp4_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), sym_buffer=b, **pairs)
     assert not any(isinstance(event, tuple) and event[0] == "launch" for event in backend.events)
+
+
+@pytest.mark.parametrize("name", ["shared_l1_weights", "shared_l2_weights"])
+@pytest.mark.parametrize("weight_format", [2, 50, 52])
+def test_shared_fp8_wrong_layout_rejected_before_launch(backend, name, weight_format):
+    backend.buffer.num_shared_experts = 2
+    pairs = dict(zip(("l1_weights", "l2_weights", "shared_l1_weights", "shared_l2_weights"), (*weights(), *shared_weights())))
+    pairs[name][0].npu_format = weight_format
+    with pytest.raises(ValueError, match=rf"{name}: FP8 weights require NZ.*got format={weight_format}"):
+        api.fp8_fp4_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), sym_buffer=backend.buffer, **pairs)
+    assert not any(isinstance(e, tuple) and e[0] == "launch" for e in backend.events)
 
 
 def test_format_cast_returning_nd_fails_at_preparation(backend, monkeypatch):

@@ -144,6 +144,7 @@ __aicore__ inline void Gmm1Aiv1EpilogueTileA8W4(ActivationQuantOp& activationQua
                                                 Te::MakeShape(count, Get<N_VALUE>(actualShape)));
         AscendC::Te::Copy(copyGm2Ub, tensorBlockUbFirst, tensorBlockGmFirst);
         AscendC::Te::Copy(copyGm2Ub, tensorBlockUbSecond, tensorBlockGmSecond);
+        activationQuantOp.LoadRouteWeights(gmmAddrInfo.metaInfoGlobal, mLoc + row, count);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
         Std::tuple<int64_t, int64_t, int64_t, int64_t> epilogueShape{count, Get<N_VALUE>(actualShape), 0, 0};
@@ -300,7 +301,8 @@ __aicore__ inline void RunGmm1A8W4(
     PersistentKernel* persistentKernel = nullptr)
 {
     static_assert(std::is_same_v<ElementA, __fp8e4m3>, "Activation must be __fp8e4m3");
-    static_assert(std::is_same_v<ElementB, __fp4e2m1x2>, "Weight must be __fp4e2m1x2");
+    static_assert(std::is_same_v<ElementB, __fp4e2m1x2> || (IsShared && std::is_same_v<ElementB, __fp8e4m3>),
+                  "Routed weights must be FP4; shared weights may be FP8");
 
     using GmmConfig = GmmKernel::Config<true, ElementA, ElementB, ElementC, ElementMxScaleA, ElementMxScaleB, false,
                                         IsShared, false, IsWaveFlagGrained, FuseGateUp>;
@@ -389,7 +391,7 @@ __aicore__ inline void UpdateMoeExpertGmm1GlobalBuffer(
         gmmAddrInfo.gmm1OutGlobal = workspace.gmm1MmadResPtr + globalTokenStartIndex * n * sizeof(bfloat16_t);
     }
 
-    gmmAddrInfo.metaInfoGlobal = workspace.metaInfoPtr;
+    gmmAddrInfo.metaInfoGlobal = workspace.metaInfoPtr + globalTokenStartIndex * META_INFO_SIZE * sizeof(int32_t);
     gmmAddrInfo.activationToGmm2Flag = reinterpret_cast<__gm__ int32_t*>(workspace.flagActivationToGmm2Ptr) +
                                        expertOffset * syncLayout.activationFlagSlotCountPerExpert +
                                        static_cast<uint64_t>(expertMGroupOffset) * INT_CACHELINE;

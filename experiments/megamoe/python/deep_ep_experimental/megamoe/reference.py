@@ -59,22 +59,33 @@ def dequantize_input(codes, scales):
     return fp8_decode(codes) * np.repeat(scale, 32, axis=-1)
 
 
-def unpack_weight(pair):
+def unpack_weight(pair, *, weight_bits=4):
     packed, scales = pair
     packed = np.asarray(packed, dtype=np.uint8)
-    values = np.empty((*packed.shape[:-1], packed.shape[-1] * 2), dtype=np.float32)
-    values[..., ::2], values[..., 1::2] = FP4[packed & 15], FP4[packed >> 4]
+    if weight_bits == 4:
+        values = np.empty((*packed.shape[:-1], packed.shape[-1] * 2), dtype=np.float32)
+        values[..., ::2], values[..., 1::2] = FP4[packed & 15], FP4[packed >> 4]
+    elif weight_bits == 8:
+        values = fp8_decode(packed)
+    else:
+        raise ValueError("weight_bits must be 4 or 8")
     shape = (*values.shape[:-1], values.shape[-1] // 32)
     scale = np.exp2(np.asarray(scales, dtype=np.int16).reshape(shape) - 127).astype(np.float32)
     return values * np.repeat(scale, 32, axis=-1)
 
 
-def make_weights(experts, hidden, intermediate, seed):
-    """Generate packed FP4 and non-uniform E8M0 scales; never quantize weights on the hot path."""
+def make_weights(experts, hidden, intermediate, seed, *, weight_bits=4):
+    """Generate FP4 routed or FP8 shared weights and non-uniform E8M0 scales off the hot path."""
+    if weight_bits not in (4, 8):
+        raise ValueError("weight_bits must be 4 or 8")
     rng = np.random.default_rng(seed)
     result = []
     for n, k in ((2 * intermediate, hidden), (hidden, intermediate)):
-        packed = rng.integers(0, 256, (experts, n, k // 2), dtype=np.uint8)
+        if weight_bits == 4:
+            packed = rng.integers(0, 256, (experts, n, k // 2), dtype=np.uint8)
+        else:
+            # 含FP4无法表示的FP8值，防止Golden只覆盖FP4展开的退化子集。
+            packed = fp8_encode(rng.uniform(-6, 6, (experts, n, k)).astype(np.float32))
         exponent = int(np.floor(-0.5 * np.log2(k))) - 2
         scales = rng.integers(127 + exponent - 1, 127 + exponent + 2, (experts, n, k // 64, 2), dtype=np.uint8)
         result.append((packed, scales))

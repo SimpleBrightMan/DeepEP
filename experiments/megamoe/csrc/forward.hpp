@@ -23,14 +23,18 @@ class Plan {
 public:
     Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world, int64_t max_tokens,
          bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts, uint64_t symmetric_address,
-         int64_t symmetric_bytes, int64_t local_rank = -1);
+         int64_t symmetric_bytes, int64_t local_rank = -1, bool route_weight_before_quant = false,
+         bool variable_token_counts = false, c10::optional<torch::Tensor> workspace_hint = c10::nullopt);
+
+    torch::Tensor workspace_tensor() const { return workspace_; }
 
     std::tuple<torch::Tensor, torch::Tensor> forward(
         torch::Tensor x, c10::optional<torch::Tensor> x_scales, torch::Tensor topk_ids, torch::Tensor topk_weights,
         torch::Tensor weight1, torch::Tensor weight2, torch::Tensor weight_scales1, torch::Tensor weight_scales2,
         c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> shared_weight1,
         c10::optional<torch::Tensor> shared_weight2, c10::optional<torch::Tensor> shared_weight_scales1,
-        c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<torch::Tensor> out);
+        c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<double> activation_clamp,
+        c10::optional<torch::Tensor> out);
 
     int64_t workspace_bytes() const
     {

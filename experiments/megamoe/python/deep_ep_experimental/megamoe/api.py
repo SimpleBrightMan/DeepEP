@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 import importlib
+import math
+import numbers
 import threading
 from typing import TYPE_CHECKING
 
@@ -31,7 +33,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 8:
+    if getattr(extension, "api_protocol", None) != 13:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -60,6 +62,21 @@ def _check_fp4_weight_format(weight, name):
         )
 
 
+def _check_shared_weight(weight, name):
+    import torch
+    import torch_npu
+
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"{name}: shared weights must be FP8 E4M3, got {weight.dtype}; packed FP4 is not accepted")
+    actual = torch_npu.get_npu_format(weight)
+    if actual not in (29, 51):
+        raise ValueError(
+            f"{name}: FP8 weights require NZ format 29 or 51 (NZ_C0_32), "
+            f"got format={actual}, dtype={weight.dtype}, shape={tuple(weight.shape)}; "
+            "call transform_weights_for_mega_moe(..., shared=True) on raw ND weights once"
+        )
+
+
 class SymmBuffer:
     """Collective resource owner. All ranks construct/call/destroy in the same order.
 
@@ -81,6 +98,8 @@ class SymmBuffer:
         *,
         ranks_per_node: int = 0,
         timeout: int = 120,
+        route_weight_before_quant: bool = False,
+        variable_token_counts: bool = False,
     ):
         import torch
         import torch.distributed as dist
@@ -99,12 +118,20 @@ class SymmBuffer:
             integer("world_size", size, 2, 128)
             integer("ranks_per_node", ranks_per_node, 0, size)
             integer("timeout", timeout, 1, 300)
+            if not isinstance(route_weight_before_quant, bool):
+                raise TypeError("route_weight_before_quant must be bool")
+            if not isinstance(variable_token_counts,bool):
+                raise TypeError("variable_token_counts must be bool")
+            if variable_token_counts and mma_type!='fp8xfp4':
+                raise ValueError('variable token counts currently require A8W4')
+            if route_weight_before_quant and (mma_type != "fp8xfp4" or num_topk > 8):
+                raise ValueError("pre-quant routing requires A8W4 and topK<=8")
             if hidden % 64 or intermediate_hidden % 128:
                 raise ValueError("hidden must be divisible by 64; intermediate_hidden by 128")
             if activation != "swiglu" or mma_type not in {"fp8xfp4", "fp8xfp8"}:
                 raise ValueError("Only SwiGLU with FP8xFP4/FP8xFP8 is implemented; no BF16xBF16")
             if mma_type != "fp8xfp4" and num_shared_experts:
-                raise ValueError("Shared experts currently require FP8xFP4 weights")
+                raise ValueError("Shared FP8 experts currently require the routed FP8xFP4 kernel")
             if num_experts % size or num_experts // size > 128:
                 raise ValueError("Experts must divide EP, with at most 128 local experts")
             if ranks_per_node and size % ranks_per_node:
@@ -123,6 +150,8 @@ class SymmBuffer:
             activation,
             ranks_per_node,
             timeout,
+            route_weight_before_quant,
+            variable_token_counts,
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
@@ -135,6 +164,9 @@ class SymmBuffer:
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
         self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
         self.ranks_per_node = ranks_per_node
+        self.route_weight_before_quant = route_weight_before_quant
+        self.variable_token_counts = variable_token_counts
+        self._graph_plans = {}
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
         try:
@@ -167,10 +199,17 @@ class SymmBuffer:
 
     def _prepare(self, bs):
         integer("BS", bs, 1, self.num_max_tokens_per_rank)
+        npu=npu_api()
+        capturing=bool(getattr(npu,'is_current_stream_capturing',lambda:False)())
         if self._plan_bs == bs:
+            if capturing:self._graph_plans[bs]=self._plan
             return
-        # 只保留当前 BS 的计划，不让不同 BS 的最坏容量 workspace 累积占满 HBM。
+        # 捕获图保留各自计划，但scratch优先复用，避免每个BS都常驻一份最坏容量。
+        workspace_hint=getattr(self._plan,'workspace_tensor',None)
         self._plan = self._plan_bs = None
+        if bs in self._graph_plans:
+            self._plan,self._plan_bs=self._graph_plans[bs],bs
+            return
         runtime = self._runtime
         address = require_native("MegaMoE").megamoe_workspace_address(runtime.native)
         ext = _extension()
@@ -187,8 +226,13 @@ class SymmBuffer:
             ext.ffts_config(),
             address,
             runtime.native.capacity,
+            -1,
+            self.route_weight_before_quant,
+            self.variable_token_counts,
+            workspace_hint,
         )
         self._plan_bs = bs
+        if capturing:self._graph_plans[bs]=self._plan
 
     def prepare(self, bs: int) -> SymmBuffer:
         """Collectively prepare/reuse one BS before timing; all ranks must call together."""
@@ -199,7 +243,7 @@ class SymmBuffer:
                 integer("BS", bs, 1, self.num_max_tokens_per_rank)
             except Exception as failure:
                 error = str(failure)
-            collective_check(self.group, "prepare", error, bs)
+            collective_check(self.group, "prepare", error, None if self.variable_token_counts else bs)
             try:
                 runtime = self._runtime
                 runtime.stream.wait_stream(npu_api().current_stream(runtime.device))
@@ -223,6 +267,14 @@ class SymmBuffer:
             if not hasattr(self._plan, "enable_compute_replay"):
                 raise RuntimeError("Installed wheel lacks compute replay; rebuild this branch (omit --skip-build)")
             self._plan.enable_compute_replay()
+
+    def retain_prepared_plan(self) -> None:
+        """Keep the current plan alive for a captured graph; scratch can still be shared."""
+        with self._lock:
+            self._runtime.ensure_alive()
+            if self._plan is None:
+                raise RuntimeError('retain requires one prepared plan')
+            self._graph_plans[self._plan_bs]=self._plan
 
     @property
     def workspace_bytes(self) -> int:
@@ -281,15 +333,17 @@ class SymmBuffer:
                 self.topk_weights[:bs].cpu().tolist(),
                 self.num_experts,
                 self.num_topk,
+                allow_invalid=self.variable_token_counts,
             )
         except Exception as failure:
             error = str(failure)
-        collective_check(self.group, "input preflight", error, (bs, x is not None))
+        collective_check(self.group, "input preflight", error, (None if self.variable_token_counts else bs, x is not None))
 
     def destroy(self):
         with self._lock:
             self._runtime.close()
             self._plan = self._plan_bs = None
+            self._graph_plans.clear()
             self.x = self.x_sf = self.topk_idx = self.topk_weights = None
 
     def __del__(self):
@@ -320,7 +374,7 @@ def _pack_weight_scale_blocks(scale):
 
 
 class _TilePackedWeightPair(tuple):
-    """FP4 tile-pack v1；protocol 8保留原数值合同，不与DS数学研究版混装。"""
+    """路由FP4 tile-pack v1；不得与旧版原生库混装。"""
 
 
 class _RoutedWeightPair(_TilePackedWeightPair):
@@ -356,7 +410,8 @@ def _tilepack_fp4_for_nz_cast(weight):
 
 
 def transform_weights_for_mega_moe(
-    l1_weights: WeightPair, l2_weights: WeightPair, activation: str = "swiglu", *, shared: bool = False
+    l1_weights: WeightPair, l2_weights: WeightPair, activation: str = "swiglu", *, shared: bool = False,
+    keep_planar: bool = True
 ) -> tuple[WeightPair, WeightPair]:
     """Convert raw Ascend packed weights to NZ once, without quantizing again.
 
@@ -366,8 +421,9 @@ def transform_weights_for_mega_moe(
     supported BS (1..65536), with no layout switch above 4096. The legacy planar
     copy is still prepared for tuple compatibility, not selected by routed launches.
     Keep the returned l1 pair intact and immutable. Pass shared=True for
-    shared experts, whose GMM1 remains planar. Routed FP4 data uses tile-pack v1,
-    not ordinary NZ; regenerate old prepared weights. FP8/shared preparation is unchanged.
+    shared experts: raw FP8 E4M3 [S,N,K] plus E8M0 [S,N,K/64,2] scales,
+    both projections stay planar and are converted to ordinary NZ without quantization.
+    Shared packed FP4 is no longer accepted. Routed FP4 still uses tile-pack v1.
     This is not the CUDA UTCCP transform. Old prepared FP4 routed weights must
     be regenerated from raw ND inputs; do not transform prepared NZ twice.
     """
@@ -389,6 +445,10 @@ def transform_weights_for_mega_moe(
             weight = weight.view(torch.uint8)  # 重解释 FP4 的位模式，不能做数值类型转换。
         if weight.dtype not in {torch.uint8, torch.float8_e4m3fn}:
             raise TypeError("Weights must be packed FP4 int8/uint8 or FP8 E4M3")
+        if shared and weight.dtype != torch.float8_e4m3fn:
+            raise TypeError(f"{name}: shared weights must be FP8 E4M3; packed FP4 is not accepted")
+        if shared and torch_npu.get_npu_format(weight) != 2:
+            raise ValueError(f"{name}: prepare shared FP8 from raw ND weights, not prepared NZ weights")
         k = weight.shape[-1] * (2 if weight.dtype == torch.uint8 else 1)
         expected = (*weight.shape[:2], k // 64, 2)
         if k % 64:
@@ -399,25 +459,34 @@ def transform_weights_for_mega_moe(
         if scale.dtype != torch.float8_e8m0fnu or tuple(scale.shape) != expected:
             raise ValueError(f"{name}: expected E8M0 scales {expected} or raw packed int32 [E,N,K/128]")
         scale = scale.contiguous()
+        if shared:
+            weight = torch_npu.npu_format_cast(weight, 29)
+            _check_shared_weight(weight, name)
+            transformed.append((weight, scale))
+            continue
         if weight.dtype == torch.uint8:
             if name == "l1_weights" and not shared:
                 if weight.shape[1] % 256:
                     raise ValueError("Routed FP4 GMM1 requires gate/up widths divisible by 128")
                 # 两种布局一次准备；独立存储并启用版本计数，禁止原地修改后两份权重失配。
                 with torch.inference_mode(False):
-                    planar_weight = torch_npu.npu_format_cast(
-                        _tilepack_fp4_for_nz_cast(weight), 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
-                    )
-                    planar_scale = scale.view(torch.uint8).clone().view(torch.float8_e8m0fnu)
+                    if keep_planar:
+                        planar_weight = torch_npu.npu_format_cast(
+                            _tilepack_fp4_for_nz_cast(weight), 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
+                        )
+                        planar_scale = scale.view(torch.uint8).clone().view(torch.float8_e8m0fnu)
                     weight = _interleave_gate_up_128(weight)
                     scale = _pack_weight_scale_blocks(
                         _interleave_gate_up_128(scale.view(torch.uint8)).view(torch.float8_e8m0fnu))
                     weight = torch_npu.npu_format_cast(
                         _tilepack_fp4_for_nz_cast(weight), 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
                     )
-                    _check_fp4_weight_format(planar_weight, name)
                     _check_fp4_weight_format(weight, name)
-                    transformed.append(_RoutedWeightPair((weight, scale), (planar_weight, planar_scale)))
+                    if keep_planar:
+                        _check_fp4_weight_format(planar_weight, name)
+                        transformed.append(_RoutedWeightPair((weight, scale), (planar_weight, planar_scale)))
+                    else:
+                        transformed.append(_TilePackedWeightPair((weight, scale)))
                 continue
             # uint8 只是两个 FP4 的存储载体；FP8 布局参数不能代替输入的 FP4 类型声明。
             weight = torch_npu.npu_format_cast(
@@ -450,7 +519,7 @@ def mega_moe(
 
     x: BF16 [B,H], or (FP8 E4M3 [B,H], E8M0 [B,H/32]).
     FP8 is copied into the original communication record, never dequantized/requantized.
-    Routed A8W4 uses Wave+GM; its current launcher does not support shared experts.
+    Routed weights remain FP4; optional shared experts use FP8 E4M3 weights.
     No backward or graph guarantee yet.
     """
     return _run(
@@ -480,6 +549,7 @@ def _run(
     out=None,
     timer=None,
     cumulative_stats=None,
+    activation_clamp=None,
 ):
     import torch
 
@@ -535,11 +605,17 @@ def _run(
         for name, weight in (
             ("l1_weights", w1),
             ("l2_weights", w2),
-            ("shared_l1_weights", shared[0]),
-            ("shared_l2_weights", shared[1]),
         ):
             if weight is not None:
                 _check_fp4_weight_format(weight, name)
+    for name, weight, shape in (
+        ("shared_l1_weights", shared[0], (b.num_shared_experts, 2 * b.intermediate_hidden, b.hidden)),
+        ("shared_l2_weights", shared[1], (b.num_shared_experts, b.hidden, b.intermediate_hidden)),
+    ):
+        if weight is not None:
+            _check_shared_weight(weight, name)
+            if tuple(weight.shape) != shape:
+                raise ValueError(f"{name}: expected FP8 shape {shape}, got {tuple(weight.shape)}")
     if cumulative_stats is not None:
         stats = cumulative_stats
         if (
@@ -559,14 +635,17 @@ def _run(
     with b._lock:
         runtime.ensure_alive()
         caller = npu_api().current_stream(runtime.device)
+        capturing=bool(getattr(npu_api(),'is_current_stream_capturing',lambda:False)())
         runtime.stream.wait_stream(caller)
         # 同一 owner 的调用串行进入专属流，禁止不同流覆盖仍在使用的对称空间。
         with npu_api().stream(runtime.stream):
             b._prepare(data.shape[0])
-            result = b._plan.forward(data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, out)
+            result = b._plan.forward(data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared,
+                                     activation_clamp, out)
             if cumulative_stats is not None:
                 cumulative_stats.add_(result[1])
                 cumulative_stats.record_stream(runtime.stream)
+        if capturing:b._graph_plans[data.shape[0]]=b._plan
         caller.wait_stream(runtime.stream)
         for tensor in result:
             tensor.record_stream(caller)
@@ -596,8 +675,13 @@ def fp8_fp4_mega_moe(
     timer is a fresh buffer.allocate_timer() for a separate diagnostic call.
     Routed weights are applied after GMM2; see README numerical compatibility.
     """
-    if recipe != (1, 1, 32) or activation != "swiglu" or activation_clamp is not None or fast_math is not True:
-        raise NotImplementedError("Beta supports recipe=(1,1,32), SwiGLU, no clamp, default math only")
+    if recipe != (1, 1, 32) or activation != "swiglu" or fast_math is not True:
+        raise NotImplementedError("Beta supports recipe=(1,1,32), SwiGLU, default math only")
+    if activation_clamp is not None:
+        if (isinstance(activation_clamp, bool) or not isinstance(activation_clamp, numbers.Real)
+                or not math.isfinite(activation_clamp) or not 0 < activation_clamp <= 3.4028234663852886e38):
+            raise ValueError("activation_clamp must be None or finite positive FP32")
+        activation_clamp = float(activation_clamp)
     if not isinstance(sym_buffer, SymmBuffer):
         raise TypeError("sym_buffer must be this installation's MegaMoE SymmBuffer")
     import torch
@@ -620,4 +704,5 @@ def fp8_fp4_mega_moe(
         out=y,
         timer=timer,
         cumulative_stats=cumulative_local_expert_recv_stats,
+        activation_clamp=activation_clamp,
     )

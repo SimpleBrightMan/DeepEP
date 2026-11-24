@@ -117,7 +117,7 @@ HOST_DEVICE int64_t CalcRailTopkIdsRecvSize(const MegaMoeTilingData* tilingData)
 // falls back to direct routing; single-server EP2..8 is also supported.
 HOST_DEVICE bool UseDecodeRailRouting(const MegaMoeTilingData* t)
 {
-    return t->topoType == TOPO_TYPE_MTE &&
+    return t->variableTokenCounts == 0U && t->topoType == TOPO_TYPE_MTE &&
            UsesCountEpochInputReady(t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4, t->bs) &&
            (t->epWorldSize <= MEGA_MOE_SERVER_SIZE || t->epWorldSize % MEGA_MOE_SERVER_SIZE == 0) &&
            t->blockAivNum > CalcServerNum(t->epWorldSize);
@@ -144,7 +144,8 @@ HOST_DEVICE int64_t CalcQuantTokenScaleBytes(int64_t h, uint32_t elemsPerByte)
         static_cast<uint32_t>(sizeof(int8_t));
     uint32_t scaleBytes = mxScaleNum * static_cast<uint32_t>(sizeof(int8_t));
     uint32_t tokenScaleBytes = Ops::Base::CeilAlign(dataBytes + scaleBytes, static_cast<uint32_t>(ALIGN_32));
-    return static_cast<int64_t>(tokenScaleBytes);
+    // 协议11始终保留一行32B路由权重；是否消费由跨rank一致的tiling标记决定。
+    return static_cast<int64_t>(tokenScaleBytes + ALIGN_32);
 }
 
 // Combine 回传一行 BF16，不附带量化 scale。
