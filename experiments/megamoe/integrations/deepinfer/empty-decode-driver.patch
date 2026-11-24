@@ -1,0 +1,108 @@
+--- a/run_system.py
++++ b/run_system.py
+@@ -13,6 +13,52 @@
+ from replay_core import Ledger,arrival_plan,write_progress,cache_inventory,CACHE_OBSERVATION_POLICY
+ from socket_control import SocketControl
+ from fixed_workload import FullTokenLedger,local_concurrency,isolated_unfinished_check,install_fixed_cache_limit
++
++
++
++def empty_decode_allowed(seqs, scheduled):
++    # Keep known cache/finish work on the original path. SchedulerOutputs
++    # owns ignored requests and is passed intact to the existing post-process.
++    return (not seqs and scheduled.is_empty() and scheduled.num_batched_tokens == 0
++            and not scheduled.finished_seqs
++            and not any(x.size for x in (scheduled.clone_states, scheduled.clone_blocks, scheduled.zero_states)))
++
++
++def choose_empty_decode(engine, execute, *, torch, dist, group, vote, eplb, state_type, sampler_type):
++    worker = engine.driver_worker
++
++    def run(seqs, scheduled, trace_item):
++        if scheduled.prompt_run:
++            return execute(seqs, scheduled)
++        vote.fill_(0 if empty_decode_allowed(seqs, scheduled) else 1)
++        dist.all_reduce(vote, op=dist.ReduceOp.MAX, group=group)
++        if vote.item():
++            return execute(seqs, scheduled)
++        trace_item['empty_decode_elided'] = True
++        # Preserve previous ZOS output, current EPLB cadence, and the deferred
++        # placeholder state. The real model would only write dummy KV rows.
++        previous = worker.flush_inflight_reqs()
++        sampler = sampler_type(post_funcs=[])
++        # The regular sampler runs EPLB inside inference_mode.
++        with torch.inference_mode():
++            eplb.step(False)
++        def finish_eplb():
++            sampler.moe_load_balance_ratio = eplb.take_moe_load_balance_ratio()
++        sampler.post_funcs.append(finish_eplb)
++        worker.engine_callbacks.pre_sampler_sync_fn(scheduled)
++        worker.maybe_gc_collect()
++        sample_end = torch.cuda.Event(enable_timing=True)
++        sample_end.record()
++        worker.prev_step_state = state_type(
++            seq_metadata_list=[worker.model_runner._placeholder_seq_metadata(False)],
++            scheduler_outputs=scheduled, sampler_output=sampler, is_prompt=False,
++            is_placeholder=True, sample_end_evt=sample_end,
++        )
++        engine.deferred_release.collect_request_outputs(previous)
++        return previous
++
++    return run
++
+ 
+ def parse():
+     p=argparse.ArgumentParser();p.add_argument('--source',type=Path,required=True);p.add_argument('--root',type=Path,required=True)
+@@ -112,6 +158,33 @@
+         trace_ranks=tuple(study.get('trace_ranks',[0]));assert 0 in trace_ranks and all(0<=r<dp_size for r in trace_ranks)
+         all_steps=[];current_step=[];trace_logging=False;observer_hook_s=0.
+         execute=engine._execute_model_async_step
++        execute_with_vote=None
++        policy=study['empty_decode_policy']
++        if policy=='skip-global-empty':
++            from deepinfer import envs
++            from deepinfer.engine.engine_type import EngineType
++            from deepinfer.model_executor import eplb as eplb_module
++            from deepinfer.worker.zos_status import WorkerStepState
++            from deepinfer.sequence import SamplerOutput
++            assert study['cp']==1 and study['ep']==dp_size and dist.get_world_size()==dp_size
++            assert dist.get_world_size(PG.expert_parallel_group())==dp_size
++            assert dist.get_world_size(engine_cpu_group)==dp_size
++            assert engine.engine_type==EngineType.NORMAL and engine.driver_worker.is_driver_worker
++            assert envs.DEEPINFER_ZERO_OVERHEAD_SCHEDULING and engine.copy_state is None
++            assert int(env['DEEPINFER_EXPERT_REARRANGEMENT_STEP_INTERVAL'])==1000000000
++            manager=eplb_module.current();assert manager is not None
++            # Keep decode votes off both native scheduling and outer unfinished groups.
++            vote_group=dist.new_group(list(range(dp_size)),backend='gloo')
++            vote=torch.empty(1,dtype=torch.int32,device='cpu')
++            execute_with_vote=choose_empty_decode(engine,execute,torch=torch,dist=dist,group=vote_group,
++                vote=vote,eplb=manager,state_type=WorkerStepState,sampler_type=SamplerOutput)
++        elif policy!='baseline':
++            raise ValueError(policy)
++        record('empty_decode_policy',policy=policy)
++        def execute_observed(seqs,scheduled,item):
++            if execute_with_vote is None:
++                return execute(seqs,scheduled)
++            return execute_with_vote(seqs,scheduled,item)
+         def observed_execute(seq_metadata_list,scheduler_outputs):
+             nonlocal current_step,observer_hook_s
+             hook_start=time.perf_counter()
+@@ -127,8 +200,8 @@
+             observer_hook_s+=time.perf_counter()-hook_start
+             if trace_logging and dp_rank in trace_ranks:
+                 with torch.profiler.record_function(f"replay:step_{item['step']}:{item['kind']}:N{item['sequences']}:Q{item['query_tokens']}"):
+-                    return execute(seq_metadata_list,scheduler_outputs)
+-            return execute(seq_metadata_list,scheduler_outputs)
++                    return execute_observed(seq_metadata_list,scheduler_outputs,item)
++            return execute_observed(seq_metadata_list,scheduler_outputs,item)
+         engine._execute_model_async_step=observed_execute
+ 
+         def run_case(rate,name,smoke=False,profile=False,warm_count=None,warmup_only=False,fixed_concurrency=None):
+@@ -296,6 +369,7 @@
+                 warmup_only=bool(warmup_only or warm_count is not None),elapsed_s=elapsed,bookkeeping_s=bookkeeping_s+observer_hook_s-hook_initial,observer_hook_s=observer_hook_s-hook_initial,profile=profile,captured=captured,
+                 output_validation_samples=validation_samples,step_count=len(all_steps)-step_start,
+                 request_file_sha256=hashlib.sha256(token_file.read_bytes()).hexdigest())
++            report['empty_decode_elided']=sum(bool(row.get('empty_decode_elided')) for row in all_steps[step_start:])
+             payload=dict(report=report,requests=list(ledger.requests.values()),snapshots=snapshots,steps=all_steps[step_start:],routes=route_snapshot)
+             (out/f'{name}-dp{dp_rank}-replay.json').write_text(json.dumps(payload,separators=(',',':')),encoding='utf8')
+             record('case_complete',**report)

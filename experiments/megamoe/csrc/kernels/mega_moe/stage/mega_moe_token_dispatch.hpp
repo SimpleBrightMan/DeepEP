@@ -698,7 +698,7 @@ __aicore__ inline void LoadMteExpertCounts(const MoeStageCommonConfig& common, c
 
 // Wave 进入逐专家流水前一次准备完整 count 表；每个物理 block 只发布一次 ready。
 // W4 Wave-ahead 路径同时将 prefix 持久化到 GM，避免后续 Activation 覆盖 UB 后丢失 Dispatch 状态。
-template <bool NeedCumsumReload = false, typename ActivationType>
+template <bool NeedCumsumReload = false, bool PublishOccupancy = false, typename ActivationType>
 __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfig& common,
                                                        const BlockWorkspaceContext& countWorkspace,
                                                        const Params& params,
@@ -771,7 +771,13 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
     __gm__ int32_t* countTableReady =
         reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.flagSendCntCalToUpdParamsPtr) +
         static_cast<uint64_t>(countWorkspace.blockIdx) * INT_CACHELINE;
-    WriteGmByPassDCache(countTableReady, static_cast<int32_t>(1));
+    int32_t readyState = 1;
+    if constexpr (PublishOccupancy) {
+        // prefix已经包含所有源rank：1表示本rank无接收任务，2表示有任务。
+        // 两者都在原MTE3完成后发布；不能按本地发送token数判断接收侧为空。
+        readyState = scratch.cumsumInfoTensor.GetValue(rawCountElementCount - 1U) == 0 ? 1 : 2;
+    }
+    WriteGmByPassDCache(countTableReady, readyState);
 }
 
 /*

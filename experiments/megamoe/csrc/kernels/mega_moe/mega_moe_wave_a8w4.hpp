@@ -554,9 +554,25 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     exceptionDump_.UpdateStage(MegaMoeImpl::Stage::MOE_GMM1_ACTIVATION);
     DispatchBuffInit();
     if (!computeReplay_) {
-        PrepareMoeExpertTokenCountTable<false>(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
-        if (GetSubBlockIdx() == 0U) {
-            WaitForMoeExpertTokenCountReady(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr, countWorkspace_, 0U);
+        PrepareMoeExpertTokenCountTable<false, true>(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
+        WaitForMoeExpertTokenCountReady(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr, countWorkspace_, 0U);
+        const int32_t readyState = AscendC::ReadGmByPassDCache(
+            reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr) +
+            static_cast<uint64_t>(countWorkspace_.blockIdx) * INT_CACHELINE);
+        if (readyState == 1) {
+            // 本rank无routed任务，不创建空wave和三个逐专家游标。
+            // shared与跨卡输出握手仍必须执行；不能直接返回整个kernel。
+            if constexpr (g_coreType == AIV) {
+                if (GetSubBlockIdx() == 1U && sharedExpertNum_ > 0U) {
+                    SharedActivationCursor shared{};
+                    Aiv1ActivationUb::Init();
+                    while (!shared.done) {
+                        TryRunSharedExpertActivation(shared);
+                    }
+                    Aiv1ActivationUb::Finish();
+                }
+            }
+            return;
         }
     }
     // routed调度统一走Wave；数据完成仍由各stage内部的真实依赖保证。
