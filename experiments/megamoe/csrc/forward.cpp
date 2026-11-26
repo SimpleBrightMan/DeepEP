@@ -5,8 +5,10 @@
 #include "kernel_launch.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 #include <acl/acl.h>
 #include "shmem.h"
@@ -17,6 +19,9 @@
 #include "check.hpp"
 #include "kernels/mega_moe/common/ascend_timer_v2.hpp"
 #include "kernels/mega_moe/common/mega_moe_constants.hpp"
+#include "kernels/mega_moe/common/mega_moe_schedule_policy.hpp"
+#include "kernels/mega_moe/common/aiv1_async_events.hpp"
+#include "kernels/mega_moe/common/mega_moe_aiv1_ub_layout.hpp"
 #include "kernels/mega_moe/common/mega_moe_workspace.hpp"
 #include "kernels/mega_moe/mc2_common/mc2_moe_context.hpp"
 
@@ -43,7 +48,7 @@ uint32_t DispatchCopyBytes(const MegaMoeTilingData& t)
 {
     const uint32_t token = AlignUp(t.h, uint32_t{256});
     const uint32_t scale = AlignUp(CeilDiv(t.h, uint32_t{32}), uint32_t{32});
-    return token + scale;
+    return token + scale + 32U;
 }
 
 MegaMoeDispatchBufferConfig DispatchConfig(const MegaMoeTilingData& t, uint32_t ub)
@@ -61,8 +66,9 @@ MegaMoeDispatchBufferConfig DispatchConfig(const MegaMoeTilingData& t, uint32_t 
     const uint32_t route = static_cast<uint32_t>(c.routeItemsPerBatch);
     const uint32_t without_slots = fixed + route * sizeof(int32_t);
     const uint32_t budget = ub > without_slots ? ub - without_slots : 0U;
+    const int32_t maxSlots = MAX_DISPATCH_BUFFER_COUNT;
     c.bufferCount = std::clamp(static_cast<int32_t>(budget / (c.copyBufferBytes + 32U)), MIN_DISPATCH_BUFFER_COUNT,
-                               MAX_DISPATCH_BUFFER_COUNT);
+                               maxSlots);
     if (static_cast<uint64_t>(c.routeItemsPerBatch) < total) {
         const uint32_t fixed_with_slots = fixed + static_cast<uint32_t>(c.bufferCount) * (c.copyBufferBytes + 32U);
         const uint32_t route_budget = ub > fixed_with_slots ? ub - fixed_with_slots : 0U;
@@ -121,48 +127,21 @@ MegaMoeSendMaskBufferConfig SendMaskConfig(const MegaMoeTilingData& t, uint32_t 
     return c;
 }
 
-uint64_t HostFlagElements(const MegaMoeTilingData& t)
-{
-    const uint64_t waves = CeilDiv<uint64_t>(t.maxOutputSize, 256U);
-    const uint64_t wave_slots = waves * MegaMoeImpl::INT_CACHELINE;
-    uint64_t count = static_cast<uint64_t>(t.moeExpertPerRank) *
-                     (wave_slots + wave_slots + static_cast<uint64_t>(MegaMoeImpl::INT_CACHELINE) * t.aicNum);
-    const bool is_w4 = t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 ||
-                       t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A4W4 ||
-                       t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A4W4_NZ;
-    if (is_w4 || (t.topoType == MegaMoeImpl::TOPO_TYPE_MTE && t.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT)) {
-        // Pairwise GMM2/combine publishes one sequence per AIC.
-        count += static_cast<uint64_t>(t.aicNum) * MegaMoeImpl::INT_CACHELINE;
-    }
-    if (t.topoType == MegaMoeImpl::TOPO_TYPE_MTE && (t.combineQuantMode != MegaMoeImpl::COMBINE_NO_QUANT ||
-                                                     t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4)) {
-        // Match WorkspaceInfo: the atomic A8W4 path owns one counter per M-group,
-        // while quantized Combine retains one ready slot per AIC.
-        const uint64_t ready_slots_per_expert = t.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT
-                                                    ? wave_slots
-                                                    : static_cast<uint64_t>(t.aicNum) * MegaMoeImpl::INT_CACHELINE;
-        count += static_cast<uint64_t>(t.moeExpertPerRank) * ready_slots_per_expert;
-    }
-    if (t.sharedExpertNum > 0U) {
-        count += CeilDiv<uint64_t>(t.bs, 256U) * t.sharedExpertNum * MegaMoeImpl::INT_CACHELINE;
-        if (t.topoType == MegaMoeImpl::TOPO_TYPE_MTE && t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4) {
-            count += 4ULL * t.aicNum * MegaMoeImpl::INT_CACHELINE;
-        }
-    }
-    return count;
-}
-
 void SetSendMaskConfigs(MegaMoeTilingData& t, uint32_t ub)
 {
-    const uint32_t reset_per_core =
-        static_cast<uint32_t>(CeilDiv(HostFlagElements(t), static_cast<uint64_t>(t.blockAivNum)));
+    // UB Reset 预算直接读取真实布局；新增同步区只需修改 WorkspaceInfo。
+    const MegaMoeImpl::WorkspaceInfo layout(nullptr, &t);
+    const uint32_t reset_per_core = static_cast<uint32_t>(
+        CeilDiv(static_cast<uint64_t>(layout.flagResetElementCount), static_cast<uint64_t>(t.blockAivNum)));
     const uint32_t reset_count = std::min(reset_per_core, static_cast<uint32_t>(DISPATCH_RESET_BATCH));
     const uint32_t reset_bytes = AlignUp(reset_count, uint32_t{MegaMoeImpl::INT32_PER_256B}) * 4U;
-    const uint32_t quant_out = AlignUp(t.h, 256U) + AlignUp(CeilDiv(t.h, 32U), 32U);
+    const uint32_t quant_out = DispatchCopyBytes(t);
     const uint32_t quant_in = AlignUp(t.h, 128U) * 2U;
-    const auto sharedPolicy = MegaMoeImpl::SelectSharedExpertPolicy(
-        t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4, t.sharedExpertNum, t.bs);
-    const uint32_t route_cores = sharedPolicy.routeAiv1Only ? t.aicNum : t.blockAivNum;
+    const auto inputMode = MegaMoeImpl::SelectInputPreparationMode(
+        t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4, t.sharedExpertNum, t.bs,
+        t.variableTokenCounts != 0U);
+    const uint32_t route_cores =
+        inputMode == MegaMoeImpl::InputPreparationMode::Aiv1RouteOverlap ? t.aicNum : t.blockAivNum;
     const uint32_t max_experts = MegaMoeImpl::CalcSendMaskExpertCapacity(&t, route_cores);
     const uint32_t accumulator = AlignUp(max_experts * 4U, 32U);
     const uint32_t fixed = reset_bytes + 2048U + 2U * quant_out + 2U * quant_in + accumulator;
@@ -236,11 +215,12 @@ PlatformInfo GetPlatformInfo()
 
 MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t topk, int64_t local_experts,
                              int64_t world, int64_t max_tokens, int64_t max_recv, bool is_a8w4, int64_t shared_experts,
-                             const PlatformInfo& p)
+                             const PlatformInfo& p, bool variable_token_counts)
 {
     MegaMoeTilingData t{};
     t.moeExpertPerRank = static_cast<uint32_t>(local_experts);
     t.bs = static_cast<uint32_t>(bs);
+    t.variableTokenCounts = variable_token_counts ? 1U : 0U;
     t.h = static_cast<uint32_t>(h);
     t.hiddenDim = static_cast<uint32_t>(hidden_dim);
     t.epWorldSize = static_cast<uint32_t>(world);
@@ -263,19 +243,8 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     t.actSubMode = static_cast<uint8_t>(MegaMoeImpl::MegaMoeActSubMode::DEFAULT);
     t.activationAlpha = 1.0F;
     t.activationBeta = 1.0F;
-    // 按本次每卡 BS 选择，不用预分配容量；小 batch 缩短 wave，较早释放 GMM2。
-    if (is_a8w4 && t.bs <= MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS) {
-        const uint64_t gmm1_tasks_per_m_group =
-            CeilDiv<uint64_t>(t.hiddenDim / MegaMoeImpl::ACTIVATION_N_HALF, MegaMoeImpl::GMM1_FUSED_TILE_N);
-        t.mGroupsPerWave =
-            static_cast<uint32_t>(CeilDiv<uint64_t>(static_cast<uint64_t>(p.aic) * 2U, gmm1_tasks_per_m_group));
-    } else {
-        // 大 batch 和 A8W8 的预算包括 GMM2 的最低任务量约束。
-        const uint64_t gmm1_tiles = CeilDiv<uint64_t>(t.hiddenDim, 256U);
-        const uint64_t gmm2_tiles = CeilDiv<uint64_t>(t.h, 256U);
-        t.mGroupsPerWave = static_cast<uint32_t>(std::max(
-            CeilDiv<uint64_t>(static_cast<uint64_t>(p.aic) * 4U, gmm1_tiles), CeilDiv<uint64_t>(p.aic, gmm2_tiles)));
-    }
+    // 使用本次每卡BS，不用预分配容量；小BS的连续提交预算用于摊薄阶段边界。
+    t.mGroupsPerWave = MegaMoeImpl::CalcWaveMGroupsPerWave(is_a8w4, t.bs, t.hiddenDim, t.h, p.aic);
     t.isPerExpertWeightTensor = false;
     t.dispatchBufferConfig = DispatchConfig(t, p.ub);
     SetSendMaskConfigs(t, p.ub);
@@ -294,7 +263,8 @@ void CheckTensor(const torch::Tensor& t, int64_t dims, const char* name)
 
 Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world,
            int64_t max_tokens, bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts,
-           uint64_t symmetric_address, int64_t symmetric_bytes)
+           uint64_t symmetric_address, int64_t symmetric_bytes, int64_t local_rank, bool route_weight_before_quant,
+           bool variable_token_counts, c10::optional<torch::Tensor> workspace_hint)
     : ffts_(ffts)
 {
     CheckTensor(example, 2, "plan input");
@@ -307,29 +277,49 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     TORCH_CHECK(ranks_per_node == 0 || (ranks_per_node > 0 && ranks_per_node <= world && world % ranks_per_node == 0),
                 "Plan ranks_per_node must divide EP");
     const auto required = buffer_size(world, experts, max_tokens, topk, example.size(1));
+    if (local_rank >= 0) {
+        TORCH_CHECK(local_rank < world && is_a8w4 && shared_experts == 0,
+                    "Local compute requires valid virtual rank, W4A8 and no shared experts");
+        // 仅提供Init所需的本地地址视图；没有对称堆、远端映射或设备通信初始化。
+        local_buffer_ = torch::zeros({required}, example.options().dtype(torch::kUInt8));
+        symmetric_address = reinterpret_cast<uint64_t>(local_buffer_.data_ptr());
+        symmetric_bytes = required;
+    }
     TORCH_CHECK(symmetric_address != 0 && symmetric_bytes >= required, "MegaMoE symmetric buffer needs ", required,
                 " bytes, got ", symmetric_bytes);
     platform_ = GetPlatformInfo();
     tiling_ = MakeTiling(example.size(0), example.size(1), intermediate * 2, topk, experts, world, max_tokens, 0,
-                         is_a8w4, shared_experts, platform_);
+                         is_a8w4, shared_experts, platform_, variable_token_counts);
     tiling_.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
+    TORCH_CHECK(!route_weight_before_quant || (is_a8w4 && topk <= MegaMoeImpl::META_INFO_SIZE),
+                "pre-quant routing requires A8W4 and topK<=8");
+    tiling_.topkWeightsPrefetch = route_weight_before_quant ? 1U : 0U;
     static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
     const MegaMoeImpl::WorkspaceInfo info(nullptr, &tiling_);
     const int64_t bytes =
         info.workspaceSize + static_cast<int64_t>(platform_.system_workspace) + kReservedWorkspaceBytes;
     TORCH_CHECK(bytes > info.workspaceSize, "MegaMoE workspace size overflow");
-    workspace_ = torch::empty({bytes}, example.options().dtype(torch::kUInt8));
+    if (workspace_hint.has_value()) {
+        CheckTensor(*workspace_hint, 1, "workspace hint");
+        TORCH_CHECK(workspace_hint->device()==example.device() && workspace_hint->scalar_type()==torch::kUInt8,
+                    "workspace hint must be uint8 on the plan device");
+    }
+    // 同一owner的图在专属流串行运行，可共享scratch；每张图仍保留自己的tiling/context。
+    workspace_ = workspace_hint.has_value() && workspace_hint->numel()>=bytes
+                     ? *workspace_hint : torch::empty({bytes}, example.options().dtype(torch::kUInt8));
     context_ = torch::empty({static_cast<int64_t>(sizeof(Mc2Aclnn::Mc2MoeContext))}, workspace_.options());
 
     // peer 地址和 context 只在准备阶段解析，不在每次 forward 中重新分配、同步拷贝。
     Mc2Aclnn::Mc2MoeContext context{};
-    const int rank = aclshmem_my_pe();
+    const int rank = local_rank >= 0 ? static_cast<int>(local_rank) : aclshmem_my_pe();
     TORCH_CHECK(rank >= 0 && rank < world && world <= Mc2Aclnn::HCCL_MAX_RANK_SIZE, "Invalid SHMEM rank/world: ", rank,
                 "/", world);
     context.epRankId = static_cast<uint32_t>(rank);
     context.rankSizePerServer = static_cast<uint32_t>(world);
     for (int64_t peer = 0; peer < world; ++peer) {
-        void* address = aclshmem_ptr(reinterpret_cast<void*>(symmetric_address), static_cast<int32_t>(peer));
+        void* address = local_rank >= 0
+                            ? reinterpret_cast<void*>(symmetric_address)
+                            : aclshmem_ptr(reinterpret_cast<void*>(symmetric_address), static_cast<int32_t>(peer));
         TORCH_CHECK(address != nullptr, "rank=", rank, " prepare: cannot resolve peer=", peer);
         context.epHcclBuffer_[peer] = reinterpret_cast<uint64_t>(address);
     }
@@ -342,9 +332,16 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     torch::Tensor weight1, torch::Tensor weight2, torch::Tensor weight_scales1, torch::Tensor weight_scales2,
     c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> shared_weight1,
     c10::optional<torch::Tensor> shared_weight2, c10::optional<torch::Tensor> shared_weight_scales1,
-    c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<torch::Tensor> out)
+    c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<double> activation_clamp,
+    c10::optional<torch::Tensor> out)
 {
+    TORCH_CHECK(!activation_clamp.has_value() ||
+                    (std::isfinite(*activation_clamp) && *activation_clamp > 0.0 &&
+                     *activation_clamp <= std::numeric_limits<float>::max()),
+                "activation_clamp must be None or finite positive FP32");
     CheckTensor(x, 2, "x");
+    TORCH_CHECK(!local_buffer_.defined() || compute_replay_,
+                "Local compute requires prepare_local_compute before forward; communication is forbidden");
     CheckTensor(topk_ids, 2, "topk_ids");
     CheckTensor(topk_weights, 2, "topk_weights");
     CheckTensor(weight1, 3, "weight1");
@@ -415,7 +412,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                 "all four shared weight and scale tensors must be supplied together");
     int64_t shared_experts = 0;
     if (has_shared) {
-        TORCH_CHECK(is_a8w4, "shared experts currently require A8W4 weights");
+        TORCH_CHECK(is_a8w4, "shared FP8 experts currently require the routed A8W4 kernel");
         CheckTensor(*shared_weight1, 3, "shared_weight1");
         CheckTensor(*shared_weight2, 3, "shared_weight2");
         CheckTensor(*shared_weight_scales1, 4, "shared_weight_scales1");
@@ -427,14 +424,15 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
              {&*shared_weight1, &*shared_weight2, &*shared_weight_scales1, &*shared_weight_scales2}) {
             TORCH_CHECK(tensor->device() == x.device(), "shared tensors must be on the same device as x");
         }
-        TORCH_CHECK(shared_weight1->scalar_type() == torch::kUInt8 && shared_weight2->scalar_type() == torch::kUInt8,
-                    "shared weights must use packed E2M1 uint8 NZ storage");
+        TORCH_CHECK(shared_weight1->scalar_type() == c10::ScalarType::Float8_e4m3fn &&
+                        shared_weight2->scalar_type() == c10::ScalarType::Float8_e4m3fn,
+                    "shared weights must use FP8 E4M3 NZ storage; packed FP4 is no longer accepted");
         TORCH_CHECK(shared_weight_scales1->scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
                         shared_weight_scales2->scalar_type() == c10::ScalarType::Float8_e8m0fnu,
                     "shared weight scales must be FP8 E8M0");
-        TORCH_CHECK(shared_weight1->sizes() == torch::IntArrayRef({shared_experts, hidden, h / 2}) &&
-                        shared_weight2->sizes() == torch::IntArrayRef({shared_experts, h, hidden / 4}),
-                    "shared weights must match routed H and hiddenDim: [S, hiddenDim, H/2], [S, H, hiddenDim/4]");
+        TORCH_CHECK(shared_weight1->sizes() == torch::IntArrayRef({shared_experts, hidden, h}) &&
+                        shared_weight2->sizes() == torch::IntArrayRef({shared_experts, h, hidden / 2}),
+                    "shared FP8 weights must match routed H and hiddenDim: [S, hiddenDim, H], [S, H, hiddenDim/2]");
         TORCH_CHECK(shared_weight_scales1->sizes() ==
                             torch::IntArrayRef({shared_experts, hidden, CeilDiv(h, int64_t{64}), 2}) &&
                         shared_weight_scales2->sizes() ==
@@ -446,16 +444,21 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     torch::Tensor y = out.has_value() ? *out : torch::empty(x.sizes(), x.options().dtype(torch::kBFloat16));
     CheckTensor(y, 2, "out");
     TORCH_CHECK(y.scalar_type() == torch::kBFloat16 && y.sizes() == x.sizes(), "out must be BF16 [BS, H]");
-    torch::Tensor expert_tokens = torch::empty({experts}, x.options().dtype(torch::kInt32));
+    torch::Tensor expert_tokens =
+        compute_replay_ ? replay_counts_ : torch::empty({experts}, x.options().dtype(torch::kInt32));
 
     const auto stream = c10_npu::getCurrentNPUStream();
     auto ptr = [](const torch::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
     auto opt = [&](const c10::optional<torch::Tensor>& tensor) { return tensor ? ptr(*tensor) : nullptr; };
+    // 每次调用显式传递，不把某次 clamp 留在复用 Plan 中影响后续 None 调用。
+    auto launch_tiling = tiling_;
+    launch_tiling.clampLimit = activation_clamp.has_value()
+                                  ? static_cast<float>(*activation_clamp) : std::numeric_limits<float>::max();
     mega_moe_kernel_do(platform_.block_dim, platform_.ub, stream.stream(), is_a8w4, ptr(context_), ptr(x),
                        opt(x_scales), ptr(topk_ids), ptr(topk_weights), ptr(weight1), ptr(weight2), ptr(weight_scales1),
                        ptr(weight_scales2), opt(shared_weight1), opt(shared_weight2), opt(shared_weight_scales1),
                        opt(shared_weight_scales2), ptr(y), ptr(expert_tokens), ptr(workspace_), opt(timer),
-                       reinterpret_cast<const uint8_t*>(&tiling_), ffts_);
+                       reinterpret_cast<const uint8_t*>(&launch_tiling), ffts_, compute_replay_);
     // The direct kernel launch bypasses the PyTorch dispatcher; record that
     // every argument remains live until the current NPU stream reaches it.
     for (const auto* tensor : {&x, &topk_ids, &topk_weights, &weight1, &weight2, &weight_scales1, &weight_scales2,
@@ -474,7 +477,78 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     if (x_scales) {
         c10_npu::NPUCachingAllocator::recordStream(x_scales->storage().data_ptr(), stream);
     }
+    if (local_buffer_.defined()) {
+        c10_npu::NPUCachingAllocator::recordStream(local_buffer_.storage().data_ptr(), stream);
+    }
+    replay_counts_ = expert_tokens;
     return {y, expert_tokens};
+}
+
+void Plan::enable_compute_replay()
+{
+    TORCH_CHECK(tiling_.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 && tiling_.sharedExpertNum == 0,
+                "Compute replay requires W4A8 with no shared experts");
+    TORCH_CHECK(replay_counts_.defined(), "Compute replay requires a complete priming forward first");
+    // 完整 forward 留下 Dispatch 输入和专家计数；切换前保证设备已完成，不能重放半成品。
+    TORCH_CHECK(aclrtSynchronizeDevice() == ACL_SUCCESS, "Compute replay priming synchronization failed");
+    compute_replay_ = true;
+}
+
+void Plan::prepare_local_compute(torch::Tensor data, torch::Tensor scales, torch::Tensor counts)
+{
+    TORCH_CHECK(local_buffer_.defined(), "prepare_local_compute requires a local-only Plan");
+    CheckTensor(data, 2, "local dispatched data");
+    CheckTensor(scales, 2, "local dispatched scales");
+    TORCH_CHECK(data.device() == workspace_.device() && scales.device() == workspace_.device(),
+                "Local input must be on the Plan device");
+    TORCH_CHECK(data.element_size() == 1 && scales.element_size() == 1 && data.size(1) == tiling_.h &&
+                    scales.size(0) == data.size(0) && scales.size(1) == tiling_.h / 32 &&
+                    data.size(0) <= tiling_.maxOutputSize,
+                "Local input must be packed E4M3 [rows,H] and E8M0 [rows,H/32] within workspace capacity");
+    TORCH_CHECK(counts.device().is_cpu() && counts.scalar_type() == torch::kInt32 && counts.dim() == 1 &&
+                    counts.is_contiguous() && counts.numel() == tiling_.moeExpertPerRank,
+                "Local counts must be contiguous CPU int32 [local_experts]");
+    int64_t rows = 0;
+    for (int64_t e = 0; e < counts.numel(); ++e) {
+        TORCH_CHECK(counts.data_ptr<int32_t>()[e] >= 0, "Negative local expert count: expert=", e);
+        rows += counts.data_ptr<int32_t>()[e];
+    }
+    TORCH_CHECK(rows > 0 && rows == data.size(0), "Local counts sum must match nonempty dispatched rows");
+    // Torch队列先完成，随后同步D2D/H2D复制；准备不进入性能区间。
+    TORCH_CHECK(aclrtSynchronizeDevice() == ACL_SUCCESS, "Local input preparation synchronization failed");
+    auto* base = static_cast<uint8_t*>(workspace_.data_ptr());
+    const MegaMoeImpl::WorkspaceInfo info(base, &tiling_);
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(info.dispatchRevDataPtr, data.nbytes(), data.data_ptr(), data.nbytes(),
+                                        ACL_MEMCPY_DEVICE_TO_DEVICE));
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(info.dispatchRevScalePtr, scales.nbytes(), scales.data_ptr(), scales.nbytes(),
+                                        ACL_MEMCPY_DEVICE_TO_DEVICE));
+    // MTE count表按AIC block-major布局，每个计算核有相同的完整专家计数。
+    const int64_t stride = AlignUp<int64_t>(counts.numel(), MegaMoeImpl::INT_CACHELINE);
+    std::vector<int32_t> block_counts(platform_.aic * stride, 0);
+    for (uint32_t block = 0; block < platform_.aic; ++block) {
+        std::copy_n(counts.data_ptr<int32_t>(), counts.numel(), block_counts.data() + block * stride);
+    }
+    const size_t bytes = block_counts.size() * sizeof(int32_t);
+    ASCEND_DEEPEP_CHECK_ACL(
+        aclrtMemcpy(info.expertRevTokenNumsPtr, bytes, block_counts.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE));
+    // BF16 0xffff为NaN；未被GMM2完整覆盖的输出必须让smoke失败，不能误读旧显存。
+    const size_t output_bytes = rows * static_cast<int64_t>(tiling_.h) * sizeof(uint16_t);
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemset(info.gmm2MmadResPtr, output_bytes, 0xff, output_bytes));
+    replay_counts_ = counts.to(workspace_.device());
+    local_rows_ = rows;
+    compute_replay_ = true;
+}
+
+torch::Tensor Plan::local_compute_output()
+{
+    TORCH_CHECK(local_buffer_.defined() && compute_replay_, "Local compute not prepared");
+    auto result =
+        torch::empty({local_rows_, static_cast<int64_t>(tiling_.h)}, workspace_.options().dtype(torch::kBFloat16));
+    TORCH_CHECK(aclrtSynchronizeDevice() == ACL_SUCCESS, "Local compute output synchronization failed");
+    const MegaMoeImpl::WorkspaceInfo info(static_cast<uint8_t*>(workspace_.data_ptr()), &tiling_);
+    ASCEND_DEEPEP_CHECK_ACL(aclrtMemcpy(result.data_ptr(), result.nbytes(), info.gmm2MmadResPtr, result.nbytes(),
+                                        ACL_MEMCPY_DEVICE_TO_DEVICE));
+    return result;
 }
 
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden)
@@ -485,10 +559,282 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
                 "Invalid buffer shape");
     // The buffer outlives BS/weight-mode changes. Reserve the decode rail/count
     // layout as well; prefill continues to bind its original device offsets.
-    const MegaMoeImpl::PeermemSizeParams params{
-        tokens, topk, hidden, experts, world, 2, 1, false, false, MegaMoeImpl::TOPO_TYPE_MTE, true};
+    const MegaMoeImpl::PeermemSizeParams params{tokens, topk, hidden, experts, world, 2, 1, true};
     return AlignUp<int64_t>(MegaMoeImpl::EXCEPTION_DUMP_REGION_SIZE + MegaMoeImpl::CalcPeermemLeastSize(params),
                             2LL << 20);
+}
+
+int64_t tp_buffer_size(int64_t tp_world, int64_t tokens, int64_t topk, int64_t hidden, int64_t rs_tokens_per_chunk)
+{
+    TORCH_CHECK(tp_world >= 2 && tp_world <= 8 && tokens >= 1 && tokens <= 65536 && topk >= 1 && topk <= 32 &&
+                    hidden >= 1024 && hidden <= 8192 && hidden % 64 == 0 && rs_tokens_per_chunk >= 1,
+                "Invalid TP MegaMoE buffer shape");
+    return AlignUp<int64_t>(
+        MegaMoeImpl::EXCEPTION_DUMP_REGION_SIZE +
+            MegaMoeImpl::CalcTpPeermemLeastSize(tokens, tp_world, topk, hidden, rs_tokens_per_chunk),
+        2LL << 20);
+}
+
+TpPlan::TpPlan(torch::Tensor example, int64_t global_intermediate, int64_t shared_intermediate, int64_t topk,
+               int64_t num_experts, int64_t tp_world, int64_t max_tokens, int64_t shared_experts, uint64_t ffts,
+               uint64_t symmetric_address, int64_t symmetric_bytes, bool route_weight_before_quant,
+               int64_t m_groups_per_wave, int64_t ag_cores_per_peer, int64_t rs_tokens_per_chunk,
+               c10::optional<torch::Tensor> workspace_hint)
+    : ffts_(ffts)
+{
+    CheckTensor(example, 2, "tp plan input");
+    const int64_t bs = example.size(0);
+    const int64_t h = example.size(1);
+    TORCH_CHECK(bs > 0 && bs <= max_tokens && max_tokens <= 65536,
+                "TpPlan BS must be in [1, max_tokens], max_tokens <= 65536");
+    TORCH_CHECK(tp_world >= 2 && tp_world <= 8, "TpPlan tp_world must be in [2, 8] (single-node MTE)");
+    TORCH_CHECK(h >= 1024 && h <= 8192 && h % 64 == 0, "TpPlan hidden must be in [1024, 8192] and divisible by 64");
+    TORCH_CHECK(global_intermediate >= 256 && global_intermediate % (tp_world * 128) == 0,
+                "TpPlan global_intermediate must be divisible by tp_world * 128 (local intermediate >= 128, %128==0)");
+    const int64_t local_inter = global_intermediate / tp_world;
+    TORCH_CHECK(local_inter >= 128 && local_inter <= 4096, "TpPlan local intermediate out of range");
+    TORCH_CHECK(num_experts >= 1 && num_experts <= 1024 && topk >= 1 && topk <= 32 && topk <= num_experts,
+                "TpPlan invalid num_experts or topk");
+    TORCH_CHECK(shared_experts >= 0 && shared_experts <= 8, "TpPlan shared_experts must be in [0, 8]");
+    if (shared_experts > 0) {
+        TORCH_CHECK(shared_intermediate >= 256 && shared_intermediate <= 8192 && shared_intermediate % 256 == 0,
+                    "TpPlan shared_intermediate must be divisible by 256");
+    }
+    TORCH_CHECK(m_groups_per_wave >= 1 && m_groups_per_wave <= 256, "TpPlan m_groups_per_wave out of range");
+    TORCH_CHECK(rs_tokens_per_chunk >= 1 && rs_tokens_per_chunk <= 1024, "TpPlan rs_tokens_per_chunk out of range");
+
+    platform_ = GetPlatformInfo();
+    TORCH_CHECK(ag_cores_per_peer >= 1 && ag_cores_per_peer * (tp_world - 1) < static_cast<int64_t>(platform_.aiv),
+                "TpPlan ag_cores_per_peer * (tp_world - 1) must leave >= 1 AIV for route table construction");
+
+    const auto required = tp_buffer_size(tp_world, max_tokens, topk, h, rs_tokens_per_chunk);
+    TORCH_CHECK(symmetric_address != 0 && symmetric_bytes >= required, "TP MegaMoE symmetric buffer needs ", required,
+                " bytes, got ", symmetric_bytes);
+
+    tiling_ = {};
+    tiling_.bs = static_cast<uint32_t>(bs);
+    tiling_.numMaxTokensPerRank = static_cast<uint32_t>(max_tokens);
+    tiling_.tpWorldSize = static_cast<uint32_t>(tp_world);
+    tiling_.numExperts = static_cast<uint32_t>(num_experts);
+    tiling_.topK = static_cast<uint32_t>(topk);
+    tiling_.h = static_cast<uint32_t>(h);
+    tiling_.routedGmm1OutDim = static_cast<uint32_t>(local_inter * 2);
+    tiling_.sharedExpertNum = static_cast<uint32_t>(shared_experts);
+    tiling_.sharedGmm1OutDim = shared_experts > 0 ? static_cast<uint32_t>(shared_intermediate * 2) : 0U;
+    tiling_.aicNum = platform_.aic;
+    tiling_.aivNum = platform_.aiv;
+    tiling_.mGroupsPerWave = static_cast<uint32_t>(m_groups_per_wave);
+    tiling_.agCoresPerPeer = static_cast<uint32_t>(ag_cores_per_peer);
+    tiling_.rsTokensPerChunk = static_cast<uint32_t>(rs_tokens_per_chunk);
+    tiling_.clampLimit = std::numeric_limits<float>::max();
+    tiling_.activationAlpha = 1.0F;
+    tiling_.activationBeta = 1.0F;
+    tiling_.sharedPrecisionMode = static_cast<uint8_t>(MegaMoeImpl::SharedPrecisionMode::NONE);
+    tiling_.routeWeightBeforeQuant = route_weight_before_quant ? 1U : 0U;
+    tiling_.actMode = static_cast<uint8_t>(MegaMoeImpl::MegaMoeActMode::SWIGLU);
+    tiling_.actSubMode = static_cast<uint8_t>(MegaMoeImpl::MegaMoeActSubMode::DEFAULT);
+
+    const auto ubPlan = MegaMoeImpl::MakeTpAiv1ResidentUbLayout(tiling_.h);
+    TORCH_CHECK(ubPlan.valid && ubPlan.end <= platform_.ub, "TpPlan AIV1 resident UB overflow: required=", ubPlan.end,
+                " available=", platform_.ub);
+
+    const MegaMoeImpl::TpWorkspaceInfo info(nullptr, &tiling_);
+    const int64_t bytes =
+        info.workspaceSize + static_cast<int64_t>(platform_.system_workspace) + kReservedWorkspaceBytes;
+    TORCH_CHECK(bytes > info.workspaceSize, "TP MegaMoE workspace size overflow");
+    if (workspace_hint.has_value()) {
+        CheckTensor(*workspace_hint, 1, "workspace hint");
+        TORCH_CHECK(workspace_hint->device() == example.device() && workspace_hint->scalar_type() == torch::kUInt8,
+                    "workspace hint must be uint8 on the plan device");
+    }
+    workspace_ = (workspace_hint.has_value() && workspace_hint->numel() >= bytes)
+                     ? *workspace_hint
+                     : torch::empty({bytes}, example.options().dtype(torch::kUInt8));
+    context_ = torch::empty({static_cast<int64_t>(sizeof(Mc2Aclnn::Mc2MoeContext))}, workspace_.options());
+
+    Mc2Aclnn::Mc2MoeContext context{};
+    const int rank = aclshmem_my_pe();
+    TORCH_CHECK(rank >= 0 && rank < tp_world && tp_world <= Mc2Aclnn::HCCL_MAX_RANK_SIZE,
+                "Invalid SHMEM rank/tp_world: ", rank, "/", tp_world);
+    context.epRankId = static_cast<uint32_t>(rank);
+    context.rankSizePerServer = static_cast<uint32_t>(tp_world);
+    for (int64_t peer = 0; peer < tp_world; ++peer) {
+        void* address = aclshmem_ptr(reinterpret_cast<void*>(symmetric_address), static_cast<int32_t>(peer));
+        TORCH_CHECK(address != nullptr, "rank=", rank, " tp prepare: cannot resolve peer=", peer);
+        context.epHcclBuffer_[peer] = reinterpret_cast<uint64_t>(address);
+    }
+    ASCEND_DEEPEP_CHECK_ACL(
+        aclrtMemcpy(context_.data_ptr(), sizeof(context), &context, sizeof(context), ACL_MEMCPY_HOST_TO_DEVICE));
+}
+
+std::tuple<torch::Tensor, torch::Tensor> TpPlan::forward(
+    torch::Tensor x, c10::optional<torch::Tensor> x_scales, torch::Tensor topk_ids, torch::Tensor topk_weights,
+    torch::Tensor weight1, torch::Tensor weight2, torch::Tensor weight_scales1, torch::Tensor weight_scales2,
+    c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> shared_weight1,
+    c10::optional<torch::Tensor> shared_weight2, c10::optional<torch::Tensor> shared_weight_scales1,
+    c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<double> activation_clamp,
+    c10::optional<torch::Tensor> out, c10::optional<bool> route_weight_before_quant)
+{
+    // 严格遵守零 D2H/H2D 同步约束：仅在 Host 校验 Tensor 元信息，不读取任何 Device 内存。
+    TORCH_CHECK(!activation_clamp.has_value() ||
+                    (std::isfinite(*activation_clamp) && *activation_clamp > 0.0 &&
+                     *activation_clamp <= std::numeric_limits<float>::max()),
+                "activation_clamp must be None or finite positive FP32");
+    CheckTensor(x, 2, "x");
+    CheckTensor(topk_ids, 2, "topk_ids");
+    CheckTensor(topk_weights, 2, "topk_weights");
+    CheckTensor(weight1, 3, "weight1");
+    CheckTensor(weight2, 3, "weight2");
+    CheckTensor(weight_scales1, 4, "weight_scales1");
+    CheckTensor(weight_scales2, 4, "weight_scales2");
+
+    const bool prequantized = x_scales.has_value();
+    TORCH_CHECK(x.scalar_type() == (prequantized ? c10::ScalarType::Float8_e4m3fn : torch::kBFloat16),
+                "x must be BF16, or FP8 E4M3 with E8M0 scales");
+    if (prequantized) {
+        CheckTensor(*x_scales, 2, "x_scales");
+        TORCH_CHECK(x_scales->scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
+                        x_scales->sizes() == torch::IntArrayRef({x.size(0), CeilDiv(x.size(1), int64_t{32})}),
+                    "x_scales must be E8M0 [BS, H/32]");
+    }
+    TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32, "topk_ids must be int32");
+    TORCH_CHECK(topk_weights.scalar_type() == torch::kFloat32, "topk_weights must be float32");
+    TORCH_CHECK(weight1.scalar_type() == torch::kUInt8 && weight2.scalar_type() == torch::kUInt8,
+                "TP MegaMoE routed weight1/weight2 must be packed E2M1 uint8 (A8W4)");
+    TORCH_CHECK(weight_scales1.scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
+                    weight_scales2.scalar_type() == c10::ScalarType::Float8_e8m0fnu,
+                "routed weight scales must be FP8 E8M0 tensors");
+
+    if (timer.has_value()) {
+#ifndef DEEPEP_MEGAMOE_TIMER
+        TORCH_CHECK(false, "Rebuild with DEEPEP_MEGAMOE_TIMER=ON before passing timer");
+#endif
+        CheckTensor(*timer, 1, "timer");
+        TORCH_CHECK(timer->scalar_type() == torch::kInt64 && timer->numel() == AscendTimer::TOTAL_BUFFER_SIZE,
+                    "timer must be int64 with TOTAL_BUFFER_SIZE elements");
+    }
+
+    for (const auto* tensor : {&topk_ids, &topk_weights, &weight1, &weight2, &weight_scales1, &weight_scales2}) {
+        TORCH_CHECK(tensor->device() == x.device(), "TP MegaMoE tensors must be on the same NPU");
+    }
+    for (const auto* tensor : {&x_scales, &timer, &out}) {
+        TORCH_CHECK(!tensor->has_value() || tensor->value().device() == x.device(),
+                    "optional TP MegaMoE tensors must be on the same NPU");
+    }
+
+    const int64_t bs = x.size(0);
+    const int64_t h = x.size(1);
+    const int64_t topk = topk_ids.size(1);
+    const int64_t experts = weight1.size(0);
+    const int64_t routed_n1 = weight1.size(1);
+    const int64_t routed_inter = routed_n1 / 2;
+    TORCH_CHECK(x.device() == workspace_.device() && bs == tiling_.bs && h == tiling_.h && topk == tiling_.topK &&
+                    experts == tiling_.numExperts && routed_n1 == tiling_.routedGmm1OutDim,
+                "Input/device/routed-weights differ from the prepared TpPlan");
+    TORCH_CHECK(topk_ids.sizes() == torch::IntArrayRef({bs, topk}) &&
+                    topk_weights.sizes() == torch::IntArrayRef({bs, topk}),
+                "topk_ids/topk_weights must have shape [BS, topK]");
+    TORCH_CHECK(weight1.sizes() == torch::IntArrayRef({experts, routed_n1, h / 2}) &&
+                    weight2.sizes() == torch::IntArrayRef({experts, h, routed_inter / 2}),
+                "packed A8W4 routed weight shapes mismatch");
+    TORCH_CHECK(weight_scales1.sizes() == torch::IntArrayRef({experts, routed_n1, CeilDiv(h, int64_t{64}), 2}) &&
+                    weight_scales2.sizes() ==
+                        torch::IntArrayRef({experts, h, CeilDiv(routed_inter, int64_t{64}), 2}),
+                "routed weight scale shapes mismatch");
+
+    const bool has_shared = shared_weight1.has_value();
+    TORCH_CHECK(shared_weight2.has_value() == has_shared,
+                "shared_weight1 and shared_weight2 must be supplied together");
+    int64_t shared_experts = 0;
+    auto shared_mode = MegaMoeImpl::SharedPrecisionMode::NONE;
+    if (has_shared) {
+        CheckTensor(*shared_weight1, 3, "shared_weight1");
+        CheckTensor(*shared_weight2, 3, "shared_weight2");
+        TORCH_CHECK(shared_weight1->device() == x.device() && shared_weight2->device() == x.device(),
+                    "shared weights must be on the same device as x");
+        shared_experts = shared_weight1->size(0);
+        const int64_t shared_n1 = tiling_.sharedGmm1OutDim;
+        const int64_t shared_inter = shared_n1 / 2;
+        TORCH_CHECK(shared_weight1->sizes() == torch::IntArrayRef({shared_experts, shared_n1, h}) &&
+                        shared_weight2->sizes() == torch::IntArrayRef({shared_experts, h, shared_inter}),
+                    "shared weight shapes must be [S, 2*I_shared, H] and [S, H, I_shared]");
+        if (shared_weight1->scalar_type() == torch::kBFloat16) {
+            TORCH_CHECK(shared_weight2->scalar_type() == torch::kBFloat16 &&
+                            !shared_weight_scales1.has_value() && !shared_weight_scales2.has_value(),
+                        "BF16 shared experts require BF16 shared_weight1/2 without shared scales");
+            shared_mode = MegaMoeImpl::SharedPrecisionMode::BF16;
+        } else if (shared_weight1->scalar_type() == c10::ScalarType::Float8_e4m3fn) {
+            TORCH_CHECK(shared_weight2->scalar_type() == c10::ScalarType::Float8_e4m3fn &&
+                            shared_weight_scales1.has_value() && shared_weight_scales2.has_value(),
+                        "FP8 shared experts require FP8 E4M3 shared_weight1/2 and E8M0 shared_weight_scales1/2");
+            CheckTensor(*shared_weight_scales1, 4, "shared_weight_scales1");
+            CheckTensor(*shared_weight_scales2, 4, "shared_weight_scales2");
+            TORCH_CHECK(shared_weight_scales1->device() == x.device() &&
+                            shared_weight_scales2->device() == x.device() &&
+                            shared_weight_scales1->scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
+                            shared_weight_scales2->scalar_type() == c10::ScalarType::Float8_e8m0fnu,
+                        "shared weight scales must be FP8 E8M0 on the same device");
+            TORCH_CHECK(shared_weight_scales1->sizes() ==
+                                torch::IntArrayRef({shared_experts, shared_n1, CeilDiv(h, int64_t{64}), 2}) &&
+                            shared_weight_scales2->sizes() ==
+                                torch::IntArrayRef({shared_experts, h, CeilDiv(shared_inter, int64_t{64}), 2}),
+                        "shared weight scale shapes mismatch");
+            shared_mode = MegaMoeImpl::SharedPrecisionMode::FP8_MX;
+        } else {
+            TORCH_CHECK(false, "shared weights must be BF16 or FP8 E4M3");
+        }
+    } else {
+        TORCH_CHECK(!shared_weight_scales1.has_value() && !shared_weight_scales2.has_value(),
+                    "unexpected shared weight scales without shared weights");
+    }
+    TORCH_CHECK(shared_experts == tiling_.sharedExpertNum, "Shared expert count differs from the prepared TpPlan");
+
+    const bool pre_quant_weight = route_weight_before_quant.has_value()
+                                      ? *route_weight_before_quant
+                                      : (tiling_.routeWeightBeforeQuant != 0U);
+    TORCH_CHECK(!pre_quant_weight || topk <= MegaMoeImpl::META_INFO_SIZE,
+                "route_weight_before_quant requires topK <= 8");
+
+    torch::Tensor y = out.has_value() ? *out : torch::empty(x.sizes(), x.options().dtype(torch::kBFloat16));
+    CheckTensor(y, 2, "out");
+    TORCH_CHECK(y.scalar_type() == torch::kBFloat16 && y.sizes() == x.sizes(), "out must be BF16 [BS, H]");
+    torch::Tensor expert_tokens = torch::empty({experts}, x.options().dtype(torch::kInt32));
+
+    auto launch_tiling = tiling_;
+    launch_tiling.sharedPrecisionMode = static_cast<uint8_t>(shared_mode);
+    launch_tiling.routeWeightBeforeQuant = pre_quant_weight ? 1U : 0U;
+    launch_tiling.clampLimit = activation_clamp.has_value() ? static_cast<float>(*activation_clamp)
+                                                            : std::numeric_limits<float>::max();
+
+    const auto stream = c10_npu::getCurrentNPUStream();
+    auto ptr = [](const torch::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
+    auto opt = [&](const c10::optional<torch::Tensor>& tensor) { return tensor ? ptr(*tensor) : nullptr; };
+
+    mega_moe_tp_kernel_do(platform_.block_dim, platform_.ub, stream.stream(), ptr(context_), ptr(x), opt(x_scales),
+                          ptr(topk_ids), ptr(topk_weights), ptr(weight1), ptr(weight2), ptr(weight_scales1),
+                          ptr(weight_scales2), opt(shared_weight1), opt(shared_weight2), opt(shared_weight_scales1),
+                          opt(shared_weight_scales2), ptr(y), ptr(expert_tokens), ptr(workspace_), opt(timer),
+                          reinterpret_cast<const uint8_t*>(&launch_tiling), ffts_);
+
+    for (const auto* tensor : {&x, &topk_ids, &topk_weights, &weight1, &weight2, &weight_scales1, &weight_scales2,
+                               &workspace_, &context_, &y, &expert_tokens}) {
+        c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
+    }
+    if (timer.has_value()) {
+        c10_npu::NPUCachingAllocator::recordStream(timer->storage().data_ptr(), stream);
+    }
+    if (has_shared) {
+        c10_npu::NPUCachingAllocator::recordStream(shared_weight1->storage().data_ptr(), stream);
+        c10_npu::NPUCachingAllocator::recordStream(shared_weight2->storage().data_ptr(), stream);
+        if (shared_weight_scales1.has_value()) {
+            c10_npu::NPUCachingAllocator::recordStream(shared_weight_scales1->storage().data_ptr(), stream);
+            c10_npu::NPUCachingAllocator::recordStream(shared_weight_scales2->storage().data_ptr(), stream);
+        }
+    }
+    if (x_scales.has_value()) {
+        c10_npu::NPUCachingAllocator::recordStream(x_scales->storage().data_ptr(), stream);
+    }
+    return {y, expert_tokens};
 }
 
 }  // namespace deepep::megamoe

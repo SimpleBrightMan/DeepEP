@@ -31,12 +31,8 @@ __aicore__ inline QuantProcessConfig CreateQuantProcessConfig(uint32_t tokenHidd
         Ops::Base::CeilAlign(tokenHiddenDim / AElemsPerByte, static_cast<uint32_t>(ALIGN_256)) * sizeof(ActivationType);
     uint32_t quantScaleAlignBytes = Ops::Base::CeilAlign(
         quantScaleNumAlignPerToken * static_cast<uint32_t>(sizeof(QuantScaleOutType)), static_cast<uint32_t>(ALIGN_32));
-    uint32_t quantTokenScaleAlignBytes = quantTokenAlignBytes + quantScaleAlignBytes;
-    if constexpr (TopkWeightsPrefetch) {
-        uint32_t weightAlignBytes = Ops::Base::CeilAlign(static_cast<uint32_t>(params.tilingData->topK * sizeof(float)),
-                                                         static_cast<uint32_t>(ALIGN_32));
-        quantTokenScaleAlignBytes += weightAlignBytes;
-    }
+    uint32_t quantTokenScaleAlignBytes = quantTokenAlignBytes + quantScaleAlignBytes + ALIGN_32;
+
     return {quantTokenAlignBytes, quantScaleAlignBytes, quantTokenScaleAlignBytes, quantScaleNumAlignPerToken};
 }
 
@@ -47,6 +43,9 @@ struct QuantProcessScratch {
     LocalTensor<ActivationType> xOutTensor0;
     LocalTensor<ActivationType> xOutTensor1;
     LocalTensor<uint16_t> mxTempTensor;
+    // 仅FP8打包时复用整个量化scratch；两槽容量由真实连续span推导。
+    LocalTensor<uint8_t> fp8PackTensor;
+    uint32_t fp8PackRowsPerSlot = 1U;
 };
 
 template <typename TopkWeightsType, typename ActivationType, bool TopkWeightsPrefetch>
@@ -55,33 +54,12 @@ __aicore__ inline void LoadTopkWeightsToUb(const Params& params, const QuantProc
                                            const LocalTensor<ActivationType>& xOutTensor, int32_t tokenIndex,
                                            TEventID event)
 {
-    if constexpr (TopkWeightsPrefetch) {
-        GlobalTensor<TopkWeightsType> weightGm;
-        weightGm.SetGlobalBuffer(reinterpret_cast<__gm__ TopkWeightsType*>(
-            params.probsGmAddr +
-            static_cast<uint64_t>(tokenIndex) * params.tilingData->topK * sizeof(TopkWeightsType)));
-        uint32_t weightOffsetInUb = config.quantTokenAlignBytes + config.quantScaleAlignBytes;
-        if constexpr (Std::IsSame<TopkWeightsType, bfloat16_t>::value) {
-            LocalTensor<TopkWeightsType> weightBf16Tmp =
-                scratch.mxTempTensor.template ReinterpretCast<TopkWeightsType>();
-            DataCopyPad(weightBf16Tmp, weightGm,
-                        {1U, static_cast<uint32_t>(params.tilingData->topK * sizeof(TopkWeightsType)), 0U, 0U, 0U},
-                        {false, 0U, 0U, 0U});
-            SetFlag<AscendC::HardEvent::MTE2_V>(event);
-            WaitFlag<AscendC::HardEvent::MTE2_V>(event);
-            LocalTensor<float> weightFp32Ub = xOutTensor[weightOffsetInUb].template ReinterpretCast<float>();
-            Cast(weightFp32Ub, weightBf16Tmp, AscendC::RoundMode::CAST_NONE, params.tilingData->topK);
-            PipeBarrier<PIPE_V>();
-        } else {
-            LocalTensor<TopkWeightsType> weightUb =
-                xOutTensor[weightOffsetInUb].template ReinterpretCast<TopkWeightsType>();
-            DataCopyPad(weightUb, weightGm,
-                        {1U, static_cast<uint32_t>(params.tilingData->topK * sizeof(TopkWeightsType)), 0U, 0U, 0U},
-                        {false, 0U, 0U, 0U});
-            SetFlag<AscendC::HardEvent::MTE2_V>(event);
-            WaitFlag<AscendC::HardEvent::MTE2_V>(event);
-        }
-    }
+    if (params.tilingData->topkWeightsPrefetch == 0U) return;
+    GlobalTensor<float> weights;
+    weights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.probsGmAddr));
+    auto dst = xOutTensor[config.quantTokenAlignBytes + config.quantScaleAlignBytes].template ReinterpretCast<float>();
+    DataCopyPad(dst, weights[static_cast<uint64_t>(tokenIndex) * params.tilingData->topK],
+                {1U, params.tilingData->topK * static_cast<uint32_t>(sizeof(float)), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
 }
 
 // 原型：MegaMoe::QuantProcessInRank。量化一个逻辑 AIV 任务负责的本卡 token。
@@ -96,21 +74,44 @@ __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidde
     scales.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(params.inputScaleGmAddr));
     output.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(params.peermemInfo.quantTokenScalePtr));
     const uint32_t scaleBytes = config.quantScaleNumAlignPerToken;
+    const uint32_t rowsPerSlot = scratch.fp8PackRowsPerSlot;
+    const uint32_t slotBytes = rowsPerSlot * config.quantTokenScaleAlignBytes;
+    // GM->UB DataCopyPad的dstStride以32B为单位，blockLen以byte为单位。
+    // 自动对齐仅占用每行内部padding；记录stride和scale起点均32B对齐。
+    const uint32_t inputGap = (config.quantTokenScaleAlignBytes -
+        Ops::Base::CeilAlign(hidden, static_cast<uint32_t>(ALIGN_32))) / ALIGN_32;
+    const uint32_t scaleGap = (config.quantTokenScaleAlignBytes -
+        Ops::Base::CeilAlign(scaleBytes, static_cast<uint32_t>(ALIGN_32))) / ALIGN_32;
     SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
     SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
-    for (uint32_t index = 0; index < range.count; ++index) {
+    uint32_t sequence = 0U;
+    for (uint32_t index = 0; index < range.count; index += rowsPerSlot) {
         const uint64_t row = range.start + index;
-        const auto event = index % DOUBLE_BUFFER == 0 ? EVENT_ID0 : EVENT_ID1;
-        auto buffer = (index % DOUBLE_BUFFER == 0 ? scratch.xOutTensor0 : scratch.xOutTensor1)
-                          .template ReinterpretCast<uint8_t>();
+        const uint32_t remaining = static_cast<uint32_t>(range.count - index);
+        const uint32_t count = rowsPerSlot < remaining ? rowsPerSlot : remaining;
+        const uint32_t slot = sequence++ % DOUBLE_BUFFER;
+        const auto event = slot == 0U ? EVENT_ID0 : EVENT_ID1;
+        // 未声明可复用span的其他后端保持原单行槽，不访问未初始化的fp8PackTensor。
+        auto buffer = rowsPerSlot > 1U ? scratch.fp8PackTensor[slot * slotBytes]
+            : (slot == 0U ? scratch.xOutTensor0 : scratch.xOutTensor1).template ReinterpretCast<uint8_t>();
         WaitFlag<HardEvent::MTE3_MTE2>(event);
-        DataCopyPad(buffer, input[row * hidden], {1U, hidden, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-        DataCopyPad(buffer[config.quantTokenAlignBytes], scales[row * scaleBytes], {1U, scaleBytes, 0U, 0U, 0U},
+        DataCopyPad(buffer, input[row * hidden], {static_cast<uint16_t>(count), hidden, 0U, inputGap, 0U},
                     {false, 0U, 0U, 0U});
+        DataCopyPad(buffer[config.quantTokenAlignBytes], scales[row * scaleBytes],
+                    {static_cast<uint16_t>(count), scaleBytes, 0U, scaleGap, 0U},
+                    {false, 0U, 0U, 0U});
+        if (params.tilingData->topkWeightsPrefetch != 0U) {
+            GlobalTensor<uint8_t> weights;
+            weights.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(params.probsGmAddr));
+            DataCopyPad(buffer[config.quantTokenAlignBytes + config.quantScaleAlignBytes],
+                        weights[row * params.tilingData->topK * sizeof(float)],
+                        {static_cast<uint16_t>(count), params.tilingData->topK * static_cast<uint32_t>(sizeof(float)), 0U,
+                         (config.quantTokenScaleAlignBytes - ALIGN_32) / ALIGN_32, 0U}, {false, 0U, 0U, 0U});
+        }
         SetFlag<HardEvent::MTE2_MTE3>(event);
         WaitFlag<HardEvent::MTE2_MTE3>(event);
         DataCopyPad(output[row * config.quantTokenScaleAlignBytes], buffer,
-                    {1U, config.quantTokenScaleAlignBytes, 0U, 0U, 0U});
+                    {1U, count * config.quantTokenScaleAlignBytes, 0U, 0U, 0U});
         SetFlag<HardEvent::MTE3_MTE2>(event);
     }
     WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
@@ -162,7 +163,7 @@ __aicore__ inline void QuantizeLocalTokens(const AivJobContext& job, const MoeSt
                     xCopyInPadParams);
         LoadTopkWeightsToUb<TopkWeightsType, ActivationType, TopkWeightsPrefetch>(params, config, scratch, xOutTensor,
                                                                                   tokenRange.start + index, event);
-        if constexpr (!TopkWeightsPrefetch) {
+        {
             SetFlag<AscendC::HardEvent::MTE2_V>(event);
             WaitFlag<AscendC::HardEvent::MTE2_V>(event);
         }

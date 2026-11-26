@@ -40,6 +40,13 @@ def test_build_variants_have_disjoint_python_and_native_outputs(monkeypatch):
 
 
 def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
+    shmem_libs = (
+        "libshmem.so",
+        "libshmem_utils.so",
+        "aclshmem_bootstrap_config_store.so",
+        "aclshmem_bootstrap_uid.so",
+    )
+    shmem_digest = hashlib.sha256(b"fixture-shmem").hexdigest()
     entries = {
         "deep_ep/_C.fake.so": b"not-an-executable",
         "deep_ep/_build_info.json": json.dumps(
@@ -48,9 +55,12 @@ def wheel(tmp_path, enabled, payload, ep_gmm_fused=False):
                 "megamoe": {"enabled": enabled},
                 "ep_gmm_fused": {"enabled": ep_gmm_fused},
                 "shmem": {"revision": "test-sdk"},
+                "shmem_runtime": {name: shmem_digest for name in shmem_libs},
             }
         ).encode(),
         "test.dist-info/licenses/deepseek-deepep.LICENSE": b"fixture",
+        "test.dist-info/licenses/cann.LICENSE": b"fixture",
+        **{"deep_ep/.libs/" + name: b"fixture-shmem" for name in shmem_libs},
     }
     if payload:
         for name in ("api.py", "benchmark.py", "configs/smoke.json", "libmegamoe_kernel.so", "_C.fake.so"):

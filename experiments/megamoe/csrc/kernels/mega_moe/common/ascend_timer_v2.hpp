@@ -22,6 +22,7 @@ enum FixedTiming {
     FIXED_TIMING_COUNT
 };
 
+// ISSUE新槽改变raw buffer大小，旧buffer不能被误解为新的异步发射语义。
 enum DynamicTimingType {
     AIV_DISPATCH = 0,
     AIV_SWIGLU_WAIT,
@@ -39,6 +40,30 @@ enum DynamicTimingType {
     AIC_SHARED_GMM2,
     AIV_SHARED_GMM2_PROLOGUE,
     AIV_SHARED_SWIGLU,
+    AIC_GMM2_ISSUE,
+    AIC_GMM1_BEGIN,
+    AIC_GMM1_END,
+    AIC_GMM2_BEGIN,
+    AIC_GMM2_END,
+    AIC_GMM2_FIX_DRAIN,
+    AIC_GMM1_ISSUE,
+    // 布局版本槽：不记录事件；使旧的排空式 trace 与被动 trace 长度不同，禁止误解码。
+    PASSIVE_TRACE_SCHEMA_V1,
+    // 跨任务异步版只把issue段画实心条；sync记录调度器原生的完成观察。
+    // 新槽同时改变raw大小，拒绝使用旧扩展/旧parser误读。
+    AIV_DISPATCH_ISSUE,
+    AIV_DISPATCH_SYNC,
+    AIV_SWIGLU_ISSUE,
+    AIV_SWIGLU_SYNC,
+    AIV_COMBINE_ISSUE,
+    // TP4 MegaMoE 专用打点槽：WAIT 槽在默认泳道图中隐藏，使软同步等待自然以空泡呈现。
+    AIV_ALLGATHER,
+    AIV_ROUTE_TABLE,
+    AIV_ROUTE_WAIT,
+    AIV_PERMUTE,
+    AIV_UNPERMUTE_SEND,
+    AIV_RECV_REDUCE_WAIT,
+    AIV_RECV_REDUCE,
     DYNAMIC_TYPE_COUNT_ENUM
 };
 
@@ -46,6 +71,9 @@ enum DynamicTimingType {
 // 为大 BS 的 tile 依赖等待预留空间，超限由主机校验明确报错。
 static constexpr int MAX_DYNAMIC_ITER = 4096;
 static constexpr int N_CORE_COUNT = 96;
+// 完整被动采集全部角色；不增加同步，开销按实测shape复核。
+static constexpr int DYNAMIC_TRACE_GROUPS = 32;
+static constexpr int DYNAMIC_TRACE_AIV0 = 1;
 static constexpr int DYNAMIC_TYPE_COUNT = DYNAMIC_TYPE_COUNT_ENUM;
 static constexpr int N_TIMING_ITEM_PER_CORE = FIXED_TIMING_COUNT + DYNAMIC_TYPE_COUNT * MAX_DYNAMIC_ITER;
 static constexpr int N_TIMING_COUNTER_PER_CORE = N_TIMING_ITEM_PER_CORE * 2;

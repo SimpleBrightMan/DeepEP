@@ -39,26 +39,8 @@ namespace MegaMoeImpl {
 // 窗口首部的跨卡同步区（rankSyncInWorld）字节数，数据区从此偏移起。
 constexpr int64_t PEERMEM_DATA_OFFSET = 1024 * 60LL;
 
-// 通信拓扑：决定窗口数据区按 MTE 还是 URMA 布局推进。
-constexpr int64_t TOPO_TYPE_MTE = 0U;   // mte
-constexpr int64_t TOPO_TYPE_URMA = 1U;  // urma
-
-// ============================ 各区尺寸（host / device 共用） ============================
-
-// URMA layered 路径仍使用 mask 槽；MTE WAVE 不再经过该布局。
-HOST_DEVICE int64_t CalcDispatchMaskAlignSizeBy(int64_t numMaxTokensPerRank, int64_t topK)
-{
-    int64_t sendTotalNum = numMaxTokensPerRank * topK;
-    int64_t alignedRouteCount = Ops::Base::CeilAlign(sendTotalNum * static_cast<int64_t>(sizeof(int32_t)), ALIGN_256) /
-                                static_cast<int64_t>(sizeof(int32_t));
-    return Ops::Base::CeilAlign(alignedRouteCount / 8, ALIGN_32);
-}
-
-HOST_DEVICE int64_t CalcDispatchMaskAlignSize(const MegaMoeTilingData* tilingData)
-{
-    return CalcDispatchMaskAlignSizeBy(static_cast<int64_t>(tilingData->numMaxTokensPerRank),
-                                       static_cast<int64_t>(tilingData->topK));
-}
+// 当前 MegaMoE 只支持 MTE；tiling 中保留字段以保持 ABI。
+constexpr int64_t TOPO_TYPE_MTE = 0U;  // mte
 
 // 每个 (localExpert, srcRank) 槽直接保存有序 topkIndex。
 // 同一 token 的 topK expert id 不重复，因此单专家从一张源卡最多接收 numMaxTokensPerRank 个 index。
@@ -72,12 +54,6 @@ HOST_DEVICE int64_t CalcDispatchRouteIndexAlignSize(const MegaMoeTilingData* til
 HOST_DEVICE int64_t CalcRouteIndexRecvSize(int64_t routeIndexAlignSize, int64_t moeExpertPerRank, int64_t epWorldSize)
 {
     return Ops::Base::CeilAlign(moeExpertPerRank * epWorldSize * routeIndexAlignSize, ALIGN_512);
-}
-
-HOST_DEVICE int64_t CalcMaskRecvSize(int64_t maskAlignSize, int64_t moeExpertPerRank, int64_t epWorldSize)
-{
-    int64_t maskSlotSize = maskAlignSize + ALIGN_32;
-    return Ops::Base::CeilAlign(moeExpertPerRank * epWorldSize * maskSlotSize, ALIGN_512);
 }
 
 // 独立 raw count 表按 [localExpert][sourceRank] 排列，供接收端一次搬入并做前缀和。
@@ -100,7 +76,6 @@ HOST_DEVICE int64_t CalcMteExpertCountRecvSize(int64_t moeExpertPerRank, int64_t
         ALIGN_512);
 }
 
-// ============================ Rail topkIds 中转区（MTE 路径） ============================
 // 每服务器卡数。rank r 的 rail rank 在目标 server u 上为 u * SERVER_SIZE + r % SERVER_SIZE。
 constexpr int64_t MEGA_MOE_SERVER_SIZE = 8;
 // Platform contract: an aligned 512B peer-write packet becomes visible as a unit.
@@ -142,8 +117,8 @@ HOST_DEVICE int64_t CalcRailTopkIdsRecvSize(const MegaMoeTilingData* tilingData)
 // falls back to direct routing; single-server EP2..8 is also supported.
 HOST_DEVICE bool UseDecodeRailRouting(const MegaMoeTilingData* t)
 {
-    return t->topoType == TOPO_TYPE_MTE &&
-           UseDecodeInputReady(t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4, t->bs) &&
+    return t->variableTokenCounts == 0U && t->topoType == TOPO_TYPE_MTE &&
+           UsesCountEpochInputReady(t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4, t->bs) &&
            (t->epWorldSize <= MEGA_MOE_SERVER_SIZE || t->epWorldSize % MEGA_MOE_SERVER_SIZE == 0) &&
            t->blockAivNum > CalcServerNum(t->epWorldSize);
 }
@@ -160,8 +135,8 @@ HOST_DEVICE uint32_t CalcSendMaskExpertCapacity(const MegaMoeTilingData* t, uint
     return capacity;
 }
 
-// 单 token 的量化记录字节数 = 量化数据 + mx scale（prefetch 场景再拼 topk 权重），按 32B 对齐。
-HOST_DEVICE int64_t CalcQuantTokenScaleBytes(int64_t h, uint32_t elemsPerByte, int64_t topK, bool topkWeightsPrefetch)
+// 单 token 的通信记录 = 量化数据 + MX scale，按 32B 对齐。
+HOST_DEVICE int64_t CalcQuantTokenScaleBytes(int64_t h, uint32_t elemsPerByte)
 {
     uint32_t mxScaleNum = Ops::Base::CeilDiv(static_cast<uint32_t>(h), static_cast<uint32_t>(ALIGN_32));
     uint32_t dataBytes =
@@ -169,24 +144,14 @@ HOST_DEVICE int64_t CalcQuantTokenScaleBytes(int64_t h, uint32_t elemsPerByte, i
         static_cast<uint32_t>(sizeof(int8_t));
     uint32_t scaleBytes = mxScaleNum * static_cast<uint32_t>(sizeof(int8_t));
     uint32_t tokenScaleBytes = Ops::Base::CeilAlign(dataBytes + scaleBytes, static_cast<uint32_t>(ALIGN_32));
-    if (topkWeightsPrefetch) {
-        uint32_t weightBytes = Ops::Base::CeilAlign(static_cast<uint32_t>(topK) * static_cast<uint32_t>(sizeof(float)),
-                                                    static_cast<uint32_t>(ALIGN_32));
-        tokenScaleBytes = Ops::Base::CeilAlign(tokenScaleBytes + weightBytes, static_cast<uint32_t>(ALIGN_32));
-    }
-    return static_cast<int64_t>(tokenScaleBytes);
+    // 协议11始终保留一行32B路由权重；是否消费由跨rank一致的tiling标记决定。
+    return static_cast<int64_t>(tokenScaleBytes + ALIGN_32);
 }
 
-// combine 接收区单 token 记录字节数：须与 kernel InitCombineBuffers 的 combine record 布局一致。
-HOST_DEVICE int64_t CalcCombineTokenBytes(int64_t h, int64_t yDtypeSize, bool isQuantCombine)
+// Combine 回传一行 BF16，不附带量化 scale。
+HOST_DEVICE int64_t CalcCombineTokenBytes(int64_t h, int64_t yDtypeSize)
 {
-    if (!isQuantCombine) {
-        return h * yDtypeSize;
-    }
-    int64_t tokenStorageBytes = Ops::Base::CeilAlign(h, ALIGN_256);
-    int64_t scaleCount = Ops::Base::CeilDiv(h, static_cast<int64_t>(MXFP_SCALE_GROUP_NUM));
-    int64_t storedScaleBytes = Ops::Base::CeilAlign(scaleCount, static_cast<int64_t>(MXFP_MULTI_BASE_SIZE));
-    return Ops::Base::CeilAlign(tokenStorageBytes + storedScaleBytes, ALIGN_32);
+    return h * yDtypeSize;
 }
 
 // 计算窗口总大小的入参（供 host 侧 tiling 校验 cclBufferSize 使用）。
@@ -198,9 +163,6 @@ struct PeermemSizeParams {
     int64_t epWorldSize;
     int64_t yDtypeSize;
     uint32_t elemsPerByte;
-    bool topkWeightsPrefetch;
-    bool isQuantCombine;
-    int64_t topoType;
     bool reserveDecodeRail = false;
 };
 
@@ -211,26 +173,20 @@ struct PeermemSizeParams {
  */
 HOST_DEVICE int64_t CalcPeermemLeastSize(const PeermemSizeParams& params)
 {
-    int64_t routeRecvSize = 0;
-    if (params.topoType == TOPO_TYPE_MTE) {
-        int64_t routeIndexAlignSize =
-            Ops::Base::CeilAlign(params.numMaxTokensPerRank * static_cast<int64_t>(sizeof(int32_t)), ALIGN_32);
-        routeRecvSize = CalcRouteIndexRecvSize(routeIndexAlignSize, params.moeExpertPerRank, params.epWorldSize);
-    } else {
-        int64_t maskAlignSize = CalcDispatchMaskAlignSizeBy(params.numMaxTokensPerRank, params.topK);
-        routeRecvSize = CalcMaskRecvSize(maskAlignSize, params.moeExpertPerRank, params.epWorldSize);
-    }
-    const bool rail = params.topoType == TOPO_TYPE_MTE && params.reserveDecodeRail;
+    const int64_t routeIndexAlignSize =
+        Ops::Base::CeilAlign(params.numMaxTokensPerRank * static_cast<int64_t>(sizeof(int32_t)), ALIGN_32);
+    const int64_t routeRecvSize =
+        CalcRouteIndexRecvSize(routeIndexAlignSize, params.moeExpertPerRank, params.epWorldSize);
+    const bool rail = params.reserveDecodeRail;
     int64_t expertCountRecvSize = rail ? CalcMteExpertCountRecvSize(params.moeExpertPerRank, params.epWorldSize)
                                        : CalcExpertCountRecvSize(params.moeExpertPerRank, params.epWorldSize);
     int64_t railBytes =
         rail ? CalcServerNum(params.epWorldSize) * CalcRailTopkIdsSlotDataBytes(params.numMaxTokensPerRank, params.topK)
              : 0;
 
-    int64_t tokenScaleBytes =
-        CalcQuantTokenScaleBytes(params.h, params.elemsPerByte, params.topK, params.topkWeightsPrefetch);
+    int64_t tokenScaleBytes = CalcQuantTokenScaleBytes(params.h, params.elemsPerByte);
     int64_t quantTokenScaleSize = Ops::Base::CeilAlign(params.numMaxTokensPerRank * tokenScaleBytes, ALIGN_512);
-    int64_t combineTokenBytes = CalcCombineTokenBytes(params.h, params.yDtypeSize, params.isQuantCombine);
+    int64_t combineTokenBytes = CalcCombineTokenBytes(params.h, params.yDtypeSize);
     int64_t combineSendSize =
         Ops::Base::CeilAlign(params.numMaxTokensPerRank * params.topK * combineTokenBytes, ALIGN_512);
     return PEERMEM_DATA_OFFSET + routeRecvSize + expertCountRecvSize + railBytes + quantTokenScaleSize +
@@ -245,8 +201,6 @@ struct PeermemInfo {
     GM_ADDR expertCountRecvPtr;
     GM_ADDR railTopkIdsRecvPtr{nullptr};
     GM_ADDR quantTokenScalePtr;
-    GM_ADDR dispatchRecivePtr;
-    GM_ADDR dispatchFlagPtr;
     GM_ADDR combineSendPtr;
 
     __aicore__ inline PeermemInfo() = default;
@@ -256,14 +210,10 @@ struct PeermemInfo {
         rankSyncInWorldPtr = base;
         int64_t offset = PEERMEM_DATA_OFFSET;
         maskRecvPtr = base + offset;
-        if (tilingData->topoType == TOPO_TYPE_MTE) {
+        {
             offset += CalcRouteIndexRecvSize(CalcDispatchRouteIndexAlignSize(tilingData),
                                              static_cast<int64_t>(tilingData->moeExpertPerRank),
                                              static_cast<int64_t>(tilingData->epWorldSize));
-        } else {
-            offset += CalcMaskRecvSize(CalcDispatchMaskAlignSize(tilingData),
-                                       static_cast<int64_t>(tilingData->moeExpertPerRank),
-                                       static_cast<int64_t>(tilingData->epWorldSize));
         }
 
         expertCountRecvPtr = base + offset;
@@ -275,21 +225,11 @@ struct PeermemInfo {
             offset += CalcExpertCountRecvSize(tilingData->moeExpertPerRank, tilingData->epWorldSize);
         }
 
-        int64_t tokenScaleBytes =
-            CalcQuantTokenScaleBytes(static_cast<int64_t>(tilingData->h), elemsPerByte,
-                                     static_cast<int64_t>(tilingData->topK), tilingData->topkWeightsPrefetch == 1);
-        if (tilingData->topoType == TOPO_TYPE_MTE) {
+        int64_t tokenScaleBytes = CalcQuantTokenScaleBytes(static_cast<int64_t>(tilingData->h), elemsPerByte);
+        {
             quantTokenScalePtr = base + offset;
             offset += Ops::Base::CeilAlign(static_cast<int64_t>(tilingData->numMaxTokensPerRank) * tokenScaleBytes,
                                            ALIGN_512);
-        } else {
-            dispatchRecivePtr = base + offset;
-            int64_t relayRecordBytes = Ops::Base::CeilAlign(tokenScaleBytes, ALIGN_512);
-            offset += Ops::Base::CeilAlign(
-                static_cast<int64_t>(tilingData->bs) * relayRecordBytes * static_cast<int64_t>(serverNum), ALIGN_512);
-            dispatchFlagPtr = base + offset;
-            offset += Ops::Base::CeilAlign(
-                static_cast<int64_t>(serverNum) * tilingData->bs * static_cast<int64_t>(sizeof(uint64_t)), ALIGN_512);
         }
         combineSendPtr = base + offset;
     }

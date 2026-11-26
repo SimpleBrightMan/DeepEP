@@ -206,5 +206,6 @@ struct MegaMoeTilingData {
     uint32_t numMaxTokensPerRank;
     // 物理每机 EP rank 数，rank 按机器连续编号；0 表示未知，仅关闭刀片交错；peer均衡及wave轮换仍有效。
     uint32_t dispatchRanksPerNode;
+    uint32_t variableTokenCounts;  // 全rank一致：不同本地M共用direct-count协议，允许-1无效路由。
 };
 #endif

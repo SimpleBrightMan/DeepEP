@@ -17,9 +17,7 @@
 #include "../mega_moe_tiling.hpp"
 #include "mega_moe_constants.hpp"
 #include "mega_moe_workspace.hpp"
-#if defined(ENABLE_MEGA_MOE_LAYERED_KERNEL)
-#include "adv_api/hcomm/hcomm.h"
-#endif
+#include "mega_moe_wave_schedule.hpp"
 #include "../mc2_common/mc2_moe_context.hpp"
 
 class AscendTimerDevice;
@@ -32,11 +30,12 @@ using ProblemShape = AscendC::Shape<int64_t, int64_t, int64_t, int64_t>;
 
 // GMM1/GMM2 逐专家遍历的公共状态。expertIdx 标识当前专家，globalTokenStartIndex 表示该专家
 // 在本卡 MoE 专家紧凑 token 序列中的起始索引。
-struct ExpertLoopState {
+// N/K 使用 GMM1 约定，GMM2 在执行配置中转换；计算主循环的 M 保留完整专家行数。
+// GMM1/GMM2 分别持有上下文，执行时只读，当前范围用 ExpertSlice 表达；独立 AIV1 可建立局部 slice 视图。
+struct ExpertContext {
     ProblemShape problemShape;
     int64_t globalTokenStartIndex = 0;
     uint32_t expertIdx = 0U;
-    bool expertCountTableReady = false;
 };
 
 // GMM1/GMM2 执行期间共同维护的流水状态；引用成员将更新直接回写到调用方持有的状态。
@@ -44,20 +43,6 @@ struct GmmRuntimeState {
     uint32_t& startBlockIdx;
     int32_t& vecSetSyncCom;
     uint16_t& pingpongIdx;
-};
-
-// 标识 MoE 专家序列中的二维 token 位置。
-struct ExpertTokenPosition {
-    uint32_t expertIdx = 0U;
-    uint32_t tokenIndexInExpert = 0U;
-    // 从全部本卡 MoE 专家起点累计的全局连续 row，避免末波 Combine 重新标量扫描 count 表。
-    uint64_t globalTokenIndex = 0U;
-};
-
-// 标识 MoE 专家紧凑 token 序列中的左闭右开区间 [begin, end)。
-struct ExpertTokenRange {
-    ExpertTokenPosition begin{};
-    ExpertTokenPosition end{};
 };
 
 using Mc2MoeContext = Mc2Aclnn::Mc2MoeContext;
@@ -74,19 +59,14 @@ struct GMMAddrInfo {
     __gm__ int32_t* dispatchToGmm1Flag;
     __gm__ int32_t* gmm2CombineSyncCounter;
     __gm__ int32_t* gmmToEpilogueFlag;
-    __gm__ int32_t* gmm1TileStatus;
     __gm__ int32_t* sharedExpertGmm2TileCounter;
     // 仅 Wave 调试采集设置；其他调用保持空指针。
     AscendTimerDevice* timer = nullptr;
+    // 仅非量化、非prefetch的routed Wave启用；GM计数此时表示issued而非completed。
+    bool gmm1AsyncCompletion = false;
+    // 完整专家行数，不是当前wave/slice的M；0表示未知，缓存策略保持默认。
+    uint32_t expertTokenCount = 0U;
 };
-
-#if defined(ENABLE_MEGA_MOE_LAYERED_KERNEL)
-struct CombineCommParams {
-    uint32_t rankId;
-    Hcomm<COMM_PROTOCOL_UBC_CTP>* hcomm;
-    __gm__ Mc2MoeContext* mc2Context;
-};
-#endif
 
 // 保存 TensorList 入口地址，供按 expert 布局解析当前专家权重。
 struct ExpertWeightTensorListAddrs {
@@ -114,9 +94,6 @@ struct Params {
     WorkspaceInfo workspaceInfo;
     PeermemInfo peermemInfo;
     MegaMoeTilingData* tilingData;
-#if defined(ENABLE_MEGA_MOE_LAYERED_KERNEL)
-    CombineCommParams combineCommParams;
-#endif
 };
 
 enum class AddrUpdateMode : int32_t { GMM1, GMM2 };
@@ -164,7 +141,6 @@ struct GmmExecutionConfig {
 struct MoeSyncWorkspaceLayout {
     int32_t dispatchFlagSlotCountPerExpert;
     int32_t activationFlagSlotCountPerExpert;
-    uint32_t gmm1TileStatusCountPerExpert;
 };
 
 struct GroupSyncSlotLayout {

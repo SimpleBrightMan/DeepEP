@@ -24,6 +24,7 @@ def test_device_schema_and_extended_size():
 
     def names(enum, sentinel):
         body = re.search(r"enum\s+" + enum + r"\s*\{(.*?)\};", header, re.S)[1]
+        body = re.sub(r"//[^\n]*", "", body)
         return [item.split("=")[0].strip() for item in body.split(",") if item.strip() != sentinel]
 
     assert names("FixedTiming", "FIXED_TIMING_COUNT") == p.FIXED_NAMES
@@ -77,6 +78,10 @@ def test_binary_to_csv_to_trace_wait_metadata(raw_file):
     assert compute["args"]["n_tile"] == 1
     assert compute["args"]["wave_id"] == 4
     assert len(trace_events(events, "keep", first_start_cycle(events), include_wait=True)) == 4
+    prologue = next(event for event in trace if event["args"]["event_family"] == "AIV_GMM1_PROLOGUE")
+    assert "PROLOGUE_ISSUE" in prologue["name"]
+    assert prologue["args"]["timer_protocol"] == "passive_aiv1_async_v2"
+    assert prologue["args"]["observation"] == "scalar_issue_with_native_dependencies"
 
 
 def test_truncated_and_overflow_rejected(raw_file):
@@ -94,3 +99,11 @@ def test_truncated_and_overflow_rejected(raw_file):
 def test_sync_alignment_is_explicit_and_requires_anchor():
     with pytest.raises(ValueError, match="missing"):
         synchronized_rank_bases({0: [{"name": "AIC_GMM1", "start_cycle": 100, "end_cycle": 200}]})
+
+
+def test_aiv_async_issue_is_not_completion_or_double_renamed():
+    event = dict(name='AIV_SWIGLU_ISSUE_0', rank=0, group_id=0, core_type='AIV', sub_id=1,
+                 start_cycle=1000, end_cycle=2000)
+    rows = trace_events([event], 'keep', 0, time_origin='rank')
+    assert rows[0]['name'] == event['name']
+    assert rows[0]['args']['observation'] == 'scalar_issue_with_native_dependencies'

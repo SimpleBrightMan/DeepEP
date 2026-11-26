@@ -447,41 +447,23 @@ __aicore__ constexpr inline decltype(auto) Get(T&& value)
     return Get<Second, Rest...>(AscendC::Std::get<First>(AscendC::Std::forward<T>(value)));
 }
 
-__aicore__ inline ExpertLoopState CreateExpertLoopState(const MoeStageCommonConfig& context)
+__aicore__ inline ExpertContext CreateExpertContext(const MoeStageCommonConfig& context)
 {
-    ExpertLoopState state;
-    Get<N_VALUE>(state.problemShape) = context.gmm1OutputDim;
-    Get<K_VALUE>(state.problemShape) = context.tokenHiddenDim;
-    return state;
+    ExpertContext expertContext;
+    Get<N_VALUE>(expertContext.problemShape) = context.gmm1OutputDim;
+    Get<K_VALUE>(expertContext.problemShape) = context.tokenHiddenDim;
+    return expertContext;
 }
 
 // 按专家顺序推进连续 token 行偏移，并用当前专家的 token 数更新 M 维度。
-__aicore__ inline void UpdateExpertLoopState(ExpertLoopState& state, uint32_t expertIdx, uint64_t expertTokenCount)
+// 仅支持顺序遍历（包括空专家），不是按任意 expertIdx 查询前缀；不要跳过中间专家。
+__aicore__ inline void UpdateExpertContext(ExpertContext& expertContext, uint32_t expertIdx, uint64_t expertTokenCount)
 {
-    if (expertIdx != state.expertIdx) {
-        state.globalTokenStartIndex += Get<M_VALUE>(state.problemShape);
+    if (expertIdx != expertContext.expertIdx) {
+        expertContext.globalTokenStartIndex += Get<M_VALUE>(expertContext.problemShape);
     }
-    state.expertIdx = expertIdx;
-    Get<M_VALUE>(state.problemShape) = static_cast<int64_t>(expertTokenCount);
-}
-
-// 按当前 Wave 的剩余容量推进专家 token 位置，返回本次推进覆盖的 token 数。
-template <uint32_t TileM>
-__aicore__ inline uint32_t AdvanceExpertTokenPositionInWave(uint32_t expertTokenCount, uint32_t waveMGroupTarget,
-                                                            uint32_t& waveMGroupCount, ExpertTokenPosition& position)
-{
-    uint32_t expertRemainingTokenCount = expertTokenCount - position.tokenIndexInExpert;
-    uint32_t waveRemainingTokenCapacity = (waveMGroupTarget - waveMGroupCount) * TileM;
-    uint32_t sliceTokenCount =
-        expertRemainingTokenCount < waveRemainingTokenCapacity ? expertRemainingTokenCount : waveRemainingTokenCapacity;
-    waveMGroupCount += Ops::Base::CeilDiv(sliceTokenCount, TileM);
-    position.tokenIndexInExpert += sliceTokenCount;
-    position.globalTokenIndex += sliceTokenCount;
-    if (position.tokenIndexInExpert >= expertTokenCount) {
-        ++position.expertIdx;
-        position.tokenIndexInExpert = 0U;
-    }
-    return sliceTokenCount;
+    expertContext.expertIdx = expertIdx;
+    Get<M_VALUE>(expertContext.problemShape) = static_cast<int64_t>(expertTokenCount);
 }
 
 // 轮询 GM 中的 int32 ready flag，并在两次读取之间加入短暂退避。

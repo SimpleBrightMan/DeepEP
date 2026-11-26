@@ -152,7 +152,7 @@ def main(argv=None):
 from importlib.resources import files
 from deep_ep._native import require_native
 require_native("cluster preflight")
-import deep_ep_experimental.megamoe._C
+from deep_ep_experimental.megamoe import _C
 info = json.loads(files("deep_ep").joinpath("_build_info.json").read_text())
 with open(sys.argv[1], "w") as f:
     json.dump(dict(build=info, torch=torch.__version__, torch_npu=torch_npu.__version__,
@@ -161,8 +161,11 @@ with open(sys.argv[1], "w") as f:
         run([sys.executable, "-I", "-c", code, str(target)])
         return read_json(target)
 
-    interfaces = json.loads(run(["ip", "-j", "-4", "addr", "show", "up"], capture=True))
-    interface = interface_for(plan["hosts"][rank], interfaces)
+    if plan.get("local", False):
+        interface = "lo"
+    else:
+        interfaces = json.loads(run(["ip", "-j", "-4", "addr", "show", "up"], capture=True))
+        interface = interface_for(plan["hosts"][rank], interfaces)
     os.environ.update(
         OMP_NUM_THREADS="1",
         PYTHONUNBUFFERED="1",

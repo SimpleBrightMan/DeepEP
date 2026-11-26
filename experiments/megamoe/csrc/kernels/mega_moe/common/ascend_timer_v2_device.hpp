@@ -53,6 +53,12 @@ public:
         return timerAddr_ != nullptr && coreId_ >= 0 && coreId_ < AscendTimer::N_CORE_COUNT;
     }
 
+    __aicore__ inline bool DynamicEnabled() const
+    {
+        return Enabled() && coreId_ < AscendTimer::DYNAMIC_TRACE_GROUPS * 3 &&
+               (AscendTimer::DYNAMIC_TRACE_AIV0 != 0 || coreId_ % 3 != 1);
+    }
+
     // 由调度层指定实际服务的 Wave，不能从本核任务序号反推。
     __aicore__ inline void SetWave(int64_t waveId)
     {
@@ -80,11 +86,11 @@ public:
         }
     }
 
-    // 起点复用原有同步；Combine 结束点等待本核流水完成，计入异步搬运耗时。
+    // 只观察 Scalar 推进；异步搬运的完成由算法原有依赖保证，timer 不排空流水。
     __aicore__ inline bool StartTile(AscendTimer::DynamicTimingType type, uint32_t m, uint32_t n, uint32_t rows,
                                      uint32_t tileN = 256U)
     {
-        if (!Enabled() || expert_ < 0) {
+        if (!DynamicEnabled() || expert_ < 0) {
             return false;
         }
         tileActive_ = true;
@@ -104,9 +110,6 @@ public:
         if (!Enabled() || !tileActive_) {
             return;
         }
-        if (activeType_ == static_cast<int>(AscendTimer::AIV_COMBINE)) {
-            AscendC::PipeBarrier<PIPE_ALL>();
-        }
         EndRaw(activeType_, activeIndex_, AscendC::GetSystemCycle());
         activeType_ = activeIndex_ = -1;
         tileActive_ = false;
@@ -118,7 +121,6 @@ public:
         if (!Enabled() || timingId < 0 || timingId >= AscendTimer::FIXED_TIMING_COUNT) {
             return;
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
         WriteWave(timingId, AscendTimer::NO_WAVE);
         WriteStart(timingId, AscendC::GetSystemCycle());
     }
@@ -129,17 +131,34 @@ public:
         if (!Enabled() || timingId < 0 || timingId >= AscendTimer::FIXED_TIMING_COUNT) {
             return;
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
         WriteEnd(timingId, AscendC::GetSystemCycle());
+    }
+
+    // 旁路观察已有生命周期边界，不改变活动tile状态，不增加任何流水同步。
+    __aicore__ inline int BeginBoundary(AscendTimer::DynamicTimingType type)
+    {
+        if (!DynamicEnabled()) {
+            return -1;
+        }
+        int index = BeginRaw(static_cast<int>(type), AscendC::GetSystemCycle());
+        if (index >= 0) {
+            WriteWave(DynamicTimingIndex(static_cast<int>(type), index), waveId_);
+        }
+        return index;
+    }
+    __aicore__ inline void EndBoundary(AscendTimer::DynamicTimingType type, int index)
+    {
+        if (Enabled() && index >= 0) {
+            EndRaw(static_cast<int>(type), index, AscendC::GetSystemCycle());
+        }
     }
 
     // 每次 slice 独立记录；依赖等待会把当前执行段拆成真实的前后两段。
     __aicore__ inline void StartSpan(AscendTimer::DynamicTimingType type)
     {
-        if (!Enabled()) {
+        if (!DynamicEnabled()) {
             return;
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
         activeType_ = static_cast<int>(type);
         activeWaveId_ = waveId_;
         activeIndex_ = BeginRaw(activeType_, AscendC::GetSystemCycle());
@@ -150,7 +169,6 @@ public:
         if (!Enabled() || activeType_ != static_cast<int>(type)) {
             return;
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
         EndRaw(activeType_, activeIndex_, AscendC::GetSystemCycle());
         activeType_ = -1;
         activeIndex_ = -1;
@@ -316,8 +334,8 @@ private:
     AscendTimerDevice* timer_;
 };
 
-// Prologue is a per-expert interval; keep the existing span completion semantics.
-// Declare before prologue resources so their cleanup completes before EndSpan.
+// Prologue 区间保留已有资源析构边界，但不额外强制异步流水完成。
+// 声明在资源之前，使原有析构先于 EndSpan；导出为 ISSUE/观察区间。
 class AscendTimerSpanScope {
 public:
     __aicore__ inline AscendTimerSpanScope(AscendTimerDevice* timer, AscendTimer::DynamicTimingType type)

@@ -16,7 +16,7 @@ from deep_ep_experimental.megamoe.api import _MegaRuntime
 @pytest.mark.parametrize("case", ["same-host", "different-host", "missing-host", "mapping", "device", "engine"])
 def test_megamoe_bootstrap(monkeypatch, backend, case):
     monkeypatch.setattr(_runtime, "endpoint", lambda: "tcp://127.0.0.1:19091")
-    monkeypatch.setattr(_runtime, "_OWNER", None)
+    monkeypatch.setattr(_runtime, "_OWNERS", set())
     monkeypatch.setattr(_runtime, "_host_boot_id", lambda: "test-host")
     created = []
 
@@ -27,7 +27,12 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
     def core_runtime(*args):
         pytest.fail("MegaMoE must use its own native runtime factory")
 
-    native = SimpleNamespace(runtime_busy=lambda: False, Runtime=core_runtime, create_megamoe_runtime=create)
+    native = SimpleNamespace(
+        runtime_busy=lambda: False,
+        next_instance_id=lambda: 1,
+        Runtime=core_runtime,
+        create_megamoe_runtime=create,
+    )
     monkeypatch.setattr(_runtime, "require_native", lambda operation: native)
     monkeypatch.setattr(
         _runtime,
@@ -50,7 +55,7 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
         elif case == "device":
             peer[6] = 0
         elif case == "engine":
-            peer[7] = 1
+            peer[-1] += 1
         return [local, peer]
 
     if backend == "store":

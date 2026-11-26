@@ -30,10 +30,12 @@
 #include "activation/swiglu_activation.hpp"
 #include "activation/swigluoai_activation.hpp"
 #include "block_epilogue_ub_layout.hpp"
+#include "../common/aiv1_activation_ub.hpp"
 #include "quant/mx_quant_common.hpp"
 #include "quant/mx_quant_compute_scale.hpp"
 #include "quant/mxfp4_quant.hpp"
 #include "quant/mxfp8_quant.hpp"
+#include "quant/deepinfer_swiglu_quant.hpp"
 
 namespace ActivationQuantMsg {
 using ActMode = MegaMoeImpl::MegaMoeActMode;
@@ -55,6 +57,8 @@ public:
     __aicore__ inline BlockEpilogueActivationMxQuant() {}
 
     static constexpr uint32_t MAX_SINGLE_MN = TileM * TileN;
+    static constexpr uint32_t UB_TILE_M = TileM;
+    static constexpr uint32_t UB_TILE_N = TileN;
 
     struct Arguments {
         GM_ADDR yGmAddr{nullptr};
@@ -64,6 +68,9 @@ public:
         uint8_t actSubMode{static_cast<uint8_t>(ActSubMode::DEFAULT)};
         float activationAlpha{1.0f};
         float activationBeta{1.0f};
+        uint32_t ubBaseBytes{0U};
+        bool routeWeightBeforeQuant{false};
+        bool deepInferQuant{false};
         Arguments() = default;
     };
 
@@ -81,9 +88,16 @@ public:
 public:
     __aicore__ inline void Init(Params const& params);
     __aicore__ inline auto GetTopkWeightTensor();
+    __aicore__ inline void LoadRouteWeights(GM_ADDR metadata, uint32_t row, uint32_t count)
+    {
+        if (!routeWeightBeforeQuant_ || metadata == nullptr) return;
+        GlobalTensor<float> src;
+        src.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(metadata) + static_cast<uint64_t>(row) * META_INFO_SIZE);
+        DataCopy(weightUb_, src, count * META_INFO_SIZE);
+    }
     // 计算并写回一个激活/量化 tile，不包含流水通知。
     __aicore__ inline void operator()(const BlockShape& blockShape, const BlockCoord& blockCoord,
-                                      uint16_t pingpongIdx = 0);
+                                      uint16_t pingpongIdx = 0, bool deferOutput = false);
     __aicore__ inline void UpdateGlobalAddr(const BlockCoord& baseOffset);
     __aicore__ inline void UpdateNextProblem(const ProblemShape& problemShape);
 
@@ -134,6 +148,8 @@ private:
     uint8_t actSubMode_{static_cast<uint8_t>(ActSubMode::DEFAULT)};
     float activationAlpha_{1.0f};
     float activationBeta_{1.0f};
+    bool routeWeightBeforeQuant_{false};
+    bool deepInferQuant_{false};
 };
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
@@ -197,23 +213,32 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
     actSubMode_ = params.actSubMode;
     activationAlpha_ = params.activationAlpha;
     activationBeta_ = params.activationBeta;
+    routeWeightBeforeQuant_ = params.routeWeightBeforeQuant;
+    deepInferQuant_ = params.deepInferQuant;
 
     constexpr auto ubOffsets = Detail::BuildActivationMxQuantUbOffsets<DataTypeIn, TileM, TileN, IsInterleaved_>();
-    gluRes_ = LocalTensor<bfloat16_t>(TPosition::VECCALC, ubOffsets.activationOutputOffsetBytes,
+    l0cOutUbFirst_ = LocalTensor<DataTypeIn>(TPosition::VECIN, params.ubBaseBytes + kUbFirstOffset, kUbInputElementCapacity);
+    l0cOutUbSecond_ = LocalTensor<DataTypeIn>(TPosition::VECIN, params.ubBaseBytes + kUbSecondOffset, kUbInputElementCapacity);
+    gluRes_ = LocalTensor<bfloat16_t>(TPosition::VECCALC, params.ubBaseBytes + ubOffsets.activationOutputOffsetBytes,
                                       ubOffsets.activationQuantElementCapacity);
-    quantOutput_ = LocalTensor<int8_t>(TPosition::VECOUT, ubOffsets.quantOutputOffsetBytes,
+    quantOutput_ = LocalTensor<int8_t>(TPosition::VECOUT, params.ubBaseBytes + ubOffsets.quantOutputOffsetBytes,
                                        ubOffsets.activationQuantElementCapacity);
     quantScaleOutput_ =
-        LocalTensor<int8_t>(TPosition::VECOUT, ubOffsets.quantScaleOffsetBytes, ubOffsets.scaleElementCapacity);
-    maxExp_ = LocalTensor<uint16_t>(TPosition::VECCALC, ubOffsets.maxExpOffsetBytes, ubOffsets.scaleElementCapacity);
+        LocalTensor<int8_t>(TPosition::VECOUT, params.ubBaseBytes + ubOffsets.quantScaleOffsetBytes, ubOffsets.scaleElementCapacity);
+    maxExp_ = LocalTensor<uint16_t>(TPosition::VECCALC, params.ubBaseBytes + ubOffsets.maxExpOffsetBytes, ubOffsets.scaleElementCapacity);
     halfScale_ =
-        LocalTensor<uint16_t>(TPosition::VECCALC, ubOffsets.reciprocalScaleOffsetBytes, ubOffsets.scaleElementCapacity);
+        LocalTensor<uint16_t>(TPosition::VECCALC, params.ubBaseBytes + ubOffsets.reciprocalScaleOffsetBytes, ubOffsets.scaleElementCapacity);
 
-    // weight UB: 放在 VECIN 区之后的安全区域，仅 mode=1 分配
-    if constexpr (TopkWeightsPrefetch) {
-        weightUb_ = LocalTensor<float>(TPosition::VECCALC, ubOffsets.topkWeightOffsetBytes,
-                                       ubOffsets.topkWeightElementCapacity);
+    // 元数据与输入/量化scratch分离，不能覆盖尚未消费的gate/up。
+    weightUb_ = LocalTensor<float>(TPosition::VECCALC, params.ubBaseBytes + ubOffsets.topkWeightOffsetBytes,
+                                    ubOffsets.topkWeightElementCapacity);
+    if (deepInferQuant_) {
+        // 旧SF区与尚未读取的up输入重叠；融合计算必须使用metadata之后的独立SF尾区。
+        quantScaleOutput_ = LocalTensor<int8_t>(TPosition::VECOUT,
+            params.ubBaseBytes + ubOffsets.topkWeightOffsetBytes + ubOffsets.topkWeightElementCapacity * sizeof(float),
+            ubOffsets.scaleElementCapacity);
     }
+
 }
 
 template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t TileN, bool TopkWeightsPrefetch,
@@ -299,10 +324,9 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
     gatedActivationContext.gate = firstSrc;
     gatedActivationContext.up = secondSrc;
     gatedActivationContext.output = gluResAddr;
-    if constexpr (TopkWeightsPrefetch) {
-        gatedActivationContext.topkWeights = (__ubuf__ float*)weightUb_.GetPhyAddr();
-    } else {
-        gatedActivationContext.topkWeights = nullptr;
+    {
+        gatedActivationContext.topkWeights = routeWeightBeforeQuant_
+                                                ? reinterpret_cast<__ubuf__ float*>(weightUb_.GetPhyAddr()) : nullptr;
     }
     gatedActivationContext.gateTail = gateTail;
     gatedActivationContext.upTail = upTail;
@@ -339,7 +363,11 @@ BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeig
         Activation::RunSwiGLUOAI<DataTypeIn, TopkWeightsPrefetch>(gatedActivationContext, swiGluOaiParams);
     } else {
         const Activation::SwiGluParams swiGluParams{clampLimit_};
-        Activation::RunSwiGLU<DataTypeIn, TopkWeightsPrefetch, false>(gatedActivationContext, swiGluParams);
+        if (routeWeightBeforeQuant_) {
+            Activation::RunSwiGLU<DataTypeIn, true, false>(gatedActivationContext, swiGluParams);
+        } else {
+            Activation::RunSwiGLU<DataTypeIn, false, false>(gatedActivationContext, swiGluParams);
+        }
     }
 }
 
@@ -383,7 +411,8 @@ template <typename DataTypeOut_, typename DataTypeIn_, uint32_t TileM, uint32_t 
 __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_, TileM, TileN, TopkWeightsPrefetch,
                                                       IsInterleaved_>::operator()(const BlockShape& blockShape,
                                                                                   const BlockCoord& blockCoord,
-                                                                                  uint16_t pingpongIdx)
+                                                                                  uint16_t pingpongIdx,
+                                                                                  bool deferOutput)
 {
     uint32_t tileRowCount = Get<M_VALUE>(blockShape);     // 128
     uint32_t tileColumnCount = Get<N_VALUE>(blockShape);  // 256
@@ -404,10 +433,32 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
         (__ubuf__ uint16_t*)maxExp_.GetPhyAddr(), (__ubuf__ uint16_t*)halfScale_.GetPhyAddr(), tileColumnCount,
         pingpongIdx);
     uint32_t outputRowStrideElements = Ops::Base::CeilAlign(tileColumnCount, static_cast<uint32_t>(ONE_BLK_SIZE));
-    RunGatedActivationTile(ubPointers.firstInput, ubPointers.secondInput, ubPointers.activationOutput,
-                           static_cast<uint16_t>(tileRowCount), static_cast<uint16_t>(tileColumnCount),
-                           outputRowStrideElements);
-    RunMxQuantTile(ubPointers, static_cast<uint16_t>(tileRowCount), outputRowStrideElements);
+    bool compat = false;
+    if constexpr (IsSameType<DataTypeIn, bfloat16_t>::value &&
+                  IsSameType<DataTypeOut, fp8_e4m3fn_t>::value && !IsInterleaved_) {
+        if (deepInferQuant_) {
+            // gate/up每行先完整读入寄存器，再写更小的FP8输出；输出只覆盖已消费的up前缀。
+            if (routeWeightBeforeQuant_) {
+                DeepInferSwiGluQuant<true>(ubPointers.firstInput, ubPointers.secondInput,
+                    reinterpret_cast<__ubuf__ uint8_t*>(ubPointers.quantOutput),
+                    reinterpret_cast<__ubuf__ int16_t*>(ubPointers.quantScale),
+                    reinterpret_cast<__ubuf__ float*>(weightUb_.GetPhyAddr()),
+                    tileRowCount, tileColumnCount, TileN, outputRowStrideElements, clampLimit_);
+            } else {
+                DeepInferSwiGluQuant<false>(ubPointers.firstInput, ubPointers.secondInput,
+                    reinterpret_cast<__ubuf__ uint8_t*>(ubPointers.quantOutput),
+                    reinterpret_cast<__ubuf__ int16_t*>(ubPointers.quantScale), nullptr,
+                    tileRowCount, tileColumnCount, TileN, outputRowStrideElements, clampLimit_);
+            }
+            compat = true;
+        }
+    }
+    if (!compat) {
+        RunGatedActivationTile(ubPointers.firstInput, ubPointers.secondInput, ubPointers.activationOutput,
+                               static_cast<uint16_t>(tileRowCount), static_cast<uint16_t>(tileColumnCount),
+                               outputRowStrideElements);
+        RunMxQuantTile(ubPointers, static_cast<uint16_t>(tileRowCount), outputRowStrideElements);
+    }
     SetFlag<HardEvent::V_MTE3>(0);
     WaitFlag<HardEvent::V_MTE3>(0);
     // scale已按compact布局生成，直接copy到GM，省掉原先TransMxScaleLayout重排scale。
@@ -431,10 +482,16 @@ __aicore__ inline void BlockEpilogueActivationMxQuant<DataTypeOut_, DataTypeIn_,
         StoreQuantScaleCompact(quantScaleGlobal_, quantScaleOutput_, tileRowCount, yScaleOffset,
                                intermediateHiddenScaleElements_, tileColumnCount);
     }
-    SetFlag<HardEvent::MTE3_V>(0);
-    WaitFlag<HardEvent::MTE3_V>(0);
-    SetFlag<HardEvent::MTE3_S>(0);
-    WaitFlag<HardEvent::MTE3_S>(0);
+    if (deferOutput) {
+        // MTE3->V等待已经排入V队列；再由V通知下轮MTE2，保护输入/输出重叠的UB。
+        // Scalar可以切换到Dispatch/Combine，不在这里等待量化写出完成。
+        Aiv1ActivationUb::Release();
+    } else {
+        SetFlag<HardEvent::MTE3_V>(0);
+        WaitFlag<HardEvent::MTE3_V>(0);
+        SetFlag<HardEvent::MTE3_S>(0);
+        WaitFlag<HardEvent::MTE3_S>(0);
+    }
 }
 
 }  // namespace MegaMoeImpl
