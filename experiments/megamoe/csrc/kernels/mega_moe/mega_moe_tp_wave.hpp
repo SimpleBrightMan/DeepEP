@@ -129,12 +129,15 @@ public:
         int32_t epoch = 0;
         if constexpr (g_coreType == AIC) {
             if (tiling_.sharedExpertNum > 0U) {
-                // BF16 共享专家且输入 x 本身为 BF16 时直接读取用户 xGm，无需等待 AIV_QUANT；
-                // FP8 共享专家或 FP8->BF16 反量化路径通过 flagLocalPrepDonePtr 软同步等待 AIV_QUANT 落地。
+                // BF16+直读输入 或 FP8_MX+预量化输入 时直接读取用户 xGm/xScalesGm，无需等待 AIV_QUANT；
+                // 其余路径通过 flagLocalPrepDonePtr 软同步等待 AIV_QUANT 落盘 sharedBf16InputPtr。
                 const bool sharedBf16Direct =
                     (tiling_.sharedPrecisionMode == static_cast<uint8_t>(SharedPrecisionMode::BF16)) &&
                     (xScalesGm_ == nullptr);
-                if (!sharedBf16Direct) {
+                const bool sharedFp8Direct =
+                    (tiling_.sharedPrecisionMode == static_cast<uint8_t>(SharedPrecisionMode::FP8_MX)) &&
+                    (xScalesGm_ != nullptr);
+                if (!sharedBf16Direct && !sharedFp8Direct) {
                     WaitUntilGmFlagIsNonZero(reinterpret_cast<__gm__ int32_t*>(workspace_.flagLocalPrepDonePtr));
                     PipeBarrier<PIPE_ALL>();
                 }
@@ -403,6 +406,23 @@ private:
         bool permTimerOpen = false;
         uint64_t permTimerWave = 0U;
 
+        TpEarlyUnpermCursor earlyUnperm{};
+        earlyUnperm.Init(tiling_, blockIdx_);
+        bool allGmm2Done = false;
+        auto checkAllGmm2Done = [&]() __aicore__ -> bool {
+            if (allGmm2Done) {
+                return true;
+            }
+            auto* doneFlags = reinterpret_cast<__gm__ int32_t*>(workspace_.flagRoutedGmm2DonePtr);
+            for (uint32_t c = 0U; c < tiling_.aicNum; ++c) {
+                if (ReadGmByPassDCache(doneFlags + static_cast<uint64_t>(c) * INT_CACHELINE) < 1) {
+                    return false;
+                }
+            }
+            allGmm2Done = true;
+            return true;
+        };
+
         auto closePermTimer = [&]() __aicore__ {
             if (permTimerOpen) {
                 timer_.EndSpan(AscendTimer::AIV_PERMUTE);
@@ -427,8 +447,8 @@ private:
         }
         Aiv1ActivationUb::Init();
 
-        while (hasAct || actPending || !sharedCursor.done || permAsync.pending ||
-               permPos.expertIdx < tiling_.numExperts) {
+        while (hasAct || actPending || !sharedCursor.done || permAsync.HasPending() ||
+               permPos.expertIdx < tiling_.numExperts || (!earlyUnperm.done && !checkAllGmm2Done())) {
             bool progressed = false;
 
             if (actPending) {
@@ -436,11 +456,15 @@ private:
                 progressed |= RetireTpRoutedActivation(actReadyFlag, actPending);
             }
 
-            // Routed GMM1 tile 是否已发布：先探测再关闭 Permute 区间，避免空轮询打碎 WAVE 粒度 AIV_PERMUTE
+            // Routed GMM1 tile 是否已发布：先探测再刷出在途 Permute 并关闭区间
             if (hasAct) {
                 auto* issuedFlag = reinterpret_cast<__gm__ int32_t*>(workspace_.flagGmm1IssuedPtr) +
                                    static_cast<uint64_t>(blockIdx_) * INT_CACHELINE;
                 if (ReadGmByPassDCache(issuedFlag) >= readySequence + 1) {
+                    if (permAsync.HasPending()) {
+                        ensurePermTimer(permWave);
+                        FlushAndRetireTpPermute(tiling_, ubLayout_, workspace_, permAsync);
+                    }
                     closePermTimer();
                     if (TryRunTpRoutedActivation(actCursor, readySequence, actReadyFlag, actPending)) {
                         actCursor.nextTile += tiling_.aicNum;
@@ -453,8 +477,8 @@ private:
                 }
             }
 
-            // Shared SwiGLU 探测
-            if (!sharedCursor.done) {
+            // Shared SwiGLU 探测（仅在 Wave 0 Permute 完成后再抢占，避免拖慢首 Wave 路由输入供给）
+            if (!sharedCursor.done && (permWave > 0U || permPos.expertIdx >= tiling_.numExperts)) {
                 bool canRunShared = sharedCursor.gmm1Ready;
                 if (!canRunShared) {
                     canRunShared = true;
@@ -467,6 +491,10 @@ private:
                     }
                 }
                 if (canRunShared) {
+                    if (permAsync.HasPending()) {
+                        ensurePermTimer(permWave);
+                        FlushAndRetireTpPermute(tiling_, ubLayout_, workspace_, permAsync);
+                    }
                     closePermTimer();
                     if (TryRunTpSharedSwiGlu(tiling_, blockIdx_, workspace_, sharedEpilogueOp_, sharedCursor, timer_)) {
                         progressed = true;
@@ -475,23 +503,13 @@ private:
                 }
             }
 
-            // Permute 推进（保持整 Wave 连续打点）
-            if (permAsync.pending) {
-                ensurePermTimer(permWave);
-                RetireTpPermuteReady(workspace_, permAsync);
-                if (!HasTpWaveCapacity(permPos, permGroups) || permPos.expertIdx >= tiling_.numExperts) {
-                    closePermTimer();
-                    if (permPos.expertIdx < tiling_.numExperts) {
-                        permGroups = 0U;
-                        ++permWave;
-                    }
-                }
-                progressed = true;
-                continue;
-            }
-
+            // 跨 Slice 不断流 Permute：6 槽环跨专家 slice 保持在途，仅在批次阈值或 Wave 末尾刷盘发布
             if (permPos.expertIdx < tiling_.numExperts) {
                 if (!HasTpWaveCapacity(permPos, permGroups) && permGroups != 0U) {
+                    if (permAsync.HasPending()) {
+                        ensurePermTimer(permWave);
+                        FlushAndRetireTpPermute(tiling_, ubLayout_, workspace_, permAsync);
+                    }
                     closePermTimer();
                     permGroups = 0U;
                     ++permWave;
@@ -507,8 +525,13 @@ private:
                     const ExpertSlice slice{range.begin.expertIdx, range.begin.tokenIndexInExpert, rows,
                                             range.begin.globalTokenIndex};
                     IssueTpPermuteSlice(tiling_, ubLayout_, workspace_, blockIdx_, slice, permWave, permAsync);
-                    if (!permAsync.pending &&
-                        (!HasTpWaveCapacity(permPos, permGroups) || permPos.expertIdx >= tiling_.numExperts)) {
+                    const uint32_t flushThreshold = (permWave == 0U) ? 4U : 8U;
+                    const bool waveDone =
+                        !HasTpWaveCapacity(permPos, permGroups) || (permPos.expertIdx >= tiling_.numExperts);
+                    if (waveDone || permAsync.pendingSliceCount >= flushThreshold) {
+                        FlushAndRetireTpPermute(tiling_, ubLayout_, workspace_, permAsync);
+                    }
+                    if (waveDone) {
                         closePermTimer();
                         if (permPos.expertIdx < tiling_.numExperts) {
                             permGroups = 0U;
@@ -516,10 +539,35 @@ private:
                         }
                     }
                 } else if (permPos.expertIdx >= tiling_.numExperts) {
+                    if (permAsync.HasPending()) {
+                        ensurePermTimer(permWave);
+                        FlushAndRetireTpPermute(tiling_, ubLayout_, workspace_, permAsync);
+                    }
                     closePermTimer();
                 }
                 progressed = true;
                 continue;
+            }
+
+            if (permAsync.HasPending()) {
+                ensurePermTimer(permWave);
+                FlushAndRetireTpPermute(tiling_, ubLayout_, workspace_, permAsync);
+                closePermTimer();
+                progressed = true;
+                continue;
+            }
+
+            // P1：Permute 与 Shared SwiGLU 全部完成后，利用 Phase 2 后半段 AIV1 空闲窗口抢跑已完成专家的部分 Unpermute
+            if (!earlyUnperm.done && sharedCursor.done) {
+                if (!earlyUnperm.permDrained) {
+                    DrainTpPermuteBuffers(permAsync);
+                    earlyUnperm.permDrained = true;
+                }
+                if (!checkAllGmm2Done() &&
+                    StepTpEarlySplitUnpermute(tiling_, rankId_, workspace_, earlyUnperm, timer_)) {
+                    progressed = true;
+                    continue;
+                }
             }
 
             if (!progressed) {
@@ -531,7 +579,9 @@ private:
 
         closePermTimer();
         Aiv1ActivationUb::Finish();
-        DrainTpPermuteBuffers(permAsync);
+        if (!earlyUnperm.permDrained) {
+            DrainTpPermuteBuffers(permAsync);
+        }
         timer_.ClearSlice();
         timer_.SetWave(AscendTimer::NO_WAVE);
     }
@@ -643,6 +693,10 @@ private:
         uint64_t gmm2WaveCount = 0U;
 
         const bool gmm2Lag = (tiling_.bs * tiling_.tpWorldSize >= 512U);
+        const uint32_t splitExpert = tiling_.numExperts > 1U
+                                         ? Min(tiling_.numExperts - 1U, Max(1U, tiling_.numExperts / 2U))
+                                         : 1U;
+        bool splitPublished = !gmm2Lag || (tiling_.numExperts < 2U);
         ExpertWaveRange pendingWave{{}, {}, tiling_.numExperts};
         ExpertTokenPosition gmm1Cursor{};
 
@@ -671,6 +725,18 @@ private:
                 timer_.SetWave(static_cast<int64_t>(gmm2WaveCount));
                 RunTpGmm2Wave(curGmm2Wave, gmm2Ctx, gmm2Addr, gmm2StartBlock, gmm2SliceSeq, gmm1Kernel, gmm2Kernel);
                 ++gmm2WaveCount;
+                if (!splitPublished && curGmm2Wave.end.expertIdx >= splitExpert) {
+                    splitPublished = true;
+                    if constexpr (g_coreType == AIC) {
+                        SetFlag<HardEvent::FIX_S>(0);
+                        WaitFlag<HardEvent::FIX_S>(0);
+                        asc_sync_data_barrier(DSB_DDR);
+                        WriteGmByPassDCache(
+                            reinterpret_cast<__gm__ int32_t*>(workspace_.flagGmm2SplitDonePtr) +
+                                static_cast<uint64_t>(blockIdx_) * INT_CACHELINE,
+                            static_cast<int32_t>(curGmm2Wave.end.globalTokenIndex) + 1);
+                    }
+                }
             }
             if (gmm2Lag) {
                 pendingWave = wave;

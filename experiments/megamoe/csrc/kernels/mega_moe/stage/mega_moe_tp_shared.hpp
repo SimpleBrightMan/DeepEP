@@ -148,8 +148,11 @@ __aicore__ inline void ProcessTpSharedGmm1(const MegaMoeTpTilingData& tiling, ui
     } else if (mode == SharedPrecisionMode::FP8_MX) {
         GmmKernel::CatlassMxFp8NzMatmul mxMmad;
         const uint64_t scaleK = static_cast<uint64_t>(CalcTpMxScaleStrideBytes(fullK));
-        GM_ADDR aBase = workspace.agXDataPtr + static_cast<uint64_t>(rankId) * fullM * fullK;
-        GM_ADDR saBase = workspace.agXScalePtr + static_cast<uint64_t>(rankId) * fullM * scaleK;
+        GM_ADDR aBase = (xScalesGm != nullptr) ? xGm : workspace.sharedBf16InputPtr;
+        GM_ADDR saBase = (xScalesGm != nullptr)
+                             ? xScalesGm
+                             : (workspace.sharedBf16InputPtr +
+                                TpCeilAlign(static_cast<int64_t>(fullM) * fullK, ALIGN_512));
         for (uint32_t s = 0U; s < tiling.sharedExpertNum; ++s) {
             GM_ADDR bBase = sharedWeight1 + static_cast<uint64_t>(s) * fullN * fullK;
             GM_ADDR sbBase = sharedWeightScales1 + static_cast<uint64_t>(s) * fullN * scaleK;

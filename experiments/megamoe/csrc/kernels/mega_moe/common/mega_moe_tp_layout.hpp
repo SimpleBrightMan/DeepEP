@@ -94,11 +94,25 @@ MEGAMOE_TP_HOST_DEVICE constexpr int64_t CalcTpMxScaleStrideBytes(int64_t cols)
     return TpCeilDiv(cols, static_cast<int64_t>(MXFP_DIVISOR_SIZE)) * MXFP_MULTI_BASE_SIZE;
 }
 
+MEGAMOE_TP_HOST_DEVICE constexpr int64_t CalcTpAgTokenDataStrideBytes(int64_t h)
+{
+    return TpCeilAlign(h, ALIGN_256);
+}
+
+MEGAMOE_TP_HOST_DEVICE constexpr int64_t CalcTpAgTokenScaleStrideBytes(int64_t h)
+{
+    return TpCeilAlign(CalcTpMxScaleStrideBytes(h), ALIGN_32);
+}
+
+MEGAMOE_TP_HOST_DEVICE constexpr int64_t CalcTpAgTokenRecordBytes(int64_t h)
+{
+    return CalcTpAgTokenDataStrideBytes(h) + CalcTpAgTokenScaleStrideBytes(h);
+}
+
 /*
  * TP 模式对称窗口布局：
  *   [0, 60KiB)          rankSyncInWorld（复用跨卡握手与每 AIV 单调递增 epoch 计数槽）
- *   agSrcData           [M_max, H] FP8
- *   agSrcScale          [M_max, S_h] E8M0
+ *   agSrcData           [M_max, Align256(H) + Align32(S_h)] 紧致打包 (FP8 data + E8M0 scale)
  *   agSrcTopkIds        [M_max, topK] int32
  *   agSrcTopkWeights    [M_max, topK] float32
  *   rsRecvBuf           [tpWorldSize, M_max, H] BF16
@@ -124,12 +138,10 @@ MEGAMOE_TP_HOST_DEVICE inline TpPeermemLayout BuildTpPeermemLayout(
     layout.rankSyncOffset = offset;
     offset += TP_PEERMEM_SYNC_BYTES;
 
-    const int64_t scaleH = CalcTpMxScaleStrideBytes(h);
+    const int64_t agRecordBytes = CalcTpAgTokenRecordBytes(h);
     layout.agSrcDataOffset = offset;
-    offset += TpCeilAlign(maxTokensPerRank * h, ALIGN_512);
-
-    layout.agSrcScaleOffset = offset;
-    offset += TpCeilAlign(maxTokensPerRank * scaleH, ALIGN_512);
+    layout.agSrcScaleOffset = offset + CalcTpAgTokenDataStrideBytes(h);
+    offset += TpCeilAlign(maxTokensPerRank * agRecordBytes, ALIGN_512);
 
     layout.agSrcTopkIdsOffset = offset;
     offset += TpCeilAlign(maxTokensPerRank * topK * static_cast<int64_t>(sizeof(int32_t)), ALIGN_512);
@@ -205,6 +217,8 @@ struct TpWorkspaceInfo {
     GM_ADDR actQuantDataPtr{nullptr};
     GM_ADDR actQuantScalePtr{nullptr};
     GM_ADDR gmm2OutPtr{nullptr};
+    GM_ADDR earlyTokenStatePtr{nullptr};
+    GM_ADDR earlyPartialFp32Ptr{nullptr};
 
     // 共享专家独立计算区域 (本卡 bs)
     GM_ADDR sharedBf16InputPtr{nullptr};
@@ -221,6 +235,8 @@ struct TpWorkspaceInfo {
     GM_ADDR flagPermuteToGmm1Ptr{nullptr};
     GM_ADDR flagGmm1IssuedPtr{nullptr};
     GM_ADDR flagActToGmm2Ptr{nullptr};
+    GM_ADDR flagGmm2SplitDonePtr{nullptr};
+    GM_ADDR flagEarlyChunkDonePtr{nullptr};
     GM_ADDR flagRoutedGmm2DonePtr{nullptr};
     GM_ADDR flagSharedGmm1DonePtr{nullptr};
     GM_ADDR flagSharedActDonePtr{nullptr};
@@ -256,8 +272,9 @@ private:
 
         int64_t offset = 0;
 
-        agXDataPtr = TpAllocAligned(base, offset, maxGlobalTokens * h);
-        agXScalePtr = TpAllocAligned(base, offset, maxGlobalTokens * scaleH);
+        const int64_t agRecordBytes = CalcTpAgTokenRecordBytes(h);
+        agXDataPtr = TpAllocAligned(base, offset, maxGlobalTokens * agRecordBytes);
+        agXScalePtr = agXDataPtr != nullptr ? (agXDataPtr + CalcTpAgTokenDataStrideBytes(h)) : nullptr;
         agTopkIdsPtr = TpAllocAligned(base, offset, maxGlobalTokens * topK * static_cast<int64_t>(sizeof(int32_t)));
         agTopkWeightsPtr = TpAllocAligned(base, offset, maxGlobalTokens * topK * static_cast<int64_t>(sizeof(float)));
 
@@ -280,6 +297,10 @@ private:
         const int64_t maxMGroupsPerExpert = TpCeilDiv(maxGlobalTokens, static_cast<int64_t>(L1_TILE_M_256));
         mGroupFlagSlotsPerExpert = static_cast<int32_t>(maxMGroupsPerExpert * INT_CACHELINE);
 
+        const int64_t chunkGranularity =
+            t->rsTokensPerChunk > 0U ? static_cast<int64_t>(t->rsTokensPerChunk) : TP_DEFAULT_RS_TOKENS_PER_CHUNK;
+        const int64_t maxChunksPerRank = TpCeilDiv(maxLocalTokens, chunkGranularity);
+
         const int64_t flagBegin = offset;
         flagRegionBeginPtr = base != nullptr ? (base + offset) : nullptr;
 
@@ -289,6 +310,8 @@ private:
         flagPermuteToGmm1Ptr = TpAllocFlagInts(base, offset, experts * mGroupFlagSlotsPerExpert);
         flagGmm1IssuedPtr = TpAllocFlagInts(base, offset, aicNum * INT_CACHELINE);
         flagActToGmm2Ptr = TpAllocFlagInts(base, offset, experts * mGroupFlagSlotsPerExpert);
+        flagGmm2SplitDonePtr = TpAllocFlagInts(base, offset, aicNum * INT_CACHELINE);
+        flagEarlyChunkDonePtr = TpAllocFlagInts(base, offset, world * maxChunksPerRank * INT_CACHELINE);
         flagRoutedGmm2DonePtr = TpAllocFlagInts(base, offset, aicNum * INT_CACHELINE);
         if (t->sharedExpertNum > 0U) {
             flagSharedGmm1DonePtr = TpAllocFlagInts(base, offset, aicNum * INT_CACHELINE);
@@ -306,6 +329,8 @@ private:
         actQuantDataPtr = TpAllocAligned(base, offset, maxRoutedRows * routedInter);
         actQuantScalePtr = TpAllocAligned(base, offset, maxRoutedRows * scaleRoutedInter);
         gmm2OutPtr = TpAllocAligned(base, offset, maxRoutedRows * h * static_cast<int64_t>(sizeof(uint16_t)));
+        earlyTokenStatePtr = TpAllocAligned(base, offset, maxGlobalTokens * static_cast<int64_t>(sizeof(int32_t)));
+        earlyPartialFp32Ptr = TpAllocAligned(base, offset, maxGlobalTokens * h * static_cast<int64_t>(sizeof(float)));
 
         if (t->sharedExpertNum > 0U) {
             const int64_t sharedCount = static_cast<int64_t>(t->sharedExpertNum);
@@ -331,19 +356,18 @@ private:
 /*
  * Phase 2 AIV1 常驻 UB 分区：
  *   [0, ActivationBytes)                     SwiGLU + MXFP8 量化工作区（~66.5 KiB，Routed 与 Shared 串行复用）
- *   [permDataBase, permScaleBase)            Permute 6 槽 token 数据环（6 * H 字节，H=4096 时 24 KiB）
- *   [permScaleBase, permIdxBase)             Permute 6 槽 scale 环（6 * Align32(scaleH) 字节）
+ *   [permRecordBase, permIdxBase)            Permute 6 槽紧致 (data + scale) 记录环（6 * 4224B，H=4096 时 24.75 KiB）
  *   [permIdxBase, permEnd)                   Permute 批量索引缓存（4 KiB，单批最多 1024 个 permRowToToken 索引）
  */
 constexpr uint32_t TP_PERMUTE_IDX_BATCH_CAP = 1024U;
 
 struct TpAiv1ResidentUbLayout {
     uint32_t activationBytes;
-    uint32_t permDataBase;
-    uint32_t permScaleBase;
+    uint32_t permRecordBase;
     uint32_t permIdxBase;
     uint32_t permRowDataBytes;
     uint32_t permRowScaleBytes;
+    uint32_t permRecordBytes;
     uint32_t end;
     bool valid;
 };
@@ -352,14 +376,13 @@ MEGAMOE_TP_HOST_DEVICE constexpr TpAiv1ResidentUbLayout MakeTpAiv1ResidentUbLayo
 {
     const uint32_t actBytes =
         static_cast<uint32_t>(AlignResidentUb(Aiv1ResidentUbLayout::ActivationBytes));
-    const uint32_t rowDataBytes = static_cast<uint32_t>(AlignResidentUb(h));
-    const uint32_t scaleCols = ((h + 63U) / 64U) * 2U;
-    const uint32_t rowScaleBytes = static_cast<uint32_t>(AlignResidentUb(scaleCols));
-    const uint32_t permDataBase = actBytes;
-    const uint32_t permScaleBase = permDataBase + TP_PERMUTE_RING_SLOTS * rowDataBytes;
-    const uint32_t permIdxBase = permScaleBase + TP_PERMUTE_RING_SLOTS * rowScaleBytes;
+    const uint32_t rowDataBytes = static_cast<uint32_t>(CalcTpAgTokenDataStrideBytes(h));
+    const uint32_t rowScaleBytes = static_cast<uint32_t>(CalcTpAgTokenScaleStrideBytes(h));
+    const uint32_t recordBytes = rowDataBytes + rowScaleBytes;
+    const uint32_t permRecordBase = actBytes;
+    const uint32_t permIdxBase = permRecordBase + TP_PERMUTE_RING_SLOTS * recordBytes;
     const uint32_t end = permIdxBase + TP_PERMUTE_IDX_BATCH_CAP * static_cast<uint32_t>(sizeof(int32_t));
-    return {actBytes, permDataBase, permScaleBase, permIdxBase, rowDataBytes, rowScaleBytes, end,
+    return {actBytes, permRecordBase, permIdxBase, rowDataBytes, rowScaleBytes, recordBytes, end,
             h > 0U && h % 64U == 0U && end <= 256U * 1024U};
 }
 

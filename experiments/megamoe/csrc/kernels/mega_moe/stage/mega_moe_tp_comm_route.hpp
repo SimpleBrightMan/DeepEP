@@ -124,123 +124,140 @@ __aicore__ inline void ProcessTpInputPrep(const MegaMoeTpTilingData& tiling, uin
                 SyncFuncStatic<HardEvent::MTE3_S, EVENT_ID0>();
             }
 
-            // 2b. 处理本地 x / x_scales
-            GlobalTensor<uint8_t> dstPeerDataGm, dstPeerScaleGm, dstWsDataGm, dstWsScaleGm;
-            dstPeerDataGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(localPeermem.agSrcDataPtr));
-            dstPeerScaleGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(localPeermem.agSrcScalePtr));
-            dstWsDataGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.agXDataPtr));
-            dstWsScaleGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.agXScalePtr));
+        // 2b. 处理本地 x / x_scales（按紧致单记录 [Align256(H) | Align32(scaleH)] 一次写出）
+        const uint32_t dataStride = static_cast<uint32_t>(CalcTpAgTokenDataStrideBytes(h));
+        const uint32_t recordBytes = static_cast<uint32_t>(CalcTpAgTokenRecordBytes(h));
+        GlobalTensor<uint8_t> dstPeerRecordGm, dstWsRecordGm;
+        dstPeerRecordGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(localPeermem.agSrcDataPtr));
+        dstWsRecordGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.agXDataPtr));
 
-            if (xScalesGm == nullptr) {
-                // BF16 输入：逐 token 双缓冲 MXFP8 量化
-                GlobalTensor<bfloat16_t> srcBf16Gm;
-                srcBf16Gm.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(xGm));
+        if (xScalesGm == nullptr) {
+            // BF16 输入：逐 token 双缓冲 MXFP8 量化，UB 内 [outDataUb | outScaleUb] 天然紧邻构成单条 recordBytes 记录
+            GlobalTensor<bfloat16_t> srcBf16Gm;
+            srcBf16Gm.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(xGm));
 
-                const uint32_t xInBytes = static_cast<uint32_t>(TpCeilAlign(h, ALIGN_128)) * sizeof(bfloat16_t);
-                const uint32_t xOutDataBytes = static_cast<uint32_t>(TpCeilAlign(h, ALIGN_256));
-                const uint32_t xOutScaleBytes = scaleAlign;
-                const uint32_t mxTempBytes = 4096U;
+            const bool writeSharedPlanarFp8 =
+                (tiling.sharedExpertNum > 0U) &&
+                (tiling.sharedPrecisionMode == static_cast<uint8_t>(SharedPrecisionMode::FP8_MX));
+            GlobalTensor<uint8_t> dstShFp8DataGm, dstShFp8ScaleGm;
+            if (writeSharedPlanarFp8) {
+                dstShFp8DataGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.sharedBf16InputPtr));
+                dstShFp8ScaleGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(
+                    workspace.sharedBf16InputPtr + TpCeilAlign(static_cast<int64_t>(tiling.bs) * h, ALIGN_512)));
+            }
 
-                uint32_t ubCursor = 0U;
-                const uint32_t mxTempAddr = ubCursor;
-                ubCursor += mxTempBytes;
-                const uint32_t xInAddr0 = ubCursor;
-                ubCursor += xInBytes;
-                const uint32_t xInAddr1 = ubCursor;
-                ubCursor += xInBytes;
-                const uint32_t xOutDataAddr0 = ubCursor;
-                ubCursor += xOutDataBytes;
-                const uint32_t xOutScaleAddr0 = ubCursor;
-                ubCursor += xOutScaleBytes;
-                const uint32_t xOutDataAddr1 = ubCursor;
-                ubCursor += xOutDataBytes;
-                const uint32_t xOutScaleAddr1 = ubCursor;
-                ubCursor += xOutScaleBytes;
+            const uint32_t xInBytes = static_cast<uint32_t>(TpCeilAlign(h, ALIGN_128)) * sizeof(bfloat16_t);
+            const uint32_t xOutDataBytes = dataStride;
+            const uint32_t xOutScaleBytes = scaleAlign;
+            const uint32_t mxTempBytes = 4096U;
 
-                LocalTensor<int16_t> scratchSpan(TPosition::VECCALC, 0U, ubCursor / sizeof(int16_t));
-                Duplicate<int16_t>(scratchSpan, 0, static_cast<int32_t>(ubCursor / sizeof(int16_t)));
-                SyncFuncStatic<HardEvent::V_MTE2, EVENT_ID2>();
+            uint32_t ubCursor = 0U;
+            const uint32_t mxTempAddr = ubCursor;
+            ubCursor += mxTempBytes;
+            const uint32_t xInAddr0 = ubCursor;
+            ubCursor += xInBytes;
+            const uint32_t xInAddr1 = ubCursor;
+            ubCursor += xInBytes;
+            const uint32_t xOutDataAddr0 = ubCursor;
+            ubCursor += xOutDataBytes;
+            const uint32_t xOutScaleAddr0 = ubCursor;
+            ubCursor += xOutScaleBytes;
+            const uint32_t xOutDataAddr1 = ubCursor;
+            ubCursor += xOutDataBytes;
+            const uint32_t xOutScaleAddr1 = ubCursor;
+            ubCursor += xOutScaleBytes;
 
-                LocalTensor<uint16_t> mxTempUb(TPosition::VECCALC, mxTempAddr, mxTempBytes / sizeof(uint16_t));
-                __ubuf__ uint16_t* maxExpAddr = reinterpret_cast<__ubuf__ uint16_t*>(mxTempUb.GetPhyAddr());
-                const uint32_t scaleNumAlign =
-                    static_cast<uint32_t>(TpCeilAlign(TpCeilDiv(h, ALIGN_32), 2));
-                __ubuf__ uint16_t* halfScaleAddr = reinterpret_cast<__ubuf__ uint16_t*>(
-                    mxTempUb[TpCeilAlign(scaleNumAlign, ALIGN_32)].GetPhyAddr());
+            LocalTensor<int16_t> scratchSpan(TPosition::VECCALC, 0U, ubCursor / sizeof(int16_t));
+            Duplicate<int16_t>(scratchSpan, 0, static_cast<int32_t>(ubCursor / sizeof(int16_t)));
+            SyncFuncStatic<HardEvent::V_MTE2, EVENT_ID2>();
 
-                SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-                SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
-                for (uint32_t idx = 0U; idx < myTokens.count; ++idx) {
-                    const bool first = (idx % 2U == 0U);
-                    const TEventID ev = first ? EVENT_ID0 : EVENT_ID1;
-                    LocalTensor<bfloat16_t> xInUb(TPosition::VECCALC, first ? xInAddr0 : xInAddr1,
-                                                  xInBytes / sizeof(bfloat16_t));
-                    LocalTensor<uint8_t> outDataUb(TPosition::VECCALC, first ? xOutDataAddr0 : xOutDataAddr1,
-                                                   xOutDataBytes);
-                    LocalTensor<uint8_t> outScaleUb(TPosition::VECCALC, first ? xOutScaleAddr0 : xOutScaleAddr1,
-                                                    xOutScaleBytes);
+            LocalTensor<uint16_t> mxTempUb(TPosition::VECCALC, mxTempAddr, mxTempBytes / sizeof(uint16_t));
+            __ubuf__ uint16_t* maxExpAddr = reinterpret_cast<__ubuf__ uint16_t*>(mxTempUb.GetPhyAddr());
+            const uint32_t scaleNumAlign = static_cast<uint32_t>(TpCeilAlign(TpCeilDiv(h, ALIGN_32), 2));
+            __ubuf__ uint16_t* halfScaleAddr =
+                reinterpret_cast<__ubuf__ uint16_t*>(mxTempUb[TpCeilAlign(scaleNumAlign, ALIGN_32)].GetPhyAddr());
 
-                    WaitFlag<HardEvent::MTE3_MTE2>(ev);
-                    const uint64_t localTok = myTokens.start + idx;
-                    const uint64_t globalTok = localGlobalTokenBase + idx;
-                    DataCopyPad(xInUb, srcBf16Gm[localTok * h],
-                                {1U, static_cast<uint32_t>(h * sizeof(bfloat16_t)), 0U, 0U, 0U},
-                                {false, 0U, 0U, 0U});
-                    SetFlag<HardEvent::MTE2_V>(ev);
-                    WaitFlag<HardEvent::MTE2_V>(ev);
+            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+            for (uint32_t idx = 0U; idx < myTokens.count; ++idx) {
+                const bool first = (idx % 2U == 0U);
+                const TEventID ev = first ? EVENT_ID0 : EVENT_ID1;
+                const uint32_t recAddr = first ? xOutDataAddr0 : xOutDataAddr1;
+                LocalTensor<bfloat16_t> xInUb(TPosition::VECCALC, first ? xInAddr0 : xInAddr1,
+                                              xInBytes / sizeof(bfloat16_t));
+                LocalTensor<uint8_t> outRecordUb(TPosition::VECCALC, recAddr, recordBytes);
+                LocalTensor<uint8_t> outDataUb(TPosition::VECCALC, recAddr, xOutDataBytes);
+                LocalTensor<uint8_t> outScaleUb(TPosition::VECCALC, first ? xOutScaleAddr0 : xOutScaleAddr1,
+                                                xOutScaleBytes);
 
-                    Mxfp8::ComputeFp8Token<bfloat16_t, fp8_e4m3fn_t>(
-                        reinterpret_cast<__ubuf__ bfloat16_t*>(xInUb.GetPhyAddr()), maxExpAddr,
-                        reinterpret_cast<__ubuf__ uint16_t*>(outScaleUb.GetPhyAddr()), halfScaleAddr,
-                        reinterpret_cast<__ubuf__ int8_t*>(outDataUb.GetPhyAddr()), h, scaleNumAlign);
+                WaitFlag<HardEvent::MTE3_MTE2>(ev);
+                const uint64_t localTok = myTokens.start + idx;
+                const uint64_t globalTok = localGlobalTokenBase + idx;
+                DataCopyPad(xInUb, srcBf16Gm[localTok * h],
+                            {1U, static_cast<uint32_t>(h * sizeof(bfloat16_t)), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+                SetFlag<HardEvent::MTE2_V>(ev);
+                WaitFlag<HardEvent::MTE2_V>(ev);
 
-                    SetFlag<HardEvent::V_MTE3>(ev);
-                    WaitFlag<HardEvent::V_MTE3>(ev);
-                    DataCopyPad(dstPeerDataGm[localTok * h], outDataUb, {1U, h, 0U, 0U, 0U});
-                    DataCopyPad(dstWsDataGm[globalTok * h], outDataUb, {1U, h, 0U, 0U, 0U});
-                    DataCopyPad(dstPeerScaleGm[localTok * scaleH], outScaleUb, {1U, scaleH, 0U, 0U, 0U});
-                    DataCopyPad(dstWsScaleGm[globalTok * scaleH], outScaleUb, {1U, scaleH, 0U, 0U, 0U});
-                    SetFlag<HardEvent::MTE3_MTE2>(ev);
+                Mxfp8::ComputeFp8Token<bfloat16_t, fp8_e4m3fn_t>(
+                    reinterpret_cast<__ubuf__ bfloat16_t*>(xInUb.GetPhyAddr()), maxExpAddr,
+                    reinterpret_cast<__ubuf__ uint16_t*>(outScaleUb.GetPhyAddr()), halfScaleAddr,
+                    reinterpret_cast<__ubuf__ int8_t*>(outDataUb.GetPhyAddr()), h, scaleNumAlign);
+
+                SetFlag<HardEvent::V_MTE3>(ev);
+                WaitFlag<HardEvent::V_MTE3>(ev);
+                DataCopy(dstPeerRecordGm[localTok * recordBytes], outRecordUb, recordBytes);
+                DataCopy(dstWsRecordGm[globalTok * recordBytes], outRecordUb, recordBytes);
+                if (writeSharedPlanarFp8) {
+                    DataCopyPad(dstShFp8DataGm[localTok * h], outDataUb, {1U, h, 0U, 0U, 0U});
+                    DataCopyPad(dstShFp8ScaleGm[localTok * scaleH], outScaleUb, {1U, scaleH, 0U, 0U, 0U});
                 }
-                WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-                WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
-            } else {
-                // 预量化 (FP8, E8M0) 输入：大块双缓冲直拷
-                GlobalTensor<uint8_t> srcDataGm, srcScaleGm;
-                srcDataGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(xGm));
-                srcScaleGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(xScalesGm));
+                SetFlag<HardEvent::MTE3_MTE2>(ev);
+            }
+            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+        } else {
+            // 预量化 (FP8, E8M0) 输入：在 UB 双缓冲组装为紧致单记录后整块连续写出
+            GlobalTensor<uint8_t> srcDataGm, srcScaleGm;
+            srcDataGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(xGm));
+            srcScaleGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(xScalesGm));
 
-                constexpr uint32_t kDataSlotCap = 96U * 1024U;
-                constexpr uint32_t kScaleSlotCap = 16U * 1024U;
-                const uint32_t batchTokens = Min(kDataSlotCap / h, kScaleSlotCap / scaleAlign);
+            constexpr uint32_t kRecSlotCap = 112U * 1024U;
+            const uint32_t batchTokens = Max(1U, kRecSlotCap / recordBytes);
+            const bool aligned32In = (h % ALIGN_32 == 0U) && (scaleH % ALIGN_32 == 0U) && (h == dataStride) &&
+                                     (scaleH == scaleAlign);
 
-                SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-                SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
-                uint32_t seq = 0U;
-                for (uint32_t off = 0U; off < myTokens.count; off += batchTokens) {
-                    const uint32_t cnt = Min(batchTokens, myTokens.count - off);
-                    const uint32_t slot = seq++ % 2U;
-                    const TEventID ev = slot == 0U ? EVENT_ID0 : EVENT_ID1;
-                    LocalTensor<uint8_t> dataUb(TPosition::VECCALC, slot * kDataSlotCap, kDataSlotCap);
-                    LocalTensor<uint8_t> scaleUb(TPosition::VECCALC, 2U * kDataSlotCap + slot * kScaleSlotCap,
-                                                 kScaleSlotCap);
+            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+            uint32_t seq = 0U;
+            for (uint32_t off = 0U; off < myTokens.count; off += batchTokens) {
+                const uint32_t cnt = Min(batchTokens, myTokens.count - off);
+                const uint32_t slot = seq++ % 2U;
+                const TEventID ev = slot == 0U ? EVENT_ID0 : EVENT_ID1;
+                LocalTensor<uint8_t> recUb(TPosition::VECCALC, slot * kRecSlotCap, cnt * recordBytes);
 
-                    WaitFlag<HardEvent::MTE3_MTE2>(ev);
-                    const uint64_t localTok = myTokens.start + off;
-                    const uint64_t globalTok = localGlobalTokenBase + off;
-                    DataCopyPad(dataUb, srcDataGm[localTok * h], {1U, cnt * h, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-                    DataCopyPad(scaleUb, srcScaleGm[localTok * scaleH], {1U, cnt * scaleH, 0U, 0U, 0U},
-                                {false, 0U, 0U, 0U});
-                    SetFlag<HardEvent::MTE2_MTE3>(ev);
-                    WaitFlag<HardEvent::MTE2_MTE3>(ev);
-                    DataCopyPad(dstPeerDataGm[localTok * h], dataUb, {1U, cnt * h, 0U, 0U, 0U});
-                    DataCopyPad(dstWsDataGm[globalTok * h], dataUb, {1U, cnt * h, 0U, 0U, 0U});
-                    DataCopyPad(dstPeerScaleGm[localTok * scaleH], scaleUb, {1U, cnt * scaleH, 0U, 0U, 0U});
-                    DataCopyPad(dstWsScaleGm[globalTok * scaleH], scaleUb, {1U, cnt * scaleH, 0U, 0U, 0U});
-                    SetFlag<HardEvent::MTE3_MTE2>(ev);
+                WaitFlag<HardEvent::MTE3_MTE2>(ev);
+                const uint64_t localTokBase = myTokens.start + off;
+                const uint64_t globalTokBase = localGlobalTokenBase + off;
+                for (uint32_t t = 0U; t < cnt; ++t) {
+                    const uint64_t lTok = localTokBase + t;
+                    const uint32_t dstOff = t * recordBytes;
+                    if (aligned32In) {
+                        DataCopy(recUb[dstOff], srcDataGm[lTok * h], h);
+                        DataCopy(recUb[dstOff + dataStride], srcScaleGm[lTok * scaleH], scaleH);
+                    } else {
+                        DataCopyPad(recUb[dstOff], srcDataGm[lTok * h], {1U, h, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+                        DataCopyPad(recUb[dstOff + dataStride], srcScaleGm[lTok * scaleH], {1U, scaleH, 0U, 0U, 0U},
+                                    {false, 0U, 0U, 0U});
+                    }
                 }
-                WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-                WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+                SetFlag<HardEvent::MTE2_MTE3>(ev);
+                WaitFlag<HardEvent::MTE2_MTE3>(ev);
+                DataCopy(dstPeerRecordGm[localTokBase * recordBytes], recUb, cnt * recordBytes);
+                DataCopy(dstWsRecordGm[globalTokBase * recordBytes], recUb, cnt * recordBytes);
+                SetFlag<HardEvent::MTE3_MTE2>(ev);
+            }
+            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
 
                 // 若共享专家使用 BF16 而输入 x 是预量化 FP8，反量化本卡 x 到 sharedBf16InputPtr
                 if (tiling.sharedExpertNum > 0U &&
@@ -356,17 +373,14 @@ __aicore__ inline int32_t ProcessTpAllGatherAndRoute(const MegaMoeTpTilingData& 
         const WorkRange myRange = GetBalancedTokenRange(bs, subIdx, coresForThisPeer);
 
         if (myRange.count > 0U) {
-            GlobalTensor<uint8_t> remDataGm, remScaleGm, dstDataGm, dstScaleGm;
-            remDataGm.SetGlobalBuffer(
+            const uint32_t recordBytes = static_cast<uint32_t>(CalcTpAgTokenRecordBytes(h));
+            GlobalTensor<uint8_t> remRecordGm, dstRecordGm;
+            remRecordGm.SetGlobalBuffer(
                 reinterpret_cast<__gm__ uint8_t*>(g_winRankAddr_[peer] + localPeermem.layout.agSrcDataOffset));
-            remScaleGm.SetGlobalBuffer(
-                reinterpret_cast<__gm__ uint8_t*>(g_winRankAddr_[peer] + localPeermem.layout.agSrcScaleOffset));
-            dstDataGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.agXDataPtr));
-            dstScaleGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.agXScalePtr));
+            dstRecordGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.agXDataPtr));
 
-            constexpr uint32_t kDataSlotCap = 96U * 1024U;
-            constexpr uint32_t kScaleSlotCap = 16U * 1024U;
-            const uint32_t batchTokens = Min(kDataSlotCap / h, kScaleSlotCap / scaleAlign);
+            constexpr uint32_t kRecSlotCap = 112U * 1024U;
+            const uint32_t batchTokens = Max(1U, kRecSlotCap / recordBytes);
 
             SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
             SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
@@ -375,19 +389,16 @@ __aicore__ inline int32_t ProcessTpAllGatherAndRoute(const MegaMoeTpTilingData& 
                 const uint32_t cnt = Min(batchTokens, myRange.count - off);
                 const uint32_t slot = seq++ % 2U;
                 const TEventID ev = slot == 0U ? EVENT_ID0 : EVENT_ID1;
-                LocalTensor<uint8_t> dataUb(TPosition::VECCALC, slot * kDataSlotCap, kDataSlotCap);
-                LocalTensor<uint8_t> scaleUb(TPosition::VECCALC, 2U * kDataSlotCap + slot * kScaleSlotCap,
-                                             kScaleSlotCap);
+                LocalTensor<uint8_t> recUb(TPosition::VECCALC, slot * kRecSlotCap, kRecSlotCap);
 
                 WaitFlag<HardEvent::MTE3_MTE2>(ev);
                 const uint64_t srcTok = myRange.start + off;
                 const uint64_t dstTok = static_cast<uint64_t>(peer) * bs + srcTok;
-                DataCopyPad(dataUb, remDataGm[srcTok * h], {1U, cnt * h, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-                DataCopyPad(scaleUb, remScaleGm[srcTok * scaleH], {1U, cnt * scaleH, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+                const uint32_t copyBytes = cnt * recordBytes;
+                DataCopy(recUb, remRecordGm[srcTok * recordBytes], copyBytes);
                 SetFlag<HardEvent::MTE2_MTE3>(ev);
                 WaitFlag<HardEvent::MTE2_MTE3>(ev);
-                DataCopyPad(dstDataGm[dstTok * h], dataUb, {1U, cnt * h, 0U, 0U, 0U});
-                DataCopyPad(dstScaleGm[dstTok * scaleH], scaleUb, {1U, cnt * scaleH, 0U, 0U, 0U});
+                DataCopy(dstRecordGm[dstTok * recordBytes], recUb, copyBytes);
                 SetFlag<HardEvent::MTE3_MTE2>(ev);
             }
             WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
@@ -649,17 +660,33 @@ __aicore__ inline int32_t ProcessTpAllGatherAndRoute(const MegaMoeTpTilingData& 
 }
 
 /*
- * Phase 2 AIV1 Permute 异步状态机：
- *   - 仅使用常驻 UB [permDataBase, permEnd) 与本地事件槽 0..5 (MTE2<->MTE3) + 7 (MTE3->S)，
- *     与 Routed/Shared SwiGLU 的 UB [0, actBytes) 及事件 ActivationUb(0)/ActivationDone(6) 完全正交。
+ * Phase 2 AIV1 Permute 跨 Slice 不断流异步状态机：
+ *   - 仅使用常驻 UB [permRecordBase, end) 与本地事件槽 0..5 (MTE2<->MTE3) + 7 (MTE3->S / MTE2->S)，
+ *     与 Routed/Shared SwiGLU 的 UB [0, actBytes) 及事件 ActivationUb(0)/ActivationDone(6) 完全正交；
+ *   - 跨专家 slice 保持 3 行在途 MTE2 预取不断流，批量缓存已完成 slice 并在阈值/Wave 边界统一刷盘通知。
  */
-struct TpPermuteAsyncState {
-    uint32_t issuedRows = 0U;
-    int64_t pendingPermRow = -1;
+constexpr uint32_t TP_PERMUTE_PREFETCH_DEPTH = 3U;
+constexpr uint32_t TP_PERMUTE_MAX_PENDING_SLICES = 24U;
+
+struct TpPermuteSliceSpan {
     uint32_t expertIdx = 0U;
     uint32_t rowBeginInExpert = 0U;
     uint32_t rowEndInExpert = 0U;
-    bool pending = false;
+};
+
+struct TpPermuteAsyncState {
+    uint32_t issuedRows = 0U;
+    uint64_t inflightPermRow[TP_PERMUTE_PREFETCH_DEPTH]{};
+    uint32_t inflightSlot[TP_PERMUTE_PREFETCH_DEPTH]{};
+    uint32_t inflightHead = 0U;
+    uint32_t inflightTail = 0U;
+    TpPermuteSliceSpan pendingSlices[TP_PERMUTE_MAX_PENDING_SLICES]{};
+    uint32_t pendingSliceCount = 0U;
+
+    __aicore__ inline bool HasPending() const
+    {
+        return (inflightHead < inflightTail) || (pendingSliceCount > 0U);
+    }
 };
 
 __aicore__ inline void StoreTpPermutedRow(const TpAiv1ResidentUbLayout& ubLayout, const TpWorkspaceInfo& workspace,
@@ -668,10 +695,9 @@ __aicore__ inline void StoreTpPermutedRow(const TpAiv1ResidentUbLayout& ubLayout
 {
     const TEventID ev = static_cast<TEventID>(slot);
     WaitFlag<HardEvent::MTE2_MTE3>(ev);
-    LocalTensor<uint8_t> dataUb(TPosition::VECCALC, ubLayout.permDataBase + slot * ubLayout.permRowDataBytes,
-                                ubLayout.permRowDataBytes);
-    LocalTensor<uint8_t> scaleUb(TPosition::VECCALC, ubLayout.permScaleBase + slot * ubLayout.permRowScaleBytes,
-                                 ubLayout.permRowScaleBytes);
+    const uint32_t recBase = ubLayout.permRecordBase + slot * ubLayout.permRecordBytes;
+    LocalTensor<uint8_t> dataUb(TPosition::VECCALC, recBase, ubLayout.permRowDataBytes);
+    LocalTensor<uint8_t> scaleUb(TPosition::VECCALC, recBase + ubLayout.permRowDataBytes, ubLayout.permRowScaleBytes);
     GlobalTensor<uint8_t> dstDataGm, dstScaleGm;
     dstDataGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.permutedXPtr));
     dstScaleGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.permutedScalePtr));
@@ -685,27 +711,45 @@ __aicore__ inline void StoreTpPermutedRow(const TpAiv1ResidentUbLayout& ubLayout
     SetFlag<HardEvent::MTE3_MTE2>(ev);
 }
 
-__aicore__ inline void RetireTpPermuteReady(const TpWorkspaceInfo& workspace, TpPermuteAsyncState& state)
+__aicore__ inline void FlushAndRetireTpPermute(const MegaMoeTpTilingData& tiling,
+                                               const TpAiv1ResidentUbLayout& ubLayout,
+                                               const TpWorkspaceInfo& workspace, TpPermuteAsyncState& state)
 {
-    if (!state.pending) {
+    if (!state.HasPending()) {
         return;
     }
+    const uint32_t h = tiling.h;
+    const uint32_t scaleH = static_cast<uint32_t>(CalcTpMxScaleStrideBytes(h));
+    const bool aligned32 = (h % ALIGN_32 == 0U) && (scaleH % ALIGN_32 == 0U);
+
+    while (state.inflightHead < state.inflightTail) {
+        const uint32_t idx = state.inflightHead % TP_PERMUTE_PREFETCH_DEPTH;
+        StoreTpPermutedRow(ubLayout, workspace, h, scaleH, state.inflightSlot[idx], state.inflightPermRow[idx],
+                           aligned32);
+        ++state.inflightHead;
+    }
+
+    SetFlag<HardEvent::MTE3_S>(static_cast<TEventID>(Aiv1AsyncEvents::DispatchDone));
     WaitFlag<HardEvent::MTE3_S>(static_cast<TEventID>(Aiv1AsyncEvents::DispatchDone));
     asc_sync_data_barrier(DSB_DDR);
-    if (state.rowBeginInExpert < state.rowEndInExpert) {
-        __gm__ int32_t* readyBase = reinterpret_cast<__gm__ int32_t*>(workspace.flagPermuteToGmm1Ptr) +
-                                    static_cast<uint64_t>(state.expertIdx) * workspace.mGroupFlagSlotsPerExpert;
-        const uint32_t firstGroup = state.rowBeginInExpert / L1_TILE_M_256;
-        const uint32_t lastGroup = (state.rowEndInExpert - 1U) / L1_TILE_M_256;
-        for (uint32_t g = firstGroup; g <= lastGroup; ++g) {
-            const uint32_t gBegin = g * L1_TILE_M_256;
-            const uint32_t gEnd = gBegin + L1_TILE_M_256;
-            const uint32_t ovBegin = state.rowBeginInExpert > gBegin ? state.rowBeginInExpert : gBegin;
-            const uint32_t ovEnd = state.rowEndInExpert < gEnd ? state.rowEndInExpert : gEnd;
-            AtomicAdd(readyBase + static_cast<uint64_t>(g) * INT_CACHELINE, static_cast<int32_t>(ovEnd - ovBegin));
+
+    for (uint32_t s = 0U; s < state.pendingSliceCount; ++s) {
+        const auto& span = state.pendingSlices[s];
+        if (span.rowBeginInExpert < span.rowEndInExpert) {
+            __gm__ int32_t* readyBase = reinterpret_cast<__gm__ int32_t*>(workspace.flagPermuteToGmm1Ptr) +
+                                        static_cast<uint64_t>(span.expertIdx) * workspace.mGroupFlagSlotsPerExpert;
+            const uint32_t firstGroup = span.rowBeginInExpert / L1_TILE_M_256;
+            const uint32_t lastGroup = (span.rowEndInExpert - 1U) / L1_TILE_M_256;
+            for (uint32_t g = firstGroup; g <= lastGroup; ++g) {
+                const uint32_t gBegin = g * L1_TILE_M_256;
+                const uint32_t gEnd = gBegin + L1_TILE_M_256;
+                const uint32_t ovBegin = span.rowBeginInExpert > gBegin ? span.rowBeginInExpert : gBegin;
+                const uint32_t ovEnd = span.rowEndInExpert < gEnd ? span.rowEndInExpert : gEnd;
+                AtomicAdd(readyBase + static_cast<uint64_t>(g) * INT_CACHELINE, static_cast<int32_t>(ovEnd - ovBegin));
+            }
         }
     }
-    state.pending = false;
+    state.pendingSliceCount = 0U;
 }
 
 __aicore__ inline void IssueTpPermuteSlice(const MegaMoeTpTilingData& tiling, const TpAiv1ResidentUbLayout& ubLayout,
@@ -726,22 +770,19 @@ __aicore__ inline void IssueTpPermuteSlice(const MegaMoeTpTilingData& tiling, co
         return;
     }
 
+    if (state.pendingSliceCount >= TP_PERMUTE_MAX_PENDING_SLICES) {
+        FlushAndRetireTpPermute(tiling, ubLayout, workspace, state);
+    }
+
     const uint32_t h = tiling.h;
     const uint32_t scaleH = static_cast<uint32_t>(CalcTpMxScaleStrideBytes(h));
+    const uint32_t recordBytes = ubLayout.permRecordBytes;
     const bool aligned32 = (h % ALIGN_32 == 0U) && (scaleH % ALIGN_32 == 0U);
     GlobalTensor<int32_t> permIdxGm;
     permIdxGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspace.permRowToTokenPtr));
     LocalTensor<int32_t> permIdxUb(TPosition::VECCALC, ubLayout.permIdxBase, TP_PERMUTE_IDX_BATCH_CAP);
-    GlobalTensor<uint8_t> srcDataGm, srcScaleGm;
-    srcDataGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.agXDataPtr));
-    srcScaleGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.agXScalePtr));
-
-    // 6 槽环形缓冲内保持最多 3 行 MTE2 在途预取，重叠 MTE2 读与 MTE3 写
-    constexpr uint32_t kPrefetchDepth = 3U;
-    uint64_t inflightPermRow[kPrefetchDepth];
-    uint32_t inflightSlot[kPrefetchDepth];
-    uint32_t inflightHead = 0U;
-    uint32_t inflightTail = 0U;
+    GlobalTensor<uint8_t> srcRecordGm;
+    srcRecordGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.agXDataPtr));
 
     for (uint32_t batchOff = 0U; batchOff < owned.count; batchOff += TP_PERMUTE_IDX_BATCH_CAP) {
         const uint32_t batchCnt = Min(TP_PERMUTE_IDX_BATCH_CAP, owned.count - batchOff);
@@ -758,46 +799,28 @@ __aicore__ inline void IssueTpPermuteSlice(const MegaMoeTpTilingData& tiling, co
             if (state.issuedRows >= TP_PERMUTE_RING_SLOTS) {
                 WaitFlag<HardEvent::MTE3_MTE2>(ev);
             }
-            LocalTensor<uint8_t> dataUb(TPosition::VECCALC, ubLayout.permDataBase + slot * ubLayout.permRowDataBytes,
-                                        ubLayout.permRowDataBytes);
-            LocalTensor<uint8_t> scaleUb(TPosition::VECCALC, ubLayout.permScaleBase + slot * ubLayout.permRowScaleBytes,
-                                         ubLayout.permRowScaleBytes);
-            if (aligned32) {
-                DataCopy(dataUb, srcDataGm[static_cast<uint64_t>(srcTok) * h], h);
-                DataCopy(scaleUb, srcScaleGm[static_cast<uint64_t>(srcTok) * scaleH], scaleH);
-            } else {
-                DataCopyPad(dataUb, srcDataGm[static_cast<uint64_t>(srcTok) * h], {1U, h, 0U, 0U, 0U},
-                            {false, 0U, 0U, 0U});
-                DataCopyPad(scaleUb, srcScaleGm[static_cast<uint64_t>(srcTok) * scaleH], {1U, scaleH, 0U, 0U, 0U},
-                            {false, 0U, 0U, 0U});
-            }
+            LocalTensor<uint8_t> recUb(TPosition::VECCALC, ubLayout.permRecordBase + slot * recordBytes, recordBytes);
+            // 单条 32B 对齐 DataCopy 同时搬入 (FP8 data + E8M0 scale)，随机 MTE2 读事务减半!
+            DataCopy(recUb, srcRecordGm[static_cast<uint64_t>(srcTok) * recordBytes], recordBytes);
             SetFlag<HardEvent::MTE2_MTE3>(ev);
 
-            inflightPermRow[inflightTail % kPrefetchDepth] = permRow;
-            inflightSlot[inflightTail % kPrefetchDepth] = slot;
-            ++inflightTail;
+            state.inflightPermRow[state.inflightTail % TP_PERMUTE_PREFETCH_DEPTH] = permRow;
+            state.inflightSlot[state.inflightTail % TP_PERMUTE_PREFETCH_DEPTH] = slot;
+            ++state.inflightTail;
             ++state.issuedRows;
 
-            if (inflightTail - inflightHead >= kPrefetchDepth) {
-                const uint32_t idx = inflightHead % kPrefetchDepth;
-                StoreTpPermutedRow(ubLayout, workspace, h, scaleH, inflightSlot[idx], inflightPermRow[idx], aligned32);
-                ++inflightHead;
+            if (state.inflightTail - state.inflightHead >= TP_PERMUTE_PREFETCH_DEPTH) {
+                const uint32_t idx = state.inflightHead % TP_PERMUTE_PREFETCH_DEPTH;
+                StoreTpPermutedRow(ubLayout, workspace, h, scaleH, state.inflightSlot[idx], state.inflightPermRow[idx],
+                                   aligned32);
+                ++state.inflightHead;
             }
         }
         SyncFuncStatic<HardEvent::S_MTE2, static_cast<TEventID>(Aiv1AsyncEvents::DispatchDone)>();
     }
 
-    while (inflightHead < inflightTail) {
-        const uint32_t idx = inflightHead % kPrefetchDepth;
-        StoreTpPermutedRow(ubLayout, workspace, h, scaleH, inflightSlot[idx], inflightPermRow[idx], aligned32);
-        ++inflightHead;
-    }
-    state.pendingPermRow = -1;
-    state.expertIdx = slice.expertIdx;
-    state.rowBeginInExpert = slice.rowStartInExpert + owned.start;
-    state.rowEndInExpert = state.rowBeginInExpert + owned.count;
-    state.pending = true;
-    SetFlag<HardEvent::MTE3_S>(static_cast<TEventID>(Aiv1AsyncEvents::DispatchDone));
+    const uint32_t rBegin = slice.rowStartInExpert + owned.start;
+    state.pendingSlices[state.pendingSliceCount++] = {slice.expertIdx, rBegin, rBegin + owned.count};
 }
 
 __aicore__ inline void DrainTpPermuteBuffers(TpPermuteAsyncState& state)
