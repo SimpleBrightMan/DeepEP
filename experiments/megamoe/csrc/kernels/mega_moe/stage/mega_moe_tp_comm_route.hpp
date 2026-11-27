@@ -10,6 +10,9 @@
 #define MEGA_MOE_TP_COMM_ROUTE_HPP
 
 #include <c_api/asc_simd.h>
+#if defined(__NPU_DEVICE__)
+#include "shmem.h"
+#endif
 #include "../common/mega_moe_tp_layout.hpp"
 #include "../common/mega_moe_utils.hpp"
 #include "../common/mega_moe_mxfp8_utils.hpp"
@@ -124,12 +127,11 @@ __aicore__ inline void ProcessTpInputPrep(const MegaMoeTpTilingData& tiling, uin
                 SyncFuncStatic<HardEvent::MTE3_S, EVENT_ID0>();
             }
 
-        // 2b. 处理本地 x / x_scales（按紧致单记录 [Align256(H) | Align32(scaleH)] 一次写出）
+        // 2b. 处理本地 x / x_scales（按紧致单记录 [Align256(H) | Align32(scaleH)] 单写落地到对称窗口 agXDataPtr）
         const uint32_t dataStride = static_cast<uint32_t>(CalcTpAgTokenDataStrideBytes(h));
         const uint32_t recordBytes = static_cast<uint32_t>(CalcTpAgTokenRecordBytes(h));
-        GlobalTensor<uint8_t> dstPeerRecordGm, dstWsRecordGm;
-        dstPeerRecordGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(localPeermem.agSrcDataPtr));
-        dstWsRecordGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.agXDataPtr));
+        GlobalTensor<uint8_t> dstSymRecordGm;
+        dstSymRecordGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(localPeermem.agXDataPtr));
 
         if (xScalesGm == nullptr) {
             // BF16 输入：逐 token 双缓冲 MXFP8 量化，UB 内 [outDataUb | outScaleUb] 天然紧邻构成单条 recordBytes 记录
@@ -205,8 +207,7 @@ __aicore__ inline void ProcessTpInputPrep(const MegaMoeTpTilingData& tiling, uin
 
                 SetFlag<HardEvent::V_MTE3>(ev);
                 WaitFlag<HardEvent::V_MTE3>(ev);
-                DataCopy(dstPeerRecordGm[localTok * recordBytes], outRecordUb, recordBytes);
-                DataCopy(dstWsRecordGm[globalTok * recordBytes], outRecordUb, recordBytes);
+                DataCopy(dstSymRecordGm[globalTok * recordBytes], outRecordUb, recordBytes);
                 if (writeSharedPlanarFp8) {
                     DataCopyPad(dstShFp8DataGm[localTok * h], outDataUb, {1U, h, 0U, 0U, 0U});
                     DataCopyPad(dstShFp8ScaleGm[localTok * scaleH], outScaleUb, {1U, scaleH, 0U, 0U, 0U});
@@ -216,7 +217,7 @@ __aicore__ inline void ProcessTpInputPrep(const MegaMoeTpTilingData& tiling, uin
             WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
             WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
         } else {
-            // 预量化 (FP8, E8M0) 输入：在 UB 双缓冲组装为紧致单记录后整块连续写出
+            // 预量化 (FP8, E8M0) 输入：在 UB 双缓冲组装为紧致单记录后单次连续写入对称窗口
             GlobalTensor<uint8_t> srcDataGm, srcScaleGm;
             srcDataGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(xGm));
             srcScaleGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(xScalesGm));
@@ -252,8 +253,7 @@ __aicore__ inline void ProcessTpInputPrep(const MegaMoeTpTilingData& tiling, uin
                 }
                 SetFlag<HardEvent::MTE2_MTE3>(ev);
                 WaitFlag<HardEvent::MTE2_MTE3>(ev);
-                DataCopy(dstPeerRecordGm[localTokBase * recordBytes], recUb, cnt * recordBytes);
-                DataCopy(dstWsRecordGm[globalTokBase * recordBytes], recUb, cnt * recordBytes);
+                DataCopy(dstSymRecordGm[globalTokBase * recordBytes], recUb, cnt * recordBytes);
                 SetFlag<HardEvent::MTE3_MTE2>(ev);
             }
             WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
@@ -346,65 +346,109 @@ __aicore__ inline int32_t ProcessTpAllGatherAndRoute(const MegaMoeTpTilingData& 
     const uint32_t scaleAlign = static_cast<uint32_t>(TpCeilAlign(scaleH, ALIGN_32));
 
     if (GetSubBlockIdx() == 0U) {
-        // ==================== AllGather 子组（32 个 AIV0，每 AICore 至多 1 个 AIV 读远端） ====================
+        // ==================== AllGather 子组（AIV0：默认 URMA 多 QP 推送，零占用 AICore MTE2/BIU 带宽） ====================
         timer.SetWave(AscendTimer::NO_WAVE);
         AscendTimerSpanScope agSpan(timer.Enabled() ? &timer : nullptr, AscendTimer::AIV_ALLGATHER);
 
         const uint32_t agIdx = aivIdx / 2U;
         const uint32_t agTotalCores = tiling.aicNum;
         const uint32_t numPeers = tpWorldSize - 1U;
-        const uint32_t baseCores = agTotalCores / numPeers;
-        const uint32_t extraPeers = agTotalCores % numPeers;
-        const uint32_t splitPoint = extraPeers * (baseCores + 1U);
-        uint32_t peerSlot = 0U;
-        uint32_t subIdx = 0U;
-        uint32_t coresForThisPeer = baseCores;
-        if (agIdx < splitPoint) {
-            peerSlot = agIdx / (baseCores + 1U);
-            subIdx = agIdx % (baseCores + 1U);
-            coresForThisPeer = baseCores + 1U;
-        } else {
-            const uint32_t remIdx = agIdx - splitPoint;
-            peerSlot = extraPeers + remIdx / baseCores;
-            subIdx = remIdx % baseCores;
-            coresForThisPeer = baseCores;
-        }
-        const uint32_t peer = (rankId + 1U + peerSlot) % tpWorldSize;
-        const WorkRange myRange = GetBalancedTokenRange(bs, subIdx, coresForThisPeer);
+        const uint32_t recordBytes = static_cast<uint32_t>(CalcTpAgTokenRecordBytes(h));
 
-        if (myRange.count > 0U) {
-            const uint32_t recordBytes = static_cast<uint32_t>(CalcTpAgTokenRecordBytes(h));
-            GlobalTensor<uint8_t> remRecordGm, dstRecordGm;
-            remRecordGm.SetGlobalBuffer(
-                reinterpret_cast<__gm__ uint8_t*>(g_winRankAddr_[peer] + localPeermem.layout.agSrcDataOffset));
-            dstRecordGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.agXDataPtr));
+        if (tiling.useUrmaAllGather != 0U) {
+#if defined(__NPU_DEVICE__)
+            const uint32_t cfgQps =
+                tiling.udmaQpsPerPeer > 0U ? static_cast<uint32_t>(tiling.udmaQpsPerPeer) : 1U;
+            const uint32_t qpsPerPeer = Min(cfgQps, Max(1U, agTotalCores / numPeers));
+            if (agIdx < numPeers * qpsPerPeer) {
+                aclshmemx_instance_ctx_set(tiling.shmemInstanceId);
+                const uint32_t peerSlot = agIdx / qpsPerPeer;
+                const uint32_t qpIdx = agIdx % qpsPerPeer;
+                const uint32_t peer = (rankId + 1U + peerSlot) % tpWorldSize;
+                const WorkRange myRange = GetBalancedTokenRange(bs, qpIdx, qpsPerPeer);
 
-            constexpr uint32_t kRecSlotCap = 112U * 1024U;
-            const uint32_t batchTokens = Max(1U, kRecSlotCap / recordBytes);
+                if (myRange.count > 0U) {
+                    __gm__ uint8_t* symSlicePtr =
+                        reinterpret_cast<__gm__ uint8_t*>(localPeermem.agXDataPtr) +
+                        (static_cast<uint64_t>(rankId) * bs + myRange.start) * static_cast<uint64_t>(recordBytes);
+                    constexpr uint64_t kMaxSinglePutBytes = 64ULL * 1024ULL * 1024ULL;
+                    const uint64_t totalBytes = static_cast<uint64_t>(myRange.count) * recordBytes;
+                    uint64_t sent = 0ULL;
+                    while (sent < totalBytes) {
+                        const uint32_t chunk = static_cast<uint32_t>(
+                            (totalBytes - sent) > kMaxSinglePutBytes ? kMaxSinglePutBytes : (totalBytes - sent));
+                        aclshmemx_udma_qp_put_nbi<uint8_t, PIPE_S, ACLSHMEMX_UDMA_OP_CONFIG_DEFAULT>(
+                            symSlicePtr + sent, symSlicePtr + sent, nullptr, chunk, static_cast<int>(peer), qpIdx, 0U);
+                        sent += chunk;
+                    }
+                    aclshmemx_udma_qp_quiet(static_cast<int>(peer), qpIdx);
+                }
 
-            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-            SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
-            uint32_t seq = 0U;
-            for (uint32_t off = 0U; off < myRange.count; off += batchTokens) {
-                const uint32_t cnt = Min(batchTokens, myRange.count - off);
-                const uint32_t slot = seq++ % 2U;
-                const TEventID ev = slot == 0U ? EVENT_ID0 : EVENT_ID1;
-                LocalTensor<uint8_t> recUb(TPosition::VECCALC, slot * kRecSlotCap, kRecSlotCap);
+                // 本 (rankId, qpIdx) 的 UDMA 写入在目标卡 HBM 确认完成后，发布单调递增 epoch 通知
+                auto* remDoneSlot = reinterpret_cast<__gm__ int32_t*>(
+                                        g_winRankAddr_[peer] + localPeermem.layout.agPeerDoneOffset) +
+                                    (static_cast<uint64_t>(rankId) * TP_UDMA_MAX_QPS_PER_PEER + qpIdx) * INT_CACHELINE;
+                WriteGmByPassDCache(remDoneSlot, epoch);
+                asc_sync_data_barrier(DSB_DDR);
 
-                WaitFlag<HardEvent::MTE3_MTE2>(ev);
-                const uint64_t srcTok = myRange.start + off;
-                const uint64_t dstTok = static_cast<uint64_t>(peer) * bs + srcTok;
-                const uint32_t copyBytes = cnt * recordBytes;
-                DataCopy(recUb, remRecordGm[srcTok * recordBytes], copyBytes);
-                SetFlag<HardEvent::MTE2_MTE3>(ev);
-                WaitFlag<HardEvent::MTE2_MTE3>(ev);
-                DataCopy(dstRecordGm[dstTok * recordBytes], recUb, copyBytes);
-                SetFlag<HardEvent::MTE3_MTE2>(ev);
+                // 等待对端 peer 推入本卡对应 (peer, qpIdx) 分片完成
+                auto* locDoneSlot = reinterpret_cast<__gm__ int32_t*>(localPeermem.agPeerDonePtr) +
+                                    (static_cast<uint64_t>(peer) * TP_UDMA_MAX_QPS_PER_PEER + qpIdx) * INT_CACHELINE;
+                WaitUntilGmFlagAtLeast(locDoneSlot, epoch);
             }
-            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
-            SyncFuncStatic<HardEvent::MTE3_S, EVENT_ID0>();
-            asc_sync_data_barrier(DSB_DDR);
+#endif
+        } else {
+            const uint32_t baseCores = agTotalCores / numPeers;
+            const uint32_t extraPeers = agTotalCores % numPeers;
+            const uint32_t splitPoint = extraPeers * (baseCores + 1U);
+            uint32_t peerSlot = 0U;
+            uint32_t subIdx = 0U;
+            uint32_t coresForThisPeer = baseCores;
+            if (agIdx < splitPoint) {
+                peerSlot = agIdx / (baseCores + 1U);
+                subIdx = agIdx % (baseCores + 1U);
+                coresForThisPeer = baseCores + 1U;
+            } else {
+                const uint32_t remIdx = agIdx - splitPoint;
+                peerSlot = extraPeers + remIdx / baseCores;
+                subIdx = remIdx % baseCores;
+                coresForThisPeer = baseCores;
+            }
+            const uint32_t peer = (rankId + 1U + peerSlot) % tpWorldSize;
+            const WorkRange myRange = GetBalancedTokenRange(bs, subIdx, coresForThisPeer);
+
+            if (myRange.count > 0U) {
+                GlobalTensor<uint8_t> remRecordGm, dstRecordGm;
+                remRecordGm.SetGlobalBuffer(
+                    reinterpret_cast<__gm__ uint8_t*>(g_winRankAddr_[peer] + localPeermem.layout.agXDataOffset));
+                dstRecordGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(localPeermem.agXDataPtr));
+
+                constexpr uint32_t kRecSlotCap = 112U * 1024U;
+                const uint32_t batchTokens = Max(1U, kRecSlotCap / recordBytes);
+
+                SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+                SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+                uint32_t seq = 0U;
+                for (uint32_t off = 0U; off < myRange.count; off += batchTokens) {
+                    const uint32_t cnt = Min(batchTokens, myRange.count - off);
+                    const uint32_t slot = seq++ % 2U;
+                    const TEventID ev = slot == 0U ? EVENT_ID0 : EVENT_ID1;
+                    LocalTensor<uint8_t> recUb(TPosition::VECCALC, slot * kRecSlotCap, kRecSlotCap);
+
+                    WaitFlag<HardEvent::MTE3_MTE2>(ev);
+                    const uint64_t peerGlobalTok = static_cast<uint64_t>(peer) * bs + myRange.start + off;
+                    const uint32_t copyBytes = cnt * recordBytes;
+                    DataCopy(recUb, remRecordGm[peerGlobalTok * recordBytes], copyBytes);
+                    SetFlag<HardEvent::MTE2_MTE3>(ev);
+                    WaitFlag<HardEvent::MTE2_MTE3>(ev);
+                    DataCopy(dstRecordGm[peerGlobalTok * recordBytes], recUb, copyBytes);
+                    SetFlag<HardEvent::MTE3_MTE2>(ev);
+                }
+                WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+                WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+                SyncFuncStatic<HardEvent::MTE3_S, EVENT_ID0>();
+                asc_sync_data_barrier(DSB_DDR);
+            }
         }
     } else {
         // ==================== RouteTable 子组（32 个 AIV1） ====================
@@ -753,8 +797,9 @@ __aicore__ inline void FlushAndRetireTpPermute(const MegaMoeTpTilingData& tiling
 }
 
 __aicore__ inline void IssueTpPermuteSlice(const MegaMoeTpTilingData& tiling, const TpAiv1ResidentUbLayout& ubLayout,
-                                           const TpWorkspaceInfo& workspace, uint32_t blockIdx,
-                                           const ExpertSlice& slice, uint64_t waveId, TpPermuteAsyncState& state)
+                                           const TpPeermemInfo& localPeermem, const TpWorkspaceInfo& workspace,
+                                           uint32_t blockIdx, const ExpertSlice& slice, uint64_t waveId,
+                                           TpPermuteAsyncState& state)
 {
     if constexpr (g_coreType == AIC) {
         return;
@@ -782,7 +827,7 @@ __aicore__ inline void IssueTpPermuteSlice(const MegaMoeTpTilingData& tiling, co
     permIdxGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspace.permRowToTokenPtr));
     LocalTensor<int32_t> permIdxUb(TPosition::VECCALC, ubLayout.permIdxBase, TP_PERMUTE_IDX_BATCH_CAP);
     GlobalTensor<uint8_t> srcRecordGm;
-    srcRecordGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.agXDataPtr));
+    srcRecordGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(localPeermem.agXDataPtr));
 
     for (uint32_t batchOff = 0U; batchOff < owned.count; batchOff += TP_PERMUTE_IDX_BATCH_CAP) {
         const uint32_t batchCnt = Min(TP_PERMUTE_IDX_BATCH_CAP, owned.count - batchOff);

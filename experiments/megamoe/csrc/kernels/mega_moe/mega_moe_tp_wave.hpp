@@ -524,7 +524,8 @@ private:
                     ensurePermTimer(permWave);
                     const ExpertSlice slice{range.begin.expertIdx, range.begin.tokenIndexInExpert, rows,
                                             range.begin.globalTokenIndex};
-                    IssueTpPermuteSlice(tiling_, ubLayout_, workspace_, blockIdx_, slice, permWave, permAsync);
+                    IssueTpPermuteSlice(tiling_, ubLayout_, localPeermem_, workspace_, blockIdx_, slice, permWave,
+                                        permAsync);
                     const uint32_t flushThreshold = (permWave == 0U) ? 4U : 8U;
                     const bool waveDone =
                         !HasTpWaveCapacity(permPos, permGroups) || (permPos.expertIdx >= tiling_.numExperts);

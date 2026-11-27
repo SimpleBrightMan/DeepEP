@@ -52,14 +52,14 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     constexpr uint64_t alignment = 2ULL * 1024 * 1024;
     if (size < 2 || size > (megamoe ? 128 : 512) || (!megamoe && (size & (size - 1))) || rank < 0 || rank >= size ||
         bytes < alignment || bytes > (megamoe ? (1ULL << 30) : ((1ULL << 63) - 1U)) || bytes % alignment != 0 ||
-        timeout < 1 || timeout > 3600 || (megamoe && (udma || mpi)) ||
+        timeout < 1 || timeout > 3600 || (megamoe && mpi) ||
         (!mpi && uid_bytes.empty() &&
          (endpoint.empty() || endpoint.size() >= ACLSHMEM_MAX_IP_PORT_LEN ||
           endpoint.find('\0') != std::string::npos))) {
         throw std::invalid_argument("Invalid rank, capacity, timeout or bootstrap endpoint");
     }
     // BF16 and FP8 use the same peer-table transport at every supported EP size.
-    peer_table_ = udma;
+    peer_table_ = udma && !megamoe;
     if (peer_table_ && (size < 2 || size > 512 || (size & (size - 1)))) {
         throw std::invalid_argument("peer-table requires EP2/4/8/16/32/64/128/256/512");
     }
@@ -96,7 +96,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     using SetPeerQpMasks = int (*)(const uint64_t*, uint32_t);
     auto set_masks =
         udma ? reinterpret_cast<SetPeerQpMasks>(dlsym(RTLD_DEFAULT, "aclshmemx_set_udma_peer_qp_masks")) : nullptr;
-    if (udma && dense != "1" && !set_masks) {
+    if (udma && !megamoe && dense != "1" && !set_masks) {
         throw std::runtime_error(
             "SHMEM lacks aclshmemx_set_udma_peer_qp_masks; use the SDK pinned in dependencies.lock.json, "
             "or explicitly select dense channels with DEEPEP_SHMEM_DENSE_QPS=1");
@@ -111,7 +111,15 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     attr.instance_id = instance_id_;
     bool runtime_started = false;
     try {
-        if (udma && first) {
+        if (udma && megamoe && first) {
+            constexpr uint32_t kMegaMoeUdmaQpsPerPeer = 8U;
+            check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_UDMA, kMegaMoeUdmaQpsPerPeer),
+                  "aclshmemx_set_qp_num(MegaMoE)");
+            check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, false), "aclshmemx_set_shared_jetty(MegaMoE)");
+            if (set_masks) {
+                check(set_masks(nullptr, 0U), "aclshmemx_set_udma_peer_qp_masks(MegaMoE)");
+            }
+        } else if (udma && first) {
             // Combine owns pairs 0..15; peer-table Dispatch uses pairs 0..7.
             // Serialized operators reuse the bank, not concurrent SQ writers.
             // The pinned SDK shares Clos SQs across peers; MESH routes are separate.
@@ -131,7 +139,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
                 sparse_qp_enabled_ = !masks.empty();
             }
         }
-        sparse_qp_enabled_ = udma && dense != "1";
+        sparse_qp_enabled_ = udma && !megamoe && dense != "1";
         auto mode = mpi ? ACLSHMEMX_INIT_WITH_MPI : ACLSHMEMX_INIT_WITH_DEFAULT;
         if (!uid_bytes.empty()) {
             std::memcpy(&uid, uid_bytes.data(), sizeof(uid));

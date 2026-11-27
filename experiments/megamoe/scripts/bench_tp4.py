@@ -143,6 +143,7 @@ def main():
     parser.add_argument("--m-groups-per-wave", type=int, default=22)
     parser.add_argument("--ag-cores-per-peer", type=int, default=11)
     parser.add_argument("--rs-tokens-per-chunk", type=int, default=64)
+    parser.add_argument("--ag-backend", choices=("urma", "mte"), default="urma")
     parser.add_argument("--check-tokens", type=int, default=32, help="Tokens per rank checked against CPU NumPy oracle")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
@@ -228,6 +229,7 @@ def main():
             m_groups_per_wave=args.m_groups_per_wave,
             ag_cores_per_peer=args.ag_cores_per_peer,
             rs_tokens_per_chunk=args.rs_tokens_per_chunk,
+            ag_backend=args.ag_backend,
         )
 
     shared1_buf = None

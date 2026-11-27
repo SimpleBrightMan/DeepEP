@@ -72,7 +72,8 @@ public:
            int64_t m_groups_per_wave = MegaMoeImpl::TP_DEFAULT_M_GROUPS_PER_WAVE,
            int64_t ag_cores_per_peer = MegaMoeImpl::TP_DEFAULT_AG_CORES_PER_PEER,
            int64_t rs_tokens_per_chunk = MegaMoeImpl::TP_DEFAULT_RS_TOKENS_PER_CHUNK,
-           c10::optional<torch::Tensor> workspace_hint = c10::nullopt);
+           c10::optional<torch::Tensor> workspace_hint = c10::nullopt, bool use_urma_allgather = true,
+           int64_t shmem_instance_id = 0);
 
     torch::Tensor workspace_tensor() const { return workspace_; }
     int64_t workspace_bytes() const { return workspace_.numel(); }

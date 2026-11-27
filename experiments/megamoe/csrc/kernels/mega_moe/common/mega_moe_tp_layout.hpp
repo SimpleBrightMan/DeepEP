@@ -33,6 +33,7 @@ constexpr uint32_t TP_DEFAULT_M_GROUPS_PER_WAVE = 22U;
 constexpr uint32_t TP_DEFAULT_AG_CORES_PER_PEER = 11U;
 constexpr uint32_t TP_DEFAULT_RS_TOKENS_PER_CHUNK = 64U;
 constexpr uint32_t TP_PERMUTE_RING_SLOTS = 6U;
+constexpr uint32_t TP_UDMA_MAX_QPS_PER_PEER = 8U;
 
 struct alignas(8) MegaMoeTpTilingData {
     uint32_t bs;                     // 本卡本次实际输入 token 数 (e.g. 4096)
@@ -56,8 +57,12 @@ struct alignas(8) MegaMoeTpTilingData {
     uint8_t routeWeightBeforeQuant;  // 0=Unpermute FP32 加权, 1=SwiGLU 量化前乘权重
     uint8_t actMode;                 // MegaMoeActMode::SWIGLU
     uint8_t actSubMode;              // MegaMoeActSubMode::DEFAULT
+    uint8_t useUrmaAllGather;        // 0=MTE2 跨卡拉取, 1=URMA(UDMA) 多 QP 推送
+    uint8_t udmaQpsPerPeer;          // 每个远端 peer 的专用 UDMA QP 数 (默认 8)
+    uint16_t reserved0;
+    uint32_t shmemInstanceId;        // SHMEM 实例 ID (默认 0)
 };
-static_assert(sizeof(MegaMoeTpTilingData) == 72, "MegaMoeTpTilingData ABI size changed");
+static_assert(sizeof(MegaMoeTpTilingData) == 80, "MegaMoeTpTilingData ABI size changed");
 
 #if defined(__CCE_AICORE__)
 #define MEGAMOE_TP_HOST_DEVICE __host__ __aicore__
@@ -112,18 +117,19 @@ MEGAMOE_TP_HOST_DEVICE constexpr int64_t CalcTpAgTokenRecordBytes(int64_t h)
 /*
  * TP 模式对称窗口布局：
  *   [0, 60KiB)          rankSyncInWorld（复用跨卡握手与每 AIV 单调递增 epoch 计数槽）
- *   agSrcData           [M_max, Align256(H) + Align32(S_h)] 紧致打包 (FP8 data + E8M0 scale)
+ *   agXData             [tpWorldSize, M_max, Align256(H) + Align32(S_h)] 对称紧致打包记录 (支持 URMA PUT 直写与 Permute 直读)
  *   agSrcTopkIds        [M_max, topK] int32
  *   agSrcTopkWeights    [M_max, topK] float32
+ *   agPeerDone          [tpWorldSize, TP_UDMA_MAX_QPS_PER_PEER] * 64B cacheline (单调递增 epoch 通知槽，免清零)
  *   rsRecvBuf           [tpWorldSize, M_max, H] BF16
  *   rsChunkReady        [tpWorldSize, maxChunksPerRank] * 64B cacheline (存单调递增 epoch，免清零)
  */
 struct TpPeermemLayout {
     int64_t rankSyncOffset;
-    int64_t agSrcDataOffset;
-    int64_t agSrcScaleOffset;
+    int64_t agXDataOffset;
     int64_t agSrcTopkIdsOffset;
     int64_t agSrcTopkWeightsOffset;
+    int64_t agPeerDoneOffset;
     int64_t rsRecvBufOffset;
     int64_t rsChunkReadyOffset;
     int64_t totalBytes;
@@ -139,15 +145,19 @@ MEGAMOE_TP_HOST_DEVICE inline TpPeermemLayout BuildTpPeermemLayout(
     offset += TP_PEERMEM_SYNC_BYTES;
 
     const int64_t agRecordBytes = CalcTpAgTokenRecordBytes(h);
-    layout.agSrcDataOffset = offset;
-    layout.agSrcScaleOffset = offset + CalcTpAgTokenDataStrideBytes(h);
-    offset += TpCeilAlign(maxTokensPerRank * agRecordBytes, ALIGN_512);
+    layout.agXDataOffset = offset;
+    offset += TpCeilAlign(tpWorldSize * maxTokensPerRank * agRecordBytes, ALIGN_512);
 
     layout.agSrcTopkIdsOffset = offset;
     offset += TpCeilAlign(maxTokensPerRank * topK * static_cast<int64_t>(sizeof(int32_t)), ALIGN_512);
 
     layout.agSrcTopkWeightsOffset = offset;
     offset += TpCeilAlign(maxTokensPerRank * topK * static_cast<int64_t>(sizeof(float)), ALIGN_512);
+
+    layout.agPeerDoneOffset = offset;
+    offset += TpCeilAlign(tpWorldSize * static_cast<int64_t>(TP_UDMA_MAX_QPS_PER_PEER) *
+                              static_cast<int64_t>(INT_CACHELINE * sizeof(int32_t)),
+                          ALIGN_512);
 
     layout.rsRecvBufOffset = offset;
     offset += TpCeilAlign(tpWorldSize * maxTokensPerRank * h * static_cast<int64_t>(sizeof(uint16_t)), ALIGN_512);
@@ -171,10 +181,10 @@ MEGAMOE_TP_HOST_DEVICE inline int64_t CalcTpPeermemLeastSize(
 
 struct TpPeermemInfo {
     GM_ADDR rankSyncInWorldPtr{nullptr};
-    GM_ADDR agSrcDataPtr{nullptr};
-    GM_ADDR agSrcScalePtr{nullptr};
+    GM_ADDR agXDataPtr{nullptr};
     GM_ADDR agSrcTopkIdsPtr{nullptr};
     GM_ADDR agSrcTopkWeightsPtr{nullptr};
+    GM_ADDR agPeerDonePtr{nullptr};
     GM_ADDR rsRecvBufPtr{nullptr};
     GM_ADDR rsChunkReadyPtr{nullptr};
     TpPeermemLayout layout{};
@@ -185,10 +195,10 @@ struct TpPeermemInfo {
         layout = BuildTpPeermemLayout(t->numMaxTokensPerRank, t->tpWorldSize, t->topK, t->h, t->rsTokensPerChunk);
         if (base != nullptr) {
             rankSyncInWorldPtr = base + layout.rankSyncOffset;
-            agSrcDataPtr = base + layout.agSrcDataOffset;
-            agSrcScalePtr = base + layout.agSrcScaleOffset;
+            agXDataPtr = base + layout.agXDataOffset;
             agSrcTopkIdsPtr = base + layout.agSrcTopkIdsOffset;
             agSrcTopkWeightsPtr = base + layout.agSrcTopkWeightsOffset;
+            agPeerDonePtr = base + layout.agPeerDoneOffset;
             rsRecvBufPtr = base + layout.rsRecvBufOffset;
             rsChunkReadyPtr = base + layout.rsChunkReadyOffset;
         }
@@ -196,9 +206,7 @@ struct TpPeermemInfo {
 };
 
 struct TpWorkspaceInfo {
-    // AllGather 落地与全局路由表区域
-    GM_ADDR agXDataPtr{nullptr};
-    GM_ADDR agXScalePtr{nullptr};
+    // 全局路由表区域（AllGather 后的紧致 x+scale 直接驻留在对称窗口 localPeermem.agXDataPtr，免双份拷贝）
     GM_ADDR agTopkIdsPtr{nullptr};
     GM_ADDR agTopkWeightsPtr{nullptr};
     GM_ADDR routePartialCountsPtr{nullptr};
@@ -272,9 +280,6 @@ private:
 
         int64_t offset = 0;
 
-        const int64_t agRecordBytes = CalcTpAgTokenRecordBytes(h);
-        agXDataPtr = TpAllocAligned(base, offset, maxGlobalTokens * agRecordBytes);
-        agXScalePtr = agXDataPtr != nullptr ? (agXDataPtr + CalcTpAgTokenDataStrideBytes(h)) : nullptr;
         agTopkIdsPtr = TpAllocAligned(base, offset, maxGlobalTokens * topK * static_cast<int64_t>(sizeof(int32_t)));
         agTopkWeightsPtr = TpAllocAligned(base, offset, maxGlobalTokens * topK * static_cast<int64_t>(sizeof(float)));
 

@@ -117,6 +117,7 @@ class SymmBuffer:
         m_groups_per_wave: int = 22,
         ag_cores_per_peer: int = 11,
         rs_tokens_per_chunk: int = 64,
+        ag_backend: str = "urma",
     ):
         import torch
         import torch.distributed as dist
@@ -143,6 +144,8 @@ class SymmBuffer:
             integer("rs_tokens_per_chunk", rs_tokens_per_chunk, 1, 1024)
             if parallel_mode not in {"ep", "tp"}:
                 raise ValueError("parallel_mode must be 'ep' or 'tp'")
+            if ag_backend not in {"urma", "mte"}:
+                raise ValueError("ag_backend must be 'urma' or 'mte'")
             if not isinstance(route_weight_before_quant, bool):
                 raise TypeError("route_weight_before_quant must be bool")
             if not isinstance(variable_token_counts, bool):
@@ -196,6 +199,7 @@ class SymmBuffer:
             m_groups_per_wave,
             ag_cores_per_peer,
             rs_tokens_per_chunk,
+            ag_backend if parallel_mode == "tp" else "mte",
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
@@ -218,6 +222,7 @@ class SymmBuffer:
         self.m_groups_per_wave = m_groups_per_wave
         self.ag_cores_per_peer = ag_cores_per_peer
         self.rs_tokens_per_chunk = rs_tokens_per_chunk
+        self.ag_backend = ag_backend if parallel_mode == "tp" else "mte"
         self._graph_plans = {}
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
@@ -227,7 +232,12 @@ class SymmBuffer:
             error = str(failure)
         # 输入分配失败先通知所有 rank，再进入 SHMEM，避免其他 rank 已在建链等待。
         collective_check(group, "input allocation", error)
-        self._runtime = _MegaRuntime(group, capacity, timeout)
+        use_urma = self.parallel_mode == "tp" and self.ag_backend == "urma"
+        self._runtime = (
+            _MegaRuntime(group, capacity, timeout, udma=True)
+            if use_urma
+            else _MegaRuntime(group, capacity, timeout)
+        )
 
     def allocate_inputs(self):
         """Legacy idempotent helper. Inputs are already allocated by the constructor."""
@@ -266,6 +276,7 @@ class SymmBuffer:
         address = require_native("MegaMoE").megamoe_workspace_address(runtime.native)
         ext = _extension()
         if self.parallel_mode == "tp":
+            inst_id = int(getattr(runtime.native, "instance_id", 0))
             self._plan = ext.TpPlan(
                 self.x[:bs],
                 self.intermediate_hidden,
@@ -283,6 +294,8 @@ class SymmBuffer:
                 self.ag_cores_per_peer,
                 self.rs_tokens_per_chunk,
                 workspace_hint,
+                self.ag_backend == "urma",
+                inst_id,
             )
         else:
             self._plan = ext.Plan(

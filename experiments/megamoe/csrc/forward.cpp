@@ -579,7 +579,7 @@ TpPlan::TpPlan(torch::Tensor example, int64_t global_intermediate, int64_t share
                int64_t num_experts, int64_t tp_world, int64_t max_tokens, int64_t shared_experts, uint64_t ffts,
                uint64_t symmetric_address, int64_t symmetric_bytes, bool route_weight_before_quant,
                int64_t m_groups_per_wave, int64_t ag_cores_per_peer, int64_t rs_tokens_per_chunk,
-               c10::optional<torch::Tensor> workspace_hint)
+               c10::optional<torch::Tensor> workspace_hint, bool use_urma_allgather, int64_t shmem_instance_id)
     : ffts_(ffts)
 {
     CheckTensor(example, 2, "tp plan input");
@@ -633,6 +633,10 @@ TpPlan::TpPlan(torch::Tensor example, int64_t global_intermediate, int64_t share
     tiling_.routeWeightBeforeQuant = route_weight_before_quant ? 1U : 0U;
     tiling_.actMode = static_cast<uint8_t>(MegaMoeImpl::MegaMoeActMode::SWIGLU);
     tiling_.actSubMode = static_cast<uint8_t>(MegaMoeImpl::MegaMoeActSubMode::DEFAULT);
+    tiling_.useUrmaAllGather = use_urma_allgather ? 1U : 0U;
+    tiling_.udmaQpsPerPeer = static_cast<uint8_t>(MegaMoeImpl::TP_UDMA_MAX_QPS_PER_PEER);
+    tiling_.reserved0 = 0U;
+    tiling_.shmemInstanceId = static_cast<uint32_t>(shmem_instance_id);
 
     const auto ubPlan = MegaMoeImpl::MakeTpAiv1ResidentUbLayout(tiling_.h);
     TORCH_CHECK(ubPlan.valid && ubPlan.end <= platform_.ub, "TpPlan AIV1 resident UB overflow: required=", ubPlan.end,

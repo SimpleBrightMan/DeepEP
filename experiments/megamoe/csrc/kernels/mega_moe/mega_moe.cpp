@@ -129,7 +129,7 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_tp_kernel_do(
     const uint8_t* tiling_host, uint64_t ffts_addr)
 {
     const auto& tiling = *reinterpret_cast<const MegaMoeImpl::MegaMoeTpTilingData*>(tiling_host);
-    static_assert(sizeof(MegaMoeImpl::MegaMoeTpTilingData) == 72, "MegaMoeTpTilingData ABI changed");
+    static_assert(sizeof(MegaMoeImpl::MegaMoeTpTilingData) == 80, "MegaMoeTpTilingData ABI changed");
     const auto resident = MegaMoeImpl::MakeTpAiv1ResidentUbLayout(tiling.h);
     if (!resident.valid || resident.end > ub_bytes) {
         throw std::invalid_argument("TP MegaMoE AIV1 resident UB unsupported: H=" + std::to_string(tiling.h) +

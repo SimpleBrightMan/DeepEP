@@ -119,8 +119,8 @@ class Runtime:
             raise ValueError("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1")
         self.bootstrap = bootstrap
         store_group = self._megamoe and isinstance(group, StoreGroup)
-        if self._megamoe and (group is None or udma):
-            raise ValueError("MegaMoE requires a ProcessGroup or StoreGroup and the MTE runtime")
+        if self._megamoe and (group is None or type(udma) is not bool):
+            raise ValueError("MegaMoE requires a ProcessGroup or StoreGroup and a bool udma flag")
         if store_group:
             if rank is not None or world_size is not None:
                 raise ValueError("Pass either group or rank/world_size, not both")
@@ -256,7 +256,11 @@ class Runtime:
                 else (
                     native.Runtime(rank, size, capacity, address, timeout, udma, use_1g_huge_pages, uid)
                     if not self._megamoe
-                    else factory(rank, size, capacity, address, timeout)
+                    else (
+                        factory(rank, size, capacity, address, timeout, udma)
+                        if udma
+                        else factory(rank, size, capacity, address, timeout)
+                    )
                 )
             )
             _OWNERS.add(self)

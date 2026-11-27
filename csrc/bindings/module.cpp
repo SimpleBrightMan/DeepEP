@@ -72,10 +72,11 @@ PYBIND11_MODULE(_C, module)
 #ifdef DEEPEP_BUILD_MEGAMOE
     module.def(
         "create_megamoe_runtime",
-        [](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout) {
-            return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, false, true);
+        [](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma) {
+            return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, udma, true);
         },
-        py::call_guard<py::gil_scoped_release>());
+        py::arg("rank"), py::arg("size"), py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"),
+        py::arg("udma") = false, py::call_guard<py::gil_scoped_release>());
     module.def("megamoe_workspace_address", &deepep::Session::workspace_address);
 #endif
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
