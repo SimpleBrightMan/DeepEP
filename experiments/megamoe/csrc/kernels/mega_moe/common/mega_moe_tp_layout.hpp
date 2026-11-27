@@ -332,12 +332,16 @@ private:
  * Phase 2 AIV1 常驻 UB 分区：
  *   [0, ActivationBytes)                     SwiGLU + MXFP8 量化工作区（~66.5 KiB，Routed 与 Shared 串行复用）
  *   [permDataBase, permScaleBase)            Permute 6 槽 token 数据环（6 * H 字节，H=4096 时 24 KiB）
- *   [permScaleBase, permEnd)                 Permute 6 槽 scale 环（6 * Align32(scaleH) 字节）
+ *   [permScaleBase, permIdxBase)             Permute 6 槽 scale 环（6 * Align32(scaleH) 字节）
+ *   [permIdxBase, permEnd)                   Permute 批量索引缓存（4 KiB，单批最多 1024 个 permRowToToken 索引）
  */
+constexpr uint32_t TP_PERMUTE_IDX_BATCH_CAP = 1024U;
+
 struct TpAiv1ResidentUbLayout {
     uint32_t activationBytes;
     uint32_t permDataBase;
     uint32_t permScaleBase;
+    uint32_t permIdxBase;
     uint32_t permRowDataBytes;
     uint32_t permRowScaleBytes;
     uint32_t end;
@@ -353,8 +357,9 @@ MEGAMOE_TP_HOST_DEVICE constexpr TpAiv1ResidentUbLayout MakeTpAiv1ResidentUbLayo
     const uint32_t rowScaleBytes = static_cast<uint32_t>(AlignResidentUb(scaleCols));
     const uint32_t permDataBase = actBytes;
     const uint32_t permScaleBase = permDataBase + TP_PERMUTE_RING_SLOTS * rowDataBytes;
-    const uint32_t end = permScaleBase + TP_PERMUTE_RING_SLOTS * rowScaleBytes;
-    return {actBytes, permDataBase, permScaleBase, rowDataBytes, rowScaleBytes, end,
+    const uint32_t permIdxBase = permScaleBase + TP_PERMUTE_RING_SLOTS * rowScaleBytes;
+    const uint32_t end = permIdxBase + TP_PERMUTE_IDX_BATCH_CAP * static_cast<uint32_t>(sizeof(int32_t));
+    return {actBytes, permDataBase, permScaleBase, permIdxBase, rowDataBytes, rowScaleBytes, end,
             h > 0U && h % 64U == 0U && end <= 256U * 1024U};
 }
 

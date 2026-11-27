@@ -663,7 +663,8 @@ struct TpPermuteAsyncState {
 };
 
 __aicore__ inline void StoreTpPermutedRow(const TpAiv1ResidentUbLayout& ubLayout, const TpWorkspaceInfo& workspace,
-                                          uint32_t h, uint32_t scaleH, uint32_t slot, uint64_t permRow)
+                                          uint32_t h, uint32_t scaleH, uint32_t slot, uint64_t permRow,
+                                          bool aligned32)
 {
     const TEventID ev = static_cast<TEventID>(slot);
     WaitFlag<HardEvent::MTE2_MTE3>(ev);
@@ -674,8 +675,13 @@ __aicore__ inline void StoreTpPermutedRow(const TpAiv1ResidentUbLayout& ubLayout
     GlobalTensor<uint8_t> dstDataGm, dstScaleGm;
     dstDataGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.permutedXPtr));
     dstScaleGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.permutedScalePtr));
-    DataCopyPad(dstDataGm[permRow * h], dataUb, {1U, h, 0U, 0U, 0U});
-    DataCopyPad(dstScaleGm[permRow * scaleH], scaleUb, {1U, scaleH, 0U, 0U, 0U});
+    if (aligned32) {
+        DataCopy(dstDataGm[permRow * h], dataUb, h);
+        DataCopy(dstScaleGm[permRow * scaleH], scaleUb, scaleH);
+    } else {
+        DataCopyPad(dstDataGm[permRow * h], dataUb, {1U, h, 0U, 0U, 0U});
+        DataCopyPad(dstScaleGm[permRow * scaleH], scaleUb, {1U, scaleH, 0U, 0U, 0U});
+    }
     SetFlag<HardEvent::MTE3_MTE2>(ev);
 }
 
@@ -722,41 +728,71 @@ __aicore__ inline void IssueTpPermuteSlice(const MegaMoeTpTilingData& tiling, co
 
     const uint32_t h = tiling.h;
     const uint32_t scaleH = static_cast<uint32_t>(CalcTpMxScaleStrideBytes(h));
-    auto* permRowToTokenPtr = reinterpret_cast<__gm__ int32_t*>(workspace.permRowToTokenPtr);
+    const bool aligned32 = (h % ALIGN_32 == 0U) && (scaleH % ALIGN_32 == 0U);
+    GlobalTensor<int32_t> permIdxGm;
+    permIdxGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspace.permRowToTokenPtr));
+    LocalTensor<int32_t> permIdxUb(TPosition::VECCALC, ubLayout.permIdxBase, TP_PERMUTE_IDX_BATCH_CAP);
     GlobalTensor<uint8_t> srcDataGm, srcScaleGm;
     srcDataGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.agXDataPtr));
     srcScaleGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(workspace.agXScalePtr));
 
-    for (uint32_t i = 0U; i < owned.count; ++i) {
-        const uint64_t permRow = slice.globalRowStart + owned.start + i;
-        const uint32_t srcTok = static_cast<uint32_t>(ReadGmByPassDCache(permRowToTokenPtr + permRow));
-        const uint32_t slot = state.issuedRows % TP_PERMUTE_RING_SLOTS;
-        const TEventID ev = static_cast<TEventID>(slot);
-        if (state.issuedRows >= TP_PERMUTE_RING_SLOTS) {
-            WaitFlag<HardEvent::MTE3_MTE2>(ev);
-        }
-        LocalTensor<uint8_t> dataUb(TPosition::VECCALC, ubLayout.permDataBase + slot * ubLayout.permRowDataBytes,
-                                    ubLayout.permRowDataBytes);
-        LocalTensor<uint8_t> scaleUb(TPosition::VECCALC, ubLayout.permScaleBase + slot * ubLayout.permRowScaleBytes,
-                                     ubLayout.permRowScaleBytes);
-        DataCopyPad(dataUb, srcDataGm[static_cast<uint64_t>(srcTok) * h], {1U, h, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
-        DataCopyPad(scaleUb, srcScaleGm[static_cast<uint64_t>(srcTok) * scaleH], {1U, scaleH, 0U, 0U, 0U},
-                    {false, 0U, 0U, 0U});
-        SetFlag<HardEvent::MTE2_MTE3>(ev);
+    // 6 槽环形缓冲内保持最多 3 行 MTE2 在途预取，重叠 MTE2 读与 MTE3 写
+    constexpr uint32_t kPrefetchDepth = 3U;
+    uint64_t inflightPermRow[kPrefetchDepth];
+    uint32_t inflightSlot[kPrefetchDepth];
+    uint32_t inflightHead = 0U;
+    uint32_t inflightTail = 0U;
 
-        if (state.pendingPermRow >= 0) {
-            StoreTpPermutedRow(ubLayout, workspace, h, scaleH, (state.issuedRows - 1U) % TP_PERMUTE_RING_SLOTS,
-                               static_cast<uint64_t>(state.pendingPermRow));
+    for (uint32_t batchOff = 0U; batchOff < owned.count; batchOff += TP_PERMUTE_IDX_BATCH_CAP) {
+        const uint32_t batchCnt = Min(TP_PERMUTE_IDX_BATCH_CAP, owned.count - batchOff);
+        const uint64_t batchPermBase = slice.globalRowStart + owned.start + batchOff;
+        DataCopyPad(permIdxUb, permIdxGm[batchPermBase],
+                    {1U, batchCnt * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+        SyncFuncStatic<HardEvent::MTE2_S, static_cast<TEventID>(Aiv1AsyncEvents::DispatchDone)>();
+
+        for (uint32_t i = 0U; i < batchCnt; ++i) {
+            const uint64_t permRow = batchPermBase + i;
+            const uint32_t srcTok = static_cast<uint32_t>(permIdxUb.GetValue(i));
+            const uint32_t slot = state.issuedRows % TP_PERMUTE_RING_SLOTS;
+            const TEventID ev = static_cast<TEventID>(slot);
+            if (state.issuedRows >= TP_PERMUTE_RING_SLOTS) {
+                WaitFlag<HardEvent::MTE3_MTE2>(ev);
+            }
+            LocalTensor<uint8_t> dataUb(TPosition::VECCALC, ubLayout.permDataBase + slot * ubLayout.permRowDataBytes,
+                                        ubLayout.permRowDataBytes);
+            LocalTensor<uint8_t> scaleUb(TPosition::VECCALC, ubLayout.permScaleBase + slot * ubLayout.permRowScaleBytes,
+                                         ubLayout.permRowScaleBytes);
+            if (aligned32) {
+                DataCopy(dataUb, srcDataGm[static_cast<uint64_t>(srcTok) * h], h);
+                DataCopy(scaleUb, srcScaleGm[static_cast<uint64_t>(srcTok) * scaleH], scaleH);
+            } else {
+                DataCopyPad(dataUb, srcDataGm[static_cast<uint64_t>(srcTok) * h], {1U, h, 0U, 0U, 0U},
+                            {false, 0U, 0U, 0U});
+                DataCopyPad(scaleUb, srcScaleGm[static_cast<uint64_t>(srcTok) * scaleH], {1U, scaleH, 0U, 0U, 0U},
+                            {false, 0U, 0U, 0U});
+            }
+            SetFlag<HardEvent::MTE2_MTE3>(ev);
+
+            inflightPermRow[inflightTail % kPrefetchDepth] = permRow;
+            inflightSlot[inflightTail % kPrefetchDepth] = slot;
+            ++inflightTail;
+            ++state.issuedRows;
+
+            if (inflightTail - inflightHead >= kPrefetchDepth) {
+                const uint32_t idx = inflightHead % kPrefetchDepth;
+                StoreTpPermutedRow(ubLayout, workspace, h, scaleH, inflightSlot[idx], inflightPermRow[idx], aligned32);
+                ++inflightHead;
+            }
         }
-        state.pendingPermRow = static_cast<int64_t>(permRow);
-        ++state.issuedRows;
+        SyncFuncStatic<HardEvent::S_MTE2, static_cast<TEventID>(Aiv1AsyncEvents::DispatchDone)>();
     }
 
-    if (state.pendingPermRow >= 0) {
-        StoreTpPermutedRow(ubLayout, workspace, h, scaleH, (state.issuedRows - 1U) % TP_PERMUTE_RING_SLOTS,
-                           static_cast<uint64_t>(state.pendingPermRow));
-        state.pendingPermRow = -1;
+    while (inflightHead < inflightTail) {
+        const uint32_t idx = inflightHead % kPrefetchDepth;
+        StoreTpPermutedRow(ubLayout, workspace, h, scaleH, inflightSlot[idx], inflightPermRow[idx], aligned32);
+        ++inflightHead;
     }
+    state.pendingPermRow = -1;
     state.expertIdx = slice.expertIdx;
     state.rowBeginInExpert = slice.rowStartInExpert + owned.start;
     state.rowEndInExpert = state.rowBeginInExpert + owned.count;
