@@ -41,38 +41,48 @@ __aicore__ inline void SyncTpSubgroup(GM_ADDR syncBasePtr, uint32_t subIdx, uint
 }
 
 /*
- * Phase 0：本卡输入准备 + 软同步通知区一次性清零（64 AIV 并行，末尾全核 SyncAll<false>()）。
- *   - 兼容 BF16 输入 x（内部 MXFP8 量化）与预量化 (FP8, E8M0) 输入 x；
- *   - 本地 token 同时写入本卡对称窗口 agSrc*（供远端 MTE2 拉取）与本地 workspace.ag*（免去 Phase 1 自拷）；
- *   - 若共享专家为 BF16 且输入 x 为预量化 FP8，顺带反量化本卡 x 到 workspace.sharedBf16InputPtr。
+ * Phase 0：软同步通知区一次性清零 + 本卡输入准备。
+ *   - 64 AIV 先并行清零连续 flag 区，完成后立刻与 32 AIC 做全核 SyncAll<false>()，
+ *     使 AIC 在 BF16 共享专家直读场景下可零等待立刻启动 Shared GMM1（t ≈ 1us）；
+ *   - 随后 64 AIV 并行完成本卡 x 量化/拷贝与 topk 拷贝，AIV 组内 SyncAll<true>() 后由 aivIdx=0
+ *     发布 flagLocalPrepDonePtr，供 FP8 共享专家或 FP8->BF16 反量化路径的 AIC 软同步等待；
+ *   - 本地 token 同时写入本卡对称窗口 agSrc*（供远端 MTE2 拉取）与本地 workspace.ag*（免去 Phase 1 自拷）。
  */
 __aicore__ inline void ProcessTpInputPrep(const MegaMoeTpTilingData& tiling, uint32_t rankId, GM_ADDR xGm,
                                           GM_ADDR xScalesGm, GM_ADDR topkIdsGm, GM_ADDR topkWeightsGm,
                                           const TpPeermemInfo& localPeermem, const TpWorkspaceInfo& workspace,
                                           AscendTimerDevice& timer)
 {
-    if constexpr (g_coreType == AIV) {
-        const uint32_t aivIdx = static_cast<uint32_t>(GetBlockIdx());
-        const uint32_t aivNum = tiling.aivNum;
-        const AivJobContext aivJob{aivIdx, aivNum};
+    if constexpr (g_coreType == AIC) {
+        timer.Start(AscendTimer::AIC_WAIT_INPUT_PREP);
+        SyncAll<false>();
+        timer.End(AscendTimer::AIC_WAIT_INPUT_PREP);
+        return;
+    }
 
-        // 1. 清零连续软同步区
-        timer.Start(AscendTimer::AIV_RESET);
-        constexpr int32_t kResetBatchInts = 4096;  // 16 KiB UB
-        LocalTensor<int32_t> zeroUb(TPosition::VECCALC, 0U, kResetBatchInts);
-        Duplicate<int32_t>(zeroUb, 0, kResetBatchInts);
-        SyncFuncStatic<HardEvent::V_MTE3, EVENT_ID0>();
-        ResetWorkspaceRegion<INT_CACHELINE>(aivJob, workspace.flagRegionBeginPtr,
-                                            static_cast<int32_t>(workspace.flagResetElementCount), kResetBatchInts,
-                                            zeroUb);
-        SyncFuncStatic<HardEvent::MTE3_V, EVENT_ID0>();
-        SyncFuncStatic<HardEvent::MTE3_MTE2, EVENT_ID0>();
-        SyncFuncStatic<HardEvent::MTE3_S, EVENT_ID0>();
-        timer.End(AscendTimer::AIV_RESET);
+    const uint32_t aivIdx = static_cast<uint32_t>(GetBlockIdx());
+    const uint32_t aivNum = tiling.aivNum;
+    const AivJobContext aivJob{aivIdx, aivNum};
 
-        // 2. 准备本卡负责的 bs 子区间
-        const WorkRange myTokens = GetBalancedTokenRange(tiling.bs, aivIdx, aivNum);
-        if (myTokens.count > 0U) {
+    // 1. 清零连续软同步区，完成后立刻放行 AIC（使 BF16 Shared GMM1 提前与 AIV_QUANT + CrossRankSync + AllGather 全重叠）
+    timer.Start(AscendTimer::AIV_RESET);
+    constexpr int32_t kResetBatchInts = 4096;  // 16 KiB UB
+    LocalTensor<int32_t> zeroUb(TPosition::VECCALC, 0U, kResetBatchInts);
+    Duplicate<int32_t>(zeroUb, 0, kResetBatchInts);
+    SyncFuncStatic<HardEvent::V_MTE3, EVENT_ID0>();
+    ResetWorkspaceRegion<INT_CACHELINE>(aivJob, workspace.flagRegionBeginPtr,
+                                        static_cast<int32_t>(workspace.flagResetElementCount), kResetBatchInts, zeroUb);
+    SyncFuncStatic<HardEvent::MTE3_V, EVENT_ID0>();
+    SyncFuncStatic<HardEvent::MTE3_MTE2, EVENT_ID0>();
+    SyncFuncStatic<HardEvent::MTE3_S, EVENT_ID0>();
+    asc_sync_data_barrier(DSB_DDR);
+    PipeBarrier<PIPE_ALL>();
+    timer.End(AscendTimer::AIV_RESET);
+    SyncAll<false>();
+
+    // 2. 准备本卡负责的 bs 子区间
+    const WorkRange myTokens = GetBalancedTokenRange(tiling.bs, aivIdx, aivNum);
+    if (myTokens.count > 0U) {
             timer.Start(AscendTimer::AIV_QUANT);
             const uint32_t h = tiling.h;
             const uint32_t scaleH = static_cast<uint32_t>(CalcTpMxScaleStrideBytes(h));
@@ -271,25 +281,23 @@ __aicore__ inline void ProcessTpInputPrep(const MegaMoeTpTilingData& tiling, uin
                     }
                 }
             }
-            timer.End(AscendTimer::AIV_QUANT);
-        }
-        SyncFuncStatic<HardEvent::MTE3_S, EVENT_ID0>();
-        asc_sync_data_barrier(DSB_DDR);
-        PipeBarrier<PIPE_ALL>();
-    } else {
-        timer.Start(AscendTimer::AIC_WAIT_INPUT_PREP);
+        timer.End(AscendTimer::AIV_QUANT);
     }
-
-    SyncAll<false>();
-    if constexpr (g_coreType == AIC) {
-        timer.End(AscendTimer::AIC_WAIT_INPUT_PREP);
+    SyncFuncStatic<HardEvent::MTE3_S, EVENT_ID0>();
+    asc_sync_data_barrier(DSB_DDR);
+    PipeBarrier<PIPE_ALL>();
+    SyncAll<true>();
+    if (aivIdx == 0U) {
+        WriteGmByPassDCache(reinterpret_cast<__gm__ int32_t*>(workspace.flagLocalPrepDonePtr), 1);
     }
 }
 
 /*
- * Phase 1：64 AIV 跨卡握手 + 静态分核并行执行：
- *   - AllGather 组 (agCoresPerPeer * (TP - 1) 个 AIV)：单 AIV 固定拉取单一远端 rank 的 FP8 data + E8M0 scale；
- *   - RouteTable 组 (剩余 AIV)：拉取远端 topk_ids/weights + 三趟确定性 Histogram / PrefixSum / Scatter（零原子争用）。
+ * Phase 1：64 AIV 跨卡握手 + 每 AICore 内部 AIV0/AIV1 对称分工：
+ *   - AllGather 组 (每 AICore 的 AIV0，共 aicNum=32 核)：按 peer 均衡划分（TP4 下 11/11/10），
+ *     单 AIV0 固定拉取单一远端 rank 的 FP8 data + E8M0 scale，避免同 AICore 双 AIV 并发抢占 BIU/MTE2；
+ *   - RouteTable 组 (每 AICore 的 AIV1，共 aicNum=32 核)：拉取远端 topk_ids/weights + 三趟确定性
+ *     Histogram / PrefixSum / Scatter（零原子争用）。
  * 返回本轮跨卡握手的 1-based 单调递增 epoch，供 Phase 3 免清零 rsChunkReady 标志使用。
  */
 __aicore__ inline int32_t ProcessTpAllGatherAndRoute(const MegaMoeTpTilingData& tiling, uint32_t rankId,
@@ -315,22 +323,37 @@ __aicore__ inline int32_t ProcessTpAllGatherAndRoute(const MegaMoeTpTilingData& 
     SyncAll<true>();
     timer.End(AscendTimer::AIV_INPUT_CROSS_RANK_SYNC);
 
-    const uint32_t agTotalCores = tiling.agCoresPerPeer * (tpWorldSize - 1U);
-    const uint32_t routeCores = aivNum - agTotalCores;
     const uint32_t bs = tiling.bs;
     const uint32_t h = tiling.h;
     const uint32_t scaleH = static_cast<uint32_t>(CalcTpMxScaleStrideBytes(h));
     const uint32_t scaleAlign = static_cast<uint32_t>(TpCeilAlign(scaleH, ALIGN_32));
 
-    if (aivIdx < agTotalCores) {
-        // ==================== AllGather 子组 ====================
+    if (GetSubBlockIdx() == 0U) {
+        // ==================== AllGather 子组（32 个 AIV0，每 AICore 至多 1 个 AIV 读远端） ====================
         timer.SetWave(AscendTimer::NO_WAVE);
         AscendTimerSpanScope agSpan(timer.Enabled() ? &timer : nullptr, AscendTimer::AIV_ALLGATHER);
 
-        const uint32_t peerSlot = aivIdx / tiling.agCoresPerPeer;
-        const uint32_t subIdx = aivIdx % tiling.agCoresPerPeer;
+        const uint32_t agIdx = aivIdx / 2U;
+        const uint32_t agTotalCores = tiling.aicNum;
+        const uint32_t numPeers = tpWorldSize - 1U;
+        const uint32_t baseCores = agTotalCores / numPeers;
+        const uint32_t extraPeers = agTotalCores % numPeers;
+        const uint32_t splitPoint = extraPeers * (baseCores + 1U);
+        uint32_t peerSlot = 0U;
+        uint32_t subIdx = 0U;
+        uint32_t coresForThisPeer = baseCores;
+        if (agIdx < splitPoint) {
+            peerSlot = agIdx / (baseCores + 1U);
+            subIdx = agIdx % (baseCores + 1U);
+            coresForThisPeer = baseCores + 1U;
+        } else {
+            const uint32_t remIdx = agIdx - splitPoint;
+            peerSlot = extraPeers + remIdx / baseCores;
+            subIdx = remIdx % baseCores;
+            coresForThisPeer = baseCores;
+        }
         const uint32_t peer = (rankId + 1U + peerSlot) % tpWorldSize;
-        const WorkRange myRange = GetBalancedTokenRange(bs, subIdx, tiling.agCoresPerPeer);
+        const WorkRange myRange = GetBalancedTokenRange(bs, subIdx, coresForThisPeer);
 
         if (myRange.count > 0U) {
             GlobalTensor<uint8_t> remDataGm, remScaleGm, dstDataGm, dstScaleGm;
@@ -373,11 +396,12 @@ __aicore__ inline int32_t ProcessTpAllGatherAndRoute(const MegaMoeTpTilingData& 
             asc_sync_data_barrier(DSB_DDR);
         }
     } else {
-        // ==================== RouteTable 子组 ====================
+        // ==================== RouteTable 子组（32 个 AIV1） ====================
         timer.SetWave(AscendTimer::NO_WAVE);
         AscendTimerSpanScope routeSpan(timer.Enabled() ? &timer : nullptr, AscendTimer::AIV_ROUTE_TABLE);
 
-        const uint32_t rIdx = aivIdx - agTotalCores;
+        const uint32_t rIdx = aivIdx / 2U;
+        const uint32_t routeCores = tiling.aicNum;
         const uint32_t topK = tiling.topK;
         const uint32_t numExperts = tiling.numExperts;
         const uint32_t expertStride = static_cast<uint32_t>(TpCeilAlign(numExperts, INT_CACHELINE));

@@ -121,14 +121,23 @@ public:
         const int64_t oriOverflowMode = GetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>();
         SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(0);
 
-        // Phase 0: 本地量化/拷贝与连续 flag 清零（末尾全核 SyncAll<false>()）
+        // Phase 0: 连续 flag 清零（结束后立刻放行 AIC）+ AIV 本地量化/拷贝
         ProcessTpInputPrep(tiling_, rankId_, xGm_, xScalesGm_, topkIdsGm_, topkWeightsGm_, localPeermem_, workspace_,
                            timer_);
 
-        // Phase 1: AIC 执行 Shared GMM1 || 64 AIV 执行 CrossRankSync + (AllGather || RouteTable)
+        // Phase 1: AIC 执行 Shared GMM1 || 64 AIV 执行 CrossRankSync + (AIV0 AllGather || AIV1 RouteTable)
         int32_t epoch = 0;
         if constexpr (g_coreType == AIC) {
             if (tiling_.sharedExpertNum > 0U) {
+                // BF16 共享专家且输入 x 本身为 BF16 时直接读取用户 xGm，无需等待 AIV_QUANT；
+                // FP8 共享专家或 FP8->BF16 反量化路径通过 flagLocalPrepDonePtr 软同步等待 AIV_QUANT 落地。
+                const bool sharedBf16Direct =
+                    (tiling_.sharedPrecisionMode == static_cast<uint8_t>(SharedPrecisionMode::BF16)) &&
+                    (xScalesGm_ == nullptr);
+                if (!sharedBf16Direct) {
+                    WaitUntilGmFlagIsNonZero(reinterpret_cast<__gm__ int32_t*>(workspace_.flagLocalPrepDonePtr));
+                    PipeBarrier<PIPE_ALL>();
+                }
                 ProcessTpSharedGmm1(tiling_, rankId_, blockIdx_, xGm_, xScalesGm_, sharedWeight1Gm_,
                                     sharedWeightScales1Gm_, workspace_, timer_);
             }
@@ -200,7 +209,22 @@ private:
         uint32_t startBlockIdx = 0U;
         uint32_t nextTile = 0U;
         uint32_t tileCount = 0U;
+        uint32_t sliceSeq = 0U;
+        BlockJobContext job{};
     };
+
+    // 双重负载均衡映射：
+    //   1) GMM1 正向分配 (0 -> aicNum-1)，GMM2 反向分配 (aicNum-1 -> 0)，错峰抵消单核余数尾块；
+    //   2) 按 sliceSeq 奇偶翻转最低位 (^ (sliceSeq & 1U))，彻底打破偶数 tileNum 与偶数 aicNum 导致的
+    //      “偶数核永远吃满 256 行 tile、奇数核永远吃尾块”的奇偶锁相。
+    __aicore__ inline BlockJobContext MakeTpGmmJob(bool reverseBlocks, uint32_t sliceSeq) const
+    {
+        uint32_t logical = reverseBlocks ? (tiling_.aicNum - 1U - blockIdx_) : blockIdx_;
+        if ((tiling_.aicNum & 1U) == 0U) {
+            logical ^= (sliceSeq & 1U);
+        }
+        return {logical, tiling_.aicNum};
+    }
 
     __aicore__ inline bool HasTpWaveCapacity(const ExpertTokenPosition& pos, uint32_t usedMGroups) const
     {
@@ -293,8 +317,9 @@ private:
             if (rows == 0U) {
                 continue;
             }
+            cursor.job = MakeTpGmmJob(false, cursor.sliceSeq++);
             cursor.tileCount = GetMGroupCountForRows(rows, GMM1_TILE_M) * gmm1NTiles;
-            cursor.nextTile = (blockIdx_ + tiling_.aicNum - cursor.startBlockIdx) % tiling_.aicNum;
+            cursor.nextTile = (cursor.job.jobIndex + tiling_.aicNum - cursor.startBlockIdx) % tiling_.aicNum;
             cursor.startBlockIdx = (cursor.startBlockIdx + cursor.tileCount) % tiling_.aicNum;
             if (cursor.nextTile < cursor.tileCount) {
                 return true;
@@ -347,7 +372,7 @@ private:
         }
         outReadyFlag =
             RunReadyGmm1ActivationTileA8W4<QuantOutType, WeightType, bfloat16_t, ScaleType, ScaleType, GMM1_TILE_M,
-                                           FUSE_GATE_UP>(epilogueOp_, expertCtx.problemShape, addr, blockJob_,
+                                           FUSE_GATE_UP>(epilogueOp_, expertCtx.problemShape, addr, cursor.job,
                                                          cursor.nextTile, static_cast<uint32_t>(begin.globalTokenIndex),
                                                          AscendTimer::AIV_SWIGLU_ISSUE, true);
         SetFlag<HardEvent::MTE3_S>(static_cast<TEventID>(Aiv1AsyncEvents::ActivationDone));
@@ -521,12 +546,13 @@ private:
     template <typename Gmm1Kernel>
     __aicore__ inline void RunTpGmm1Slice(const ExpertContext& expertCtx, const ExpertSlice& slice,
                                           GMMAddrInfo& gmm1Addr, uint32_t& startBlockIdx, int32_t& readySeq,
-                                          Gmm1Kernel& gmm1Kernel)
+                                          uint32_t sliceSeq, Gmm1Kernel& gmm1Kernel)
     {
+        const BlockJobContext gmm1Job = MakeTpGmmJob(false, sliceSeq);
         const uint32_t gmm1NTiles =
             Ops::Base::CeilDiv(tiling_.routedGmm1OutDim / ACTIVATION_N_HALF, static_cast<uint32_t>(GMM1_TASK_N));
         const uint32_t tileCount = GetMGroupCountForRows(slice.rowCount, GMM1_TILE_M) * gmm1NTiles;
-        if (HandleWaveProblemWithoutWork(tileCount, blockJob_, startBlockIdx)) {
+        if (HandleWaveProblemWithoutWork(tileCount, gmm1Job, startBlockIdx)) {
             return;
         }
         BindTpRoutedGmm1Addr(expertCtx, slice.rowStartInExpert, gmm1Addr);
@@ -540,18 +566,20 @@ private:
         timer_.SetSlice(static_cast<int>(slice.expertIdx), slice.rowStartInExpert, slice.rowCount);
         RunGmm1A8W4<QuantOutType, WeightType, bfloat16_t, ScaleType, ScaleType, GMM1_TILE_M, EPILOGUE_TILE_M, false,
                     true, FUSE_GATE_UP, Gmm1Kernel, true>(
-            epilogueOp_, dummyParams, sliceShape, gmm1Addr, startBlockIdx, readySeq, blockJob_,
+            epilogueOp_, dummyParams, sliceShape, gmm1Addr, startBlockIdx, readySeq, gmm1Job,
             static_cast<uint32_t>(slice.globalRowStart), slice.expertIdx, &gmm1Kernel);
         timer_.ClearSlice();
     }
 
     template <typename Gmm2Kernel>
     __aicore__ inline void RunTpGmm2Slice(const ExpertContext& expertCtx, const ExpertSlice& slice,
-                                          GMMAddrInfo& gmm2Addr, uint32_t& startBlockIdx, Gmm2Kernel& gmm2Kernel)
+                                          GMMAddrInfo& gmm2Addr, uint32_t& startBlockIdx, uint32_t sliceSeq,
+                                          Gmm2Kernel& gmm2Kernel)
     {
+        const BlockJobContext gmm2Job = MakeTpGmmJob(true, sliceSeq);
         const uint32_t nTiles = Ops::Base::CeilDiv(tiling_.h, static_cast<uint32_t>(L1_TILE_N));
         const uint32_t tileCount = GetMGroupCountForRows(slice.rowCount, GMM1_TILE_M) * nTiles;
-        if (HandleWaveProblemWithoutWork(tileCount, blockJob_, startBlockIdx, false)) {
+        if (HandleWaveProblemWithoutWork(tileCount, gmm2Job, startBlockIdx, false)) {
             return;
         }
         BindTpRoutedGmm2Addr(expertCtx, slice.rowStartInExpert, gmm2Addr);
@@ -563,7 +591,7 @@ private:
         timer_.SetSlice(static_cast<int>(slice.expertIdx), slice.rowStartInExpert, slice.rowCount);
         RunGmm2A8W4<QuantOutType, WeightType, bfloat16_t, ScaleType, ScaleType, GMM1_TILE_M, false, true, false, true,
                     FUSE_GATE_UP, Gmm2Kernel, true>(
-            sliceShape, gmm2Addr, startBlockIdx, blockJob_,
+            sliceShape, gmm2Addr, startBlockIdx, gmm2Job,
             static_cast<uint32_t>(Get<M_VALUE>(expertCtx.problemShape)), slice.rowStartInExpert, nullptr, nullptr,
             false, &gmm2Kernel);
         timer_.ClearSlice();
@@ -571,7 +599,8 @@ private:
 
     template <typename Gmm1Kernel, typename Gmm2Kernel>
     __aicore__ inline void RunTpGmm2Wave(const ExpertWaveRange& wave, ExpertContext& gmm2Ctx, GMMAddrInfo& gmm2Addr,
-                                         uint32_t& startBlockIdx, Gmm1Kernel& gmm1Kernel, Gmm2Kernel& gmm2Kernel)
+                                         uint32_t& startBlockIdx, uint32_t& sliceSeq, Gmm1Kernel& gmm1Kernel,
+                                         Gmm2Kernel& gmm2Kernel)
     {
         const uint32_t endExpExclusive = wave.end.expertIdx + (wave.end.tokenIndexInExpert == 0U ? 0U : 1U);
         if constexpr (ASYNC_GMM1) {
@@ -585,7 +614,7 @@ private:
             const uint32_t expTokens = static_cast<uint32_t>(Get<M_VALUE>(gmm2Ctx.problemShape));
             const ExpertSlice slice = GetExpertSliceInWave(wave, expIdx, expTokens, gmm2Ctx.globalTokenStartIndex);
             if (slice.rowCount > 0U) {
-                RunTpGmm2Slice(gmm2Ctx, slice, gmm2Addr, startBlockIdx, gmm2Kernel);
+                RunTpGmm2Slice(gmm2Ctx, slice, gmm2Addr, startBlockIdx, sliceSeq++, gmm2Kernel);
             }
         }
         if constexpr (ASYNC_GMM1) {
@@ -608,6 +637,8 @@ private:
         GMMAddrInfo gmm2Addr{};
         uint32_t gmm1StartBlock = 0U;
         uint32_t gmm2StartBlock = 0U;
+        uint32_t gmm1SliceSeq = 0U;
+        uint32_t gmm2SliceSeq = 0U;
         uint64_t gmm1WaveCount = 0U;
         uint64_t gmm2WaveCount = 0U;
 
@@ -628,7 +659,8 @@ private:
                 if (slice.rowCount > 0U) {
                     wave.lastActiveExpert = slice.expertIdx;
                     timer_.SetWave(static_cast<int64_t>(gmm1WaveCount));
-                    RunTpGmm1Slice(gmm1Ctx, slice, gmm1Addr, gmm1StartBlock, gmm1ReadySequence, gmm1Kernel);
+                    RunTpGmm1Slice(gmm1Ctx, slice, gmm1Addr, gmm1StartBlock, gmm1ReadySequence, gmm1SliceSeq++,
+                                   gmm1Kernel);
                 }
             }
             gmm1Cursor = wave.end;
@@ -637,7 +669,7 @@ private:
             if (!gmm2Lag || gmm1WaveCount > 1U) {
                 const ExpertWaveRange& curGmm2Wave = gmm2Lag ? pendingWave : wave;
                 timer_.SetWave(static_cast<int64_t>(gmm2WaveCount));
-                RunTpGmm2Wave(curGmm2Wave, gmm2Ctx, gmm2Addr, gmm2StartBlock, gmm1Kernel, gmm2Kernel);
+                RunTpGmm2Wave(curGmm2Wave, gmm2Ctx, gmm2Addr, gmm2StartBlock, gmm2SliceSeq, gmm1Kernel, gmm2Kernel);
                 ++gmm2WaveCount;
             }
             if (gmm2Lag) {
@@ -647,7 +679,7 @@ private:
 
         if (gmm2WaveCount < gmm1WaveCount) {
             timer_.SetWave(static_cast<int64_t>(gmm2WaveCount));
-            RunTpGmm2Wave(pendingWave, gmm2Ctx, gmm2Addr, gmm2StartBlock, gmm1Kernel, gmm2Kernel);
+            RunTpGmm2Wave(pendingWave, gmm2Ctx, gmm2Addr, gmm2StartBlock, gmm2SliceSeq, gmm1Kernel, gmm2Kernel);
             ++gmm2WaveCount;
         }
 

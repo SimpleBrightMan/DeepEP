@@ -215,6 +215,7 @@ struct TpWorkspaceInfo {
 
     // 连续软同步通知区（每次调用在 Phase 0 一次性清零）
     GM_ADDR flagRegionBeginPtr{nullptr};
+    GM_ADDR flagLocalPrepDonePtr{nullptr};
     GM_ADDR flagRouteGroupSyncPtr{nullptr};
     GM_ADDR flagRouteReadyPtr{nullptr};
     GM_ADDR flagPermuteToGmm1Ptr{nullptr};
@@ -282,6 +283,7 @@ private:
         const int64_t flagBegin = offset;
         flagRegionBeginPtr = base != nullptr ? (base + offset) : nullptr;
 
+        flagLocalPrepDonePtr = TpAllocFlagInts(base, offset, INT_CACHELINE);
         flagRouteGroupSyncPtr = TpAllocFlagInts(base, offset, aivNum * INT_CACHELINE);
         flagRouteReadyPtr = TpAllocFlagInts(base, offset, INT_CACHELINE);
         flagPermuteToGmm1Ptr = TpAllocFlagInts(base, offset, experts * mGroupFlagSlotsPerExpert);

@@ -181,10 +181,15 @@ __aicore__ inline void ProcessTpUnpermuteAndReduceScatter(const MegaMoeTpTilingD
                     }
                     SyncFuncStatic<HardEvent::MTE3_S, EVENT_ID0>();
                 } else if (colChunk == h && (h % 128U == 0U)) {
-                    // 快路径（如 H=4096, topK=8）：单槽容纳完整 [topK, H] (64 KiB)，零列切分、零中转直推远端
+                    // 快路径（如 H=4096, topK=8）：单槽 64 KiB -> 192 KiB 可划 3 槽，实现 MTE2 || Vector || MTE3 三级硬件流水
                     const uint32_t slotElems = topK * h;
-                    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-                    SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+                    const uint32_t slotBytes =
+                        static_cast<uint32_t>(TpCeilAlign(static_cast<int64_t>(slotElems) * sizeof(bfloat16_t), ALIGN_256));
+                    constexpr uint32_t kPackTotalBytes = 192U * 1024U;
+                    const uint32_t numSlots = Min(3U, kPackTotalBytes / slotBytes);
+                    for (uint32_t s = 0U; s < numSlots; ++s) {
+                        SetFlag<HardEvent::MTE3_MTE2>(static_cast<TEventID>(s));
+                    }
                     uint32_t seq = 0U;
 
                     for (uint32_t subOff = 0U; subOff < chunkLen; subOff += kSubBatchMaxTokens) {
@@ -198,15 +203,15 @@ __aicore__ inline void ProcessTpUnpermuteAndReduceScatter(const MegaMoeTpTilingD
                         if (!preQuantWeight) {
                             DataCopyPad(weightsUb, agWeightsGm[globalTokBase * topK], {1U, metaBytes, 0U, 0U, 0U},
                                         {false, 0U, 0U, 0U});
-                            SyncFuncStatic<HardEvent::MTE2_V, EVENT_ID2>();
+                            SyncFuncStatic<HardEvent::MTE2_V, EVENT_ID3>();
                         }
-                        SyncFuncStatic<HardEvent::MTE2_S, EVENT_ID2>();
+                        SyncFuncStatic<HardEvent::MTE2_S, EVENT_ID3>();
 
                         for (uint32_t localT = 0U; localT < subCnt; ++localT) {
-                            const uint32_t slot = seq++ % 2U;
-                            const TEventID ev = slot == 0U ? EVENT_ID0 : EVENT_ID1;
+                            const uint32_t slot = seq++ % numSlots;
+                            const TEventID ev = static_cast<TEventID>(slot);
                             LocalTensor<bfloat16_t> packUb(
-                                TPosition::VECCALC, kPackBaseAddr + slot * kPackSlotBytes, slotElems);
+                                TPosition::VECCALC, kPackBaseAddr + slot * slotBytes, slotElems);
 
                             WaitFlag<HardEvent::MTE3_MTE2>(ev);
                             for (uint32_t k = 0U; k < topK; ++k) {
@@ -232,13 +237,14 @@ __aicore__ inline void ProcessTpUnpermuteAndReduceScatter(const MegaMoeTpTilingD
                             DataCopy(remRecvGm[dstRow * h], packUb, h);
                             SetFlag<HardEvent::MTE3_MTE2>(ev);
                         }
-                        SyncFuncStatic<HardEvent::S_MTE2, EVENT_ID2>();
+                        SyncFuncStatic<HardEvent::S_MTE2, EVENT_ID3>();
                         if (!preQuantWeight) {
-                            SyncFuncStatic<HardEvent::V_MTE2, EVENT_ID2>();
+                            SyncFuncStatic<HardEvent::V_MTE2, EVENT_ID3>();
                         }
                     }
-                    WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-                    WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
+                    for (uint32_t s = 0U; s < numSlots; ++s) {
+                        WaitFlag<HardEvent::MTE3_MTE2>(static_cast<TEventID>(s));
+                    }
                     SyncFuncStatic<HardEvent::MTE3_S, EVENT_ID0>();
                 } else {
                     // 通用分列路径（兼容 topK > 12 或 H > 4096 或 H % 128 != 0）：组装完整 outRowUb 后整行推送
