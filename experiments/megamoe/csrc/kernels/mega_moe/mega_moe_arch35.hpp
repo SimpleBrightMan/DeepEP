@@ -36,6 +36,7 @@
 #include "stage/mega_moe_gmm1_activation.hpp"
 #include "stage/mega_moe_gmm2_combine.hpp"
 #include "stage/mega_moe_unpermute.hpp"
+#include "catlass_gmm/mega_moe_bf16_matmul.hpp"
 #include "mc2_common/quantize_functions.hpp"
 
 namespace MegaMoeImpl {
@@ -494,12 +495,52 @@ template <TemplateMegaMoeTypeClass>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm1(int32_t& gmm1TileReadySequence)
 {
     if constexpr (ENABLE_A8W4 && g_coreType == AIV) {
-        if (GetSubBlockIdx() != 0U) {
+        if (GetSubBlockIdx() != 0U || params_.tilingData->sharedWeightBf16 != 0U) {
             return;
         }
     }
     if (gmmExecutionConfig_.blockJob.totalJobs == 0U ||
         gmmExecutionConfig_.blockJob.jobIndex >= gmmExecutionConfig_.blockJob.totalJobs) {
+        return;
+    }
+    if (params_.tilingData->sharedWeightBf16 != 0U) {
+        if constexpr (g_coreType == AIC) {
+            Catlass::Gemm::Block::CatlassBf16Matmul bf16Matmul;
+            const uint32_t mTiles = Ops::Base::CeilDiv(commonConfig_.tokenNum, GMM1_TILE_M);
+            const uint32_t nTiles = Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim, static_cast<uint32_t>(L1_TILE_N));
+            const uint32_t totalTiles = mTiles * nTiles;
+            GM_ADDR aBase = params_.aGmAddr;
+            for (uint32_t sharedExpertIdx = 0U; sharedExpertIdx < sharedExpertNum_; ++sharedExpertIdx) {
+                timer_.SetWave(AscendTimer::NO_WAVE);
+                timer_.SetSlice(sharedExpertIdx, 0U, commonConfig_.tokenNum);
+                GM_ADDR bBase = sharedWeightTensorListAddrs_.weight1 +
+                                static_cast<uint64_t>(sharedExpertIdx) * commonConfig_.gmm1OutputDim *
+                                    commonConfig_.tokenHiddenDim * sizeof(bfloat16_t);
+                GM_ADDR cBase = params_.workspaceInfo.sharedExpertGmm1OutPtr +
+                                static_cast<uint64_t>(sharedExpertIdx) * commonConfig_.tokenNum *
+                                    commonConfig_.gmm1OutputDim * sizeof(bfloat16_t);
+                for (uint32_t tile = blockIdx_; tile < totalTiles; tile += blockNum_) {
+                    const uint32_t mLoc = (tile / nTiles) * GMM1_TILE_M;
+                    const uint32_t nLoc = (tile % nTiles) * L1_TILE_N;
+                    const uint32_t mAct = commonConfig_.tokenNum - mLoc < GMM1_TILE_M
+                                              ? commonConfig_.tokenNum - mLoc
+                                              : GMM1_TILE_M;
+                    const uint32_t nAct = commonConfig_.gmm1OutputDim - nLoc < L1_TILE_N
+                                              ? commonConfig_.gmm1OutputDim - nLoc
+                                              : L1_TILE_N;
+                    AscendTimerTileScope tileTimer(timer_.Enabled() ? &timer_ : nullptr, AscendTimer::AIC_SHARED_GMM1,
+                                                   mLoc, nLoc, mAct, L1_TILE_N);
+                    bf16Matmul.ComputeTile(aBase, bBase, cBase, commonConfig_.tokenNum, commonConfig_.gmm1OutputDim,
+                                           commonConfig_.tokenHiddenDim, mLoc, nLoc, mAct, nAct);
+                }
+                timer_.ClearSlice();
+            }
+            SyncFuncStatic<HardEvent::FIX_S, SYNC_EVENT_ID0>();
+            WriteGmByPassDCache(
+                reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagSharedGmm1DonePtr) +
+                    blockIdx_ * INT_CACHELINE,
+                1);
+        }
         return;
     }
     ProblemShape problemShape;
@@ -581,20 +622,100 @@ __aicore__ inline bool MegaMoe<TemplateMegaMoeTypeFunc>::TryRunSharedExpertActiv
             Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF, static_cast<uint32_t>(L1_TILE_N));
     }
     if (cursor.nextTile < cursor.tileCount) {
-        ProblemShape shape;
-        InitSharedActivation(shape);
-        GMMAddrInfo addr{};
-        UpdateSharedExpertGmm1GlobalBuffer<ActivationType, SharedWeightType, ActivationQuantOutType, QuantScaleOutType,
-                                           ENABLE_A8W4>(commonConfig_, gmmExecutionConfig_, params_.workspaceInfo,
-                                                        sharedWeightTensorListAddrs_, sharedEpilogueOp_, addr,
-                                                        cursor.expert);
-        timer_.SetWave(AscendTimer::NO_WAVE);
-        timer_.SetSlice(cursor.expert, 0U, commonConfig_.tokenNum);
-        addr.timer = timer_.Enabled() ? &timer_ : nullptr;
-        RunReadyGmm1ActivationTileA8W4<QuantOutType, SharedWeightType, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
-                                       GMM1_TILE_M>(sharedEpilogueOp_, shape, addr, gmmExecutionConfig_.blockJob,
-                                                    cursor.nextTile, 0U, AscendTimer::AIV_SHARED_SWIGLU, true);
-        timer_.ClearSlice();
+        if (params_.tilingData->sharedWeightBf16 != 0U) {
+            const uint32_t inter = commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF;
+            const uint32_t nTiles = Ops::Base::CeilDiv(inter, static_cast<uint32_t>(L1_TILE_N));
+            const uint32_t mLoc = (cursor.nextTile / nTiles) * GMM1_TILE_M;
+            const uint32_t nLoc = (cursor.nextTile % nTiles) * L1_TILE_N;
+            const uint32_t mAct =
+                commonConfig_.tokenNum - mLoc < GMM1_TILE_M ? commonConfig_.tokenNum - mLoc : GMM1_TILE_M;
+            const uint32_t nAct = inter - nLoc < L1_TILE_N ? inter - nLoc : L1_TILE_N;
+            timer_.SetWave(AscendTimer::NO_WAVE);
+            timer_.SetSlice(cursor.expert, mLoc, mAct);
+            {
+                AscendTimerTileScope tileTimer(timer_.Enabled() ? &timer_ : nullptr, AscendTimer::AIV_SHARED_SWIGLU,
+                                               mLoc, nLoc, mAct, nAct);
+                Aiv1ActivationUb::Acquire();
+                constexpr uint32_t kSubRows = 16U;
+                constexpr uint32_t kElems = kSubRows * L1_TILE_N;
+                constexpr uint32_t kBf16Bytes = kElems * sizeof(bfloat16_t);
+                constexpr uint32_t kFp32Bytes = kElems * sizeof(float);
+                static_assert(2U * kBf16Bytes + 2U * kFp32Bytes <= Aiv1ResidentUbLayout::ActivationBytes);
+                GlobalTensor<bfloat16_t> srcGm, dstGm;
+                srcGm.SetGlobalBuffer(
+                    reinterpret_cast<__gm__ bfloat16_t*>(params_.workspaceInfo.sharedExpertGmm1OutPtr) +
+                    static_cast<uint64_t>(cursor.expert) * commonConfig_.tokenNum * commonConfig_.gmm1OutputDim);
+                dstGm.SetGlobalBuffer(
+                    reinterpret_cast<__gm__ bfloat16_t*>(params_.workspaceInfo.sharedExpertActivationDataPtr) +
+                    static_cast<uint64_t>(cursor.expert) * commonConfig_.tokenNum * inter);
+                LocalTensor<bfloat16_t> gateBf16(TPosition::VECIN, 0U, kElems);
+                LocalTensor<bfloat16_t> upBf16(TPosition::VECIN, kBf16Bytes, kElems);
+                LocalTensor<float> gateFp32(TPosition::VECCALC, 2U * kBf16Bytes, kElems);
+                LocalTensor<float> upFp32(TPosition::VECCALC, 2U * kBf16Bytes + kFp32Bytes, kElems);
+                LocalTensor<float> tmpFp32(TPosition::VECCALC, 0U, kElems);
+                LocalTensor<bfloat16_t> outBf16(TPosition::VECOUT, 0U, kElems);
+                const float limit = params_.tilingData->clampLimit;
+                constexpr TEventID swigluEvent = EVENT_ID2;
+                for (uint32_t sub = 0U; sub < mAct; sub += kSubRows) {
+                    const uint32_t actual = mAct - sub < kSubRows ? mAct - sub : kSubRows;
+                    const uint32_t count = actual * nAct;
+                    const uint64_t input = static_cast<uint64_t>(mLoc + sub) * (2U * inter) + nLoc;
+                    const DataCopyExtParams inCopy{
+                        static_cast<uint16_t>(actual), static_cast<uint32_t>(nAct * sizeof(bfloat16_t)),
+                        static_cast<uint32_t>((2U * inter - nAct) * sizeof(bfloat16_t)), 0U, 0U};
+                    DataCopyPad(gateBf16, srcGm[input], inCopy, {false, 0U, 0U, 0U});
+                    DataCopyPad(upBf16, srcGm[input + inter], inCopy, {false, 0U, 0U, 0U});
+                    SetFlag<HardEvent::MTE2_V>(swigluEvent);
+                    WaitFlag<HardEvent::MTE2_V>(swigluEvent);
+                    Cast(gateFp32, gateBf16, RoundMode::CAST_NONE, count);
+                    Cast(upFp32, upBf16, RoundMode::CAST_NONE, count);
+                    PipeBarrier<PIPE_V>();
+                    Mins(gateFp32, gateFp32, limit, count);
+                    Mins(upFp32, upFp32, limit, count);
+                    PipeBarrier<PIPE_V>();
+                    Maxs(upFp32, upFp32, -limit, count);
+                    Muls(tmpFp32, gateFp32, -1.0f, count);
+                    PipeBarrier<PIPE_V>();
+                    Exp(tmpFp32, tmpFp32, count);
+                    PipeBarrier<PIPE_V>();
+                    Adds(tmpFp32, tmpFp32, 1.0f, count);
+                    PipeBarrier<PIPE_V>();
+                    Div(gateFp32, gateFp32, tmpFp32, count);
+                    PipeBarrier<PIPE_V>();
+                    Mul(gateFp32, gateFp32, upFp32, count);
+                    PipeBarrier<PIPE_V>();
+                    Cast(outBf16, gateFp32, RoundMode::CAST_RINT, count);
+                    SetFlag<HardEvent::V_MTE3>(swigluEvent);
+                    WaitFlag<HardEvent::V_MTE3>(swigluEvent);
+                    const uint64_t output = static_cast<uint64_t>(mLoc + sub) * inter + nLoc;
+                    const DataCopyExtParams outCopy{
+                        static_cast<uint16_t>(actual), static_cast<uint32_t>(nAct * sizeof(bfloat16_t)), 0U,
+                        static_cast<uint32_t>((inter - nAct) * sizeof(bfloat16_t)), 0U};
+                    DataCopyPad(dstGm[output], outBf16, outCopy);
+                    if (sub + kSubRows < mAct) {
+                        Aiv1ActivationUb::Release();
+                        Aiv1ActivationUb::Acquire();
+                    }
+                }
+                Aiv1ActivationUb::Release();
+            }
+            timer_.ClearSlice();
+        } else {
+            ProblemShape shape;
+            InitSharedActivation(shape);
+            GMMAddrInfo addr{};
+            UpdateSharedExpertGmm1GlobalBuffer<ActivationType, SharedWeightType, ActivationQuantOutType, QuantScaleOutType,
+                                               ENABLE_A8W4>(commonConfig_, gmmExecutionConfig_, params_.workspaceInfo,
+                                                            sharedWeightTensorListAddrs_, sharedEpilogueOp_, addr,
+                                                            cursor.expert);
+            timer_.SetWave(AscendTimer::NO_WAVE);
+            timer_.SetSlice(cursor.expert, 0U, commonConfig_.tokenNum);
+            addr.timer = timer_.Enabled() ? &timer_ : nullptr;
+            RunReadyGmm1ActivationTileA8W4<QuantOutType, SharedWeightType, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
+                                           GMM1_TILE_M>(sharedEpilogueOp_, shape, addr, gmmExecutionConfig_.blockJob,
+                                                        cursor.nextTile, 0U, AscendTimer::AIV_SHARED_SWIGLU, true);
+            timer_.ClearSlice();
+        }
         cursor.nextTile += blockNum_;
         if (cursor.nextTile >= cursor.tileCount) {
             ++cursor.expert;
@@ -646,6 +767,48 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertTail
 template <TemplateMegaMoeTypeClass>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm2()
 {
+    if (params_.tilingData->sharedWeightBf16 != 0U) {
+        if constexpr (g_coreType == AIC) {
+            Catlass::Gemm::Block::CatlassBf16Matmul bf16Matmul;
+            const uint32_t inter = commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF;
+            const uint32_t mTiles = Ops::Base::CeilDiv(commonConfig_.tokenNum, GMM1_TILE_M);
+            const uint32_t nTiles = Ops::Base::CeilDiv(commonConfig_.tokenHiddenDim, static_cast<uint32_t>(L1_TILE_N));
+            const uint32_t totalTiles = mTiles * nTiles;
+            for (uint32_t sharedExpertIdx = 0U; sharedExpertIdx < sharedExpertNum_; ++sharedExpertIdx) {
+                timer_.SetWave(AscendTimer::NO_WAVE);
+                timer_.SetSlice(sharedExpertIdx, 0U, commonConfig_.tokenNum);
+                GM_ADDR aBase = params_.workspaceInfo.sharedExpertActivationDataPtr +
+                                static_cast<uint64_t>(sharedExpertIdx) * commonConfig_.tokenNum * inter *
+                                    sizeof(bfloat16_t);
+                GM_ADDR bBase = sharedWeightTensorListAddrs_.weight2 +
+                                static_cast<uint64_t>(sharedExpertIdx) * commonConfig_.tokenHiddenDim * inter *
+                                    sizeof(bfloat16_t);
+                GM_ADDR cBase = params_.workspaceInfo.sharedExpertResultPtr +
+                                static_cast<uint64_t>(sharedExpertIdx) * commonConfig_.tokenNum *
+                                    commonConfig_.tokenHiddenDim * sizeof(bfloat16_t);
+                __gm__ int32_t* counterBase =
+                    reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.sharedExpertGmm2TileCounterPtr) +
+                    static_cast<uint64_t>(sharedExpertIdx) * mTiles * INT_CACHELINE;
+                for (uint32_t tile = blockIdx_; tile < totalTiles; tile += blockNum_) {
+                    const uint32_t mLoc = (tile / nTiles) * GMM1_TILE_M;
+                    const uint32_t nLoc = (tile % nTiles) * L1_TILE_N;
+                    const uint32_t mAct = commonConfig_.tokenNum - mLoc < GMM1_TILE_M
+                                              ? commonConfig_.tokenNum - mLoc
+                                              : GMM1_TILE_M;
+                    const uint32_t nAct = commonConfig_.tokenHiddenDim - nLoc < L1_TILE_N
+                                              ? commonConfig_.tokenHiddenDim - nLoc
+                                              : L1_TILE_N;
+                    AscendTimerTileScope tileTimer(timer_.Enabled() ? &timer_ : nullptr, AscendTimer::AIC_SHARED_GMM2,
+                                                   mLoc, nLoc, mAct, L1_TILE_N);
+                    bf16Matmul.ComputeTile(aBase, bBase, cBase, commonConfig_.tokenNum, commonConfig_.tokenHiddenDim,
+                                           inter, mLoc, nLoc, mAct, nAct);
+                    NotifySharedExpertTileCompletion(mLoc, counterBase);
+                }
+                timer_.ClearSlice();
+            }
+        }
+        return;
+    }
     ProblemShape problemShape;
     Get<M_VALUE>(problemShape) = commonConfig_.tokenNum;
     Get<N_VALUE>(problemShape) = commonConfig_.gmm1OutputDim;
@@ -755,10 +918,13 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
         timer_.Start(AscendTimer::AIV_RESET);
     }
     ResetSyncStatus<false>(aivJob_, params_, resetBatchElementCount_, resetTensor_);
+    if (UseDeduplicatedRoutes(params_.tilingData)) {
+        ResetDedupRouteMap(aivJob_, params_, resetBatchElementCount_, resetTensor_);
+    }
     if constexpr (g_coreType == AIV) {
         timer_.End(AscendTimer::AIV_RESET);
     }
-    if (sharedExpertNum_ > 0) {
+    if (sharedExpertNum_ > 0 && params_.tilingData->sharedWeightBf16 == 0U) {
         PrepareSharedExpertInput<ActivationType, QuantScaleOutType, A_ELEMS_PER_BYTE>(
             aivJob_, commonConfig_, params_, quantProcessConfig_, sharedExpertPrepareScratch_);
     }

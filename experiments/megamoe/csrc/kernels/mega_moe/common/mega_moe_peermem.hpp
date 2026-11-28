@@ -148,6 +148,21 @@ HOST_DEVICE int64_t CalcQuantTokenScaleBytes(int64_t h, uint32_t elemsPerByte)
     return static_cast<int64_t>(tokenScaleBytes + ALIGN_32);
 }
 
+HOST_DEVICE bool UseDeduplicatedRoutes(const MegaMoeTilingData* tilingData)
+{
+    return tilingData->topoType == TOPO_TYPE_MTE &&
+           tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 &&
+           tilingData->combineQuantMode == COMBINE_NO_QUANT &&
+           tilingData->topkWeightsPrefetch == 0U &&
+           tilingData->epWorldSize <= DEDUP_MAX_EP_WORLD_SIZE &&
+           tilingData->topK <= META_INFO_SIZE;
+}
+
+HOST_DEVICE bool PackRouteWeights(const MegaMoeTilingData* tilingData)
+{
+    return tilingData->topkWeightsPrefetch != 0U || UseDeduplicatedRoutes(tilingData);
+}
+
 // Combine 回传一行 BF16，不附带量化 scale。
 HOST_DEVICE int64_t CalcCombineTokenBytes(int64_t h, int64_t yDtypeSize)
 {

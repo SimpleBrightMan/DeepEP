@@ -37,6 +37,27 @@ __aicore__ inline void ResetSyncStatus(const AivJobContext& job, const Params& p
                             resetTensor);
 
 }
+
+// The route map is consumed with scalar bypass-cache reads, so initialize it to
+// an explicit invalid row instead of relying on allocator contents from a prior launch.
+__aicore__ inline void ResetDedupRouteMap(const AivJobContext& job, const Params& params,
+                                          int32_t resetBatchElementCount, LocalTensor<int32_t>& resetTensor)
+{
+    if constexpr (g_coreType == AIC) {
+        return;
+    }
+    if (params.workspaceInfo.dedupRouteRowPtr == nullptr || resetBatchElementCount <= 0) {
+        return;
+    }
+    SyncFuncStatic<AscendC::HardEvent::MTE3_V, SYNC_EVENT_ID2>();
+    Duplicate(resetTensor, int32_t(-1), resetBatchElementCount);
+    SyncFuncStatic<AscendC::HardEvent::V_MTE3, SYNC_EVENT_ID2>();
+    int32_t routeCount = static_cast<int32_t>(
+        static_cast<uint64_t>(params.tilingData->epWorldSize) * params.tilingData->numMaxTokensPerRank *
+        params.tilingData->topK);
+    ResetWorkspaceRegion<1>(job, params.workspaceInfo.dedupRouteRowPtr, routeCount, resetBatchElementCount,
+                            resetTensor);
+}
 #endif
 
 }  // namespace MegaMoeImpl

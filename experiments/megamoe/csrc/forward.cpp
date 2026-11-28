@@ -407,37 +407,51 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                 "Input/device/weights differ from the prepared plan");
 
     const bool has_shared = shared_weight1.has_value();
-    TORCH_CHECK(shared_weight2.has_value() == has_shared && shared_weight_scales1.has_value() == has_shared &&
-                    shared_weight_scales2.has_value() == has_shared,
-                "all four shared weight and scale tensors must be supplied together");
+    TORCH_CHECK(shared_weight2.has_value() == has_shared,
+                "shared_weight1 and shared_weight2 must be supplied together");
     int64_t shared_experts = 0;
+    bool shared_bf16 = false;
     if (has_shared) {
-        TORCH_CHECK(is_a8w4, "shared FP8 experts currently require the routed A8W4 kernel");
+        TORCH_CHECK(is_a8w4, "shared experts currently require the routed A8W4 kernel");
         CheckTensor(*shared_weight1, 3, "shared_weight1");
         CheckTensor(*shared_weight2, 3, "shared_weight2");
-        CheckTensor(*shared_weight_scales1, 4, "shared_weight_scales1");
-        CheckTensor(*shared_weight_scales2, 4, "shared_weight_scales2");
+        shared_bf16 = shared_weight1->scalar_type() == torch::kBFloat16;
+        TORCH_CHECK(shared_weight2->scalar_type() == shared_weight1->scalar_type(),
+                    "shared_weight1 and shared_weight2 must have the same dtype");
         shared_experts = shared_weight1->size(0);
         TORCH_CHECK(shared_experts > 0 && shared_experts <= std::numeric_limits<uint32_t>::max(),
                     "shared expert count must be positive and fit uint32");
-        for (const auto* tensor :
-             {&*shared_weight1, &*shared_weight2, &*shared_weight_scales1, &*shared_weight_scales2}) {
-            TORCH_CHECK(tensor->device() == x.device(), "shared tensors must be on the same device as x");
+        TORCH_CHECK(shared_weight1->device() == x.device() && shared_weight2->device() == x.device(),
+                    "shared tensors must be on the same device as x");
+        if (shared_bf16) {
+            TORCH_CHECK(!shared_weight_scales1.has_value() && !shared_weight_scales2.has_value(),
+                        "BF16 shared weights do not take scales");
+            TORCH_CHECK(!prequantized, "BF16 A16W16 shared experts require BF16 input x");
+        } else {
+            TORCH_CHECK(shared_weight_scales1.has_value() && shared_weight_scales2.has_value(),
+                        "FP8 shared weights require shared_weight_scales1 and shared_weight_scales2");
+            CheckTensor(*shared_weight_scales1, 4, "shared_weight_scales1");
+            CheckTensor(*shared_weight_scales2, 4, "shared_weight_scales2");
+            TORCH_CHECK(shared_weight_scales1->device() == x.device() && shared_weight_scales2->device() == x.device(),
+                        "shared scale tensors must be on the same device as x");
+            TORCH_CHECK(shared_weight1->scalar_type() == c10::ScalarType::Float8_e4m3fn &&
+                            shared_weight2->scalar_type() == c10::ScalarType::Float8_e4m3fn,
+                        "shared weights must use FP8 E4M3 NZ or BF16 ND storage");
+            TORCH_CHECK(shared_weight_scales1->scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
+                            shared_weight_scales2->scalar_type() == c10::ScalarType::Float8_e8m0fnu,
+                        "shared weight scales must be FP8 E8M0");
+            TORCH_CHECK(shared_weight_scales1->sizes() ==
+                                torch::IntArrayRef({shared_experts, hidden, CeilDiv(h, int64_t{64}), 2}) &&
+                            shared_weight_scales2->sizes() ==
+                                torch::IntArrayRef({shared_experts, h, CeilDiv(hidden / 2, int64_t{64}), 2}),
+                        "shared scales must match [S, N, ceil(K/64), 2] for each shared weight");
         }
-        TORCH_CHECK(shared_weight1->scalar_type() == c10::ScalarType::Float8_e4m3fn &&
-                        shared_weight2->scalar_type() == c10::ScalarType::Float8_e4m3fn,
-                    "shared weights must use FP8 E4M3 NZ storage; packed FP4 is no longer accepted");
-        TORCH_CHECK(shared_weight_scales1->scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
-                        shared_weight_scales2->scalar_type() == c10::ScalarType::Float8_e8m0fnu,
-                    "shared weight scales must be FP8 E8M0");
         TORCH_CHECK(shared_weight1->sizes() == torch::IntArrayRef({shared_experts, hidden, h}) &&
                         shared_weight2->sizes() == torch::IntArrayRef({shared_experts, h, hidden / 2}),
-                    "shared FP8 weights must match routed H and hiddenDim: [S, hiddenDim, H], [S, H, hiddenDim/2]");
-        TORCH_CHECK(shared_weight_scales1->sizes() ==
-                            torch::IntArrayRef({shared_experts, hidden, CeilDiv(h, int64_t{64}), 2}) &&
-                        shared_weight_scales2->sizes() ==
-                            torch::IntArrayRef({shared_experts, h, CeilDiv(hidden / 2, int64_t{64}), 2}),
-                    "shared scales must match [S, N, ceil(K/64), 2] for each shared weight");
+                    "shared weights must match routed H and hiddenDim: [S, hiddenDim, H], [S, H, hiddenDim/2]");
+    } else {
+        TORCH_CHECK(!shared_weight_scales1.has_value() && !shared_weight_scales2.has_value(),
+                    "shared scales supplied without shared weights");
     }
 
     TORCH_CHECK(shared_experts == tiling_.sharedExpertNum, "Shared experts differ from the prepared plan");
@@ -452,6 +466,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     auto opt = [&](const c10::optional<torch::Tensor>& tensor) { return tensor ? ptr(*tensor) : nullptr; };
     // 每次调用显式传递，不把某次 clamp 留在复用 Plan 中影响后续 None 调用。
     auto launch_tiling = tiling_;
+    launch_tiling.sharedWeightBf16 = shared_bf16 ? 1U : 0U;
     launch_tiling.clampLimit = activation_clamp.has_value()
                                   ? static_cast<float>(*activation_clamp) : std::numeric_limits<float>::max();
     mega_moe_kernel_do(platform_.block_dim, platform_.ub, stream.stream(), is_a8w4, ptr(context_), ptr(x),
@@ -469,9 +484,13 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         c10_npu::NPUCachingAllocator::recordStream(timer->storage().data_ptr(), stream);
     }
     if (has_shared) {
-        for (const auto* tensor :
-             {&*shared_weight1, &*shared_weight2, &*shared_weight_scales1, &*shared_weight_scales2}) {
-            c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
+        c10_npu::NPUCachingAllocator::recordStream(shared_weight1->storage().data_ptr(), stream);
+        c10_npu::NPUCachingAllocator::recordStream(shared_weight2->storage().data_ptr(), stream);
+        if (shared_weight_scales1.has_value()) {
+            c10_npu::NPUCachingAllocator::recordStream(shared_weight_scales1->storage().data_ptr(), stream);
+        }
+        if (shared_weight_scales2.has_value()) {
+            c10_npu::NPUCachingAllocator::recordStream(shared_weight_scales2->storage().data_ptr(), stream);
         }
     }
     if (x_scales) {

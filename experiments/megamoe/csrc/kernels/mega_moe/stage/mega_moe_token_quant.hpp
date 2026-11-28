@@ -54,7 +54,7 @@ __aicore__ inline void LoadTopkWeightsToUb(const Params& params, const QuantProc
                                            const LocalTensor<ActivationType>& xOutTensor, int32_t tokenIndex,
                                            TEventID event)
 {
-    if (params.tilingData->topkWeightsPrefetch == 0U) return;
+    if (!PackRouteWeights(params.tilingData)) return;
     GlobalTensor<float> weights;
     weights.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.probsGmAddr));
     auto dst = xOutTensor[config.quantTokenAlignBytes + config.quantScaleAlignBytes].template ReinterpretCast<float>();
@@ -100,7 +100,7 @@ __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidde
         DataCopyPad(buffer[config.quantTokenAlignBytes], scales[row * scaleBytes],
                     {static_cast<uint16_t>(count), scaleBytes, 0U, scaleGap, 0U},
                     {false, 0U, 0U, 0U});
-        if (params.tilingData->topkWeightsPrefetch != 0U) {
+        if (PackRouteWeights(params.tilingData)) {
             GlobalTensor<uint8_t> weights;
             weights.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(params.probsGmAddr));
             DataCopyPad(buffer[config.quantTokenAlignBytes + config.quantScaleAlignBytes],

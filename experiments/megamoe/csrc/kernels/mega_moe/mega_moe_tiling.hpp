@@ -196,6 +196,7 @@ struct MegaMoeTilingData {
     uint32_t maxTilesPerExpert;  // GMM1 tile 状态位区每 expert 的容量，按交织调度的完整 N 上界预留
     uint8_t actMode;             // MegaMoeImpl::MegaMoeActMode 的底层协议值
     uint8_t actSubMode;          // MegaMoeImpl::MegaMoeActSubMode 的底层协议值
+    uint8_t sharedWeightBf16;    // 0: FP8 E4M3 NZ (A8W8), 1: BF16 ND (A16W16)
     float activationAlpha;       // situ: linear_beta; swigluoai: alpha(默认1.702); swiglu/swiglustep: 占位
     float activationBeta;        // situ/swigluoai: beta(默认1.0); swiglu/swiglustep: 占位
     uint32_t mGroupsPerWave;     // 每个 routed expert Wave 消费的 256-row M 分组数

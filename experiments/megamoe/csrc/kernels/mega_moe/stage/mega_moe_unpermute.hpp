@@ -143,6 +143,91 @@ __aicore__ inline void AccumulateMoeExpertsForToken(const TokenUnpermuteConfig& 
     }
 }
 
+__aicore__ inline bool IsFirstRouteForOwner(const GlobalTensor<int32_t>& topkIds, const Params& params,
+                                            int32_t tokenIdx, int32_t topkIdx, int32_t ownerRank)
+{
+    uint64_t routeBegin = static_cast<uint64_t>(tokenIdx) * params.tilingData->topK;
+    for (int32_t previous = 0; previous < topkIdx; ++previous) {
+        int32_t expert = topkIds.GetValue(routeBegin + previous);
+        if (expert >= 0 && expert / static_cast<int32_t>(params.tilingData->moeExpertPerRank) == ownerRank) {
+            return false;
+        }
+    }
+    return true;
+}
+
+__aicore__ inline int32_t FindTerminalRouteForOwner(const GlobalTensor<int32_t>& topkIds, const Params& params,
+                                                    int32_t tokenIdx, int32_t ownerRank)
+{
+    uint64_t routeBegin = static_cast<uint64_t>(tokenIdx) * params.tilingData->topK;
+    int32_t terminalTopkIdx = -1;
+    int32_t terminalExpert = -1;
+    for (int32_t topkIdx = 0; topkIdx < static_cast<int32_t>(params.tilingData->topK); ++topkIdx) {
+        int32_t expert = topkIds.GetValue(routeBegin + topkIdx);
+        if (expert > terminalExpert &&
+            expert / static_cast<int32_t>(params.tilingData->moeExpertPerRank) == ownerRank) {
+            terminalExpert = expert;
+            terminalTopkIdx = topkIdx;
+        }
+    }
+    return terminalTopkIdx;
+}
+
+// Owner ranks already applied route weights and reduced their local experts.
+// The source therefore reads one partial row per distinct owner rank, not topK rows.
+__aicore__ inline void AccumulateDeduplicatedRanksForToken(
+    const TokenUnpermuteConfig& context, const MoeStageCommonConfig& common, const Params& params,
+    TokenUnpermuteScratch& scratch, int32_t tokenIdx, int32_t localIdx,
+    const GlobalTensor<bfloat16_t>& expandedX, const MegaMoeUnpermuteBufferConfig& bufferConfig)
+{
+    GlobalTensor<int32_t> topkIds;
+    topkIds.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.expertIdxGmAddr));
+    uint64_t routeBegin = static_cast<uint64_t>(tokenIdx) * common.topK;
+    bool hasPartial = false;
+    for (int32_t topkIdx = 0; topkIdx < static_cast<int32_t>(common.topK); ++topkIdx) {
+        int32_t expert = topkIds.GetValue(routeBegin + topkIdx);
+        if (expert < 0) {
+            continue;
+        }
+        int32_t ownerRank = expert / static_cast<int32_t>(common.moeExpertPerRank);
+        if (ownerRank < 0 || ownerRank >= static_cast<int32_t>(common.worldSize) ||
+            !IsFirstRouteForOwner(topkIds, params, tokenIdx, topkIdx, ownerRank)) {
+            continue;
+        }
+
+        int32_t inputBufferIdx =
+            (localIdx * static_cast<int32_t>(common.topK + common.sharedExpertNum) + topkIdx) %
+            bufferConfig.inputBufferCount;
+        TEventID event = static_cast<TEventID>(inputBufferIdx);
+        LocalTensor<bfloat16_t> dataInBf16 =
+            scratch.dataResTensor[(inputBufferIdx + 1) * bufferConfig.bf16SlotElementCount];
+        LocalTensor<float> dataInFp32 =
+            scratch.dataResFp32Tensor[(inputBufferIdx + 1) * bufferConfig.fp32SlotElementCount];
+        int32_t terminalTopkIdx = FindTerminalRouteForOwner(topkIds, params, tokenIdx, ownerRank);
+        if (terminalTopkIdx < 0) {
+            continue;
+        }
+        uint64_t partialRow = static_cast<uint64_t>(tokenIdx) * common.topK + terminalTopkIdx;
+        LoadMoeExpertInput<COMBINE_NO_QUANT>(context, common, scratch, expandedX, partialRow, event,
+                                             dataInBf16, dataInFp32);
+        SetFlag<HardEvent::S_V>(event);
+        WaitFlag<HardEvent::S_V>(event);
+        PipeBarrier<PIPE_V>();
+        if (!hasPartial) {
+            DataCopy(scratch.dataResFp32Tensor, dataInFp32, common.tokenHiddenDim);
+        } else {
+            Add(scratch.dataResFp32Tensor, scratch.dataResFp32Tensor, dataInFp32, common.tokenHiddenDim);
+        }
+        PipeBarrier<PIPE_V>();
+        SetFlag<HardEvent::V_MTE2>(event);
+        hasPartial = true;
+    }
+    if (!hasPartial) {
+        Duplicate<float>(scratch.dataResFp32Tensor, 0.0F, common.tokenHiddenDim);
+        PipeBarrier<PIPE_V>();
+    }
+}
+
 // 等待该共享专家的 GMM2 结果就绪后累加进当前 token（等待与累加是一体动作，调用方无需分两步）。
 template <uint32_t Gmm1TileM>
 __aicore__ inline void AccumulateSharedExpertForToken(const MoeStageCommonConfig& common, const Params& params,
@@ -159,7 +244,9 @@ __aicore__ inline void AccumulateSharedExpertForToken(const MoeStageCommonConfig
         tokenGroupIndex);
     const auto sharedPolicy = SelectSharedExpertPolicy(params.tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4,
                                                        common.sharedExpertNum, common.tokenNum);
-    uint32_t gmm2NTilesPerGroup = Ops::Base::CeilDiv(common.tokenHiddenDim, sharedPolicy.gmm2TileN);
+    uint32_t gmm2TileN =
+        params.tilingData->sharedWeightBf16 != 0U ? static_cast<uint32_t>(L1_TILE_N) : sharedPolicy.gmm2TileN;
+    uint32_t gmm2NTilesPerGroup = Ops::Base::CeilDiv(common.tokenHiddenDim, gmm2TileN);
     WaitUntilGmFlagEquals(counterAddr, static_cast<int32_t>(gmm2NTilesPerGroup));
 
     GlobalTensor<bfloat16_t> sharedResult;
@@ -194,7 +281,8 @@ __aicore__ inline void ProcessTokenUnpermuteBatch(
     const GlobalTensor<bfloat16_t>& expandedX, GlobalTensor<bfloat16_t>& output, int32_t jobOffset,
     int32_t batchTokenOffset, int32_t batchTokenCount, TEventID outputBufferEvent)
 {
-    {
+    const bool deduplicateRoutes = UseDeduplicatedRoutes(params.tilingData);
+    if (!deduplicateRoutes) {
         LoadTokenUnpermuteWeights<TopkWeightsType>(common, params, scratch, jobOffset, batchTokenOffset,
                                                    batchTokenCount);
     }
@@ -203,8 +291,13 @@ __aicore__ inline void ProcessTokenUnpermuteBatch(
     }
     for (int32_t localIdx = 0; localIdx < batchTokenCount; ++localIdx) {
         int32_t tokenIdx = jobOffset + batchTokenOffset + localIdx;
-        AccumulateMoeExpertsForToken<CombineMode, TopkWeightsPrefetch>(context, common, params, scratch, tokenIdx, localIdx,
-                                                                       expandedX, bufferConfig);
+        if (deduplicateRoutes) {
+            AccumulateDeduplicatedRanksForToken(context, common, params, scratch, tokenIdx, localIdx, expandedX,
+                                                bufferConfig);
+        } else {
+            AccumulateMoeExpertsForToken<CombineMode, TopkWeightsPrefetch>(context, common, params, scratch, tokenIdx,
+                                                                           localIdx, expandedX, bufferConfig);
+        }
         for (uint32_t sharedExpertIdx = 0; sharedExpertIdx < common.sharedExpertNum; ++sharedExpertIdx) {
             AccumulateSharedExpertForToken<Gmm1TileM>(common, params, scratch, tokenIdx, localIdx, sharedExpertIdx,
                                                       bufferConfig);
@@ -351,7 +444,8 @@ __aicore__ inline void UnpermuteTokens(const TokenUnpermuteConfig& context, cons
         // 3510下DISABLE映射硬件mode4=NOTALLOC_KEEP，与DS归并读策略一致。
         // 保留已有L2命中、不为一次性消费分配新行；不改完成边界或数据布局。
         expandedX.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
-        if (TryFusedTokenUnpermute(common, params, scratch, bufferConfig, tokenRange, expandedX, output)) return;
+        if (!UseDeduplicatedRoutes(params.tilingData) &&
+            TryFusedTokenUnpermute(common, params, scratch, bufferConfig, tokenRange, expandedX, output)) return;
     }
 #endif
 

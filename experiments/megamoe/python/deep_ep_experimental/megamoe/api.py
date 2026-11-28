@@ -434,7 +434,21 @@ def transform_weights_for_mega_moe(
         raise NotImplementedError("Only SwiGLU is supported")
     transformed = []
     for name, value in (("l1_weights", l1_weights), ("l2_weights", l2_weights)):
-        weight, scale = _pair(value, name)
+        if isinstance(value, torch.Tensor):
+            weight, scale = value, None
+        elif isinstance(value, tuple) and len(value) == 2 and value[1] is None and isinstance(value[0], torch.Tensor):
+            weight, scale = value[0], None
+        else:
+            weight, scale = _pair(value, name)
+        if weight.dtype == torch.bfloat16:
+            if not shared or weight.ndim not in (2, 3) or scale is not None:
+                raise ValueError(f"{name}: BF16 weights must be 2D/3D shared tensors without scales (pass shared=True)")
+            if weight.device.type != "npu":
+                raise ValueError("Move weights to NPU before preparing")
+            transformed.append((weight.contiguous(), None))
+            continue
+        if scale is None:
+            raise TypeError(f"{name} must be a (data, scale) tensor pair")
         if weight.device.type != "npu" or scale.device != weight.device:
             raise ValueError("Move weights and scales to the same NPU before preparing")
         if weight.ndim != 3:
@@ -562,8 +576,24 @@ def _run(
     if (shared_l1_weights is None) != (shared_l2_weights is None):
         raise ValueError("Supply both shared weight pairs, or neither")
     if shared_l1_weights is not None:
-        sw1, ss1 = _pair(shared_l1_weights, "shared_l1_weights")
-        sw2, ss2 = _pair(shared_l2_weights, "shared_l2_weights")
+        def _shared_pair(value, name):
+            if isinstance(value, torch.Tensor):
+                return value, None
+            if isinstance(value, tuple) and len(value) == 2 and value[1] is None and isinstance(value[0], torch.Tensor):
+                return value[0], None
+            return _pair(value, name)
+
+        sw1, ss1 = _shared_pair(shared_l1_weights, "shared_l1_weights")
+        sw2, ss2 = _shared_pair(shared_l2_weights, "shared_l2_weights")
+        if sw1.ndim == 2:
+            if sym_buffer.num_shared_experts != 1:
+                raise ValueError("2D shared weights require num_shared_experts=1")
+            sw1 = sw1.reshape((1, *sw1.shape))
+            if ss1 is not None:
+                ss1 = ss1.reshape((1, *ss1.shape))
+            sw2 = sw2.reshape((1, *sw2.shape))
+            if ss2 is not None:
+                ss2 = ss2.reshape((1, *ss2.shape))
         shared = (sw1, sw2, ss1, ss2)
     b = sym_buffer
     if data.ndim != 2 or not 0 < data.shape[0] <= b.num_max_tokens_per_rank or data.shape[1] != b.hidden:
@@ -613,9 +643,15 @@ def _run(
         ("shared_l2_weights", shared[1], (b.num_shared_experts, b.hidden, b.intermediate_hidden)),
     ):
         if weight is not None:
-            _check_shared_weight(weight, name)
+            if weight.dtype == torch.bfloat16:
+                import torch_npu
+
+                if not weight.is_contiguous() or torch_npu.get_npu_format(weight) != 2:
+                    raise ValueError(f"{name}: BF16 shared weights must be contiguous ND")
+            else:
+                _check_shared_weight(weight, name)
             if tuple(weight.shape) != shape:
-                raise ValueError(f"{name}: expected FP8 shape {shape}, got {tuple(weight.shape)}")
+                raise ValueError(f"{name}: expected shape {shape}, got {tuple(weight.shape)}")
     if cumulative_stats is not None:
         stats = cumulative_stats
         if (

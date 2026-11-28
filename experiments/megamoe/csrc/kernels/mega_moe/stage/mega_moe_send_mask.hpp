@@ -51,6 +51,63 @@ struct SendMaskScratch {
     LocalTensor<int32_t> sendCntAccTensor;
 };
 
+// Expert waves run in ascending order. The largest expert id on one owner
+// rank is therefore the route that can safely reduce all local sibling rows.
+__aicore__ inline bool IsTerminalOwnerRoute(const MoeStageCommonConfig& common,
+                                            const GlobalTensor<int32_t>& topkIdsGm, int32_t topkIndex,
+                                            int32_t globalExpertId)
+{
+    int32_t topk = static_cast<int32_t>(common.topK);
+    int32_t tokenRouteBegin = topkIndex - topkIndex % topk;
+    int32_t ownerRank = globalExpertId / static_cast<int32_t>(common.moeExpertPerRank);
+    for (int32_t slot = 0; slot < topk; ++slot) {
+        int32_t otherExpert = topkIdsGm.GetValue(tokenRouteBegin + slot);
+        if (otherExpert > globalExpertId &&
+            otherExpert / static_cast<int32_t>(common.moeExpertPerRank) == ownerRank) {
+            return false;
+        }
+    }
+    return true;
+}
+
+__aicore__ inline bool IsTerminalOwnerRouteUb(const MoeStageCommonConfig& common,
+                                              const LocalTensor<int32_t>& topkIdsUb, int32_t topkIndex,
+                                              int32_t globalExpertId)
+{
+    int32_t topk = static_cast<int32_t>(common.topK);
+    int32_t tokenRouteBegin = topkIndex - topkIndex % topk;
+    int32_t ownerRank = globalExpertId / static_cast<int32_t>(common.moeExpertPerRank);
+    for (int32_t slot = 0; slot < topk; ++slot) {
+        int32_t otherExpert = topkIdsUb.GetValue(tokenRouteBegin + slot);
+        if (otherExpert > globalExpertId &&
+            otherExpert / static_cast<int32_t>(common.moeExpertPerRank) == ownerRank) {
+            return false;
+        }
+    }
+    return true;
+}
+
+__aicore__ inline bool IsTerminalOwnerRouteRail(const MoeStageCommonConfig& common,
+                                                const GlobalTensor<int32_t>& railTopkIdsGm, int32_t topkIndex,
+                                                int32_t globalExpertId)
+{
+    int32_t topk = static_cast<int32_t>(common.topK);
+    int32_t tokenRouteBegin = topkIndex - topkIndex % topk;
+    int32_t ownerRank = globalExpertId / static_cast<int32_t>(common.moeExpertPerRank);
+    for (int32_t slot = 0; slot < topk; ++slot) {
+        int32_t itemIdx = tokenRouteBegin + slot;
+        int32_t packet = itemIdx / static_cast<int32_t>(RAIL_PACKET_DATA_WORDS);
+        int32_t offset = itemIdx % static_cast<int32_t>(RAIL_PACKET_DATA_WORDS);
+        int32_t otherExpert =
+            railTopkIdsGm.GetValue(packet * static_cast<int32_t>(RAIL_PACKET_WORDS) + offset);
+        if (otherExpert > globalExpertId &&
+            otherExpert / static_cast<int32_t>(common.moeExpertPerRank) == ownerRank) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // MTE Wave：把当前 route batch 中命中某专家的全局 topkIndex 压紧后直接写入对端槽。
 // 每个 slot 只保存 index；raw count 在所有 ring 写完成后由 PublishExpertCounts 独立发布。
 __aicore__ inline void GatherAndSendExpertCompactRouteBatch(const MoeStageCommonConfig& common, GM_ADDR* winRankAddr,
@@ -58,7 +115,7 @@ __aicore__ inline void GatherAndSendExpertCompactRouteBatch(const MoeStageCommon
                                                             GlobalTensor<int32_t>& topkIdsGm,
                                                             GlobalTensor<int32_t>& dstRouteIndexGm,
                                                             int32_t ownedExpertBegin, int32_t ownedExpertNum,
-                                                            int32_t batchIdx)
+                                                            int32_t batchIdx, bool deduplicateRoutes)
 {
     const MegaMoeSendMaskBufferConfig& bufferConfig = config.bufferConfig;
     const uint32_t compareMaskBytes = static_cast<uint32_t>(bufferConfig.routeItemsPerBatch) / BITS_PER_BYTE;
@@ -109,6 +166,15 @@ __aicore__ inline void GatherAndSendExpertCompactRouteBatch(const MoeStageCommon
             copiedCount = remainingCapacity > 0 ? remainingCapacity : 0;
         }
         scratch.sendCntAccTensor.SetValue(ownedIdx, previousCount + copiedCount);
+        if (deduplicateRoutes) {
+            for (int32_t routeIdx = 0; routeIdx < copiedCount; ++routeIdx) {
+                int32_t topkIndex = tokValidIndexTensor.GetValue(routeIdx);
+                if (IsTerminalOwnerRoute(common, topkIdsGm, topkIndex, globalExpertId)) {
+                    tokValidIndexTensor.SetValue(
+                        routeIdx, static_cast<int32_t>(static_cast<uint32_t>(topkIndex) | TERMINAL_ROUTE_BIT));
+                }
+            }
+        }
         SyncFuncStatic<AscendC::HardEvent::S_MTE3, SYNC_EVENT_ID3>();
 
         if (copiedCount > 0) {
@@ -220,9 +286,10 @@ __aicore__ inline void GatherAndSendExpertCompactRoutesDirect(const AivJobContex
     for (int32_t bufferIdx = 0; bufferIdx < bufferConfig.bufferCount; ++bufferIdx) {
         SetFlag<AscendC::HardEvent::MTE3_V>(static_cast<TEventID>(bufferIdx));
     }
+    const bool deduplicateRoutes = UseDeduplicatedRoutes(params.tilingData);
     for (int32_t batchIdx = 0; batchIdx < bufferConfig.routeBatchCount; ++batchIdx) {
         GatherAndSendExpertCompactRouteBatch(common, winRankAddr, config, scratch, topkIdsGm, dstRouteIndexGm,
-                                             ownedExpertBegin, ownedExpertNum, batchIdx);
+                                             ownedExpertBegin, ownedExpertNum, batchIdx, deduplicateRoutes);
     }
     for (int32_t bufferIdx = 0; bufferIdx < bufferConfig.bufferCount; ++bufferIdx) {
         WaitFlag<AscendC::HardEvent::MTE3_V>(static_cast<TEventID>(bufferIdx));
@@ -348,7 +415,8 @@ __aicore__ inline void RelayExpertCompactRouteBatch(const MoeStageCommonConfig& 
                                                     GlobalTensor<int32_t>& topkIdsGm,
                                                     GlobalTensor<int32_t>& dstRouteIndexGm, int32_t ownedExpertBegin,
                                                     int32_t ownedExpertNum, int32_t sourceRank, int32_t srcTokenNum,
-                                                    int32_t realSendTotalNum, int32_t batchIdx)
+                                                    int32_t realSendTotalNum, int32_t batchIdx,
+                                                    bool deduplicateRoutes)
 {
     const MegaMoeSendMaskBufferConfig& bufferConfig = config.bufferConfig;
     const uint32_t compareMaskBytes = static_cast<uint32_t>(bufferConfig.routeItemsPerBatch) / BITS_PER_BYTE;
@@ -394,6 +462,15 @@ __aicore__ inline void RelayExpertCompactRouteBatch(const MoeStageCommonConfig& 
             copiedCount = remainingCapacity > 0 ? remainingCapacity : 0;
         }
         scratch.sendCntAccTensor.SetValue(ownedIdx, previousCount + copiedCount);
+        if (deduplicateRoutes) {
+            for (int32_t routeIdx = 0; routeIdx < copiedCount; ++routeIdx) {
+                int32_t topkIndex = tokValidIndexTensor.GetValue(routeIdx);
+                if (IsTerminalOwnerRouteRail(common, topkIdsGm, topkIndex, globalExpertId)) {
+                    tokValidIndexTensor.SetValue(
+                        routeIdx, static_cast<int32_t>(static_cast<uint32_t>(topkIndex) | TERMINAL_ROUTE_BIT));
+                }
+            }
+        }
         SyncFuncStatic<AscendC::HardEvent::S_MTE3, SYNC_EVENT_ID3>();
 
         if (copiedCount > 0) {
@@ -545,7 +622,7 @@ __aicore__ inline bool TryRelayCompactRoutes(const MoeStageCommonConfig& common,
                                              const SendMaskConfig& config, SendMaskScratch& scratch,
                                              GlobalTensor<int32_t>& topkIdsGm, int32_t ownedExpertBegin,
                                              int32_t ownedExpertNum, int32_t sourceRank, int32_t srcTokenNum,
-                                             int32_t realSendTotalNum)
+                                             int32_t realSendTotalNum, bool deduplicateRoutes)
 {
     const MegaMoeSendMaskBufferConfig& bufferConfig = config.bufferConfig;
     if (realSendTotalNum <= 0 || realSendTotalNum > RailItemsPerBatch(bufferConfig)) {
@@ -569,6 +646,25 @@ __aicore__ inline bool TryRelayCompactRoutes(const MoeStageCommonConfig& common,
                          static_cast<uint32_t>(realSendTotalNum), common.topK, ownedExpertBegin,
                          static_cast<uint32_t>(ownedExpertNum), routeStrideItems);
     SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID2>();
+    if (deduplicateRoutes) {
+        for (int32_t ownedIdx = 0; ownedIdx < ownedExpertNum; ++ownedIdx) {
+            const int32_t routeCount = scratch.sendCntAccTensor.GetValue(ownedIdx);
+            if (routeCount == 0) {
+                continue;
+            }
+            const int32_t globalExpertId = ownedExpertBegin + ownedIdx;
+            const uint32_t expertBase = static_cast<uint32_t>(ownedIdx) * routeStrideItems;
+            for (int32_t routeIdx = 0; routeIdx < routeCount; ++routeIdx) {
+                const int32_t topkIndex = routeTensor.GetValue(expertBase + static_cast<uint32_t>(routeIdx));
+                if (IsTerminalOwnerRouteUb(common, scratch.topkIdsTensor, topkIndex, globalExpertId)) {
+                    routeTensor.SetValue(
+                        expertBase + static_cast<uint32_t>(routeIdx),
+                        static_cast<int32_t>(static_cast<uint32_t>(topkIndex) | TERMINAL_ROUTE_BIT));
+                }
+            }
+        }
+        SyncFuncStatic<AscendC::HardEvent::S_MTE3, SYNC_EVENT_ID3>();
+    }
     SyncFuncStatic<AscendC::HardEvent::V_MTE3, SYNC_EVENT_ID3>();
     GlobalTensor<int32_t> dstRouteGm;
     for (int32_t ownedIdx = 0; ownedIdx < ownedExpertNum; ++ownedIdx) {
@@ -619,10 +715,11 @@ __aicore__ inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig& com
     const int32_t sourceRank = static_cast<int32_t>(relayIdx * static_cast<uint32_t>(MEGA_MOE_SERVER_SIZE) +
                                                     common.rankId % static_cast<uint32_t>(MEGA_MOE_SERVER_SIZE));
 
+    const bool deduplicateRoutes = UseDeduplicatedRoutes(params.tilingData);
     GlobalTensor<int32_t> topkIdsGm;
     topkIdsGm.SetGlobalBuffer(railSlotBase);
     if (TryRelayCompactRoutes(common, winRankAddr, config, scratch, topkIdsGm, ownedExpertBegin, ownedExpertNum,
-                              sourceRank, srcTokenNum, realSendTotalNum)) {
+                              sourceRank, srcTokenNum, realSendTotalNum, deduplicateRoutes)) {
         PublishRailExpertCounts(common, winRankAddr, config, scratch, ownedExpertBegin, ownedExpertNum, sourceRank,
                                 expectEpoch);
         return;
@@ -638,7 +735,8 @@ __aicore__ inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig& com
     const int32_t actualBatchCount = (realSendTotalNum + itemsPerBatch - 1) / itemsPerBatch;
     for (int32_t batchIdx = 0; batchIdx < actualBatchCount; ++batchIdx) {
         RelayExpertCompactRouteBatch(common, winRankAddr, config, scratch, topkIdsGm, dstRouteIndexGm, ownedExpertBegin,
-                                     ownedExpertNum, sourceRank, srcTokenNum, realSendTotalNum, batchIdx);
+                                     ownedExpertNum, sourceRank, srcTokenNum, realSendTotalNum, batchIdx,
+                                     deduplicateRoutes);
     }
     for (int32_t bufferIdx = 0; bufferIdx < bufferConfig.bufferCount; ++bufferIdx) {
         WaitFlag<AscendC::HardEvent::MTE3_V>(static_cast<TEventID>(bufferIdx));

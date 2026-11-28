@@ -352,7 +352,8 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     // (sliceGlobalRowStart + cursor.wave) mod 核数；同 wave 跨专家的 slice 使用同一偏移。
     // 空任务判断必须使用轮换后的 owner，否则小 batch/尾片可能被错误跳过而漏发。
     WorkRange owned = GetWaveCombineOwnedRange(combineJob, rows, begin.globalTokenIndex);
-    if (owned.count == 0U) {
+    const bool deduplicateRoutes = UseDeduplicatedRoutes(params_.tilingData);
+    if (!deduplicateRoutes && owned.count == 0U) {
         return true;
     }
     // 只读取当前 expert/slice 的计数；不同 slice 不共用槽，快核后续通知不能代偿慢核。
@@ -361,6 +362,9 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     if (AscendC::ReadGmByPassDCache(ready) <
         static_cast<int32_t>(GetTokenCombineProducerCount(commonConfig_, waveCombineJob_, rows))) {
         return false;
+    }
+    if (owned.count == 0U) {
+        return true;
     }
     ExpertContext expertContext = CreateExpertContext(commonConfig_);
     expertContext.expertIdx = begin.expertIdx;

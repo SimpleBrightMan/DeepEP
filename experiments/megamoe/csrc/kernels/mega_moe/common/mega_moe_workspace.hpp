@@ -26,6 +26,8 @@ struct WorkspaceInfo {
     GM_ADDR activationQuantScalePtr;
     GM_ADDR expertRevTokenNumsPtr;
     GM_ADDR metaInfoPtr;
+    // One local packed row per source route. -1 means this owner rank does not own the route.
+    GM_ADDR dedupRouteRowPtr{nullptr};
     GM_ADDR flagActivationToGmm2Ptr;
     GM_ADDR flagDispatchToGmm1Ptr;
     GM_ADDR flagSendCntCalToUpdParamsPtr;
@@ -91,6 +93,13 @@ private:
 
         metaInfoPtr = base + workspaceSize;
         workspaceSize += Ops::Base::CeilAlign(tilingData->maxOutputSize * ALIGN_32, ALIGN_512);
+
+        if (UseDeduplicatedRoutes(tilingData)) {
+            dedupRouteRowPtr = base + workspaceSize;
+            int64_t sourceRouteCount = static_cast<int64_t>(tilingData->epWorldSize) *
+                                       tilingData->numMaxTokensPerRank * tilingData->topK;
+            workspaceSize += Ops::Base::CeilAlign(SIZE_INT_32 * sourceRouteCount, ALIGN_512);
+        }
 
         // 以下三组 flag 仅由 MoE 专家使用；共享专家路径不使用这些 flag。
         constexpr bool useMteWaveCombine = true;
@@ -204,9 +213,9 @@ private:
             sharedExpertGmm1OutPtr = base + workspaceSize;
             workspaceSize += Ops::Base::CeilAlign(
                 SIZE_BF_16 * tilingData->bs * tilingData->sharedExpertNum * tilingData->hiddenDim, ALIGN_512);
-            // sharedExpertInputData：GMM1 输入数据 [bs × h]。
+            // sharedExpertInputData：GMM1 输入数据 [bs × h]（按 BF16 预留以同时兼容 FP8/BF16 共享专家）。
             sharedExpertInputDataPtr = base + workspaceSize;
-            workspaceSize += Ops::Base::CeilAlign(SIZE_INT_8 * tilingData->bs * tilingData->h, ALIGN_512);
+            workspaceSize += Ops::Base::CeilAlign(SIZE_BF_16 * tilingData->bs * tilingData->h, ALIGN_512);
             // sharedExpertInputScale：GMM1 输入 scale [bs × CeilDiv(h, 32) × 2]。
             sharedExpertInputScalePtr = base + workspaceSize;
             workspaceSize += Ops::Base::CeilAlign(SIZE_INT_8 * tilingData->bs *
@@ -214,10 +223,10 @@ private:
                                                                          static_cast<uint32_t>(MXFP_SCALE_GROUP_NUM)) *
                                                       MXFP_MULTI_BASE_SIZE,
                                                   ALIGN_512);
-            // sharedExpertActivationData：SwiGLU 量化输出 [sharedExpertNum × bs × hiddenDim / 2] FP8。
+            // sharedExpertActivationData：SwiGLU 输出 [sharedExpertNum × bs × hiddenDim / 2]（按 BF16 预留）。
             sharedExpertActivationDataPtr = base + workspaceSize;
             workspaceSize += Ops::Base::CeilAlign(
-                SIZE_INT_8 * tilingData->bs * tilingData->sharedExpertNum * tilingData->hiddenDim / ACTIVATION_N_HALF,
+                SIZE_BF_16 * tilingData->bs * tilingData->sharedExpertNum * tilingData->hiddenDim / ACTIVATION_N_HALF,
                 ALIGN_512);
             // sharedExpertActivationScale：SwiGLU scale [sharedExpertNum × bs × hiddenDim / 2 / 32]。
             sharedExpertActivationScalePtr = base + workspaceSize;

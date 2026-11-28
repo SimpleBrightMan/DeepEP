@@ -108,6 +108,14 @@ __aicore__ inline void SendCombineTokenRow(uint32_t rowElements, uint64_t gmRemo
     DataCopyPad(gmRemoteD[gmDstRowOffset], rowTensor, ub2GmParams);
 }
 
+__aicore__ inline uint64_t GetCombineDedupRouteMapIndex(const Params& params, uint32_t sourceRank, uint32_t tokenIdx,
+                                                        uint32_t topkIdx)
+{
+    uint64_t sourceToken =
+        static_cast<uint64_t>(sourceRank) * params.tilingData->numMaxTokensPerRank + tokenIdx;
+    return sourceToken * params.tilingData->topK + topkIdx;
+}
+
 }  // namespace CombineImpl
 
 constexpr uint32_t META_INFO_TENSOR_ADDR = 200U * 1024U;
@@ -252,6 +260,95 @@ __aicore__ inline void SendWaveCombineToken(const MoeStageCommonConfig& common,
     SetFlag<HardEvent::MTE3_MTE2>(eventId);
 }
 
+// The terminal route for one (source rank, token, owner rank) reduces all local
+// expert results in FP32 and sends one weighted BF16 partial row back to source.
+__aicore__ inline void CombineDeduplicatedWaveTokenRange(const MoeStageCommonConfig& common,
+                                                         const WaveCombineBufferConfig& bufferConfig,
+                                                         WaveCombineScratch& scratch, const Params& params,
+                                                         uint32_t tokenCount, uint64_t metaInfoGmRowStart)
+{
+    GlobalTensor<bfloat16_t> gmm2AllOutGm;
+    gmm2AllOutGm.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(params.workspaceInfo.gmm2MmadResPtr));
+    __gm__ int32_t* routeRows = reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.dedupRouteRowPtr);
+    __gm__ int32_t* metaBase = reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr);
+
+    uint64_t gmRemoteBaseOffset =
+        static_cast<uint64_t>(params.peermemInfo.combineSendPtr - params.peermemInfo.rankSyncInWorldPtr);
+    uint32_t slotStrideElements = bufferConfig.slotStrideBytes / sizeof(bfloat16_t);
+    // Slot 0 holds the assembled full BF16 output row; slot 1 holds FP32/BF16 chunk scratch.
+    LocalTensor<bfloat16_t> bf16Out = scratch.rowBufferTensor[0];
+    uint32_t scratchBaseAddr = static_cast<uint32_t>(scratch.rowBufferTensor[slotStrideElements].GetPhyAddr());
+    uint32_t chunkCols = (bufferConfig.slotStrideBytes / 10U) / 32U * 32U;
+    if (chunkCols > common.tokenHiddenDim) {
+        chunkCols = common.tokenHiddenDim;
+    }
+    LocalTensor<float> accFp32(TPosition::VECCALC, scratchBaseAddr, chunkCols);
+    LocalTensor<float> rowFp32(TPosition::VECCALC, scratchBaseAddr + chunkCols * sizeof(float), chunkCols);
+    LocalTensor<bfloat16_t> rowBf16(TPosition::VECCALC, scratchBaseAddr + 2U * chunkCols * sizeof(float), chunkCols);
+    DataCopyPadExtParams<bfloat16_t> gm2UbPad{false, 0U, 0U, 0U};
+    TEventID combineEvent = static_cast<TEventID>(bufferConfig.eventBase);
+
+    for (uint32_t tokenIdxInSlice = 0U; tokenIdxInSlice < tokenCount; ++tokenIdxInSlice) {
+        uint64_t globalRow = metaInfoGmRowStart + tokenIdxInSlice;
+        __gm__ int32_t* record = metaBase + globalRow * META_INFO_SIZE;
+        if (ReadGmByPassDCache(record + TERMINAL_ROUTE) == 0) {
+            continue;
+        }
+        CombineImpl::CombineTokenRoute terminalRoute = CombineImpl::LoadGmCombineTokenRoute(params, globalRow);
+        int32_t localRows[META_INFO_SIZE];
+        float localWeights[META_INFO_SIZE];
+        uint32_t matchCount = 0U;
+        for (uint32_t topkIdx = 0U; topkIdx < params.tilingData->topK; ++topkIdx) {
+            uint64_t mapIndex = CombineImpl::GetCombineDedupRouteMapIndex(params, terminalRoute.dstRankId,
+                                                                          terminalRoute.tokenIdx, topkIdx);
+            int32_t routeRow = ReadGmByPassDCache(routeRows + mapIndex);
+            if (routeRow < 0) {
+                continue;
+            }
+            int32_t weightBits =
+                ReadGmByPassDCache(metaBase + static_cast<uint64_t>(routeRow) * META_INFO_SIZE + WEIGHT_INDEX);
+            localRows[matchCount] = routeRow;
+            localWeights[matchCount] = *reinterpret_cast<const float*>(&weightBits);
+            ++matchCount;
+        }
+        if (matchCount == 0U) {
+            continue;
+        }
+
+        for (uint32_t col = 0U; col < common.tokenHiddenDim; col += chunkCols) {
+            uint32_t curCols = common.tokenHiddenDim - col < chunkCols ? common.tokenHiddenDim - col : chunkCols;
+            DataCopyExtParams gm2UbParams{1U, static_cast<uint32_t>(curCols * sizeof(bfloat16_t)), 0U, 0U, 0U};
+            for (uint32_t i = 0U; i < matchCount; ++i) {
+                DataCopyPad(rowBf16, gmm2AllOutGm[static_cast<uint64_t>(localRows[i]) * common.tokenHiddenDim + col],
+                            gm2UbParams, gm2UbPad);
+                SetFlag<HardEvent::MTE2_V>(combineEvent);
+                WaitFlag<HardEvent::MTE2_V>(combineEvent);
+                Cast(rowFp32, rowBf16, RoundMode::CAST_NONE, curCols);
+                PipeBarrier<PIPE_V>();
+                if (i == 0U) {
+                    Muls(accFp32, rowFp32, localWeights[i], curCols);
+                } else {
+                    Muls(rowFp32, rowFp32, localWeights[i], curCols);
+                    PipeBarrier<PIPE_V>();
+                    Add(accFp32, accFp32, rowFp32, curCols);
+                }
+                PipeBarrier<PIPE_V>();
+                SetFlag<HardEvent::V_MTE2>(combineEvent);
+                WaitFlag<HardEvent::V_MTE2>(combineEvent);
+            }
+            Cast(bf16Out[col], accFp32, RoundMode::CAST_RINT, curCols);
+            PipeBarrier<PIPE_V>();
+        }
+
+        SetFlag<HardEvent::V_MTE3>(combineEvent);
+        WaitFlag<HardEvent::V_MTE3>(combineEvent);
+        CombineImpl::SendCombineTokenRow<bfloat16_t>(common.tokenHiddenDim, gmRemoteBaseOffset, terminalRoute, bf16Out,
+                                                     params);
+        SetFlag<HardEvent::MTE3_V>(combineEvent);
+        WaitFlag<HardEvent::MTE3_V>(combineEvent);
+    }
+}
+
 // 使用行级流水发送当前逻辑 AIV 任务负责的已就绪 token 区间。
 
 __aicore__ inline void CombineWaveTokenRange(const MoeStageCommonConfig& common,
@@ -263,6 +360,10 @@ __aicore__ inline void CombineWaveTokenRange(const MoeStageCommonConfig& common,
         return;
     }
     if (tokenCount == 0U) {
+        return;
+    }
+    if (UseDeduplicatedRoutes(params.tilingData)) {
+        CombineDeduplicatedWaveTokenRange(common, bufferConfig, scratch, params, tokenCount, metaInfoGmRowStart);
         return;
     }
     GlobalTensor<bfloat16_t> gmm2OutGm;

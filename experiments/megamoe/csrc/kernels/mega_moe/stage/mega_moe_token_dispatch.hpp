@@ -118,21 +118,90 @@ __aicore__ inline LocalTensor<ActivationType> GetDispatchCopyBuffer(const TokenD
         context.quantTokenScaleAlignBytes / sizeof(ActivationType));
 }
 
-template <bool IsBufferReuse, bool TopkWeightsPrefetch, typename ActivationType>
+__aicore__ inline int32_t DecodeTopkIndex(int32_t encodedTopkIndex)
+{
+    return static_cast<int32_t>(static_cast<uint32_t>(encodedTopkIndex) & ROUTE_INDEX_MASK);
+}
+
+__aicore__ inline uint64_t GetDedupRouteMapIndex(const Params& params, int32_t sourceRank, int32_t tokenIndex,
+                                                 int32_t topkSlot)
+{
+    return (static_cast<uint64_t>(sourceRank) * params.tilingData->numMaxTokensPerRank + tokenIndex) *
+               params.tilingData->topK +
+           topkSlot;
+}
+
+__aicore__ inline int32_t FindExistingDedupRow(const Params& params, int32_t sourceRank, int32_t tokenIndex)
+{
+    __gm__ int32_t* routeRows = reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.dedupRouteRowPtr);
+    uint64_t tokenRouteBegin = GetDedupRouteMapIndex(params, sourceRank, tokenIndex, 0);
+    for (uint32_t slot = 0; slot < params.tilingData->topK; ++slot) {
+        int32_t row = ReadGmByPassDCache(routeRows + tokenRouteBegin + slot);
+        if (row >= 0) {
+            return row;
+        }
+    }
+    return -1;
+}
+
+__aicore__ inline void PublishDedupRouteRows(const Params& params, uint32_t globalRowBegin, uint32_t globalRowEnd)
+{
+    if (params.workspaceInfo.dedupRouteRowPtr == nullptr || globalRowBegin >= globalRowEnd) {
+        return;
+    }
+    __gm__ int32_t* routeRows = reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.dedupRouteRowPtr);
+    __gm__ int32_t* metaBase = reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr);
+    for (uint32_t row = globalRowBegin; row < globalRowEnd; ++row) {
+        __gm__ int32_t* record = metaBase + static_cast<uint64_t>(row) * META_INFO_SIZE;
+        int32_t sourceRank = ReadGmByPassDCache(record + RANK_ID);
+        int32_t tokenIndex = ReadGmByPassDCache(record + TOKEN_ID);
+        int32_t topkSlot = ReadGmByPassDCache(record + TOPK_INDEX);
+        uint64_t mapIndex = GetDedupRouteMapIndex(params, sourceRank, tokenIndex, topkSlot);
+        WriteGmByPassDCache(routeRows + mapIndex, static_cast<int32_t>(row));
+    }
+}
+
+template <bool IsBufferReuse, bool TopkWeightsPrefetch, typename ActivationType, typename QuantScaleType>
 __aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& context, const Params& params,
                                                      TokenDispatchScratch<ActivationType>& scratch, int32_t bufferIdx,
-                                                     int32_t topkIndex, int32_t remoteRankIdx, int32_t copyIdx,
+                                                     int32_t encodedTopkIndex, int32_t remoteRankIdx, int32_t copyIdx,
+                                                     GM_ADDR remoteRankBase,
                                                      GlobalTensor<ActivationType>& remoteRankGlobalTensor)
 {
     TEventID eventId = static_cast<TEventID>(bufferIdx);
     LocalTensor<ActivationType> copyTmpTensor = GetDispatchCopyBuffer(context, scratch, bufferIdx);
+    const bool deduplicateRoutes = UseDeduplicatedRoutes(params.tilingData);
+    int32_t topkIndex = deduplicateRoutes ? DecodeTopkIndex(encodedTopkIndex) : encodedTopkIndex;
     int32_t tokenIndex = topkIndex / static_cast<int32_t>(params.tilingData->topK);
+    int32_t topkSlot = topkIndex % static_cast<int32_t>(params.tilingData->topK);
     uint64_t remoteCopyOffset =
         static_cast<uint64_t>(tokenIndex) * static_cast<uint64_t>(context.quantTokenScaleAlignBytes);
     if constexpr (IsBufferReuse) {
         WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
     }
-    DataCopy(copyTmpTensor, remoteRankGlobalTensor[remoteCopyOffset], context.quantTokenScaleAlignBytes);
+    if (deduplicateRoutes) {
+        int32_t existingRow = FindExistingDedupRow(params, remoteRankIdx, tokenIndex);
+        if (existingRow >= 0) {
+            GlobalTensor<uint8_t> dispatchedData;
+            GlobalTensor<uint8_t> dispatchedScale;
+            dispatchedData.SetGlobalBuffer(
+                reinterpret_cast<__gm__ uint8_t*>(params.workspaceInfo.dispatchRevDataPtr));
+            dispatchedScale.SetGlobalBuffer(
+                reinterpret_cast<__gm__ uint8_t*>(params.workspaceInfo.dispatchRevScalePtr));
+            LocalTensor<uint8_t> copyTmpBytes = copyTmpTensor.template ReinterpretCast<uint8_t>();
+            uint32_t tokenCopyBytes = static_cast<uint32_t>(scratch.revTokenElemCnt * sizeof(ActivationType));
+            uint32_t scaleCopyBytes = static_cast<uint32_t>(scratch.revScaleElemCnt * sizeof(QuantScaleType));
+            DataCopyPad(copyTmpBytes, dispatchedData[static_cast<uint64_t>(existingRow) * tokenCopyBytes],
+                        {1U, tokenCopyBytes, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+            DataCopyPad(copyTmpBytes[context.quantTokenAlignBytes],
+                        dispatchedScale[static_cast<uint64_t>(existingRow) * scaleCopyBytes],
+                        {1U, scaleCopyBytes, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+        } else {
+            DataCopy(copyTmpTensor, remoteRankGlobalTensor[remoteCopyOffset], context.quantTokenScaleAlignBytes);
+        }
+    } else {
+        DataCopy(copyTmpTensor, remoteRankGlobalTensor[remoteCopyOffset], context.quantTokenScaleAlignBytes);
+    }
     SetFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
 
     // 与DS相同，DMA进行时由Scalar直接写路由metadata；保留原256B/row ABI，单独隔离协议收益。
@@ -141,7 +210,18 @@ __aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
                  static_cast<uint64_t>(copyIdx) * INT32_PER_256B;
     WriteGmByPassDCache(route + RANK_ID, remoteRankIdx);
     WriteGmByPassDCache(route + TOKEN_ID, tokenIndex);
-    WriteGmByPassDCache(route + TOPK_INDEX, topkIndex % static_cast<int32_t>(params.tilingData->topK));
+    WriteGmByPassDCache(route + TOPK_INDEX, topkSlot);
+    if (deduplicateRoutes) {
+        WriteGmByPassDCache(route + TERMINAL_ROUTE,
+                            (static_cast<uint32_t>(encodedTopkIndex) & TERMINAL_ROUTE_BIT) != 0U ? 1 : 0);
+        uint64_t weightOffset = context.quantWinOffset +
+                                static_cast<uint64_t>(tokenIndex) * context.quantTokenScaleAlignBytes +
+                                context.quantTokenAlignBytes + context.quantScaleAlignBytes +
+                                static_cast<uint64_t>(topkSlot) * sizeof(int32_t);
+        int32_t weightBits = ReadGmByPassDCache(
+            reinterpret_cast<__gm__ int32_t*>(remoteRankBase + weightOffset));
+        WriteGmByPassDCache(route + WEIGHT_INDEX, weightBits);
+    }
 }
 
 // copyIdx 是 workspace 绝对行号；待写行可能来自上一个 peer，不能再读取已复用的 route-index 缓冲。
@@ -205,11 +285,13 @@ __aicore__ inline void IssuePeerTokenCopies(const TokenDispatchConfig& context, 
         const auto route = reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.maskRecvPtr + copyStartIdx);
         int32_t topkIndex = ReadGmByPassDCache(route + issueIdx);
         if (progress.issuedRows < static_cast<uint32_t>(bufferCount)) {
-            FetchDispatchTokenAndMetaInfo<false, TopkWeightsPrefetch>(context, params, scratch, issueBufferIdx,
-                topkIndex, remoteRankIdx, rowDstOffset + issueIdx, remoteRankGlobalTensor);
+            FetchDispatchTokenAndMetaInfo<false, TopkWeightsPrefetch, ActivationType, QuantScaleType>(
+                context, params, scratch, issueBufferIdx, topkIndex, remoteRankIdx, rowDstOffset + issueIdx,
+                winRankAddr[remoteRankIdx], remoteRankGlobalTensor);
         } else {
-            FetchDispatchTokenAndMetaInfo<true, TopkWeightsPrefetch>(context, params, scratch, issueBufferIdx,
-                topkIndex, remoteRankIdx, rowDstOffset + issueIdx, remoteRankGlobalTensor);
+            FetchDispatchTokenAndMetaInfo<true, TopkWeightsPrefetch, ActivationType, QuantScaleType>(
+                context, params, scratch, issueBufferIdx, topkIndex, remoteRankIdx, rowDstOffset + issueIdx,
+                winRankAddr[remoteRankIdx], remoteRankGlobalTensor);
         }
         if (progress.pendingRow >= 0) {
             StoreDispatchTokenAndMetaInfo<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
@@ -273,6 +355,10 @@ __aicore__ inline void RetireDispatchReady(const MoeSyncWorkspaceLayout& syncLay
 {
     if (!state.pending) return;
     WaitFlag<HardEvent::MTE3_S>(static_cast<TEventID>(Aiv1AsyncEvents::DispatchDone));
+    if (UseDeduplicatedRoutes(params.tilingData)) {
+        PublishDedupRouteRows(params, state.completed.expertGlobalRowBegin + state.completed.localExpertRowBegin,
+                              state.completed.expertGlobalRowBegin + state.completed.localExpertRowEnd);
+    }
     PublishGmm1TileReady(syncLayout, params, state.expertIdx, static_cast<int32_t>(PipelineTileM),
                         static_cast<int32_t>(state.completed.localExpertRowBegin),
                         static_cast<int32_t>(state.completed.localExpertRowEnd), true);
@@ -325,6 +411,11 @@ __aicore__ inline void FinishDispatchOwnedRows(const TokenDispatchConfig& contex
         return;
     }
     DrainDispatchCopyBuffers<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch, progress);
+    if (UseDeduplicatedRoutes(params.tilingData)) {
+        SyncFuncStatic<AscendC::HardEvent::MTE3_S, SYNC_EVENT_ID5>();
+        PublishDedupRouteRows(params, completed.expertGlobalRowBegin + completed.localExpertRowBegin,
+                              completed.expertGlobalRowBegin + completed.localExpertRowEnd);
+    }
     PublishGmm1TileReady(syncLayout, params, expertIdx, static_cast<int32_t>(PipelineTileM),
                          static_cast<int32_t>(completed.localExpertRowBegin),
                          static_cast<int32_t>(completed.localExpertRowEnd));
