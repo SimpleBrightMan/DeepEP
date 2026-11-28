@@ -176,10 +176,17 @@ URMA_ROUTE_INLINE void CompileDeviceRoutes(Config& c, URMA_ROUTE_UB DeviceRouteI
         out.PackRows(cv, rows);
     }
     if (wave12) {
-        for (uint32_t first = 0U, wave = 0U; first < c.fragmentCount; first += 12U, ++wave) {
-            out.Batch(wave, ComputeBatch{first, RouteMin(12U, c.fragmentCount - first)});
-            out.Task(c.computeTaskCount++, ComputeBatchTask{ComputeBatchStage::Gmm1, wave});
-            out.Task(c.computeTaskCount++, ComputeBatchTask{ComputeBatchStage::Gmm2, wave});
+        uint32_t waves = 0U;
+        for (uint32_t first = 0U; first < c.fragmentCount; first += 12U, ++waves) {
+            out.Batch(waves, ComputeBatch{first, RouteMin(12U, c.fragmentCount - first)});
+        }
+        if (waves > 0U) {
+            out.Task(c.computeTaskCount++, ComputeBatchTask{ComputeBatchStage::Gmm1, 0U});
+            for (uint32_t w = 1U; w < waves; ++w) {
+                out.Task(c.computeTaskCount++, ComputeBatchTask{ComputeBatchStage::Gmm1, w});
+                out.Task(c.computeTaskCount++, ComputeBatchTask{ComputeBatchStage::Gmm2, w - 1U});
+            }
+            out.Task(c.computeTaskCount++, ComputeBatchTask{ComputeBatchStage::Gmm2, waves - 1U});
         }
     } else {
         uint32_t g1 = 0U, pending = 0U;
@@ -428,10 +435,17 @@ URMA_ROUTE_INLINE void EmitRouteTasks(const Config& c, URMA_ROUTE_UB DeviceRoute
 {
     uint32_t task = 0U;
     if (wave12) {
-        for (uint32_t first = 0U, wave = 0U; first < c.fragmentCount; first += 12U, ++wave) {
-            out.Batch(wave, ComputeBatch{first, RouteMin(12U, c.fragmentCount - first)});
-            out.Task(task++, ComputeBatchTask{ComputeBatchStage::Gmm1, wave});
-            out.Task(task++, ComputeBatchTask{ComputeBatchStage::Gmm2, wave});
+        uint32_t waves = 0U;
+        for (uint32_t first = 0U; first < c.fragmentCount; first += 12U, ++waves) {
+            out.Batch(waves, ComputeBatch{first, RouteMin(12U, c.fragmentCount - first)});
+        }
+        if (waves > 0U) {
+            out.Task(task++, ComputeBatchTask{ComputeBatchStage::Gmm1, 0U});
+            for (uint32_t w = 1U; w < waves; ++w) {
+                out.Task(task++, ComputeBatchTask{ComputeBatchStage::Gmm1, w});
+                out.Task(task++, ComputeBatchTask{ComputeBatchStage::Gmm2, w - 1U});
+            }
+            out.Task(task++, ComputeBatchTask{ComputeBatchStage::Gmm2, waves - 1U});
         }
     } else {
         for (uint32_t e = 0; e < S::kLocalExperts; ++e)

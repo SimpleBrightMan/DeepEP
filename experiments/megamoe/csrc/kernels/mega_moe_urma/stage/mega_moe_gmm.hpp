@@ -286,7 +286,9 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
         // resonance so full M=256 and tail M<256 groups balance across all AICs.
         for (uint32_t group = range.begin; group < range.end; ++group) {
             const uint64_t groupTileBegin = tileBegin + static_cast<uint64_t>(group - range.begin) * tilesPerGroup;
-            const uint32_t firstTile = FirstOwnedGroupTile(groupTileBegin, group, isGmm1, block, S::kCubeCores);
+            const uint32_t firstTile =
+                FirstOwnedGroupTile(groupTileBegin, group, isGmm1, block, S::kCubeCores, CommunicationWorkers<S>(),
+                                    tilesPerGroup);
             if (firstTile >= tilesPerGroup) continue;
             RunComputeFragment<S>(args, block, group, firstTile, isGmm1, pipeline, completion, timer);
             hasWork = true;

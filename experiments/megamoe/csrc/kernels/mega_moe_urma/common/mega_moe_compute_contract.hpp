@@ -222,8 +222,18 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t RoutedOwnerResidue(bool gmm1, uin
 // M=256 groups and partial tail groups across all CubeCores.
 MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t FirstOwnedGroupTile(uint64_t groupTileBegin, uint32_t group,
                                                                    bool gmm1, uint32_t core,
-                                                                   uint32_t cubeCores = kAic)
+                                                                   uint32_t cubeCores = kAic,
+                                                                   uint32_t commCores = 0U,
+                                                                   uint32_t tilesPerGroup = 0U)
 {
+    // Communication-paired AICs (core < commCores) experience UB mailbox backpressure
+    // while their paired AIV1 runs URMA Dispatch/Combine. Shed 1/6 of Gmm2 groups from
+    // comm cores onto non-comm AICs when all tiles still fit in one pass.
+    if (!gmm1 && commCores > 0U && cubeCores > commCores && tilesPerGroup > 0U &&
+        tilesPerGroup <= cubeCores - commCores && (group % 6U) == 0U) {
+        if (core < commCores) return tilesPerGroup;
+        return FirstOwnedComputeTile(groupTileBegin + group, core - commCores, cubeCores - commCores);
+    }
     return FirstOwnedComputeTile(groupTileBegin + group, RoutedOwnerResidue(gmm1, core, cubeCores), cubeCores);
 }
 

@@ -67,7 +67,7 @@ struct RoutedCompletionItem {
 
 // Production ownership iterator, independent of storage access. Tests compare
 // this cursor against a naive complete-task enumeration, including idle cores.
-template <class Plan, uint32_t CubeCores = kAic>
+template <class Plan, uint32_t CubeCores = kAic, uint32_t CommCores = 0U>
 class OwnedTileSequence {
 public:
     URMA_CURSOR_INLINE OwnedTileSequence(const Plan& p, uint32_t core) : plan_(p), core_(core) {}
@@ -88,7 +88,7 @@ public:
                 const auto first = plan_.Group(begin_);
                 base_ = gmm1_ ? first.gmm1TileBegin : first.gmm2TileBegin;
                 group_ = begin_;
-                tile_ = FirstOwnedGroupTile(base_, group_, gmm1_, core_, CubeCores);
+                tile_ = FirstOwnedGroupTile(base_, group_, gmm1_, core_, CubeCores, CommCores, tiles_);
                 active_ = true;
             }
             while (group_ < end_) {
@@ -104,7 +104,7 @@ public:
                 ++group_;
                 if (group_ < end_) {
                     const uint64_t groupTileBegin = base_ + static_cast<uint64_t>(group_ - begin_) * tiles_;
-                    tile_ = FirstOwnedGroupTile(groupTileBegin, group_, gmm1_, core_, CubeCores);
+                    tile_ = FirstOwnedGroupTile(groupTileBegin, group_, gmm1_, core_, CubeCores, CommCores, tiles_);
                 }
             }
             active_ = false;
@@ -255,7 +255,7 @@ public:
 
 private:
     DeviceRoutePlanView<S> plan_;
-    OwnedTileSequence<DeviceRoutePlanView<S>, S::kCubeCores> sequence_;
+    OwnedTileSequence<DeviceRoutePlanView<S>, S::kCubeCores, CommunicationWorkers<S>()> sequence_;
 };
 __aicore__ inline __gm__ int32_t* RoutedIssued(const Arguments& a, uint32_t core)
 {

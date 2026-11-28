@@ -150,6 +150,7 @@ __aicore__ inline void ProcessRouted(Arguments& args)
 template <class S, class T>
 __aicore__ inline void RunSharedComputeSequence(Arguments& a, uint32_t block, T& timer, Timer& routeTimer)
 {
+    if constexpr (g_coreType == AIC) WaitRouteSummary(a, routeTimer);
     RunSharedGmm<S, true>(a, block, timer);
     if constexpr (g_coreType == AIC) {
         // SharedMxGmm (including its destructor) no longer owns L1/events.
@@ -159,9 +160,6 @@ __aicore__ inline void RunSharedComputeSequence(Arguments& a, uint32_t block, T&
         // Do not wait for routed compute/shared GMM2: that would create a cycle
         // with the remaining Dispatch data needed by the routed experts.
         if (a.config.bs < 4096U) AtomicAdd(LocalCompletionFlag(a, kLocalFlagSharedGmm1Done), 1);
-        // SharedGmm1 has no dependency on RouteSummary; acquire RouteSummary
-        // right before routed compute so SharedGmm1 overlaps RouteSummary.
-        WaitRouteSummary(a, routeTimer);
     }
     RunCubeAndPrologue<S>(a, block, timer);
     if constexpr (g_coreType == AIC) MarkCubeComplete(a);  // routed self-return is ready before Shared GMM2
