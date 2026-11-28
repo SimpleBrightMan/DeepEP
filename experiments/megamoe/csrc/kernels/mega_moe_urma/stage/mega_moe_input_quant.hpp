@@ -27,16 +27,18 @@ __aicore__ inline void QuantizeInputBf16ToMxfp8(const Arguments& a, uint32_t wor
 
     constexpr uint32_t kHidden = S::kHidden;
     constexpr uint32_t kScaleCols = kHidden / 32U;
-    // Max 16384 elements per chunk: 32 KiB BF16 + 16 KiB FP8 + 4 KiB scales/scratch < 64 KiB UB.
-    // Keeps every DMA transfer <= 32 KiB (well within DataCopy/DataCopyPad limits).
+    // Ping-pong double-buffered chunks: 2 x 60 KiB = 120 KiB UB (< 248 KiB).
+    // Overlaps MTE2 load of chunk (i+1) with Vector quant + MTE3 store of chunk i.
     constexpr uint32_t kMaxChunkRows = 16384U / kHidden;
     static_assert(kMaxChunkRows >= 1U && kHidden % 256U == 0U);
 
-    constexpr uint32_t kBf16UbOffset = 0U;
-    constexpr uint32_t kFp8UbOffset = 32U * 1024U;
-    constexpr uint32_t kMaxExpUbOffset = 48U * 1024U;
-    constexpr uint32_t kScaleUbOffset = 52U * 1024U;
-    constexpr uint32_t kRecipUbOffset = 56U * 1024U;
+    constexpr uint32_t kBufStride = 60U * 1024U;
+    constexpr uint32_t kBf16Off = 0U;
+    constexpr uint32_t kFp8Off = 32U * 1024U;
+    constexpr uint32_t kMaxExpOff = 48U * 1024U;
+    constexpr uint32_t kScaleOff = 52U * 1024U;
+    constexpr uint32_t kRecipOff = 56U * 1024U;
+    static_assert(2U * kBufStride <= kRequiredUbBytes);
 
     GlobalTensor<bfloat16_t> srcGm;
     GlobalTensor<uint8_t> dstX, dstScale;
@@ -44,19 +46,30 @@ __aicore__ inline void QuantizeInputBf16ToMxfp8(const Arguments& a, uint32_t wor
     dstX.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(a.quantX));
     dstScale.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(a.quantXScale));
 
-    LocalTensor<bfloat16_t> bf16Ub(TPosition::VECCALC, kBf16UbOffset, kMaxChunkRows * kHidden);
-    LocalTensor<uint8_t> fp8Ub(TPosition::VECCALC, kFp8UbOffset, kMaxChunkRows * kHidden);
-    LocalTensor<uint16_t> maxExpUb(TPosition::VECCALC, kMaxExpUbOffset, kMaxChunkRows * kScaleCols);
-    LocalTensor<uint8_t> scaleUb(TPosition::VECCALC, kScaleUbOffset, kMaxChunkRows * kScaleCols);
-    LocalTensor<uint16_t> recipUb(TPosition::VECCALC, kRecipUbOffset, kMaxChunkRows * kScaleCols);
+    LocalTensor<bfloat16_t> bf16Ub[2] = {
+        LocalTensor<bfloat16_t>(TPosition::VECCALC, kBf16Off, kMaxChunkRows * kHidden),
+        LocalTensor<bfloat16_t>(TPosition::VECCALC, kBufStride + kBf16Off, kMaxChunkRows * kHidden)};
+    LocalTensor<uint8_t> fp8Ub[2] = {
+        LocalTensor<uint8_t>(TPosition::VECCALC, kFp8Off, kMaxChunkRows * kHidden),
+        LocalTensor<uint8_t>(TPosition::VECCALC, kBufStride + kFp8Off, kMaxChunkRows * kHidden)};
+    LocalTensor<uint16_t> maxExpUb[2] = {
+        LocalTensor<uint16_t>(TPosition::VECCALC, kMaxExpOff, kMaxChunkRows * kScaleCols),
+        LocalTensor<uint16_t>(TPosition::VECCALC, kBufStride + kMaxExpOff, kMaxChunkRows * kScaleCols)};
+    LocalTensor<uint8_t> scaleUb[2] = {
+        LocalTensor<uint8_t>(TPosition::VECCALC, kScaleOff, kMaxChunkRows * kScaleCols),
+        LocalTensor<uint8_t>(TPosition::VECCALC, kBufStride + kScaleOff, kMaxChunkRows * kScaleCols)};
+    LocalTensor<uint16_t> recipUb[2] = {
+        LocalTensor<uint16_t>(TPosition::VECCALC, kRecipOff, kMaxChunkRows * kScaleCols),
+        LocalTensor<uint16_t>(TPosition::VECCALC, kBufStride + kRecipOff, kMaxChunkRows * kScaleCols)};
 
-    auto* bf16Ptr = reinterpret_cast<__ubuf__ bfloat16_t*>(bf16Ub.GetPhyAddr());
-    auto* fp8Ptr = reinterpret_cast<__ubuf__ int8_t*>(fp8Ub.GetPhyAddr());
-    auto* maxExpPtr = reinterpret_cast<__ubuf__ uint16_t*>(maxExpUb.GetPhyAddr());
-    auto* scalePtr = reinterpret_cast<__ubuf__ uint16_t*>(scaleUb.GetPhyAddr());
-    auto* recipPtr = reinterpret_cast<__ubuf__ uint16_t*>(recipUb.GetPhyAddr());
+    SetCtrlSpr<60, 60>(0);
+    SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
+    SetFlag<HardEvent::V_MTE2>(EVENT_ID1);
+    SetFlag<HardEvent::MTE3_V>(EVENT_ID0);
+    SetFlag<HardEvent::MTE3_V>(EVENT_ID1);
 
     uint64_t offset = 0U;
+    uint32_t ping = 0U;
     while (offset < ownedRows) {
         const uint32_t rows = static_cast<uint32_t>(
             ownedRows - offset < kMaxChunkRows ? ownedRows - offset : kMaxChunkRows);
@@ -65,28 +78,40 @@ __aicore__ inline void QuantizeInputBf16ToMxfp8(const Arguments& a, uint32_t wor
         const uint16_t dataLoops = static_cast<uint16_t>(elems / 256U);
         const uint16_t scaleLoops = static_cast<uint16_t>((scaleCount + 127U) / 128U);
         const uint64_t gmRow = rowBegin + offset;
+        const TEventID ev = ping ? EVENT_ID1 : EVENT_ID0;
 
-        DataCopy(bf16Ub, srcGm[gmRow * kHidden], elems);
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE2>(ev);
+        DataCopy(bf16Ub[ping], srcGm[gmRow * kHidden], elems);
+        SetFlag<HardEvent::MTE2_V>(ev);
 
-        SetCtrlSpr<60, 60>(0);
+        WaitFlag<HardEvent::MTE2_V>(ev);
+        WaitFlag<HardEvent::MTE3_V>(ev);
+        auto* bf16Ptr = reinterpret_cast<__ubuf__ bfloat16_t*>(bf16Ub[ping].GetPhyAddr());
+        auto* fp8Ptr = reinterpret_cast<__ubuf__ int8_t*>(fp8Ub[ping].GetPhyAddr());
+        auto* maxExpPtr = reinterpret_cast<__ubuf__ uint16_t*>(maxExpUb[ping].GetPhyAddr());
+        auto* scalePtr = reinterpret_cast<__ubuf__ uint16_t*>(scaleUb[ping].GetPhyAddr());
+        auto* recipPtr = reinterpret_cast<__ubuf__ uint16_t*>(recipUb[ping].GetPhyAddr());
         UrmaMegaMoeImpl::MxQuant::ComputeGroupMaxExp(bf16Ptr, maxExpPtr, elems, dataLoops);
         PipeBarrier<PIPE_V>();
         UrmaMegaMoeImpl::MxQuant::ComputeMxScale<fp8_e4m3fn_t>(maxExpPtr, scalePtr, recipPtr, scaleCount, scaleLoops);
         PipeBarrier<PIPE_V>();
         UrmaMegaMoeImpl::MxQuant::QuantizeMxFp8Data<fp8_e4m3fn_t>(bf16Ptr, recipPtr, fp8Ptr, elems, dataLoops);
+        SetFlag<HardEvent::V_MTE2>(ev);
+        SetFlag<HardEvent::V_MTE3>(ev);
 
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        DataCopy(dstX[gmRow * kHidden], fp8Ub, elems);
-        DataCopyPad(dstScale[gmRow * kScaleCols], scaleUb, {1U, scaleCount, 0U, 0U, 0U});
-        SetFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
+        WaitFlag<HardEvent::V_MTE3>(ev);
+        DataCopy(dstX[gmRow * kHidden], fp8Ub[ping], elems);
+        DataCopyPad(dstScale[gmRow * kScaleCols], scaleUb[ping], {1U, scaleCount, 0U, 0U, 0U});
+        SetFlag<HardEvent::MTE3_V>(ev);
+
         offset += rows;
+        ping ^= 1U;
     }
-    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+    WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+    WaitFlag<HardEvent::V_MTE2>(EVENT_ID1);
+    WaitFlag<HardEvent::MTE3_V>(EVENT_ID0);
+    WaitFlag<HardEvent::MTE3_V>(EVENT_ID1);
+    PipeBarrier<PIPE_ALL>();
 }
 
 __aicore__ inline float DecodeFp8E4M3ToFloat(uint8_t code)

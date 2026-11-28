@@ -605,7 +605,7 @@ public:
         while (HasPending()) ConsumeOne();
     }
 
-    __aicore__ inline void Finish()
+    __aicore__ inline void Finish(bool finalBarrier = true)
     {
         using namespace AscendC;
         SubmitPendingCompute();
@@ -619,7 +619,7 @@ public:
         for (uint32_t slot = 0U; slot < Ub::outputs; ++slot) {
             WaitFlag<HardEvent::MTE3_V>(static_cast<TEventID>(slot));
         }
-        PipeBarrier<PIPE_ALL>();
+        if (finalBarrier) PipeBarrier<PIPE_ALL>();
     }
 
 private:
@@ -642,7 +642,7 @@ private:
 
 template <class S, bool FuseShared, typename TraceSink, class Observer>
 __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uint32_t workers, uint32_t column,
-                                     TraceSink& timer, Observer& observer)
+                                     TraceSink& timer, Observer& observer, uint64_t& sharedReadyMask)
 {
     constexpr uint32_t TopK = S::kTopK;
     using namespace AscendC;
@@ -669,7 +669,6 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uin
     pipeline.Init(args, firstToken, column, columns);
     bool allInputsReady = GenericAllReduceInputsReady<S>(args);
     if (allInputsReady) GenericGateReduceInputs();
-    uint64_t sharedReadyMask = 0U;
     constexpr int32_t kSharedGmm2TilesPerGroup = static_cast<int32_t>(S::kHidden / 256U);
     static_assert(TopK >= 1U && TopK <= ReduceUbContract::topk);
     if (column == 0U) {
@@ -743,7 +742,7 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uin
             }
         }
     }
-    pipeline.Finish();
+    pipeline.Finish(column + Ub::hidden >= S::kHidden);
     TraceMeta meta;
     meta.row = firstToken;
     meta.rows = owned;
@@ -760,10 +759,11 @@ struct NoReduceObserver {
 template <class S, bool FuseShared, class T, class O>
 __aicore__ inline void ReduceGeneric(const Arguments& a, uint32_t worker, uint32_t workers, T& timer, O& observer)
 {
+    uint64_t sharedReadyMask = 0U;
     // The active TopK is part of the binary identity, so the route stride is a
     // compile-time constant rather than a per-token division.
     for (uint32_t col = 0; col < S::kHidden; col += GenericReduce::ReduceUbContract::hidden)
-        GenericReduce::ReduceColumns<S, FuseShared>(a, worker, workers, col, timer, observer);
+        GenericReduce::ReduceColumns<S, FuseShared>(a, worker, workers, col, timer, observer, sharedReadyMask);
 }
 template <class S, class T>
 __aicore__ inline void ReduceGeneric(const Arguments& a, uint32_t worker, uint32_t workers, T& timer)

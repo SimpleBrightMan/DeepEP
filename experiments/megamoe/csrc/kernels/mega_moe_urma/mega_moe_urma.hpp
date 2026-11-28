@@ -219,7 +219,12 @@ __aicore__ inline void ProcessShared(Arguments& a)
         ReduceGeneric<S, true>(a, LocalWorkerIndex(block, 0U), S::kVectorCores, timer, observer);
         timer.CoarseEnd(CoarsePhase::Reduce);
     } else {
-        if (block < comm) PublishPeerStart<S>(a, block, timer);
+        if (block < comm) {
+            PublishPeerStart<S>(a, block, timer);
+            // Reclaim previous invocation's completed CQEs while Pack is warming up,
+            // avoiding a blocking tail Quiet() after Reduce.
+            if (a.config.epoch > 1U) Quiet(PeerForOwner(a.config.rank, block));
+        }
         timer.CoarseBegin(CoarsePhase::Pack);
         PackBatch<S> pack(a, timer);
         for (uint32_t round = 0; round < kPackStartupRounds; ++round)
@@ -233,11 +238,6 @@ __aicore__ inline void ProcessShared(Arguments& a)
         ReduceGeneric<S, true>(a, LocalWorkerIndex(block, 1U), S::kVectorCores, timer, incoming);
         timer.CoarseEnd(CoarsePhase::Reduce);
         if (block < comm) {
-            const auto start = timer.TraceBegin();
-            Quiet(PeerForOwner(a.config.rank, block));
-            TraceMeta completion;
-            completion.peer = PeerForOwner(a.config.rank, block);
-            timer.TraceEnd(TraceEvent::CombineSendComplete, start, completion);
             while (!ObserveIncomingCompletion<S>(a, block, incoming.peer, incoming.self)) {
                 const auto t = GetSystemCycle();
                 while (GetSystemCycle() - t < 200U) {
