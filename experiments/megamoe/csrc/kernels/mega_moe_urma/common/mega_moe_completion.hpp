@@ -79,25 +79,33 @@ public:
                 const auto batch = plan_.Batch(task.batchIndex);
                 gmm1_ = task.stage == ComputeBatchStage::Gmm1;
                 begin_ = batch.fragmentBegin;
+                end_ = begin_ + batch.fragmentCount;
                 tiles_ = plan_.Tiles(gmm1_);
-                limit_ = uint64_t(batch.fragmentCount) * tiles_;
-                if (limit_ == 0U) {
+                if (begin_ == end_ || tiles_ == 0U) {
                     ++step_;
                     continue;
                 }
                 const auto first = plan_.Group(begin_);
-                const uint64_t base = gmm1_ ? first.gmm1TileBegin : first.gmm2TileBegin;
-                next_ = FirstOwnedComputeTile(base, RoutedOwnerResidue(gmm1_, core_, CubeCores), CubeCores);
+                base_ = gmm1_ ? first.gmm1TileBegin : first.gmm2TileBegin;
+                group_ = begin_;
+                tile_ = FirstOwnedGroupTile(base_, group_, gmm1_, core_, CubeCores);
                 active_ = true;
             }
-            if (next_ < limit_) {
-                item.gmm1 = gmm1_;
-                item.group = begin_ + static_cast<uint32_t>(next_ / tiles_);
-                item.tile = static_cast<uint32_t>(next_ % tiles_);
-                item.fragment = plan_.Group(item.group);
-                item.logicalTile = (gmm1_ ? item.fragment.gmm1TileBegin : item.fragment.gmm2TileBegin) + item.tile;
-                next_ += CubeCores;
-                return true;
+            while (group_ < end_) {
+                if (tile_ < tiles_) {
+                    item.gmm1 = gmm1_;
+                    item.group = group_;
+                    item.tile = tile_;
+                    item.fragment = plan_.Group(group_);
+                    item.logicalTile = (gmm1_ ? item.fragment.gmm1TileBegin : item.fragment.gmm2TileBegin) + tile_;
+                    tile_ += CubeCores;
+                    return true;
+                }
+                ++group_;
+                if (group_ < end_) {
+                    const uint64_t groupTileBegin = base_ + static_cast<uint64_t>(group_ - begin_) * tiles_;
+                    tile_ = FirstOwnedGroupTile(groupTileBegin, group_, gmm1_, core_, CubeCores);
+                }
             }
             active_ = false;
             ++step_;
@@ -107,8 +115,8 @@ public:
 
 private:
     const Plan& plan_;
-    uint32_t core_, step_ = 0U, begin_ = 0U, tiles_ = 0U;
-    uint64_t next_ = 0U, limit_ = 0U;
+    uint32_t core_, step_ = 0U, begin_ = 0U, end_ = 0U, group_ = 0U, tile_ = 0U, tiles_ = 0U;
+    uint64_t base_ = 0U;
     bool active_ = false, gmm1_ = false;
 };
 }  // namespace MegaMoeUrma

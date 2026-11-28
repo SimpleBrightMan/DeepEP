@@ -217,6 +217,16 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t RoutedOwnerResidue(bool gmm1, uin
     return gmm1 ? cubeCores - 1U - core : core;
 }
 
+// Per-group coprime phase shift (+ group) breaks gcd(tilesPerGroup, cubeCores)
+// resonance (e.g. tilesPerGroup=12 or 16 on 32 AICs), evenly distributing full
+// M=256 groups and partial tail groups across all CubeCores.
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t FirstOwnedGroupTile(uint64_t groupTileBegin, uint32_t group,
+                                                                   bool gmm1, uint32_t core,
+                                                                   uint32_t cubeCores = kAic)
+{
+    return FirstOwnedComputeTile(groupTileBegin + group, RoutedOwnerResidue(gmm1, core, cubeCores), cubeCores);
+}
+
 struct OwnedComputeGroup {
     uint32_t group;
     uint32_t firstTile;

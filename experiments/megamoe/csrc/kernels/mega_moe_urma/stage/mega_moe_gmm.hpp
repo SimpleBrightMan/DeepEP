@@ -282,18 +282,14 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
         const bool isGmm1 = task.stage == ComputeBatchStage::Gmm1;
         const uint64_t tileBegin = isGmm1 ? first.gmm1TileBegin : first.gmm2TileBegin;
         const uint32_t tilesPerGroup = isGmm1 ? FragmentGmm1Tiles<S>(args, first) : FragmentGmm2Tiles<S>(args, first);
-        const uint64_t tileLimit = static_cast<uint64_t>(range.end - range.begin) * tilesPerGroup;
-        // Jump directly between this core's groups before loading their GM
-        // descriptors or building matmul configs. AIC/AIV0 keep identical
-        // tile order and close the context on their last owned group.
-        for (uint64_t tile = FirstOwnedComputeTile(tileBegin, RoutedOwnerResidue(isGmm1, block, S::kCubeCores), S::kCubeCores);
-             tile < tileLimit;) {
-            const auto owned = OwnedComputeGroupAt(tile, tilesPerGroup, S::kCubeCores);
-            const uint64_t nextTile = tile + static_cast<uint64_t>(owned.tileCount) * S::kCubeCores;
-            const uint32_t fragmentIndex = range.begin + owned.group;
-            RunComputeFragment<S>(args, block, fragmentIndex, owned.firstTile, isGmm1, pipeline, completion, timer);
+        // Rotate group ownership by +group to break gcd(tilesPerGroup, kCubeCores)
+        // resonance so full M=256 and tail M<256 groups balance across all AICs.
+        for (uint32_t group = range.begin; group < range.end; ++group) {
+            const uint64_t groupTileBegin = tileBegin + static_cast<uint64_t>(group - range.begin) * tilesPerGroup;
+            const uint32_t firstTile = FirstOwnedGroupTile(groupTileBegin, group, isGmm1, block, S::kCubeCores);
+            if (firstTile >= tilesPerGroup) continue;
+            RunComputeFragment<S>(args, block, group, firstTile, isGmm1, pipeline, completion, timer);
             hasWork = true;
-            tile = nextTile;
         }
     }
     if constexpr (g_coreType == AIC) completion.Finish(timer);
