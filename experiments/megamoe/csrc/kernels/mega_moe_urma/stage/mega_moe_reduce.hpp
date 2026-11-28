@@ -74,6 +74,7 @@ struct ReduceUbContract {
     static constexpr uint32_t inputs = 6U;
     static constexpr uint32_t outputs = 2U;
     static constexpr uint32_t readyGateEvent = 6U;
+    static constexpr uint32_t sharedEvent = 7U;
     static constexpr uint32_t maxTokens = (8192U + kReduceWorkers - 1U) / kReduceWorkers;
     static constexpr uint32_t maxRoutes = maxTokens * topk;
     static constexpr uint32_t maxRemoteDependencies = kWorld * 512U;
@@ -381,6 +382,7 @@ struct ReduceUbContract {
     static constexpr uint32_t inputs = 6U;
     static constexpr uint32_t outputs = 2U;
     static constexpr uint32_t readyGateEvent = 6U;
+    static constexpr uint32_t sharedEvent = 7U;
     static constexpr uint32_t maxTokens = (kMaxTokensPerRank + kReduceWorkers - 1U) / kReduceWorkers;
     static constexpr uint32_t maxRoutes = maxTokens * topk;
     static constexpr uint32_t maxRemoteDependencies = kWorld * kMaxPeerChunks;
@@ -480,7 +482,7 @@ __aicore__ inline void GenericGateReduceInputs()
 // slot metadata, not a queue waiting for a batch of ready tokens to accumulate.
 // Consumer commands are submitted before reusing a full slot; no token switch
 // resets events or drains any hardware engine.
-template <typename Element, class S, bool KeepFp32 = false, uint32_t TopK = S::kTopK>
+template <typename Element, class S, bool FuseShared = false, uint32_t TopK = S::kTopK>
 class ReduceRoutePipeline {
 public:
     __aicore__ inline void Init(const Arguments& args, uint64_t firstToken, uint32_t column, uint32_t columns)
@@ -493,13 +495,17 @@ public:
         columns_ = columns;
         returned_.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(args.symmetric + args.config.returnYOffset));
         returned_.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
-        output_.SetGlobalBuffer(reinterpret_cast<__gm__ Output*>(KeepFp32 ? args.sharedRoutedOutput : args.output));
+        output_.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(args.output));
+        if constexpr (FuseShared) {
+            sharedOut_.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(args.sharedOutput));
+            sharedInUb_ = LocalTensor<Element>(TPosition::VECCALC, Ub::end, Ub::hidden);
+            sharedFp32Ub_ = LocalTensor<float>(TPosition::VECCALC, Ub::end + Ub::bf16RowBytes, Ub::hidden);
+            static_assert(Ub::end + Ub::bf16RowBytes + Ub::fp32RowBytes <= kRequiredUbBytes);
+        }
         inputs_ = LocalTensor<Element>(TPosition::VECCALC, Ub::inputBf16Offset, Ub::inputs * Ub::hidden);
         terms_ = LocalTensor<float>(TPosition::VECCALC, Ub::inputFp32Offset, Ub::inputs * Ub::hidden);
         accumulator_ = LocalTensor<float>(TPosition::VECCALC, Ub::accumulatorOffset, Ub::hidden);
-        outputs_ =
-            LocalTensor<Output>(TPosition::VECCALC, KeepFp32 ? Ub::end : Ub::outputOffset, Ub::outputs * Ub::hidden);
-        static_assert(Ub::end + Ub::outputs * Ub::fp32RowBytes <= kRequiredUbBytes);
+        outputs_ = LocalTensor<Element>(TPosition::VECCALC, Ub::outputOffset, Ub::outputs * Ub::hidden);
         inverse_ = LocalTensor<int64_t>(TPosition::VECCALC, Ub::inverseOffset, Ub::maxRoutes);
         weights_ = LocalTensor<float>(TPosition::VECCALC, Ub::weightsOffset, Ub::maxRoutes);
         routes_ = LocalTensor<uint32_t>(TPosition::VECCALC, Ub::routeRingOffset, Ub::inputs);
@@ -508,6 +514,9 @@ public:
         }
         for (uint32_t slot = 0U; slot < Ub::outputs; ++slot) {
             SetFlag<HardEvent::MTE3_V>(static_cast<TEventID>(slot));
+        }
+        if constexpr (FuseShared) {
+            SetFlag<HardEvent::V_MTE2>(static_cast<TEventID>(Ub::sharedEvent));
         }
         SetFlag<HardEvent::MTE2_S>(static_cast<TEventID>(Ub::readyGateEvent));
     }
@@ -521,6 +530,7 @@ public:
     __aicore__ inline void SubmitToken(uint32_t token)
     {
         using namespace AscendC;
+        constexpr uint32_t kPrefetchSlot = TopK >= 2U ? TopK - 2U : 0U;
         for (uint32_t topk = 0U; topk < TopK; ++topk) {
             if (submitted_ - consumed_ == Ub::inputs) ConsumeOne();
             const uint32_t route = token * TopK + topk;
@@ -531,6 +541,16 @@ public:
             WaitFlag<HardEvent::V_MTE2>(event);
             DataCopy(inputs_[slot * Ub::hidden], returned_[row * stride_ + column_], columns_);
             SetFlag<HardEvent::MTE2_V>(event);
+            if constexpr (FuseShared) {
+                if (topk == kPrefetchSlot) {
+                    // Drain any prior token's final topk so sharedInUb_ is free before prefetching.
+                    while (submitted_ - consumed_ >= TopK - 1U) ConsumeOne();
+                    const auto sharedEv = static_cast<TEventID>(Ub::sharedEvent);
+                    WaitFlag<HardEvent::V_MTE2>(sharedEv);
+                    DataCopy(sharedInUb_, sharedOut_[(firstToken_ + token) * stride_ + column_], columns_);
+                    SetFlag<HardEvent::MTE2_V>(sharedEv);
+                }
+            }
             ++submitted_;
         }
     }
@@ -559,16 +579,22 @@ public:
         if (topk == TopK - 1U) {
             const uint32_t outputSlot = (consumed_ / TopK) % Ub::outputs;
             const auto outputEvent = static_cast<TEventID>(outputSlot);
-            LocalTensor<Output> result = outputs_[outputSlot * Ub::hidden];
+            const uint64_t outOffset = (firstToken_ + route / TopK) * stride_ + column_;
+            LocalTensor<Element> result = outputs_[outputSlot * Ub::hidden];
+            if constexpr (FuseShared) {
+                const auto sharedEv = static_cast<TEventID>(Ub::sharedEvent);
+                WaitFlag<HardEvent::MTE2_V>(sharedEv);
+                Cast(sharedFp32Ub_, sharedInUb_, RoundMode::CAST_NONE, columns_);
+                SetFlag<HardEvent::V_MTE2>(sharedEv);
+                PipeBarrier<PIPE_V>();
+                Add(accumulator_, accumulator_, sharedFp32Ub_, columns_);
+            }
             WaitFlag<HardEvent::MTE3_V>(outputEvent);
             PipeBarrier<PIPE_V>();
-            if constexpr (KeepFp32)
-                DataCopy(result, accumulator_, columns_);
-            else
-                Cast(result, accumulator_, RoundMode::CAST_RINT, columns_);
+            Cast(result, accumulator_, RoundMode::CAST_RINT, columns_);
             SetFlag<HardEvent::V_MTE3>(outputEvent);
             WaitFlag<HardEvent::V_MTE3>(outputEvent);
-            DataCopy(output_[(firstToken_ + route / TopK) * stride_ + column_], result, columns_);
+            DataCopy(output_[outOffset], result, columns_);
             SetFlag<HardEvent::MTE3_V>(outputEvent);
         }
         ++consumed_;
@@ -584,6 +610,9 @@ public:
         using namespace AscendC;
         SubmitPendingCompute();
         WaitFlag<HardEvent::MTE2_S>(static_cast<TEventID>(Ub::readyGateEvent));
+        if constexpr (FuseShared) {
+            WaitFlag<HardEvent::V_MTE2>(static_cast<TEventID>(Ub::sharedEvent));
+        }
         for (uint32_t slot = 0U; slot < Ub::inputs; ++slot) {
             WaitFlag<HardEvent::V_MTE2>(static_cast<TEventID>(slot));
         }
@@ -595,22 +624,23 @@ public:
 
 private:
     using Ub = ReduceUbContract;
-    using Output = std::conditional_t<KeepFp32, float, Element>;
     uint64_t firstToken_ = 0U;
     bool applyRouteWeight_ = true;
     uint32_t stride_ = 0, column_ = 0, columns_ = 0;
     uint32_t submitted_ = 0U;
     uint32_t consumed_ = 0U;
     AscendC::GlobalTensor<Element> returned_;
-    AscendC::GlobalTensor<Output> output_;
+    AscendC::GlobalTensor<Element> output_;
+    AscendC::GlobalTensor<Element> sharedOut_;
     AscendC::LocalTensor<Element> inputs_;
-    AscendC::LocalTensor<Output> outputs_;
-    AscendC::LocalTensor<float> terms_, accumulator_, weights_;
+    AscendC::LocalTensor<Element> outputs_;
+    AscendC::LocalTensor<Element> sharedInUb_;
+    AscendC::LocalTensor<float> terms_, accumulator_, weights_, sharedFp32Ub_;
     AscendC::LocalTensor<int64_t> inverse_;
     AscendC::LocalTensor<uint32_t> routes_;
 };
 
-template <class S, bool KeepFp32, typename TraceSink, class Observer>
+template <class S, bool FuseShared, typename TraceSink, class Observer>
 __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uint32_t workers, uint32_t column,
                                      TraceSink& timer, Observer& observer)
 {
@@ -634,11 +664,13 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uin
     LocalTensor<uint32_t> remoteCache(TPosition::VECCALC, Ub::remoteCacheOffset, Ub::remoteCacheBytes / 4U);
     LocalTensor<uint32_t> selfCache(TPosition::VECCALC, Ub::selfCacheOffset, Ub::selfCacheBytes / 4U);
     LocalTensor<uint32_t> issued(TPosition::VECCALC, Ub::issuedOffset, Ub::issuedBytes / 4U);
-    ReduceRoutePipeline<bfloat16_t, S, KeepFp32, TopK> pipeline;
+    ReduceRoutePipeline<bfloat16_t, S, FuseShared, TopK> pipeline;
     const uint32_t columns = S::kHidden - column < Ub::hidden ? S::kHidden - column : Ub::hidden;
     pipeline.Init(args, firstToken, column, columns);
     bool allInputsReady = GenericAllReduceInputsReady<S>(args);
     if (allInputsReady) GenericGateReduceInputs();
+    uint64_t sharedReadyMask = 0U;
+    constexpr int32_t kSharedGmm2TilesPerGroup = static_cast<int32_t>(S::kHidden / 256U);
     static_assert(TopK >= 1U && TopK <= ReduceUbContract::topk);
     if (column == 0U) {
         // These three arrays are outside the column payload scratch and remain
@@ -670,6 +702,19 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uin
         bool progress = false;
         for (uint32_t token = 0U; token < owned; ++token) {
             if (GenericReduceBitSet(issued, token)) continue;
+            if constexpr (FuseShared) {
+                const uint32_t sharedGroup = static_cast<uint32_t>((firstToken + token) / 256U);
+                if ((sharedReadyMask & (uint64_t{1} << sharedGroup)) == 0U) {
+                    auto* sharedFlag = reinterpret_cast<__gm__ int32_t*>(
+                        args.sharedRoutedOutput + static_cast<uint64_t>(sharedGroup) * kFlagBytes);
+                    if (ReadGmByPassDCache(sharedFlag) < kSharedGmm2TilesPerGroup) {
+                        if (pipeline.HasPending()) pipeline.ConsumeOne();
+                        continue;
+                    }
+                    sharedReadyMask |= (uint64_t{1} << sharedGroup);
+                    GenericGateReduceInputs();
+                }
+            }
             if (!allInputsReady) {
                 if (probes != 0U && (probes & 7U) == 0U) {
                     allInputsReady = GenericAllReduceInputsReady<S>(args);
@@ -702,7 +747,7 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uin
     TraceMeta meta;
     meta.row = firstToken;
     meta.rows = owned;
-    meta.bytes = static_cast<uint64_t>(owned) * columns * (KeepFp32 ? 4U : 2U);
+    meta.bytes = static_cast<uint64_t>(owned) * columns * 2U;
     timer.TraceEnd(TraceEvent::Reduce, reduceStart, meta);
 }
 
@@ -712,13 +757,13 @@ namespace MegaMoeUrma {
 struct NoReduceObserver {
     __aicore__ inline void Poll() {}
 };
-template <class S, bool KeepFp32, class T, class O>
+template <class S, bool FuseShared, class T, class O>
 __aicore__ inline void ReduceGeneric(const Arguments& a, uint32_t worker, uint32_t workers, T& timer, O& observer)
 {
     // The active TopK is part of the binary identity, so the route stride is a
     // compile-time constant rather than a per-token division.
     for (uint32_t col = 0; col < S::kHidden; col += GenericReduce::ReduceUbContract::hidden)
-        GenericReduce::ReduceColumns<S, KeepFp32>(a, worker, workers, col, timer, observer);
+        GenericReduce::ReduceColumns<S, FuseShared>(a, worker, workers, col, timer, observer);
 }
 template <class S, class T>
 __aicore__ inline void ReduceGeneric(const Arguments& a, uint32_t worker, uint32_t workers, T& timer)

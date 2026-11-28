@@ -148,7 +148,7 @@ __aicore__ inline void ProcessRouted(Arguments& args)
 }
 
 template <class S, class T>
-__aicore__ inline void RunSharedComputeSequence(const Arguments& a, uint32_t block, T& timer)
+__aicore__ inline void RunSharedComputeSequence(Arguments& a, uint32_t block, T& timer, Timer& routeTimer)
 {
     RunSharedGmm<S, true>(a, block, timer);
     if constexpr (g_coreType == AIC) {
@@ -159,6 +159,9 @@ __aicore__ inline void RunSharedComputeSequence(const Arguments& a, uint32_t blo
         // Do not wait for routed compute/shared GMM2: that would create a cycle
         // with the remaining Dispatch data needed by the routed experts.
         if (a.config.bs < 4096U) AtomicAdd(LocalCompletionFlag(a, kLocalFlagSharedGmm1Done), 1);
+        // SharedGmm1 has no dependency on RouteSummary; acquire RouteSummary
+        // right before routed compute so SharedGmm1 overlaps RouteSummary.
+        WaitRouteSummary(a, routeTimer);
     }
     RunCubeAndPrologue<S>(a, block, timer);
     if constexpr (g_coreType == AIC) MarkCubeComplete(a);  // routed self-return is ready before Shared GMM2
@@ -167,25 +170,25 @@ __aicore__ inline void RunSharedComputeSequence(const Arguments& a, uint32_t blo
     WaitComputeFlag(a.localFlags, LocalFlagRoutedPrologueReleased(S::kCubeCores) + block, 1);
     RunSharedGmm<S, false>(a, block, timer);
 }
+
 template <class S>
 __aicore__ inline void ProcessShared(Arguments& a)
 {
     Timer timer;
     timer.Init(a.timer, a.trace, a.traceCapacity, a.coarseTrace != 0);
     timer.SharedMode();
-    // S1 overlaps shared GMM, routed work and communication by engine role.
-    PrepareDeviceRoutes<S>(a, timer);
     const uint32_t block = GetBlockIdx() / GetTaskRation(), comm = CommunicationWorkers<S>();
     const int64_t overflow = GetCtrlSpr<UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL, UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL>();
     SetCtrlSpr<UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL, UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL>(0);
+    // S1 overlaps shared GMM1 with RouteSummary, routed work and communication by engine role.
+    PrepareDeviceRoutes<S>(a, timer);
     if constexpr (g_coreType == AIC) {
-        WaitRouteSummary(a, timer);
         timer.CoarseBegin(CoarsePhase::Gmm);
         if (a.coarseTrace || (!a.trace && !a.timer)) {
             NoopTimer t;
-            RunSharedComputeSequence<S>(a, block, t);
+            RunSharedComputeSequence<S>(a, block, t, timer);
         } else
-            RunSharedComputeSequence<S>(a, block, timer);
+            RunSharedComputeSequence<S>(a, block, timer, timer);
         timer.CoarseEnd(CoarsePhase::Gmm);
     } else if (GetSubBlockIdx() == 0) {
         RunAiv0RouteSummary<S>(a, block, timer);
@@ -242,18 +245,8 @@ __aicore__ inline void ProcessShared(Arguments& a)
             }
         }
     }
-    // Join routed work before adding the shared-expert result.
+    // SharedAdd is now fused into ReduceGeneric<S, true>; one final local join suffices.
     TraceLocalSync(timer, 3U);
-    if constexpr (g_coreType == AIV) {
-        timer.CoarseBegin(CoarsePhase::SharedSum);
-        SharedAdd<S>(a, LocalWorkerIndex(block, GetSubBlockIdx()), timer);
-        timer.CoarseEnd(CoarsePhase::SharedSum);
-    }
-    const auto join = timer.TraceBegin();
-    SyncAll<false>();
-    TraceMeta m;
-    m.cv = 4;
-    timer.TraceEnd(TraceEvent::LocalSync, join, m);
     timer.FinishTrace();
     SetCtrlSpr<UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL, UrmaMegaMoeImpl::OVERFLOW_MODE_CTRL>(overflow);
 }

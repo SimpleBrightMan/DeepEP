@@ -142,8 +142,11 @@ __aicore__ inline void ResetInvocationFlags(const Arguments& a, uint32_t worker)
         const uint64_t sharedGroups = (maxTokens + 255U) / 256U;
         const uint64_t tileBytes = sharedGroups * (a.sharedIntermediate / 256U) * kFlagBytes;
         const uint64_t activationBytes = sharedGroups * kFlagBytes;
+        const uint64_t sharedFlagBytes = activationBytes < 512U ? 512U : activationBytes;
         ResetFlagRegion<S>(a.sharedGmm1Done, tileBytes < 512U ? 512U : tileBytes, worker);
-        ResetFlagRegion<S>(a.sharedActivationDone, activationBytes < 512U ? 512U : activationBytes, worker);
+        ResetFlagRegion<S>(a.sharedActivationDone, sharedFlagBytes, worker);
+        // Reuse the head of sharedRoutedOutput as per-group SharedGmm2 completion flags for fused Reduce+SharedAdd.
+        ResetFlagRegion<S>(a.sharedRoutedOutput, sharedFlagBytes, worker);
     }
     // RouteSave drains each MTE3 write. The existing first route SyncAll joins
     // every reset worker before any Start, route-ready or compute publication.
@@ -435,11 +438,16 @@ __aicore__ inline void RouteLocalConfig(Arguments& a)
     a.config.receiveRows = a.config.gmm1Tiles = a.config.gmm2Tiles = 0U;
 }
 
-template <class S>
-__aicore__ inline void PrepareDeviceRoutes(Arguments& a, Timer& timer)
+struct NoPreSyncHook {
+    __aicore__ inline void operator()() const {}
+};
+
+template <class S, class PreSyncHook = NoPreSyncHook>
+__aicore__ inline void PrepareDeviceRoutes(Arguments& a, Timer& timer, PreSyncHook&& preSync = NoPreSyncHook{})
 {
     timer.CoarseBegin(CoarsePhase::Route);
-    const uint64_t start = timer.TraceBegin();
+    uint64_t start = 0U;
+    if constexpr (g_coreType == AIV) start = timer.TraceBegin();
     const uint32_t block = GetBlockIdx() / GetTaskRation();
     InvalidateRouteSummary(a);
     // No entry rank barrier: before this owner's previous invocation returned,
@@ -457,6 +465,9 @@ __aicore__ inline void PrepareDeviceRoutes(Arguments& a, Timer& timer)
         }
         ResetInvocationFlags<S>(a, worker);
         RouteOwnedExperts<S>(a, worker);
+    } else {
+        preSync();
+        start = timer.TraceBegin();
     }
     // #1: all flag resets, input quant/dequant, count DMA stores and consumers'
     // cache invalidations precede the leader's first RouteInfo/Config update.

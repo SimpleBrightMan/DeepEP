@@ -273,7 +273,7 @@ __aicore__ inline Fragment SharedFragment(const Arguments& a, uint32_t group)
     const uint32_t row = group * 256U, rows = a.config.bs - row < 256U ? a.config.bs - row : 256U;
     return {0, 0, row, rows, 0, uint64_t(group) * (a.sharedIntermediate / 256), uint64_t(group) * (S::kHidden / 256)};
 }
-template <class T>
+template <class T, bool First>
 struct SharedOutputBackend {
     const Arguments& a;
     T& timer;
@@ -285,19 +285,79 @@ struct SharedOutputBackend {
     {
         const auto start = timer.TraceBegin();
         WaitFlag<HardEvent::FIX_S>(EVENT_ID1);
-        timer.TraceEnd(TraceEvent::SharedGmm1Drain, start, m);
-        WriteGmByPassDCache(ComputeFlag(a.sharedGmm1Done, tile), 1);
+        timer.TraceEnd(First ? TraceEvent::SharedGmm1Drain : TraceEvent::SharedGmm2Drain, start, m);
+        if constexpr (First) {
+            WriteGmByPassDCache(ComputeFlag(a.sharedGmm1Done, tile), 1);
+        } else {
+            // Publish per-group SharedGmm2 completion into the head of sharedRoutedOutput
+            // so Reduce can fuse SharedAdd per M256 group without a global barrier.
+            AtomicAdd(ComputeFlag(a.sharedRoutedOutput, tile), 1);
+        }
     }
 };
+
+// Pre-launch the first owned tile of A16W16 BF16 SharedGmm1 during RoutePrepare
+// (before SyncAll #1) to overlap AIC compute with AIV input quant and routing.
+// Does NOT touch sharedGmm1Done (which ResetInvocationFlags clears concurrently);
+// RunSharedGmm<S, true> publishes sharedGmm1Done for this tile after SyncAll #2.
+template <class S, class T>
+__aicore__ inline bool RunSharedGmm1PreSync(const Arguments& a, uint32_t core, uint64_t& preSyncTile, T& timer)
+{
+    if constexpr (!S::kSharedBf16 || g_coreType != AIC) {
+        (void)a;
+        (void)core;
+        (void)preSyncTile;
+        (void)timer;
+        return false;
+    }
+    if (a.config.inputIsBf16 == 0U) return false;
+    auto v = SharedView(a);
+    const uint32_t count = a.sharedIntermediate / 256U;
+    for (uint32_t group = 0; group < (a.config.bs + 255U) / 256U; ++group) {
+        const auto f = SharedFragment<S>(a, group);
+        const uint32_t first =
+            FirstOwnedComputeTile(uint64_t(group) * count, RoutedOwnerResidue(true, core, S::kCubeCores),
+                                  S::kCubeCores);
+        if (first >= count) continue;
+        SharedBf16Gmm<true> gmm;
+        const UrmaMegaMoeImpl::BlockJobContext job{core, S::kCubeCores};
+        auto config =
+            UrmaGmmConfig::BuildGmm1ProblemConfig(FragmentShape<S>(v, f, a.sharedIntermediate), job, kComputeTileM);
+        auto addr = Gmm1Addresses<S>(v, f, a.sharedIntermediate);
+        addr.aGlobal = reinterpret_cast<GM_ADDR>(a.rawBf16X + f.rowBegin * S::kHidden * sizeof(bfloat16_t));
+        addr.aScaleGlobal = nullptr;
+        gmm.UpdateProblem(config, addr);
+        gmm.Begin();
+        TraceMeta meta = FragmentTraceMeta(f, group);
+        meta.expert = S::kExperts;
+        meta.tileN = first * 256U;
+        meta.columns = 256U;
+        const auto start = timer.TraceBegin();
+        gmm.Compute(0, first * 256U, f.rows, 256U);
+        timer.TraceEnd(TraceEvent::SharedGmm1Tile, start, meta);
+        gmm.End(true);
+        preSyncTile = f.gmm1TileBegin + first;
+        return true;
+    }
+    return false;
+}
+
 template <class S, bool First, class T>
-__aicore__ inline void RunSharedGmm(const Arguments& a, uint32_t core, T& timer)
+__aicore__ inline void RunSharedGmm(const Arguments& a, uint32_t core, T& timer, bool hasPreSync = false,
+                                    uint64_t preSyncTile = 0U)
 {
     auto v = SharedView(a);
     using GmmType = std::conditional_t<S::kSharedBf16, SharedBf16Gmm<First>, SharedMxGmm<First>>;
+    if constexpr (First && g_coreType == AIC) {
+        if (hasPreSync) {
+            WriteGmByPassDCache(ComputeFlag(a.sharedGmm1Done, preSyncTile), 1);
+        }
+    }
     GmmType gmm;
-    SharedOutputBackend<T> backend{a, timer};
-    TileCompletion<SharedOutputBackend<T>> pending(backend);
+    SharedOutputBackend<T, First> backend{a, timer};
+    TileCompletion<SharedOutputBackend<T, First>> pending(backend);
     bool active = false;
+    bool skipNext = First && hasPreSync;
     for (uint32_t group = 0; group < (a.config.bs + 255) / 256; ++group) {
         const auto f = SharedFragment<S>(a, group);
         const uint32_t count = First ? a.sharedIntermediate / 256 : S::kHidden / 256;
@@ -305,6 +365,14 @@ __aicore__ inline void RunSharedGmm(const Arguments& a, uint32_t core, T& timer)
             FirstOwnedComputeTile(uint64_t(group) * count, RoutedOwnerResidue(First, core, S::kCubeCores),
                                   S::kCubeCores);
         if (first >= count) continue;
+        uint32_t startTile = first;
+        if constexpr (First) {
+            if (skipNext) {
+                skipNext = false;
+                startTile += S::kCubeCores;
+                if (startTile >= count) continue;
+            }
+        }
         const UrmaMegaMoeImpl::BlockJobContext job{core, S::kCubeCores};
         auto config =
             UrmaGmmConfig::BuildGmm1ProblemConfig(FragmentShape<S>(v, f, a.sharedIntermediate), job, kComputeTileM);
@@ -334,7 +402,7 @@ __aicore__ inline void RunSharedGmm(const Arguments& a, uint32_t core, T& timer)
         gmm.UpdateProblem(config, addr);
         gmm.Begin();
         active = true;
-        for (uint32_t tile = first; tile < count; tile += S::kCubeCores) {
+        for (uint32_t tile = startTile; tile < count; tile += S::kCubeCores) {
             TraceMeta meta = FragmentTraceMeta(f, group);
             meta.expert = S::kExperts;
             meta.tileN = tile * 256;
@@ -342,10 +410,10 @@ __aicore__ inline void RunSharedGmm(const Arguments& a, uint32_t core, T& timer)
             const auto start = timer.TraceBegin();
             if constexpr (g_coreType == AIC) gmm.Compute(0, tile * 256, f.rows, 256);
             timer.TraceEnd(First ? TraceEvent::SharedGmm1Tile : TraceEvent::SharedGmm2Tile, start, meta);
-            if constexpr (First && g_coreType == AIC) pending.AfterSubmit(true, f.gmm1TileBegin + tile, meta);
+            if constexpr (g_coreType == AIC) pending.AfterSubmit(First, First ? (f.gmm1TileBegin + tile) : group, meta);
         }
     }
-    if constexpr (First && g_coreType == AIC) pending.Flush();
+    if constexpr (g_coreType == AIC) pending.Flush();
     if (active) {
         const auto start = timer.TraceBegin();
         gmm.End(First && g_coreType == AIC);  // W8 has no paired AIV0 context to retire.
