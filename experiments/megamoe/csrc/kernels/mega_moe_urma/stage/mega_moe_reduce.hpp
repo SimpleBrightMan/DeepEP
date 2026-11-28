@@ -15,11 +15,12 @@ namespace MegaMoeUrma {
 // All 28 steady Pack owners publish this existing counter only after Close().
 // S1 also counts 28 startup-only AIV0 owners (no startup join). No producer
 // waits for Reduce, so consumers may wait here without delaying a producer.
+template <class S>
 __aicore__ inline void WaitPackInverseReady(const Arguments& args)
 {
     using namespace AscendC;
     auto* done = reinterpret_cast<__gm__ int32_t*>(args.localFlags + kLocalFlagPackDone * kFlagBytes);
-    while (ReadGmByPassDCache(done) != static_cast<int32_t>(args.sharedExperts ? kLocalWorkers : kAic)) {
+    while (ReadGmByPassDCache(done) != static_cast<int32_t>(args.sharedExperts ? S::kVectorCores : S::kCubeCores)) {
         const uint64_t start = GetSystemCycle();
         while (GetSystemCycle() - start < 200U) {
         }
@@ -314,7 +315,7 @@ __aicore__ inline void Reduce(const Arguments& args, uint32_t worker, TraceSink&
     pipeline.Init(args, firstToken);
     bool allInputsReady = AllReduceInputsReady<S>(args);
     if (allInputsReady) GateReduceInputs();
-    WaitPackInverseReady(args);
+    WaitPackInverseReady<S>(args);
     DataCopy(inverseUb, inverse[firstRoute], owned * Ub::topk);
     DataCopy(weightsUb, weights[firstRoute], owned * Ub::topk);
 
@@ -643,7 +644,7 @@ __aicore__ inline void ReduceColumns(const Arguments& args, uint32_t worker, uin
         // These three arrays are outside the column payload scratch and remain
         // resident across all H slices. Build readiness exactly once per entry,
         // never once per polling pass or once per 2048-column slice.
-        WaitPackInverseReady(args);
+        WaitPackInverseReady<S>(args);
         if constexpr (TopK == 8U) {
             DataCopy(inverseUb, inverse[firstRoute], owned * TopK);
             DataCopy(weightsUb, weights[firstRoute], owned * TopK);

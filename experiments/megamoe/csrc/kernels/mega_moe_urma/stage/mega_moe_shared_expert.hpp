@@ -6,6 +6,7 @@
 #include <cstdint>
 #include "kernels/mega_moe_urma/mega_moe_urma_tiling.hpp"
 #include "kernels/mega_moe_common/catlass_gmm/mega_moe_mx_matmul.hpp"
+#include "kernels/mega_moe_urma/catlass_gmm/mega_moe_bf16_matmul.hpp"
 #include "kernel_operator.h"
 #include "kernels/mega_moe_urma/stage/mega_moe_gmm.hpp"
 #include "kernels/mega_moe_urma/common/mega_moe_completion.hpp"
@@ -24,9 +25,9 @@ SHARED_INLINE constexpr uint32_t SharedTaskCount(uint32_t bs, uint32_t intermedi
 {
     return ((bs + 255U) / 256U) * (intermediate / 256U) * 2U;
 }
-SHARED_INLINE constexpr uint32_t SharedOwnedTasks(uint32_t total, uint32_t worker)
+SHARED_INLINE constexpr uint32_t SharedOwnedTasks(uint32_t total, uint32_t worker, uint32_t cubeCores = kAic)
 {
-    return worker < total ? (total - 1U - worker) / 28U + 1U : 0U;
+    return worker < total ? (total - 1U - worker) / cubeCores + 1U : 0U;
 }
 struct SharedTask {
     uint32_t group, tile, slice;
@@ -36,9 +37,9 @@ SHARED_INLINE constexpr SharedTask SharedTaskAt(uint32_t task, uint32_t intermed
     const uint32_t n = intermediate / 256U;
     return {task / (n * 2U), (task / 2U) % n, task % 2U};
 }
-constexpr uint32_t kSharedMaxOwnedTasks = SharedOwnedTasks(SharedTaskCount(kMaxTokensPerRank, 16384U), 0U);
+constexpr uint32_t kSharedMaxOwnedTasks = SharedOwnedTasks(SharedTaskCount(kMaxTokensPerRank, 16384U), 0U, kMinAic);
 constexpr uint32_t kSharedDoneWords = (kSharedMaxOwnedTasks + 63U) / 64U;
-static_assert(kSharedMaxOwnedTasks == 293U && kSharedDoneWords == 5U);
+static_assert(kSharedMaxOwnedTasks == 512U && kSharedDoneWords == 8U);
 #undef SHARED_INLINE
 }  // namespace MegaMoeUrma
 
@@ -96,6 +97,65 @@ public:
         n_ = p.n;
         k_ = p.k;
         scaleK_ = p.scaleK;
+        addr_ = addr;
+    }
+    __aicore__ inline void Begin() {}
+    __aicore__ inline void Compute(uint32_t m, uint32_t n, uint32_t rows, uint32_t cols)
+    {
+        Projection(m, n, rows, cols);
+        if constexpr (First) Projection(m, n + n_ / 2U, rows, cols);
+    }
+    __aicore__ inline void End(bool = false)
+    {
+        AscendC::SetFlag<AscendC::HardEvent::FIX_S>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(EVENT_ID0);
+    }
+};
+
+// Shared-only A16W16 (BF16xBF16 -> BF16). Raw weights are contiguous ND [N,K],
+// interpreted as column-major [K,N]. Pure AIC execution; no AIV0 involvement.
+template <bool First>
+class SharedBf16Gmm {
+    using Arch = Catlass::Arch::Ascend950;
+    using Row = Catlass::layout::RowMajor;
+    using Col = Catlass::layout::ColumnMajor;
+    using T = bfloat16_t;
+    using Copy = Catlass::Gemm::Tile::PackedTileCopyTla<Arch, T, Row, T, Col, T, Row, void>;
+    using Policy = Catlass::Gemm::MmadPingpong<Arch, true, false, 1, false, 2, 2, 2, 2>;
+    using L1 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<128>>;
+    using L0 = tla::Shape<tla::Int<256>, tla::Int<256>, tla::Int<64>>;
+    using Block = Catlass::Gemm::Block::MegaMoeBlockMmadBf16<Policy, L1, L0, T, T, T, Copy>;
+    Catlass::Gemm::Block::MegaMoeResource resource_;
+    Block block_;
+    UrmaMegaMoeImpl::GMMAddrInfo addr_{};
+    uint32_t m_ = 0, n_ = 0, k_ = 0;
+
+    template <class Element, class Layout>
+    __aicore__ inline auto View(GM_ADDR p, const Layout& layout)
+    {
+        AscendC::GlobalTensor<Element> gm;
+        gm.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(p));
+        return tla::MakeTensor(gm, layout, Catlass::Arch::PositionGM{});
+    }
+    __aicore__ inline void Projection(uint32_t m, uint32_t n, uint32_t rows, uint32_t columns)
+    {
+        auto av = View<T>(addr_.aGlobal, tla::MakeLayout<T, Row>(m_, k_));
+        auto bv = View<T>(addr_.bGlobal, tla::MakeLayout<T, Col>(k_, n_));
+        auto cv = View<T>(First ? addr_.gmm1OutGlobal : addr_.gmm2OutGlobal, tla::MakeLayout<T, Row>(m_, n_));
+        auto a = tla::GetTile(av, tla::MakeCoord(m, 0), tla::MakeShape(rows, k_));
+        auto b = tla::GetTile(bv, tla::MakeCoord(0, n), tla::MakeShape(k_, columns));
+        auto c = tla::GetTile(cv, tla::MakeCoord(m, n), tla::MakeShape(rows, columns));
+        block_(a, b, c, Catlass::GemmCoord{rows, columns, k_});
+    }
+
+public:
+    __aicore__ inline SharedBf16Gmm() : block_(resource_) {}
+    template <class Problem>
+    __aicore__ inline void UpdateProblem(const Problem& p, const UrmaMegaMoeImpl::GMMAddrInfo& addr)
+    {
+        m_ = p.m;
+        n_ = p.n;
+        k_ = p.k;
         addr_ = addr;
     }
     __aicore__ inline void Begin() {}
@@ -233,7 +293,8 @@ template <class S, bool First, class T>
 __aicore__ inline void RunSharedGmm(const Arguments& a, uint32_t core, T& timer)
 {
     auto v = SharedView(a);
-    std::conditional_t<First, SharedGmm1, SharedGmm2> gmm;
+    using GmmType = std::conditional_t<S::kSharedBf16, SharedBf16Gmm<First>, SharedMxGmm<First>>;
+    GmmType gmm;
     SharedOutputBackend<T> backend{a, timer};
     TileCompletion<SharedOutputBackend<T>> pending(backend);
     bool active = false;
@@ -241,7 +302,8 @@ __aicore__ inline void RunSharedGmm(const Arguments& a, uint32_t core, T& timer)
         const auto f = SharedFragment<S>(a, group);
         const uint32_t count = First ? a.sharedIntermediate / 256 : S::kHidden / 256;
         const uint32_t first =
-            FirstOwnedComputeTile(uint64_t(group) * count, RoutedOwnerResidue(First, core), S::kCubeCores);
+            FirstOwnedComputeTile(uint64_t(group) * count, RoutedOwnerResidue(First, core, S::kCubeCores),
+                                  S::kCubeCores);
         if (first >= count) continue;
         const UrmaMegaMoeImpl::BlockJobContext job{core, S::kCubeCores};
         auto config =
@@ -252,9 +314,19 @@ __aicore__ inline void RunSharedGmm(const Arguments& a, uint32_t core, T& timer)
                                                            kComputeTileM);
         auto addr = First ? Gmm1Addresses<S>(v, f, a.sharedIntermediate) : Gmm2Addresses<S>(v, f, a.sharedIntermediate);
         if constexpr (First) {
-            addr.aGlobal = reinterpret_cast<GM_ADDR>(a.x + f.rowBegin * S::kHidden);
-            addr.aScaleGlobal = reinterpret_cast<GM_ADDR>(a.xScale + f.rowBegin * (S::kHidden / 32));
+            if constexpr (S::kSharedBf16) {
+                addr.aGlobal = reinterpret_cast<GM_ADDR>(a.rawBf16X + f.rowBegin * S::kHidden * sizeof(bfloat16_t));
+                addr.aScaleGlobal = nullptr;
+            } else {
+                addr.aGlobal = reinterpret_cast<GM_ADDR>(a.x + f.rowBegin * S::kHidden);
+                addr.aScaleGlobal = reinterpret_cast<GM_ADDR>(a.xScale + f.rowBegin * (S::kHidden / 32));
+            }
         } else {
+            if constexpr (S::kSharedBf16) {
+                addr.aGlobal = reinterpret_cast<GM_ADDR>(
+                    a.sharedActivation + f.rowBegin * a.sharedIntermediate * sizeof(bfloat16_t));
+                addr.aScaleGlobal = nullptr;
+            }
             addr.gmm2OutGlobal = reinterpret_cast<GM_ADDR>(a.sharedOutput + f.rowBegin * S::kHidden * 2);
             if constexpr (g_coreType == AIC)
                 WaitComputeFlag(a.sharedActivationDone, group, (a.sharedIntermediate / 256) * ((f.rows + 127) / 128));
@@ -302,7 +374,7 @@ public:
         : a_(a), worker_(worker), timer_(t)
     {
         total_ = SharedTaskCount(a.config.bs, a.sharedIntermediate);
-        owned_ = SharedOwnedTasks(total_, worker);
+        owned_ = SharedOwnedTasks(total_, worker, S::kCubeCores);
     }
     __aicore__ inline bool Done() const
     {
@@ -326,40 +398,98 @@ public:
             before.Before();  // End a prior idle bar before recording actual shared work.
             // Soft shared activation must never overwrite the low128KiB FIX
             // mailbox, even while no issue has yet been observed by Scalar.
-            using HighUbActivation = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 64U,
-                                                                                     256U, false, false, true>;
-            constexpr uint32_t highUb = 128U * 1024U, planeBytes = 64U * 256U * 2U;
-            static_assert(highUb + 2U * planeBytes <= kAiv1PersistentUbBase);
-            HighUbActivation op;
-            op.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a_.sharedActivation),
-                     .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a_.sharedActivationScale),
-                     .clampLimit = a_.activationClamp,
-                     .ubOffsetBytes = highUb});
+            constexpr uint32_t highUb = 128U * 1024U;
             const uint32_t inter = a_.sharedIntermediate, n = tile * 256U;
-            op.UpdateGlobalAddr({static_cast<int64_t>(f.rowBegin * inter),
-                                 static_cast<int64_t>(f.rowBegin * (inter / 32U)), 0, 0, 0, 0});
-            op.UpdateNextProblem({f.rows, inter, 0, 0});
             GlobalTensor<bfloat16_t> gm;
             gm.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(a_.sharedGmm1));
-            LocalTensor<bfloat16_t> gate(TPosition::VECIN, highUb, 64U * 256U);
-            LocalTensor<bfloat16_t> up(TPosition::VECIN, highUb + planeBytes, 64U * 256U);
             const uint32_t m = slice * 128U, rows = f.rows - m < 128U ? f.rows - m : 128U;
             auto meta = ComputeTileTraceMeta(FragmentTraceMeta(f, group), m, n, rows, 256U);
             meta.expert = S::kExperts;
             const auto start = timer_.TraceBegin();
-            for (uint32_t sub = 0; sub < rows; sub += 64U) {
-                const uint32_t actual = rows - sub < 64U ? rows - sub : 64U;
-                const uint64_t input = (f.rowBegin + m + sub) * (2U * inter) + n;
-                const DataCopyExtParams copy{static_cast<uint16_t>(actual), 512U, (2U * inter - 256U) * 2U, 0U, 0U};
-                SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
-                WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
-                DataCopyPad(gate, gm[input], copy, {false, 0U, 0U, 0U});
-                DataCopyPad(up, gm[input + inter], copy, {false, 0U, 0U, 0U});
-                SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-                WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-                SetCtrlSpr<60, 60>(0);
-                op({actual, 256U, 0, 0},
-                   {int64_t(m + sub) * inter + n, int64_t(m + sub) * (inter / 32U) + n / 32U, 0, 0, 0, 0});
+            if constexpr (S::kSharedBf16) {
+                constexpr uint32_t kSubRows = 32U;
+                constexpr uint32_t kElems = kSubRows * 256U;
+                constexpr uint32_t kBf16Bytes = kElems * sizeof(bfloat16_t);
+                constexpr uint32_t kFp32Bytes = kElems * sizeof(float);
+                static_assert(highUb + 2U * kBf16Bytes + 2U * kFp32Bytes <= kAiv1PersistentUbBase);
+                GlobalTensor<bfloat16_t> dstGm;
+                dstGm.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(a_.sharedActivation));
+                LocalTensor<bfloat16_t> gateBf16(TPosition::VECIN, highUb, kElems);
+                LocalTensor<bfloat16_t> upBf16(TPosition::VECIN, highUb + kBf16Bytes, kElems);
+                LocalTensor<float> gateFp32(TPosition::VECCALC, highUb + 2U * kBf16Bytes, kElems);
+                LocalTensor<float> upFp32(TPosition::VECCALC, highUb + 2U * kBf16Bytes + kFp32Bytes, kElems);
+                LocalTensor<float> tmpFp32(TPosition::VECCALC, highUb, kElems);
+                LocalTensor<bfloat16_t> outBf16(TPosition::VECOUT, highUb, kElems);
+                const float limit = a_.activationClamp;
+                for (uint32_t sub = 0; sub < rows; sub += kSubRows) {
+                    const uint32_t actual = rows - sub < kSubRows ? rows - sub : kSubRows;
+                    const uint32_t count = actual * 256U;
+                    const uint64_t input = (f.rowBegin + m + sub) * (2U * inter) + n;
+                    const DataCopyExtParams inCopy{
+                        static_cast<uint16_t>(actual), 512U, (2U * inter - 256U) * 2U, 0U, 0U};
+                    SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                    WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                    DataCopyPad(gateBf16, gm[input], inCopy, {false, 0U, 0U, 0U});
+                    DataCopyPad(upBf16, gm[input + inter], inCopy, {false, 0U, 0U, 0U});
+                    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                    WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                    SetCtrlSpr<60, 60>(0);
+                    Cast(gateFp32, gateBf16, RoundMode::CAST_NONE, count);
+                    Cast(upFp32, upBf16, RoundMode::CAST_NONE, count);
+                    PipeBarrier<PIPE_V>();
+                    Mins(gateFp32, gateFp32, limit, count);
+                    Mins(upFp32, upFp32, limit, count);
+                    PipeBarrier<PIPE_V>();
+                    Maxs(upFp32, upFp32, -limit, count);
+                    Muls(tmpFp32, gateFp32, -1.0f, count);
+                    PipeBarrier<PIPE_V>();
+                    Exp(tmpFp32, tmpFp32, count);
+                    PipeBarrier<PIPE_V>();
+                    Adds(tmpFp32, tmpFp32, 1.0f, count);
+                    PipeBarrier<PIPE_V>();
+                    Div(gateFp32, gateFp32, tmpFp32, count);
+                    PipeBarrier<PIPE_V>();
+                    Mul(gateFp32, gateFp32, upFp32, count);
+                    PipeBarrier<PIPE_V>();
+                    Cast(outBf16, gateFp32, RoundMode::CAST_RINT, count);
+                    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                    WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+                    const uint64_t output = (f.rowBegin + m + sub) * inter + n;
+                    const DataCopyExtParams outCopy{
+                        static_cast<uint16_t>(actual), 512U, 0U, (inter - 256U) * 2U, 0U};
+                    DataCopyPad(dstGm[output], outBf16, outCopy);
+                    SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                    WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
+                }
+            } else {
+                using HighUbActivation = UrmaMegaMoeImpl::BlockEpilogueActivationMxQuant<fp8_e4m3fn_t, bfloat16_t, 64U,
+                                                                                         256U, false, false, true>;
+                constexpr uint32_t planeBytes = 64U * 256U * 2U;
+                static_assert(highUb + 2U * planeBytes <= kAiv1PersistentUbBase);
+                HighUbActivation op;
+                op.Init({.yGmAddr = reinterpret_cast<GM_ADDR>(a_.sharedActivation),
+                         .yScaleGmAddr = reinterpret_cast<GM_ADDR>(a_.sharedActivationScale),
+                         .clampLimit = a_.activationClamp,
+                         .ubOffsetBytes = highUb});
+                op.UpdateGlobalAddr({static_cast<int64_t>(f.rowBegin * inter),
+                                     static_cast<int64_t>(f.rowBegin * (inter / 32U)), 0, 0, 0, 0});
+                op.UpdateNextProblem({f.rows, inter, 0, 0});
+                LocalTensor<bfloat16_t> gate(TPosition::VECIN, highUb, 64U * 256U);
+                LocalTensor<bfloat16_t> up(TPosition::VECIN, highUb + planeBytes, 64U * 256U);
+                for (uint32_t sub = 0; sub < rows; sub += 64U) {
+                    const uint32_t actual = rows - sub < 64U ? rows - sub : 64U;
+                    const uint64_t input = (f.rowBegin + m + sub) * (2U * inter) + n;
+                    const DataCopyExtParams copy{static_cast<uint16_t>(actual), 512U, (2U * inter - 256U) * 2U, 0U, 0U};
+                    SetFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                    WaitFlag<HardEvent::S_MTE2>(EVENT_ID0);
+                    DataCopyPad(gate, gm[input], copy, {false, 0U, 0U, 0U});
+                    DataCopyPad(up, gm[input + inter], copy, {false, 0U, 0U, 0U});
+                    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                    WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+                    SetCtrlSpr<60, 60>(0);
+                    op({actual, 256U, 0, 0},
+                       {int64_t(m + sub) * inter + n, int64_t(m + sub) * (inter / 32U) + n / 32U, 0, 0, 0, 0});
+                }
             }
             // The original M128 task/ready-count contract is unchanged: both
             // sub-slices completed their activation/scale MTE3 stores above.

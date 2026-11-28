@@ -90,18 +90,20 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t LocalWorkerIndex(uint32_t block, 
     return 2U * block + subblock;
 }
 
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t LocalOwnedRows(uint64_t rows, uint32_t worker)
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t LocalOwnedRows(uint64_t rows, uint32_t worker,
+                                                              uint32_t workers = kLocalWorkers)
 {
-    return worker < rows ? (rows - 1U - worker) / kLocalWorkers + 1U : 0U;
+    return worker < rows ? (rows - 1U - worker) / workers + 1U : 0U;
 }
 
 // Contiguous partitions preserve the old strided schedule's per-worker count,
 // including empty workers and remainder rows. Pack can therefore DMA
 // their route metadata in batches without changing timer payload accounting.
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t LocalRowBegin(uint64_t rows, uint32_t worker)
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint64_t LocalRowBegin(uint64_t rows, uint32_t worker,
+                                                             uint32_t workers = kLocalWorkers)
 {
-    const uint64_t remainder = rows % kLocalWorkers;
-    return static_cast<uint64_t>(worker) * (rows / kLocalWorkers) + (worker < remainder ? worker : remainder);
+    const uint64_t remainder = rows % workers;
+    return static_cast<uint64_t>(worker) * (rows / workers) + (worker < remainder ? worker : remainder);
 }
 
 // Peer owners never reduce. All AIV0 and all noncommunication AIV1 workers
@@ -119,7 +121,8 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t ReduceWorkerIndex(uint32_t block,
 template <class S>
 MEGAMOE_URMA_COMPUTE_INLINE constexpr bool UseLegacyReduce(const Config& config)
 {
-    return S::kHidden == 3584U && S::kTopK == 8U && config.bs <= 8192U && config.maxPeerChunks <= 512U;
+    return S::kHidden == 3584U && S::kTopK == 8U && config.bs <= 8192U && config.maxPeerChunks <= 512U &&
+           ReduceWorkers<S>() >= kReduceWorkers;
 }
 
 template <class S>
@@ -208,9 +211,10 @@ MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t FirstOwnedComputeTile(uint64_t ti
 
 // Physical core -> forward tile-owner residue. GMM1 balances the opposite
 // end of the core array; GMM2 retains its ascending owner assignment.
-MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t RoutedOwnerResidue(bool gmm1, uint32_t core)
+MEGAMOE_URMA_COMPUTE_INLINE constexpr uint32_t RoutedOwnerResidue(bool gmm1, uint32_t core,
+                                                                  uint32_t cubeCores = kAic)
 {
-    return gmm1 ? kAic - 1U - core : core;
+    return gmm1 ? cubeCores - 1U - core : core;
 }
 
 struct OwnedComputeGroup {

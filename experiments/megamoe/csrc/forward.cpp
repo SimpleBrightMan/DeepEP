@@ -383,6 +383,7 @@ struct UrmaWorkspace {
     torch::Tensor system_workspace_;
     torch::Tensor shared_gmm1_, shared_activation_, shared_scale_, shared_output_, shared_routed_output_, shared_done1_,
         shared_done_act_;
+    torch::Tensor quant_x_, quant_x_scale_, shared_bf16_x_;
 
     UrmaWorkspace(torch::Tensor example, int64_t world, int64_t intermediate, int64_t topk, int64_t cv_rows,
                   int64_t max_tokens, int64_t rank, uint64_t ffts, uint64_t symmetric_address, int64_t shared_experts,
@@ -396,6 +397,8 @@ struct UrmaWorkspace {
         config.localExperts = num_experts / world;
         config.rank = rank;
         config.gmm1AheadMGroups = 12U;
+        config.cubeCores = platform.aic;
+        config.vectorCores = platform.aiv;
         args_.sharedExperts = shared_experts;
         args_.sharedIntermediate = shared_experts ? shared_intermediate : 0;
         args_.symmetric = symmetric_address;
@@ -410,10 +413,12 @@ struct UrmaWorkspace {
         if (args_.sharedExperts) {
             const uint64_t si = args_.sharedIntermediate, groups = (max_tokens + 255U) / 256U;
             shared_gmm1_ = allocate(max_tokens * si * 4);
-            shared_activation_ = allocate(max_tokens * si);
+            // Allocate 2 bytes per element so both FP8 (1B) and BF16 (2B) shared activations fit.
+            shared_activation_ = allocate(max_tokens * si * 2);
             shared_scale_ = allocate(max_tokens * (si / 32));
             shared_output_ = allocate(uint64_t(max_tokens) * config.hidden * 2);
             shared_routed_output_ = allocate(uint64_t(max_tokens) * config.hidden * 4);
+            shared_bf16_x_ = allocate(uint64_t(max_tokens) * config.hidden * 2);
             args_.sharedRoutedOutput = Address(shared_routed_output_);
             shared_done1_ = allocate(groups * (si / 256) * MegaMoeUrma::kFlagBytes);
             shared_done_act_ = allocate(groups * MegaMoeUrma::kFlagBytes);
@@ -466,8 +471,13 @@ struct UrmaWorkspace {
         gmm2_contiguous_ = allocate(0);      // routed GMM2 writes directly to paired UB
         peer_reorder_ranges_ = allocate(0);  // lazy descriptor; placeholder for lifetime bookkeeping
         peer_reorder_spans_ = allocate(0);   // lazy descriptor; placeholder for lifetime bookkeeping
-        local_flags_ = allocate((shared_experts ? MegaMoeUrma::kSharedLocalFlagCount : 16U) * MegaMoeUrma::kFlagBytes);
-        gmm_issued_ = allocate(MegaMoeUrma::kAic * MegaMoeUrma::kFlagBytes);
+        quant_x_ = allocate(uint64_t(max_tokens) * config.hidden);
+        quant_x_scale_ = allocate(uint64_t(max_tokens) * (config.hidden / 32));
+        args_.quantX = Address(quant_x_);
+        args_.quantXScale = Address(quant_x_scale_);
+        local_flags_ = allocate(
+            (shared_experts ? MegaMoeUrma::SharedLocalFlagCount(platform.aic) : 16U) * MegaMoeUrma::kFlagBytes);
+        gmm_issued_ = allocate(platform.aic * MegaMoeUrma::kFlagBytes);
         args_.gmmIssued = Address(gmm_issued_);
         system_workspace_ = allocate(platform.system_workspace + (2ULL << 20));
 
@@ -505,7 +515,8 @@ struct UrmaWorkspace {
     // not retire a previous device workspace or require a host wait.
     void reconfigure(int64_t bs, int64_t world, int64_t intermediate, int64_t topk, int64_t cv_rows,
                      int64_t max_tokens, int64_t rank, int64_t shared_experts, int64_t shared_intermediate,
-                     int64_t num_experts, int64_t topk_weights_type)
+                     int64_t num_experts, int64_t topk_weights_type, const PlatformInfo& platform, bool input_is_bf16,
+                     bool shared_is_bf16)
     {
         const int64_t max_recv_rows = world * max_tokens * topk;
         args_.config = UrmaLayout(world, max_tokens, topk, args_.config.hidden, max_recv_rows, cv_rows,
@@ -518,6 +529,10 @@ struct UrmaWorkspace {
         args_.config.localExperts = static_cast<uint32_t>(num_experts / world);
         args_.config.rank = static_cast<uint32_t>(rank);
         args_.config.gmm1AheadMGroups = 12U;
+        args_.config.cubeCores = platform.aic;
+        args_.config.vectorCores = platform.aiv;
+        args_.config.inputIsBf16 = input_is_bf16 ? 1U : 0U;
+        args_.config.sharedIsBf16 = shared_is_bf16 ? 1U : 0U;
         args_.sharedExperts = static_cast<uint32_t>(shared_experts);
         args_.sharedIntermediate = shared_experts ? static_cast<uint32_t>(shared_intermediate) : 0U;
     }
@@ -567,7 +582,10 @@ struct UrmaWorkspace {
                                    &shared_output_,
                                    &shared_routed_output_,
                                    &shared_done1_,
-                                   &shared_done_act_})
+                                   &shared_done_act_,
+                                   &quant_x_,
+                                   &quant_x_scale_,
+                                   &shared_bf16_x_})
             visit(*tensor);
     }
 };
@@ -612,12 +630,13 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
                 " bytes, got ", symmetric_bytes);
     platform_ = GetPlatformInfo();
     if (urma) {
-        TORCH_CHECK(platform_.aic >= MegaMoeUrma::kAic && platform_.aiv >= 2U * MegaMoeUrma::kAic &&
-                        platform_.ub >= MegaMoeUrma::kRequiredUbBytes,
-                    "URMA requires 28 AIC/56 AIV and 248 KiB usable UB");
+        const uint32_t min_aic = std::max<uint32_t>(static_cast<uint32_t>(world_) + 1U, MegaMoeUrma::kMinAic);
+        TORCH_CHECK(platform_.aic >= min_aic && platform_.aic <= MegaMoeUrma::kMaxAic &&
+                        platform_.aiv == 2U * platform_.aic && platform_.ub >= MegaMoeUrma::kRequiredUbBytes,
+                    "URMA requires ", min_aic, "..", MegaMoeUrma::kMaxAic,
+                    " AIC with 1:2 AIV mix and 248 KiB usable UB, got ", platform_.aic, " AIC / ", platform_.aiv,
+                    " AIV");
         auto* device_platform = platform_ascendc::PlatformAscendCManager::GetInstance();
-        platform_.aic = MegaMoeUrma::kAic;
-        platform_.aiv = 2U * MegaMoeUrma::kAic;
         platform_.block_dim = device_platform->CalcTschBlockDim(platform_.aiv, platform_.aic, platform_.aiv);
         TORCH_CHECK(aclshmem_n_pes() == world, "MegaMoE plan does not match its SHMEM runtime");
     }
@@ -692,7 +711,6 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                 "topk_weights must be FP32 [BS,TopK]");
     TORCH_CHECK(activation_clamp >= 0.0F, "activation_clamp must be nonnegative and not NaN");
     const bool prequantized = x_scales.has_value();
-    TORCH_CHECK(!urma || prequantized, "URMA requires prequantized FP8 input with E8M0 scales");
     TORCH_CHECK(x.scalar_type() == (prequantized ? c10::ScalarType::Float8_e4m3fn : torch::kBFloat16),
                 "x must be BF16, or FP8 E4M3 with E8M0 scales");
     if (prequantized) {
@@ -730,32 +748,48 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
                     "Optional MegaMoE tensors must be on the same NPU");
 
     const bool has_shared = shared_weight1.has_value();
-    TORCH_CHECK(shared_weight2.has_value() == has_shared && shared_weight_scales1.has_value() == has_shared &&
-                    shared_weight_scales2.has_value() == has_shared && has_shared == (shared_experts_ > 0),
-                "All shared weight/scale tensors must match the configured shared expert count");
+    const bool shared_is_bf16 = has_shared && urma && shared_weight1->scalar_type() == torch::kBFloat16;
+    TORCH_CHECK(shared_weight2.has_value() == has_shared && has_shared == (shared_experts_ > 0),
+                "Shared weight tensors must match the configured shared expert count");
+    if (shared_is_bf16) {
+        TORCH_CHECK(!shared_weight_scales1.has_value() && !shared_weight_scales2.has_value(),
+                    "BF16 shared weights must not provide weight scales");
+    } else {
+        TORCH_CHECK(shared_weight_scales1.has_value() == has_shared && shared_weight_scales2.has_value() == has_shared,
+                    "All shared weight/scale tensors must match the configured shared expert count");
+    }
     int64_t shared_i = intermediate_;
     if (has_shared) {
         CheckTensor(*shared_weight1, 3, "shared_weight1");
         CheckTensor(*shared_weight2, 3, "shared_weight2");
-        CheckTensor(*shared_weight_scales1, 4, "shared_weight_scales1");
-        CheckTensor(*shared_weight_scales2, 4, "shared_weight_scales2");
         TORCH_CHECK(shared_weight1->size(1) % 2 == 0, "Shared GMM1 must contain gate/up pairs");
         shared_i = shared_weight1->size(1) / 2;
         TORCH_CHECK(urma ? (shared_i >= 256 && shared_i <= 16384 && shared_i % 256 == 0) : shared_i == intermediate_,
                     "Shared intermediate is unsupported for the selected backend");
-        const auto shared_type = urma ? c10::ScalarType::Float8_e4m3fn : torch::kUInt8;
-        TORCH_CHECK(
-            is_a8w4_ && shared_weight1->scalar_type() == shared_type && shared_weight2->scalar_type() == shared_type &&
-                shared_weight1->sizes() == torch::IntArrayRef({shared_experts_, 2 * shared_i, urma ? h : h / 2}) &&
-                shared_weight2->sizes() == torch::IntArrayRef({shared_experts_, h, urma ? shared_i : shared_i / 2}),
-            "Shared weights have invalid dtype or shape for the selected backend");
-        TORCH_CHECK(shared_weight_scales1->scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
-                        shared_weight_scales2->scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
-                        shared_weight_scales1->sizes() ==
-                            torch::IntArrayRef({shared_experts_, 2 * shared_i, CeilDiv(h, int64_t{64}), 2}) &&
-                        shared_weight_scales2->sizes() ==
-                            torch::IntArrayRef({shared_experts_, h, CeilDiv(shared_i, int64_t{64}), 2}),
-                    "Invalid shared weight scales");
+        if (shared_is_bf16) {
+            TORCH_CHECK(is_a8w4_ && shared_weight2->scalar_type() == torch::kBFloat16 &&
+                            shared_weight1->sizes() == torch::IntArrayRef({shared_experts_, 2 * shared_i, h}) &&
+                            shared_weight2->sizes() == torch::IntArrayRef({shared_experts_, h, shared_i}),
+                        "BF16 shared weights have invalid dtype or shape");
+        } else {
+            CheckTensor(*shared_weight_scales1, 4, "shared_weight_scales1");
+            CheckTensor(*shared_weight_scales2, 4, "shared_weight_scales2");
+            const auto shared_type = urma ? c10::ScalarType::Float8_e4m3fn : torch::kUInt8;
+            TORCH_CHECK(is_a8w4_ && shared_weight1->scalar_type() == shared_type &&
+                            shared_weight2->scalar_type() == shared_type &&
+                            shared_weight1->sizes() ==
+                                torch::IntArrayRef({shared_experts_, 2 * shared_i, urma ? h : h / 2}) &&
+                            shared_weight2->sizes() ==
+                                torch::IntArrayRef({shared_experts_, h, urma ? shared_i : shared_i / 2}),
+                        "Shared weights have invalid dtype or shape for the selected backend");
+            TORCH_CHECK(shared_weight_scales1->scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
+                            shared_weight_scales2->scalar_type() == c10::ScalarType::Float8_e8m0fnu &&
+                            shared_weight_scales1->sizes() ==
+                                torch::IntArrayRef({shared_experts_, 2 * shared_i, CeilDiv(h, int64_t{64}), 2}) &&
+                            shared_weight_scales2->sizes() ==
+                                torch::IntArrayRef({shared_experts_, h, CeilDiv(shared_i, int64_t{64}), 2}),
+                        "Invalid shared weight scales");
+        }
     }
     uint64_t trace_capacity = 0;
     int64_t trace_elements = 0;
@@ -767,8 +801,9 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         CheckTensor(*timer, 1, "timer");
         TORCH_CHECK(timer->scalar_type() == torch::kInt64, "timer must be int64");
         if (urma) {
-            constexpr int64_t row_elements = MegaMoeUrma::kTimerCores * MegaMoeUrma::kTraceRecordElements;
-            trace_elements = timer->numel() - MegaMoeUrma::kTimerElements;
+            const int64_t row_elements =
+                int64_t{MegaMoeUrma::TimerCores(platform_.aic)} * MegaMoeUrma::kTraceRecordElements;
+            trace_elements = timer->numel() - int64_t{MegaMoeUrma::TimerElements(platform_.aic)};
             TORCH_CHECK(Address(*timer) % 128U == 0 && trace_elements % row_elements == 0 &&
                             trace_elements >= 2 * row_elements &&
                             trace_elements <= (int64_t{MegaMoeUrma::kTraceMaxCapacity} + 1) * row_elements,
@@ -798,7 +833,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
             shared_intermediate_ = shared_i;
         }
         urma_->reconfigure(bs, world_, intermediate_, topk_, SelectCv(world_, bs), max_tokens_, aclshmem_my_pe(),
-                           shared_experts_, shared_i, world_ * experts_, topk_weights_type_);
+                           shared_experts_, shared_i, world_ * experts_, topk_weights_type_, platform_, !prequantized,
+                           shared_is_bf16);
         // Invocation flags are reset by AIV workers before the first route join.
         if (timer) {
             ASCEND_DEEPEP_CHECK_ACL(
@@ -825,8 +861,15 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         auto& args = urma_->args_;
         args.activationClamp = tiling_.clampLimit;
         args.config.epoch = generation;
-        args.x = Address(x);
-        args.xScale = Address(*x_scales);
+        if (prequantized) {
+            args.x = Address(x);
+            args.xScale = Address(*x_scales);
+            args.rawBf16X = shared_is_bf16 ? Address(urma_->shared_bf16_x_) : 0;
+        } else {
+            args.rawBf16X = Address(x);
+            args.x = args.quantX;
+            args.xScale = args.quantXScale;
+        }
         args.topkIds = Address(topk_ids);
         args.topkIdBytes = topk_ids.element_size();
         args.weights = Address(topk_weights);
@@ -844,8 +887,8 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
         if (has_shared) {
             args.sharedWeight1 = Address(*shared_weight1);
             args.sharedWeight2 = Address(*shared_weight2);
-            args.sharedScale1 = Address(*shared_weight_scales1);
-            args.sharedScale2 = Address(*shared_weight_scales2);
+            args.sharedScale1 = shared_weight_scales1 ? Address(*shared_weight_scales1) : 0;
+            args.sharedScale2 = shared_weight_scales2 ? Address(*shared_weight_scales2) : 0;
         }
         urma_args = &args;
     } else {
@@ -901,10 +944,11 @@ torch::Tensor allocate_timer(torch::Tensor example, const std::string& backend)
     TORCH_CHECK(backend == "mte" || backend == "urma", "MegaMoE backend must be mte or urma");
     int64_t elements = AscendTimer::TOTAL_BUFFER_SIZE;
     if (backend == "urma") {
-        elements = int64_t{MegaMoeUrma::kTimerCores} *
+        const uint32_t aic = GetPlatformInfo().aic;
+        elements = int64_t{MegaMoeUrma::TimerCores(aic)} *
                        (MegaMoeUrma::kTraceHeaderElements +
                         int64_t{MegaMoeUrma::kTraceMaxCapacity} * MegaMoeUrma::kTraceRecordElements) +
-                   MegaMoeUrma::kTimerElements;
+                   int64_t{MegaMoeUrma::TimerElements(aic)};
     }
     return torch::zeros({elements}, example.options().dtype(torch::kInt64));
 }

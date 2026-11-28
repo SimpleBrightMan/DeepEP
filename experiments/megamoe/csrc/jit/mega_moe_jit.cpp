@@ -232,7 +232,8 @@ std::string UrmaSpec(const MegaMoeUrma::Config& config)
     return std::to_string(config.sourceRowCapacity) + ", " + std::to_string(config.hidden) + ", " +
            std::to_string(config.intermediate) + ", " + std::to_string(config.topk) + ", " +
            std::to_string(config.localExperts) + ", " + std::to_string(config.world) + ", " +
-           std::to_string(config.topkWeightsType);
+           std::to_string(config.topkWeightsType) + ", " + std::to_string(config.cubeCores) + ", " +
+           std::to_string(config.vectorCores) + ", " + std::to_string(config.sharedIsBf16);
 }
 
 std::string UrmaSource(bool shared, const std::string& spec)

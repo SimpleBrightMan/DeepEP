@@ -87,7 +87,7 @@ public:
                 }
                 const auto first = plan_.Group(begin_);
                 const uint64_t base = gmm1_ ? first.gmm1TileBegin : first.gmm2TileBegin;
-                next_ = FirstOwnedComputeTile(base, RoutedOwnerResidue(gmm1_, core_), CubeCores);
+                next_ = FirstOwnedComputeTile(base, RoutedOwnerResidue(gmm1_, core_, CubeCores), CubeCores);
                 active_ = true;
             }
             if (next_ < limit_) {

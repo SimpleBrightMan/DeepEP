@@ -282,7 +282,7 @@ template <class S>
 __aicore__ inline void Expand(const Arguments& args, uint32_t worker)
 {
     const uint64_t rows = static_cast<uint64_t>(args.config.bs) * S::kTopK;
-    ExpandRows<S>(args, LocalRowBegin(rows, worker), LocalOwnedRows(rows, worker));
+    ExpandRows<S>(args, LocalRowBegin(rows, worker, S::kVectorCores), LocalOwnedRows(rows, worker, S::kVectorCores));
 }
 
 }  // namespace MegaMoeUrma

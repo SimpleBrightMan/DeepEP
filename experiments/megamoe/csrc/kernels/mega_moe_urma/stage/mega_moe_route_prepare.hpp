@@ -10,6 +10,7 @@
 #include "kernels/mega_moe_urma/common/mega_moe_transport.hpp"
 #include "kernels/mega_moe_urma/common/mega_moe_timer.hpp"
 #include "kernels/mega_moe_urma/stage/mega_moe_pack.hpp"
+#include "kernels/mega_moe_urma/stage/mega_moe_input_quant.hpp"
 
 // Invocation flag reset, local routes, peer route exchange and receive summary.
 
@@ -18,7 +19,7 @@ constexpr uint32_t kExpertRouteBatch = 4096U;  // preserve the E<=384 path
 constexpr uint32_t kExpertWideBatch = 3072U;
 constexpr uint32_t kExpertRouteStorageItems = 10U * kExpertWideBatch;
 static_assert(7U * kExpertRouteBatch <= kExpertRouteStorageItems);
-constexpr uint32_t kExpertRoutesPerWorker = (kExperts + kLocalWorkers - 1U) / kLocalWorkers;
+constexpr uint32_t kExpertRoutesPerWorker = (kExperts + 2U * kMinAic - 1U) / (2U * kMinAic);
 
 // A worker owns complete experts. Each output slot can hold the entire input
 // batch, including repeated expert IDs in one token's top-k list. Flat route
@@ -101,11 +102,12 @@ __aicore__ inline void RouteSave(uint64_t gm, uint32_t ub, uint32_t bytes)
 }
 // Startup-only scratch at UB offset 0 is retired before RouteOwnedExperts
 // reuses it. Assign whole 128B slots so AIV workers never share a cache line.
+template <class S>
 __aicore__ inline void ResetFlagRegion(uint64_t address, uint64_t bytes, uint32_t worker)
 {
     const uint64_t slots = bytes / kFlagBytes;
-    uint64_t offset = (slots * worker / kLocalWorkers) * kFlagBytes;
-    const uint64_t end = (slots * (worker + 1U) / kLocalWorkers) * kFlagBytes;
+    uint64_t offset = (slots * worker / S::kVectorCores) * kFlagBytes;
+    const uint64_t end = (slots * (worker + 1U) / S::kVectorCores) * kFlagBytes;
     while (offset < end) {
         const uint32_t size = static_cast<uint32_t>(end - offset < 4096U ? end - offset : 4096U);
         RouteSave(address + offset, 0U, size);
@@ -124,23 +126,24 @@ __aicore__ inline void ResetInvocationFlags(const Arguments& a, uint32_t worker)
     const uint64_t groups = RouteGroupCapacity(uint64_t(S::kEp) * S::kSourceRowCapacity, S::kLocalExperts);
     // Match the Host allocation's minimum size, including its unused padding.
     const uint64_t groupBytes = groups * kFlagBytes < 512U ? 512U : groups * kFlagBytes;
-    ResetFlagRegion(a.symmetric + c.dispatchReadyOffset, chunks * kFlagBytes, worker);
-    ResetFlagRegion(a.symmetric + c.combineReadyOffset, chunks * kFlagBytes, worker);
-    ResetFlagRegion(a.symmetric + c.barrierOffset + uint64_t(S::kEp) * kFlagBytes, uint64_t(S::kEp) * kFlagBytes,
-                    worker);
-    ResetFlagRegion(a.inputScaleDone, groupBytes, worker);
-    ResetFlagRegion(a.activationDone, groupBytes, worker);
-    ResetFlagRegion(a.gmm2Done, groupBytes, worker);
-    ResetFlagRegion(a.gmmIssued, S::kCubeCores * kFlagBytes, worker);
-    ResetFlagRegion(a.localFlags, (a.sharedExperts ? kSharedLocalFlagCount : 16U) * kFlagBytes, worker);
-    ResetFlagRegion(a.packReady, chunks * kFlagBytes, worker);
+    ResetFlagRegion<S>(a.symmetric + c.dispatchReadyOffset, chunks * kFlagBytes, worker);
+    ResetFlagRegion<S>(a.symmetric + c.combineReadyOffset, chunks * kFlagBytes, worker);
+    ResetFlagRegion<S>(a.symmetric + c.barrierOffset + uint64_t(S::kEp) * kFlagBytes, uint64_t(S::kEp) * kFlagBytes,
+                       worker);
+    ResetFlagRegion<S>(a.inputScaleDone, groupBytes, worker);
+    ResetFlagRegion<S>(a.activationDone, groupBytes, worker);
+    ResetFlagRegion<S>(a.gmm2Done, groupBytes, worker);
+    ResetFlagRegion<S>(a.gmmIssued, S::kCubeCores * kFlagBytes, worker);
+    ResetFlagRegion<S>(a.localFlags, (a.sharedExperts ? SharedLocalFlagCount(S::kCubeCores) : 16U) * kFlagBytes,
+                       worker);
+    ResetFlagRegion<S>(a.packReady, chunks * kFlagBytes, worker);
     if (a.sharedExperts) {
         const uint64_t maxTokens = S::kSourceRowCapacity / S::kTopK;
         const uint64_t sharedGroups = (maxTokens + 255U) / 256U;
         const uint64_t tileBytes = sharedGroups * (a.sharedIntermediate / 256U) * kFlagBytes;
         const uint64_t activationBytes = sharedGroups * kFlagBytes;
-        ResetFlagRegion(a.sharedGmm1Done, tileBytes < 512U ? 512U : tileBytes, worker);
-        ResetFlagRegion(a.sharedActivationDone, activationBytes < 512U ? 512U : activationBytes, worker);
+        ResetFlagRegion<S>(a.sharedGmm1Done, tileBytes < 512U ? 512U : tileBytes, worker);
+        ResetFlagRegion<S>(a.sharedActivationDone, activationBytes < 512U ? 512U : activationBytes, worker);
     }
     // RouteSave drains each MTE3 write. The existing first route SyncAll joins
     // every reset worker before any Start, route-ready or compute publication.
@@ -254,7 +257,7 @@ template <class S>
 __aicore__ inline void RouteOwnedExperts(const Arguments& a, uint32_t worker)
 {
     const uint32_t experts = S::kExperts;
-    const uint32_t each = experts / kLocalWorkers, extra = experts % kLocalWorkers;
+    const uint32_t each = experts / S::kVectorCores, extra = experts % S::kVectorCores;
     const uint32_t first = worker * each + (worker < extra ? worker : extra);
     const uint32_t owned = each + (worker < extra ? 1U : 0U);
     if (owned == 0U) return;  // empty owners still participate in the enclosing joins
@@ -447,12 +450,21 @@ __aicore__ inline void PrepareDeviceRoutes(Arguments& a, Timer& timer)
     // or double buffer is part of this argument. Keep the tail observers/join.
     if constexpr (g_coreType == AIV) {
         const uint32_t worker = LocalWorkerIndex(block, GetSubBlockIdx());
+        if (a.config.inputIsBf16 != 0U) {
+            QuantizeInputBf16ToMxfp8<S>(a, worker);
+        } else if constexpr (S::kSharedBf16) {
+            DequantizeInputMxfp8ToBf16<S>(a, worker);
+        }
         ResetInvocationFlags<S>(a, worker);
         RouteOwnedExperts<S>(a, worker);
     }
-    // #1: all flag resets, count DMA stores and consumers' cache invalidations precede
-    // the leader's first RouteInfo/Config update.
+    // #1: all flag resets, input quant/dequant, count DMA stores and consumers'
+    // cache invalidations precede the leader's first RouteInfo/Config update.
     SyncAll<false>();
+    if (a.config.inputIsBf16 != 0U) {
+        a.x = a.quantX;
+        a.xScale = a.quantXScale;
+    }
     if constexpr (g_coreType == AIV)
         if (block == 0U && GetSubBlockIdx() == 0U) RouteExpertPrefix<S>(a);
     // #2: count prefixes are immutable and ready for the exchange senders.

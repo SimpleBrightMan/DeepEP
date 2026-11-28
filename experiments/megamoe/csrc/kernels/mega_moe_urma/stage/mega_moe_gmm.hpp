@@ -286,7 +286,7 @@ __aicore__ inline void RunCubeAndPrologue(const Arguments& args, uint32_t block,
         // Jump directly between this core's groups before loading their GM
         // descriptors or building matmul configs. AIC/AIV0 keep identical
         // tile order and close the context on their last owned group.
-        for (uint64_t tile = FirstOwnedComputeTile(tileBegin, RoutedOwnerResidue(isGmm1, block), S::kCubeCores);
+        for (uint64_t tile = FirstOwnedComputeTile(tileBegin, RoutedOwnerResidue(isGmm1, block, S::kCubeCores), S::kCubeCores);
              tile < tileLimit;) {
             const auto owned = OwnedComputeGroupAt(tile, tilesPerGroup, S::kCubeCores);
             const uint64_t nextTile = tile + static_cast<uint64_t>(owned.tileCount) * S::kCubeCores;

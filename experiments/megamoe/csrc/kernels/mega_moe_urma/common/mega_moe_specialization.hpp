@@ -18,7 +18,8 @@
 namespace MegaMoeUrma {
 
 template <uint32_t Capacity, uint32_t Hidden, uint32_t Intermediate, uint32_t TopKCount, uint32_t LocalExperts,
-          uint32_t Ep, uint32_t WeightsType, uint32_t CubeCores = kAic, uint32_t VectorCores = 2U * kAic>
+          uint32_t Ep, uint32_t WeightsType, uint32_t CubeCores = kAic, uint32_t VectorCores = 2U * kAic,
+          uint32_t SharedBf16 = 0U>
 struct MegaMoeSpec {
     static_assert(Ep >= kMinWorld && Ep <= kWorld, "URMA requires EP4/EP8/EP16");
     static_assert(LocalExperts >= 1U && LocalExperts <= kMaxLocalExperts);
@@ -29,6 +30,10 @@ struct MegaMoeSpec {
     static_assert(Intermediate >= 256U && Intermediate <= 16384U && Intermediate % 256U == 0U);
     static_assert(WeightsType <= 1U);
     static_assert(Capacity >= 1U);
+    static_assert(CubeCores >= kMinAic && CubeCores <= kMaxAic && VectorCores == 2U * CubeCores,
+                  "URMA requires supported AIC/AIV core counts with 1:2 mix ratio");
+    static_assert(CubeCores > Ep - 1U, "URMA requires at least one activation core beyond communication peers");
+    static_assert(SharedBf16 <= 1U);
 
     static constexpr uint32_t kSourceRowCapacity = Capacity;
     static constexpr uint32_t kHidden = Hidden;
@@ -48,6 +53,7 @@ struct MegaMoeSpec {
     static constexpr uint32_t kCommunicationWorkers = Ep - 1U;
     static constexpr uint32_t kActivationWorkers = CubeCores - kCommunicationWorkers;
     static constexpr uint32_t kReduceWorkers = VectorCores - kCommunicationWorkers;
+    static constexpr bool kSharedBf16 = SharedBf16 != 0U;
 };
 
 }  // namespace MegaMoeUrma

@@ -309,11 +309,27 @@ def transform_weights_for_mega_moe(
 
     if activation != "swiglu":
         raise NotImplementedError("Only SwiGLU is supported")
-    pairs = (("l1_weights", _pair(l1_weights, "l1_weights")), ("l2_weights", _pair(l2_weights, "l2_weights")))
+    def _weight_pair(value, name):
+        if isinstance(value, torch.Tensor):
+            return value, None
+        if isinstance(value, tuple) and len(value) == 2 and value[1] is None and isinstance(value[0], torch.Tensor):
+            return value[0], None
+        return _pair(value, name)
+
+    pairs = (("l1_weights", _weight_pair(l1_weights, "l1_weights")), ("l2_weights", _weight_pair(l2_weights, "l2_weights")))
     if pairs[0][1][0].ndim != pairs[1][1][0].ndim:
         raise ValueError("l1_weights and l2_weights must have the same rank (3D routed or 2D shared)")
     transformed = []
     for name, (weight, scale) in pairs:
+        if weight.dtype == torch.bfloat16:
+            if weight.ndim != 2 or scale is not None:
+                raise ValueError(f"{name}: BF16 weights must be 2D shared tensors without scales")
+            if weight.device.type != "npu":
+                raise ValueError("Move weights to NPU before preparing")
+            transformed.append((weight.contiguous(), None))
+            continue
+        if scale is None:
+            raise TypeError(f"{name} must be a (data, scale) tensor pair")
         if weight.device.type != "npu" or scale.device != weight.device:
             raise ValueError("Move weights and scales to the same NPU before preparing")
         if weight.ndim not in (2, 3):
@@ -433,21 +449,28 @@ def _run(
     if (shared_l1_weights is None) != (shared_l2_weights is None):
         raise ValueError("Supply both shared weight pairs, or neither")
     if shared_l1_weights is not None:
-        sw1, ss1 = _pair(shared_l1_weights, "shared_l1_weights")
-        sw2, ss2 = _pair(shared_l2_weights, "shared_l2_weights")
+        def _shared_pair(value, name):
+            if isinstance(value, torch.Tensor):
+                return value, None
+            if isinstance(value, tuple) and len(value) == 2 and value[1] is None and isinstance(value[0], torch.Tensor):
+                return value[0], None
+            return _pair(value, name)
+
+        sw1, ss1 = _shared_pair(shared_l1_weights, "shared_l1_weights")
+        sw2, ss2 = _shared_pair(shared_l2_weights, "shared_l2_weights")
         if sw1.ndim == 2:
             if sym_buffer.num_shared_experts != 1:
                 raise ValueError("2D shared weights require num_shared_experts=1")
             sw1 = sw1.reshape((1, *sw1.shape))
-            ss1 = ss1.reshape((1, *ss1.shape))
+            if ss1 is not None:
+                ss1 = ss1.reshape((1, *ss1.shape))
             sw2 = sw2.reshape((1, *sw2.shape))
-            ss2 = ss2.reshape((1, *ss2.shape))
+            if ss2 is not None:
+                ss2 = ss2.reshape((1, *ss2.shape))
         shared = (sw1, sw2, ss1, ss2)
     clamp = normalize_clamp(activation_clamp)
     b = sym_buffer
     urma = b._backend_name == "urma"
-    if urma and scales is None:
-        raise TypeError("URMA input requires (FP8 E4M3, E8M0 scales)")
     if scales is not None and scales.dtype == torch.int16 and tuple(scales.shape) == (data.shape[0], b.hidden // 64):
         scales = scales.contiguous().view(torch.uint8).view(torch.float8_e8m0fnu).reshape((data.shape[0], b.hidden // 32))
     if data.ndim != 2 or not 0 < data.shape[0] <= b.num_max_tokens_per_rank or data.shape[1] != b.hidden:
@@ -497,11 +520,11 @@ def _run(
                     import torch_npu
 
                     if (
-                        weight.dtype != torch.float8_e4m3fn
+                        weight.dtype not in (torch.float8_e4m3fn, torch.bfloat16)
                         or not weight.is_contiguous()
                         or torch_npu.get_npu_format(weight) != 2
                     ):
-                        raise ValueError("URMA shared weights require contiguous ND FP8 E4M3")
+                        raise ValueError("URMA shared weights require contiguous ND FP8 E4M3 or BF16")
                 else:
                     _check_fp4_weight_format(weight, name)
     if cumulative_stats is not None:

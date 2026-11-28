@@ -236,7 +236,7 @@ def decode_trace(raw, *, rank, clock_mhz):
         if values.dtype.kind not in "iu" or values.dtype.itemsize != 8:
             raise ValueError("trace requires 64-bit integer storage")
         values = values.view(np.dtype(values.dtype.byteorder + "u8")).reshape(-1)
-    if values.size < ENGINE_COUNT * HEADER_WORDS:
+    if values.size < 3 * HEADER_WORDS:
         raise ValueError("trace is missing engine headers")
     if int(values[0]) != TRACE_SCHEMA:
         raise ValueError("trace schema is missing or incompatible")
@@ -244,9 +244,12 @@ def decode_trace(raw, *, rank, clock_mhz):
     if not 1 <= capacity <= 65536:
         raise ValueError("trace capacity must be in [1,65536]")
     stride = HEADER_WORDS + capacity * RECORD_WORDS
-    if values.size != ENGINE_COUNT * stride:
-        raise ValueError(f"trace size disagrees with capacity={capacity}: expected {ENGINE_COUNT * stride} words")
-    slices = values.reshape(ENGINE_COUNT, stride)
+    if values.size % stride != 0:
+        raise ValueError(f"trace size disagrees with capacity={capacity}: {values.size} is not divisible by {stride}")
+    engine_count = values.size // stride
+    if engine_count < 3 or engine_count % 3 != 0:
+        raise ValueError(f"trace engine count must be a positive multiple of 3, got {engine_count}")
+    slices = values.reshape(engine_count, stride)
     counts, overflows = [], []
     for engine, data in enumerate(slices):
         schema, engine_capacity, count, dropped, engine_id = map(int, data[:5])
@@ -292,7 +295,7 @@ def decode_trace(raw, *, rank, clock_mhz):
     metadata = dict(
         schema=TRACE_SCHEMA,
         rank=rank,
-        engine_count=ENGINE_COUNT,
+        engine_count=engine_count,
         capacity_per_engine=capacity,
         records_per_engine=counts,
         record_count=len(records),
@@ -324,7 +327,7 @@ def decode_trace(raw, *, rank, clock_mhz):
             "including initial readiness wait, and end after final context drain. "
             "All records are written after final LocalSync; record writeback is outside the raw envelope."
         )
-    for engine in range(ENGINE_COUNT):
+    for engine in range(engine_count):
         block, kind = divmod(engine, 3)
         events.extend(
             [
@@ -392,7 +395,8 @@ def filter_trace_waits(trace):
                 continue
         kept.append(event)
     metadata = dict(trace["metadata"])
-    per_engine = [0] * ENGINE_COUNT
+    engine_count = int(metadata.get("engine_count", ENGINE_COUNT))
+    per_engine = [0] * engine_count
     for event in kept:
         if event.get("ph") == "X":
             per_engine[event["tid"]] += 1
@@ -478,7 +482,8 @@ def coalesce_gmm_tiles(trace):
     events = [
         replacements.get(index, event) for index, event in enumerate(trace["traceEvents"]) if index not in removed
     ]
-    counts = [0] * ENGINE_COUNT
+    engine_count = int(trace["metadata"].get("engine_count", ENGINE_COUNT))
+    counts = [0] * engine_count
     for event in events:
         if event.get("ph") == "X":
             counts[event["tid"]] += 1
@@ -568,9 +573,11 @@ def communication_bandwidth(raw, rank, *, world=16, group_size=4, clock_mhz=1000
     if clock_mhz is not None and (not math.isfinite(clock_mhz) or clock_mhz <= 0):
         raise ValueError("clock_mhz must be positive and finite, or None")
     values = np.asarray(raw)
-    if values.size != TIMER_NUMEL or values.dtype.kind not in "iu":
-        raise ValueError(f"URMA timer requires {TIMER_NUMEL} integer values")
-    values = values.reshape(28, 3, 8, 16)
+    per_cube = 3 * 8 * 16
+    if values.size < per_cube or values.size % per_cube != 0 or values.dtype.kind not in "iu":
+        raise ValueError(f"URMA timer requires a positive multiple of {per_cube} integer values")
+    cube_cores = values.size // per_cube
+    values = values.reshape(cube_cores, 3, 8, 16)
     receive_markers = values[..., 5] == DISPATCH_SEND_TO_RECEIVE
     if np.any(receive_markers[:, :, :1]) or np.any(receive_markers[:, :, 2:]):
         raise ValueError("receive timing semantics are valid only for Dispatch")
@@ -756,9 +763,14 @@ def export_diagnostics(group, trace, directory, *, timer_ranks):
     if trace is not None:
         try:
             buffer = trace.cpu().numpy()
-            if buffer.ndim != 1 or buffer.size <= TIMER_NUMEL:
+            if buffer.ndim != 1 or buffer.size < 3 * (HEADER_WORDS + 8 * 16):
                 raise ValueError("Invalid combined timer buffer")
-            raw, counters = buffer[:-TIMER_NUMEL], buffer[-TIMER_NUMEL:]
+            capacity = int(buffer[1])
+            per_engine = HEADER_WORDS + capacity * RECORD_WORDS + 8 * 16
+            if capacity < 1 or buffer.size % per_engine != 0:
+                raise ValueError("Invalid combined timer buffer size")
+            timer_numel = (buffer.size // per_engine) * 8 * 16
+            raw, counters = buffer[:-timer_numel], buffer[-timer_numel:]
             raw.astype("<i8", copy=False).tofile(directory / "urma_trace.bin")
             export_trace(raw, directory / "urma_trace.json", rank=group.rank(), clock_mhz=1000.0)
             timing = communication_bandwidth(counters, group.rank(), world=group.size(), clock_mhz=1000.0)

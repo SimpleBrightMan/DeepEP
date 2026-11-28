@@ -12,6 +12,8 @@ constexpr uint32_t kMinWorld = 4;
 constexpr uint32_t kExperts = 2048;  // capacity only; active E = world * localExperts
 constexpr uint32_t kMaxLocalExperts = 128;
 constexpr uint32_t kAic = 28;
+constexpr uint32_t kMinAic = 16;
+constexpr uint32_t kMaxAic = 64;
 constexpr uint32_t kLocalWorkers = 2U * kAic;
 // EP16 bounds/defaults; active work partitions are derived from Config::world.
 constexpr uint32_t kCommunicationWorkers = kWorld - 1U;
@@ -32,10 +34,24 @@ constexpr uint32_t kLocalFlagReorderDone = 4U;
 constexpr uint32_t kLocalFlagSharedGmm1Done = 5U;
 constexpr uint32_t kLocalFlagRouteSummaryDone = 6U;
 constexpr uint32_t kLocalFlagRouteSourcesDone = 7U;  // committed AIV0 source snapshots
+#if defined(__NPU_DEVICE__)
+#define MEGAMOE_URMA_TILING_INLINE __aicore__ inline
+#else
+#define MEGAMOE_URMA_TILING_INLINE inline
+#endif
+
 // Separate cache lines: per-core L1 ownership handoff shared W8 -> routed W4 -> shared W8.
 constexpr uint32_t kLocalFlagSharedL1Released = 16U;
-constexpr uint32_t kLocalFlagRoutedPrologueReleased = kLocalFlagSharedL1Released + kAic;
-constexpr uint32_t kSharedLocalFlagCount = kLocalFlagRoutedPrologueReleased + kAic;
+MEGAMOE_URMA_TILING_INLINE constexpr uint32_t LocalFlagRoutedPrologueReleased(uint32_t cubeCores)
+{
+    return kLocalFlagSharedL1Released + cubeCores;
+}
+MEGAMOE_URMA_TILING_INLINE constexpr uint32_t SharedLocalFlagCount(uint32_t cubeCores)
+{
+    return kLocalFlagSharedL1Released + 2U * cubeCores;
+}
+constexpr uint32_t kLocalFlagRoutedPrologueReleased = LocalFlagRoutedPrologueReleased(kAic);
+constexpr uint32_t kSharedLocalFlagCount = SharedLocalFlagCount(kAic);
 constexpr uint32_t kLocalFlagRouteExpertsDone = 8U;  // committed AIV0 expert shards
 // Reduce dependency values are uint64 bit patterns stored in an int64 tensor.
 // Low values address a producer/CV completion flag; tagged values address a
@@ -44,10 +60,19 @@ constexpr uint64_t kReduceSelfDependency = uint64_t{1} << 63U;
 constexpr uint32_t kProtocol = 1;
 constexpr uint32_t kDeviceRoutingProtocol = 8;
 #define MEGAMOE_URMA_ROUTE_REORDER 1
-constexpr uint32_t kTimerCores = kAic * 3U;
+MEGAMOE_URMA_TILING_INLINE constexpr uint32_t TimerCores(uint32_t cubeCores)
+{
+    return cubeCores * 3U;
+}
+constexpr uint32_t kTimerCores = TimerCores(kAic);
 constexpr uint32_t kTimerPhases = 8U;
 constexpr uint32_t kTimerRecordElements = 16U;
-constexpr uint64_t kTimerElements = static_cast<uint64_t>(kTimerCores) * kTimerPhases * kTimerRecordElements;
+MEGAMOE_URMA_TILING_INLINE constexpr uint64_t TimerElements(uint32_t cubeCores)
+{
+    return static_cast<uint64_t>(TimerCores(cubeCores)) * kTimerPhases * kTimerRecordElements;
+}
+constexpr uint64_t kTimerElements = TimerElements(kAic);
+#undef MEGAMOE_URMA_TILING_INLINE
 
 // Detailed traces have independent, bounded single-writer slices per engine.
 // A slice contains a 128B header followed by capacity 128B event records.
@@ -244,6 +269,10 @@ struct Config {
     uint64_t sourceRowCapacity;  // fixed pitch; no receiver offset reply
     uint64_t routeInboxOffset, routeEntryOffset, routeReadyOffset;
     uint32_t routeSegmentCount, routeLinkCount;
+    uint32_t cubeCores = kAic;
+    uint32_t vectorCores = 2U * kAic;
+    uint32_t inputIsBf16 = 0U;
+    uint32_t sharedIsBf16 = 0U;
 };
 
 // This POD is copied as kernel launch arguments; every address is device GM.
@@ -304,6 +333,9 @@ struct Arguments {
     uint64_t sharedRoutedOutput;  // S1 FP32 routed sum; round only after adding shared result.
     uint64_t gmmIssued;           // per-AIC monotonic routed output submission count
     uint64_t expertRoutes;        // int32 [384, sourceRowCapacity], one owner per expert
+    uint64_t rawBf16X;            // BF16 [BS, H] input (original x when inputIsBf16, or dequantized for BF16 shared)
+    uint64_t quantX;              // workspace FP8 E4M3 [maxTokens, H] for on-the-fly quantization
+    uint64_t quantXScale;         // workspace E8M0 [maxTokens, H/32] for on-the-fly quantization
 };
 static_assert(sizeof(Fragment) == 40);
 static_assert(sizeof(RowSegment) == 40);

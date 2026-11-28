@@ -7,6 +7,13 @@ from .validation import collective_check
 
 
 def select_backend(group):
+    import os
+
+    override = os.environ.get("DEEPEP_MEGAMOE_BACKEND", "").strip().lower()
+    if override in ("urma", "mte"):
+        selected = override
+        collective_check(group, "MegaMoE product selection", None, selected)
+        return selected
     # Product identity is distinct from fabric topology. Unknown products keep
     # the MTE entry; its existing shape/platform/peer checks still apply.
     try:
