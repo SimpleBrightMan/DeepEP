@@ -65,9 +65,13 @@ constexpr uint32_t TOKEN_ID = 1U;
 constexpr uint32_t TOPK_INDEX = 2U;
 constexpr uint32_t WEIGHT_INDEX = 3U;
 constexpr uint32_t TERMINAL_ROUTE = 4U;
+constexpr uint32_t DEDUP_REUSE_FLAG = 5U;
 constexpr uint32_t TERMINAL_ROUTE_BIT = 1U << 31;
 constexpr uint32_t ROUTE_INDEX_MASK = ~TERMINAL_ROUTE_BIT;
 constexpr uint32_t DEDUP_MAX_EP_WORLD_SIZE = 4U;
+// Per-(sourceRank, token) dedup record: [0..7]=local route rows, [8..15]=cached float32 weights (64B).
+constexpr uint32_t DEDUP_ROUTE_STRIDE_WORDS = 16U;
+constexpr uint32_t DEDUP_WEIGHT_WORD_OFFSET = 8U;
 constexpr uint32_t SYNC_EVENT_ID0 = 0;
 constexpr uint32_t SYNC_EVENT_ID1 = 1;
 constexpr uint32_t SYNC_EVENT_ID2 = 2;

@@ -50,13 +50,22 @@ __aicore__ inline void ResetDedupRouteMap(const AivJobContext& job, const Params
         return;
     }
     SyncFuncStatic<AscendC::HardEvent::MTE3_V, SYNC_EVENT_ID2>();
-    Duplicate(resetTensor, int32_t(-1), resetBatchElementCount);
+    int32_t alignedBatch = static_cast<int32_t>(
+        Ops::Base::CeilAlign(static_cast<uint64_t>(resetBatchElementCount), static_cast<uint64_t>(INT32_PER_256B)));
+    Duplicate(resetTensor, int32_t(-1), alignedBatch);
     SyncFuncStatic<AscendC::HardEvent::V_MTE3, SYNC_EVENT_ID2>();
-    int32_t routeCount = static_cast<int32_t>(
-        static_cast<uint64_t>(params.tilingData->epWorldSize) * params.tilingData->numMaxTokensPerRank *
-        params.tilingData->topK);
-    ResetWorkspaceRegion<1>(job, params.workspaceInfo.dedupRouteRowPtr, routeCount, resetBatchElementCount,
-                            resetTensor);
+    int32_t sourceTokenCount = static_cast<int32_t>(
+        static_cast<uint64_t>(params.tilingData->epWorldSize) * params.tilingData->numMaxTokensPerRank);
+    int32_t recordWordCount = static_cast<int32_t>(Ops::Base::CeilAlign(
+        static_cast<uint64_t>(sourceTokenCount) * DEDUP_ROUTE_STRIDE_WORDS, static_cast<uint64_t>(INT_CACHELINE)));
+    int32_t firstRowWordCount = static_cast<int32_t>(
+        Ops::Base::CeilAlign(static_cast<uint64_t>(sourceTokenCount), static_cast<uint64_t>(INT_CACHELINE)));
+    ResetWorkspaceRegion<INT_CACHELINE>(job, params.workspaceInfo.dedupRouteRowPtr, recordWordCount, alignedBatch,
+                                        resetTensor);
+    if (params.workspaceInfo.dedupFirstRowPtr != nullptr) {
+        ResetWorkspaceRegion<INT_CACHELINE>(job, params.workspaceInfo.dedupFirstRowPtr, firstRowWordCount, alignedBatch,
+                                            resetTensor);
+    }
 }
 #endif
 

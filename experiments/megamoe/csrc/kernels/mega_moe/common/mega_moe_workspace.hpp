@@ -26,8 +26,10 @@ struct WorkspaceInfo {
     GM_ADDR activationQuantScalePtr;
     GM_ADDR expertRevTokenNumsPtr;
     GM_ADDR metaInfoPtr;
-    // One local packed row per source route. -1 means this owner rank does not own the route.
+    // Per-(sourceRank, token) 64B record: [0..7]=local rows (-1 if unowned), [8..15]=cached float32 weights.
     GM_ADDR dedupRouteRowPtr{nullptr};
+    // Per-(sourceRank, token) first materialized local row (-1 if not yet dispatched) for O(1) reuse lookup.
+    GM_ADDR dedupFirstRowPtr{nullptr};
     GM_ADDR flagActivationToGmm2Ptr;
     GM_ADDR flagDispatchToGmm1Ptr;
     GM_ADDR flagSendCntCalToUpdParamsPtr;
@@ -95,10 +97,13 @@ private:
         workspaceSize += Ops::Base::CeilAlign(tilingData->maxOutputSize * ALIGN_32, ALIGN_512);
 
         if (UseDeduplicatedRoutes(tilingData)) {
+            int64_t sourceTokenCount =
+                static_cast<int64_t>(tilingData->epWorldSize) * tilingData->numMaxTokensPerRank;
             dedupRouteRowPtr = base + workspaceSize;
-            int64_t sourceRouteCount = static_cast<int64_t>(tilingData->epWorldSize) *
-                                       tilingData->numMaxTokensPerRank * tilingData->topK;
-            workspaceSize += Ops::Base::CeilAlign(SIZE_INT_32 * sourceRouteCount, ALIGN_512);
+            workspaceSize +=
+                Ops::Base::CeilAlign(SIZE_INT_32 * sourceTokenCount * DEDUP_ROUTE_STRIDE_WORDS, ALIGN_512);
+            dedupFirstRowPtr = base + workspaceSize;
+            workspaceSize += Ops::Base::CeilAlign(SIZE_INT_32 * sourceTokenCount, ALIGN_512);
         }
 
         // 以下三组 flag 仅由 MoE 专家使用；共享专家路径不使用这些 flag。
